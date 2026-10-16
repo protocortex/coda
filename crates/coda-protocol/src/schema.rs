@@ -84,6 +84,11 @@ pub fn protocol_schema() -> Value {
         &mut methods,
         m::DAEMON_STATUS,
     );
+    add_method::<m::DaemonShutdownParams, m::DaemonShutdownResult>(
+        &mut generator,
+        &mut methods,
+        m::DAEMON_SHUTDOWN,
+    );
     add_method::<m::PingParams, m::PingResult>(&mut generator, &mut methods, m::DAEMON_PING);
 
     let event = generator.subschema_for::<Event>().to_value();

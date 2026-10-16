@@ -37,6 +37,8 @@ pub const USAGE_SUMMARY: &str = "usage.summary";
 pub const SESSION_SET_MODEL: &str = "session.set_model";
 /// Reports daemon state.
 pub const DAEMON_STATUS: &str = "daemon.status";
+/// Asks the daemon to stop serving and exit.
+pub const DAEMON_SHUTDOWN: &str = "daemon.shutdown";
 /// Liveness check.
 pub const DAEMON_PING: &str = "daemon.ping";
 
@@ -53,6 +55,7 @@ pub const METHODS: &[&str] = &[
     USAGE_SUMMARY,
     SESSION_SET_MODEL,
     DAEMON_STATUS,
+    DAEMON_SHUTDOWN,
     DAEMON_PING,
 ];
 
@@ -175,23 +178,25 @@ pub struct PermissionRespondResult {
     pub accepted: bool,
 }
 
-/// Parameters of [`GRANT_ADD`].
+/// Parameters of [`GRANT_ADD`]. A grant matches only when repository, tool,
+/// cwd and pattern all equal the requested call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GrantAddParams {
-    /// Session the grant applies to.
-    pub session_id: SessionId,
+    /// Canonical root of the git repository the grant applies to.
+    pub repo_path: String,
     /// Tool the grant covers.
     pub tool: String,
-    /// Argument pattern limiting the grant, or all calls of the tool.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pattern: Option<String>,
+    /// Working directory the grant applies to.
+    pub cwd: String,
+    /// Exact command or argument pattern the grant covers.
+    pub pattern: String,
 }
 
 /// Result of [`GRANT_ADD`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GrantAddResult {
-    /// Identifier of the stored grant.
-    pub grant_id: String,
+    /// When the grant was first stored, in milliseconds since the Unix epoch.
+    pub granted_at: i64,
 }
 
 /// Parameters of [`USAGE_SUMMARY`].
@@ -231,13 +236,29 @@ pub struct DaemonStatusParams {}
 /// Result of [`DAEMON_STATUS`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonStatusResult {
+    /// Process id of the daemon.
+    pub pid: u32,
+    /// Protocol version the daemon speaks.
+    pub protocol_version: u32,
     /// Version of the daemon build.
     pub version: String,
     /// Seconds since the daemon started.
     pub uptime_secs: u64,
-    /// Sessions currently loaded.
-    pub sessions: Vec<SessionInfo>,
+    /// Connections open right now, including the one asking.
+    pub client_count: u32,
+    /// Turns running right now.
+    pub active_turns: u32,
+    /// Directory holding the daemon's database.
+    pub data_dir: String,
 }
+
+/// Parameters of [`DAEMON_SHUTDOWN`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DaemonShutdownParams {}
+
+/// Result of [`DAEMON_SHUTDOWN`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DaemonShutdownResult {}
 
 /// Parameters of [`DAEMON_PING`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -266,6 +287,7 @@ mod tests {
             (USAGE_SUMMARY, "usage.summary"),
             (SESSION_SET_MODEL, "session.set_model"),
             (DAEMON_STATUS, "daemon.status"),
+            (DAEMON_SHUTDOWN, "daemon.shutdown"),
             (DAEMON_PING, "daemon.ping"),
             (crate::events::EVENT_NOTIFICATION, "session.event"),
         ];

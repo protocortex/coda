@@ -17,19 +17,22 @@ use coda_protocol::jsonrpc::{
     PARSE_ERROR, Request, Response,
 };
 use coda_protocol::methods::{
-    DAEMON_PING, INITIALIZE, InitializeParams, InitializeResult, PROTOCOL_VERSION, PingResult,
-    SESSION_SUBSCRIBE, SessionSubscribeParams, SessionSubscribeResult,
+    DAEMON_PING, DAEMON_SHUTDOWN, DAEMON_STATUS, DaemonShutdownResult, GRANT_ADD, INITIALIZE,
+    InitializeParams, InitializeResult, PROTOCOL_VERSION, PingResult, SESSION_SUBSCRIBE,
+    SessionSubscribeParams, SessionSubscribeResult,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tracing::error;
 
+use crate::grants_rpc;
+use crate::state::{ClientGuard, DaemonState};
 use crate::subscribe::{Connection, Hub, HubError, Outbox};
 
 /// `initialize` was called with a protocol version the daemon does not speak.
 pub const PROTOCOL_VERSION_MISMATCH: i64 = -32001;
 
-type HandlerResult = Result<Value, ErrorObject>;
+pub(crate) type HandlerResult = Result<Value, ErrorObject>;
 type HandlerFuture = Pin<Box<dyn Future<Output = HandlerResult> + Send>>;
 type Handler = fn(Option<Value>) -> HandlerFuture;
 
@@ -37,6 +40,7 @@ type Handler = fn(Option<Value>) -> HandlerFuture;
 pub struct Dispatcher {
     handlers: HashMap<&'static str, Handler>,
     hub: Option<Arc<Hub>>,
+    state: Option<Arc<DaemonState>>,
 }
 
 impl Default for Dispatcher {
@@ -56,10 +60,24 @@ impl Dispatcher {
         Self {
             handlers,
             hub: None,
+            state: None,
         }
     }
 
-    /// Also answers `session.subscribe` from `hub`.
+    /// Also answers `daemon.status` and `daemon.shutdown` from `state`.
+    #[must_use]
+    pub fn with_state(mut self, state: Arc<DaemonState>) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    /// Counts one open connection while the returned guard lives, if state is attached.
+    #[must_use]
+    pub fn track_client(&self) -> Option<ClientGuard> {
+        self.state.as_ref().map(DaemonState::track_client)
+    }
+
+    /// Also answers `session.subscribe` and `grant.add` from `hub`.
     #[must_use]
     pub fn with_hub(mut self, hub: Arc<Hub>) -> Self {
         self.hub = Some(hub);
@@ -98,6 +116,21 @@ impl Dispatcher {
         if request.method == SESSION_SUBSCRIBE {
             return subscribe(request, connection).await;
         }
+        let id = request.id.clone();
+        let stateful = match request.method.as_str() {
+            GRANT_ADD => {
+                Some(grants_rpc::add_grant(self.hub.as_ref(), request.params.clone()).await)
+            }
+            DAEMON_STATUS => Some(self.status()),
+            DAEMON_SHUTDOWN => Some(self.shutdown()),
+            _ => None,
+        };
+        if let Some(outcome) = stateful {
+            return Some(match outcome {
+                Ok(result) => Response::success(id, result),
+                Err(e) => Response::failure(id, e),
+            });
+        }
         let Some(handler) = self.handlers.get(request.method.as_str()) else {
             return Some(failure(request.id, METHOD_NOT_FOUND, "Method not found"));
         };
@@ -108,11 +141,28 @@ impl Dispatcher {
     }
 }
 
+impl Dispatcher {
+    fn status(&self) -> HandlerResult {
+        let state = self.state.as_ref().ok_or_else(not_found)?;
+        to_value(&state.status())
+    }
+
+    fn shutdown(&self) -> HandlerResult {
+        let state = self.state.as_ref().ok_or_else(not_found)?;
+        state.request_shutdown();
+        to_value(&DaemonShutdownResult {})
+    }
+}
+
+fn not_found() -> ErrorObject {
+    error(METHOD_NOT_FOUND, "Method not found")
+}
+
 fn failure(id: Id, code: i64, message: &str) -> Response {
     Response::failure(id, error(code, message))
 }
 
-fn error(code: i64, message: &str) -> ErrorObject {
+pub(crate) fn error(code: i64, message: &str) -> ErrorObject {
     ErrorObject {
         code,
         message: message.to_owned(),
@@ -120,12 +170,12 @@ fn error(code: i64, message: &str) -> ErrorObject {
     }
 }
 
-fn parse_params<T: DeserializeOwned>(params: Option<Value>) -> Result<T, ErrorObject> {
+pub(crate) fn parse_params<T: DeserializeOwned>(params: Option<Value>) -> Result<T, ErrorObject> {
     serde_json::from_value(params.unwrap_or(Value::Null))
         .map_err(|_| error(INVALID_PARAMS, "Invalid params"))
 }
 
-fn to_value<T: serde::Serialize>(result: &T) -> HandlerResult {
+pub(crate) fn to_value<T: serde::Serialize>(result: &T) -> HandlerResult {
     serde_json::to_value(result).map_err(|_| error(INTERNAL_ERROR, "Internal error"))
 }
 
@@ -266,6 +316,100 @@ mod tests {
 
         // Assert
         assert_eq!(error.code, INVALID_PARAMS);
+    }
+
+    fn dispatcher_with_state() -> (Dispatcher, Arc<crate::state::DaemonState>) {
+        let state = crate::state::DaemonState::new(std::path::PathBuf::from("/data"));
+        (Dispatcher::new().with_state(Arc::clone(&state)), state)
+    }
+
+    async fn call_on(dispatcher: &Dispatcher, payload: &str) -> Response {
+        let (connection, _outbox) = Connection::detached();
+        dispatcher
+            .handle(payload.as_bytes(), &connection)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn status_answers_with_daemon_facts() {
+        // Arrange
+        let (dispatcher, _state) = dispatcher_with_state();
+
+        // Act
+        let response = call_on(
+            &dispatcher,
+            r#"{"jsonrpc":"2.0","id":1,"method":"daemon.status"}"#,
+        )
+        .await;
+
+        // Assert
+        let result = result_of(response);
+        assert_eq!(result["pid"], json!(std::process::id()));
+        assert_eq!(result["protocol_version"], json!(1));
+        assert_eq!(result["data_dir"], json!("/data"));
+    }
+
+    #[tokio::test]
+    async fn status_without_state_is_method_not_found() {
+        // Arrange
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"daemon.status"}"#;
+
+        // Act
+        let (_, error) = error_of(call(request).await.unwrap());
+
+        // Assert
+        assert_eq!(error.code, METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn shutdown_answers_then_flags_the_state() {
+        // Arrange
+        let (dispatcher, state) = dispatcher_with_state();
+
+        // Act
+        let response = call_on(
+            &dispatcher,
+            r#"{"jsonrpc":"2.0","id":1,"method":"daemon.shutdown"}"#,
+        )
+        .await;
+
+        // Assert
+        assert_eq!(result_of(response), json!({}));
+        let woke = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.shutdown_requested(),
+        )
+        .await;
+        assert!(woke.is_ok());
+    }
+
+    #[tokio::test]
+    async fn grant_add_is_registered_when_a_hub_is_present() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let store = coda_store::Store::open(&dir.path().join("data")).unwrap();
+        let hub = Hub::new(store, crate::subscribe::DEFAULT_QUEUE_CAPACITY);
+        let dispatcher = Dispatcher::new().with_hub(hub);
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"grant.add","params":{"repo_path":"/r","tool":"bash","cwd":"/r","pattern":"ls"}}"#;
+
+        // Act
+        let response = call_on(&dispatcher, request).await;
+
+        // Assert
+        assert!(result_of(response)["granted_at"].is_i64());
+    }
+
+    #[tokio::test]
+    async fn grant_add_without_a_hub_is_method_not_found() {
+        // Arrange
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"grant.add","params":{"repo_path":"/r","tool":"bash","cwd":"/r","pattern":"ls"}}"#;
+
+        // Act
+        let (_, error) = error_of(call(request).await.unwrap());
+
+        // Assert
+        assert_eq!(error.code, METHOD_NOT_FOUND);
     }
 
     #[tokio::test]
