@@ -2,12 +2,20 @@
 
 //! SQLite persistence for coda. The only crate that opens the database.
 
+mod decisions;
 mod events;
+mod grants;
 pub mod migrate;
+mod pending;
 mod sessions;
+mod usage;
 
+pub use decisions::{NewDecision, StoredDecision};
 pub use events::{EventRecord, StoredEvent};
+pub use grants::{Grant, GrantKey};
+pub use pending::{NewPending, PendingPermission};
 pub use sessions::{NewSession, SessionFilter, SessionRecord};
+pub use usage::{UsageRecord, UsageSummary};
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
@@ -21,7 +29,7 @@ use coda_protocol::types::{RequestId, SessionId, TurnId};
 use rusqlite::Connection;
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 const DB_FILE_NAME: &str = "coda.db";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -151,7 +159,6 @@ impl Store {
     }
 
     /// The underlying connection.
-    #[allow(dead_code)]
     pub(crate) fn connection(&self) -> &Connection {
         &self.conn
     }
