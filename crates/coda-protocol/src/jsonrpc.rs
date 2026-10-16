@@ -2,10 +2,12 @@
 
 //! JSON-RPC 2.0 message types.
 
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::{self, DeserializeOwned};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 
 /// Invalid JSON was received.
 pub const PARSE_ERROR: i64 = -32700;
@@ -30,6 +32,16 @@ impl Serialize for Version {
     }
 }
 
+impl JsonSchema for Version {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("Version")
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({"const": VERSION_STR})
+    }
+}
+
 impl<'de> Deserialize<'de> for Version {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
@@ -44,7 +56,7 @@ impl<'de> Deserialize<'de> for Version {
 }
 
 /// A request identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum Id {
     /// Numeric identifier.
@@ -56,7 +68,7 @@ pub enum Id {
 }
 
 /// A call that expects a [`Response`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Request {
     /// Protocol version marker.
     pub jsonrpc: Version,
@@ -70,7 +82,7 @@ pub struct Request {
 }
 
 /// A call that expects no response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Notification {
     /// Protocol version marker.
     pub jsonrpc: Version,
@@ -82,7 +94,7 @@ pub struct Notification {
 }
 
 /// The error member of a failed [`Response`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorObject {
     /// Error code, see the named constants in this module.
     pub code: i64,
