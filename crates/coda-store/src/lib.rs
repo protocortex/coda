@@ -3,17 +3,25 @@
 //! SQLite persistence for coda. The only crate that opens the database.
 
 mod decisions;
+mod event_log;
 mod events;
 mod grants;
+mod index;
 pub mod migrate;
+mod originals;
 mod pending;
+mod readers;
 mod sessions;
 mod usage;
 
 pub use decisions::{NewDecision, StoredDecision};
+pub use event_log::{LogEvent, LogEventKind, LogScope, MAX_LOG_ID};
 pub use events::{EventRecord, StoredEvent};
 pub use grants::{Grant, GrantKey};
+pub use index::Symbol;
+pub use originals::MAX_ORIGINAL_BYTES;
 pub use pending::{NewPending, PendingPermission};
+pub use readers::{RepoIndex, SessionOriginals};
 pub use sessions::{NewSession, SessionFilter, SessionRecord};
 pub use usage::{UsageRecord, UsageSummary};
 
@@ -63,6 +71,14 @@ pub enum StoreError {
     PendingNotFound { request: RequestId },
     #[error("pending permission {request} is already resolved")]
     AlreadyResolved { request: RequestId },
+    #[error("log field {field} value {value} exceeds the maximum {max}")]
+    LogValueTooLarge {
+        field: &'static str,
+        value: u64,
+        max: u64,
+    },
+    #[error("original of {size} bytes exceeds the {max} byte limit")]
+    OriginalTooLarge { size: usize, max: usize },
     #[error("value {value} does not fit the database integer range")]
     ValueOutOfRange { value: u64 },
     #[error("stored value could not be encoded or decoded: {0}")]
