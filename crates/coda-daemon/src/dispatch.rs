@@ -116,27 +116,21 @@ impl Dispatcher {
         if request.method == SESSION_SUBSCRIBE {
             return subscribe(request, connection).await;
         }
-        let id = request.id.clone();
-        let stateful = match request.method.as_str() {
-            GRANT_ADD => {
-                Some(grants_rpc::add_grant(self.hub.as_ref(), request.params.clone()).await)
-            }
-            DAEMON_STATUS => Some(self.status()),
-            DAEMON_SHUTDOWN => Some(self.shutdown()),
-            _ => None,
+        let Request {
+            id, method, params, ..
+        } = request;
+        let outcome = match method.as_str() {
+            GRANT_ADD => grants_rpc::add_grant(self.hub.as_ref(), params).await,
+            DAEMON_STATUS => self.status(),
+            DAEMON_SHUTDOWN => self.shutdown(),
+            other => match self.handlers.get(other) {
+                Some(handler) => handler(params).await,
+                None => return Some(failure(id, METHOD_NOT_FOUND, "Method not found")),
+            },
         };
-        if let Some(outcome) = stateful {
-            return Some(match outcome {
-                Ok(result) => Response::success(id, result),
-                Err(e) => Response::failure(id, e),
-            });
-        }
-        let Some(handler) = self.handlers.get(request.method.as_str()) else {
-            return Some(failure(request.id, METHOD_NOT_FOUND, "Method not found"));
-        };
-        Some(match handler(request.params).await {
-            Ok(result) => Response::success(request.id, result),
-            Err(error) => Response::failure(request.id, error),
+        Some(match outcome {
+            Ok(result) => Response::success(id, result),
+            Err(e) => Response::failure(id, e),
         })
     }
 }

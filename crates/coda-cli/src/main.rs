@@ -1,33 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-const BIN_NAME: &str = "coda";
+use std::io::{stderr, stdin, stdout};
+use std::process::ExitCode;
 
-fn version_line() -> String {
-    format!("{BIN_NAME} {}", env!("CARGO_PKG_VERSION"))
-}
+use coda_cli::{Context, Io, run};
 
-fn main() {
-    if std::env::args()
-        .nth(1)
-        .is_some_and(|arg| arg == "--version" || arg == "-V")
-    {
-        println!("{}", version_line());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::version_line;
-
-    #[test]
-    fn version_line_is_name_then_package_version() {
-        // Arrange
-        let expected = concat!("coda ", env!("CARGO_PKG_VERSION"));
-
-        // Act
-        let line = version_line();
-
-        // Assert
-        assert_eq!(line, expected);
-    }
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("coda: could not start the async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ctx = match Context::from_env() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!("coda: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (mut out, mut err) = (stdout().lock(), stderr().lock());
+    let mut input = stdin().lock();
+    let mut io = Io {
+        out: &mut out,
+        err: &mut err,
+        input: &mut input,
+    };
+    runtime.block_on(run(std::env::args_os(), &ctx, &mut io))
 }
