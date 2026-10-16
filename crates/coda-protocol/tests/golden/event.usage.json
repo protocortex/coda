@@ -1,0 +1,1 @@
+{"type":"usage","session_id":"s-1","turn_id":"t-1","usage":{"input_tokens":100,"output_tokens":20,"cache_read_tokens":50,"cache_write_tokens":10}}
