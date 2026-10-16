@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 coda-protocol = { path = "../coda-protocol" }
+coda-store = { path = "../coda-store" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

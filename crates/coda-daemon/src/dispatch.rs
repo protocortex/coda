@@ -9,16 +9,22 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
+use coda_protocol::codec::encode_message;
 use coda_protocol::jsonrpc::{
     ErrorObject, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, Id, METHOD_NOT_FOUND, Message,
     PARSE_ERROR, Request, Response,
 };
 use coda_protocol::methods::{
     DAEMON_PING, INITIALIZE, InitializeParams, InitializeResult, PROTOCOL_VERSION, PingResult,
+    SESSION_SUBSCRIBE, SessionSubscribeParams, SessionSubscribeResult,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tracing::error;
+
+use crate::subscribe::{Connection, Hub, HubError, Outbox};
 
 /// `initialize` was called with a protocol version the daemon does not speak.
 pub const PROTOCOL_VERSION_MISMATCH: i64 = -32001;
@@ -30,6 +36,7 @@ type Handler = fn(Option<Value>) -> HandlerFuture;
 /// Method table that turns raw frame payloads into responses.
 pub struct Dispatcher {
     handlers: HashMap<&'static str, Handler>,
+    hub: Option<Arc<Hub>>,
 }
 
 impl Default for Dispatcher {
@@ -46,17 +53,36 @@ impl Dispatcher {
             (DAEMON_PING, ping as Handler),
             (INITIALIZE, initialize as Handler),
         ]);
-        Self { handlers }
+        Self {
+            handlers,
+            hub: None,
+        }
+    }
+
+    /// Also answers `session.subscribe` from `hub`.
+    #[must_use]
+    pub fn with_hub(mut self, hub: Arc<Hub>) -> Self {
+        self.hub = Some(hub);
+        self
+    }
+
+    /// Opens the per-connection state that subscriptions need.
+    #[must_use]
+    pub fn connect(&self) -> (Connection, Outbox) {
+        match &self.hub {
+            Some(hub) => hub.connect(),
+            None => Connection::detached(),
+        }
     }
 
     /// Answers one frame payload; returns `None` for messages that expect no reply.
-    pub async fn handle(&self, payload: &[u8]) -> Option<Response> {
+    pub async fn handle(&self, payload: &[u8], connection: &Connection) -> Option<Response> {
         let value: Value = match serde_json::from_slice(payload) {
             Ok(value) => value,
             Err(_) => return Some(failure(Id::Null, PARSE_ERROR, "Parse error")),
         };
         match serde_json::from_value::<Message>(value.clone()) {
-            Ok(Message::Request(request)) => Some(self.route(request).await),
+            Ok(Message::Request(request)) => self.route(request, connection).await,
             Ok(_) => None,
             Err(_) => {
                 let id = value
@@ -68,14 +94,17 @@ impl Dispatcher {
         }
     }
 
-    async fn route(&self, request: Request) -> Response {
+    async fn route(&self, request: Request, connection: &Connection) -> Option<Response> {
+        if request.method == SESSION_SUBSCRIBE {
+            return subscribe(request, connection).await;
+        }
         let Some(handler) = self.handlers.get(request.method.as_str()) else {
-            return failure(request.id, METHOD_NOT_FOUND, "Method not found");
+            return Some(failure(request.id, METHOD_NOT_FOUND, "Method not found"));
         };
-        match handler(request.params).await {
+        Some(match handler(request.params).await {
             Ok(result) => Response::success(request.id, result),
             Err(error) => Response::failure(request.id, error),
-        }
+        })
     }
 }
 
@@ -98,6 +127,39 @@ fn parse_params<T: DeserializeOwned>(params: Option<Value>) -> Result<T, ErrorOb
 
 fn to_value<T: serde::Serialize>(result: &T) -> HandlerResult {
     serde_json::to_value(result).map_err(|_| error(INTERNAL_ERROR, "Internal error"))
+}
+
+/// Answers through the connection's event queue so the response precedes the
+/// replayed events; returns `None` once the subscription took the reply over.
+async fn subscribe(request: Request, connection: &Connection) -> Option<Response> {
+    let params: SessionSubscribeParams = match parse_params(request.params) {
+        Ok(params) => params,
+        Err(e) => return Some(Response::failure(request.id, e)),
+    };
+    let ack = to_value(&SessionSubscribeResult { subscribed: true })
+        .map(|result| Response::success(request.id.clone(), result))
+        .ok()
+        .and_then(|response| encode_message(&Message::Response(response)).ok());
+    let Some(ack) = ack else {
+        return Some(failure(request.id, INTERNAL_ERROR, "Internal error"));
+    };
+    match connection
+        .subscribe(&params.session_id, params.since_seq, Some(ack))
+        .await
+    {
+        Ok(()) => None,
+        Err(HubError::InvalidCursor) => Some(failure(request.id, INVALID_PARAMS, "Invalid cursor")),
+        Err(HubError::Store(coda_store::StoreError::SessionNotFound { .. })) => {
+            Some(failure(request.id, INVALID_PARAMS, "Unknown session"))
+        }
+        Err(HubError::Unavailable) => {
+            Some(failure(request.id, METHOD_NOT_FOUND, "Method not found"))
+        }
+        Err(e) => {
+            error!(error = %e, "session.subscribe failed");
+            Some(failure(request.id, INTERNAL_ERROR, "Internal error"))
+        }
+    }
 }
 
 fn ping(_params: Option<Value>) -> HandlerFuture {
@@ -133,7 +195,10 @@ mod tests {
     use serde_json::{Value, json};
 
     async fn call(payload: &str) -> Option<Response> {
-        Dispatcher::new().handle(payload.as_bytes()).await
+        let (connection, _outbox) = Connection::detached();
+        Dispatcher::new()
+            .handle(payload.as_bytes(), &connection)
+            .await
     }
 
     fn error_of(response: Response) -> (Id, ErrorObject) {

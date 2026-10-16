@@ -147,6 +147,7 @@ name = "coda-daemon"
 version = "0.0.0"
 dependencies = [
  "coda-protocol",
+ "coda-store",
  "serde",
  "serde_json",
  "tempfile",
