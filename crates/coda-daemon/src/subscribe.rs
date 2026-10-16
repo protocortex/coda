@@ -15,7 +15,7 @@ use coda_protocol::codec::{CodecError, encode_message};
 use coda_protocol::events::EVENT_NOTIFICATION;
 use coda_protocol::jsonrpc::{Message, Notification, Version};
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
-use coda_store::{EventRecord, NewPending, PendingPermission, Store, StoreError};
+use coda_store::{EventRecord, Grant, GrantKey, NewPending, PendingPermission, Store, StoreError};
 use serde::Serialize;
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, warn};
@@ -257,6 +257,32 @@ impl Hub {
         let (hub, request) = (Arc::clone(self), request.clone());
         tokio::task::spawn_blocking(move || Ok(hub.store().resolve_pending(&request, decision)?))
             .await?
+    }
+
+    /// Stores a grant, keeping the first one if it exists already, and reads it back.
+    ///
+    /// # Errors
+    /// Returns [`HubError::Store`] when the store refuses the write or the read.
+    pub async fn add_grant(
+        self: &Arc<Self>,
+        repo_path: String,
+        tool: String,
+        cwd: String,
+        pattern: String,
+    ) -> Result<Option<Grant>, HubError> {
+        let hub = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let key = GrantKey {
+                repo_path: &repo_path,
+                tool: &tool,
+                cwd: &cwd,
+                pattern: &pattern,
+            };
+            let mut store = hub.store();
+            store.save_grant(&key)?;
+            Ok(store.lookup_grant(&key)?)
+        })
+        .await?
     }
 
     /// Runs `work` against the store on the blocking pool.

@@ -11,7 +11,7 @@ use coda_client::{Client, ClientError};
 use coda_config::timing::Timing;
 use coda_protocol::codec::{FrameDecoder, MAX_FRAME_BYTES, decode_message, encode_frame};
 use coda_protocol::jsonrpc::{Id, Message};
-use coda_protocol::methods::PROTOCOL_VERSION;
+use coda_protocol::methods::{DAEMON_STATUS, PROTOCOL_VERSION};
 use coda_protocol::types::SessionId;
 use common::{short_dir, timing, within};
 use serde_json::{Value, json};
@@ -141,6 +141,36 @@ async fn initialize_version_mismatch_is_surfaced() {
         }
         other => panic!("expected ProtocolMismatch, got {:?}", other.err()),
     }
+}
+
+#[tokio::test]
+async fn unchecked_connection_skips_the_handshake_with_a_foreign_daemon() {
+    // Arrange
+    let server = RawServer::bind();
+    let other_version = PROTOCOL_VERSION + 1;
+    let serve = async {
+        let (stream, _) = within(server.listener.accept()).await.unwrap();
+        let mut conn = RawConn {
+            stream,
+            decoder: FrameDecoder::new(),
+        };
+        let (id, method, _) = conn.recv_request().await;
+        assert_eq!(method, DAEMON_STATUS);
+        conn.reply(&id, json!({"protocol_version": other_version}))
+            .await;
+    };
+
+    // Act
+    let (reply, ()) = tokio::join!(
+        async {
+            let client = Client::connect_unchecked(&server.socket, timing()).await?;
+            client.request::<_, Value>(DAEMON_STATUS, &json!({})).await
+        },
+        serve
+    );
+
+    // Assert
+    assert_eq!(reply.unwrap()["protocol_version"], json!(other_version));
 }
 
 #[tokio::test]

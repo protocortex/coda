@@ -68,6 +68,20 @@ impl Client {
     /// [`ClientError::ProtocolMismatch`] if the daemon speaks another protocol
     /// version, or any error of [`Self::request`] from the handshake itself.
     pub async fn connect(socket_path: &Path, timing: Timing) -> Result<Self, ClientError> {
+        let client = Self::connect_unchecked(socket_path, timing).await?;
+        client.handshake().await?;
+        Ok(client)
+    }
+
+    /// Connects without the `initialize` handshake, so a daemon that speaks
+    /// another protocol version can still be inspected or stopped.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Connect`] if the socket cannot be opened.
+    pub async fn connect_unchecked(
+        socket_path: &Path,
+        timing: Timing,
+    ) -> Result<Self, ClientError> {
         let stream =
             UnixStream::connect(socket_path)
                 .await
@@ -81,15 +95,13 @@ impl Client {
         let mut tasks = JoinSet::new();
         tasks.spawn(read_loop(reader, Arc::clone(&shared)));
         tasks.spawn(write_loop(writer, frames, Arc::clone(&shared)));
-        let client = Self {
+        Ok(Self {
             shared,
             outbound,
             next_id: AtomicI64::new(1),
             request_timeout: timing.idle_timeout,
             _tasks: tasks,
-        };
-        client.handshake().await?;
-        Ok(client)
+        })
     }
 
     async fn handshake(&self) -> Result<(), ClientError> {

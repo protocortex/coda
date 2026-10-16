@@ -13,11 +13,14 @@ use crate::timing::Timing;
 const DEFAULT_MAX_TURNS: u32 = 50;
 const DEFAULT_TOKEN_CAP: u64 = 1_000_000;
 
-const CODA_HOME_VAR: &str = "CODA_HOME";
+/// Environment variable that moves the config and data root.
+pub const CODA_HOME_VAR: &str = "CODA_HOME";
 const HOME_VAR: &str = "HOME";
 const DEFAULT_BASE_UNDER_HOME: &str = ".config/coda";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DATA_DIR_NAME: &str = "data";
+const RUN_DIR_NAME: &str = "run";
+const SOCKET_FILE_NAME: &str = "coda.sock";
 
 const PROVIDERS_KEY: &str = "providers";
 const SECRET_KEY_SUFFIXES: [&str; 7] = [
@@ -261,6 +264,12 @@ impl Dirs {
         ))
     }
 
+    /// The root holding `config.toml`, `data/` and `run/`.
+    #[must_use]
+    pub fn base(&self) -> &Path {
+        &self.base
+    }
+
     /// Path of `config.toml`.
     #[must_use]
     pub fn config_file(&self) -> PathBuf {
@@ -271,6 +280,12 @@ impl Dirs {
     #[must_use]
     pub fn data_dir(&self) -> PathBuf {
         self.base.join(DATA_DIR_NAME)
+    }
+
+    /// Path of the daemon's Unix socket, in a directory only this user can enter.
+    #[must_use]
+    pub fn socket_path(&self) -> PathBuf {
+        self.base.join(RUN_DIR_NAME).join(SOCKET_FILE_NAME)
     }
 }
 
@@ -548,5 +563,7 @@ idle_timeout_ms = 1500
         // Assert
         assert_eq!(dirs.config_file(), PathBuf::from("/x/y/config.toml"));
         assert_eq!(dirs.data_dir(), PathBuf::from("/x/y/data"));
+        assert_eq!(dirs.socket_path(), PathBuf::from("/x/y/run/coda.sock"));
+        assert_eq!(dirs.base(), Path::new("/x/y"));
     }
 }

@@ -18,12 +18,13 @@ use coda_protocol::jsonrpc::{ErrorObject, INVALID_REQUEST, Id, Message, Response
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::dispatch::Dispatcher;
 use crate::lock::{InstanceLock, LockError};
+use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
 
 const SOCKET_DIR_MODE: u32 = 0o700;
@@ -37,6 +38,8 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_MAX_CONNECTIONS: usize = 64;
+/// Longest shutdown waits for connections to flush their last responses.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Failures starting the server.
 #[derive(Debug, thiserror::Error)]
@@ -151,7 +154,8 @@ impl Server {
         Ok(BoundServer {
             config,
             listener,
-            dispatcher: Arc::new(Dispatcher::new()),
+            hub: None,
+            state: None,
             _lock: lock,
         })
     }
@@ -222,7 +226,8 @@ fn remove_stale_socket(path: &Path, expected_uid: u32) -> Result<(), ServerError
 pub struct BoundServer {
     config: ServerConfig,
     listener: UnixListener,
-    dispatcher: Arc<Dispatcher>,
+    hub: Option<Arc<Hub>>,
+    state: Option<Arc<DaemonState>>,
     _lock: InstanceLock,
 }
 
@@ -237,22 +242,42 @@ impl Drop for BoundServer {
 }
 
 impl BoundServer {
-    /// Serves `session.subscribe` from `hub`.
+    /// Serves `session.subscribe` and `grant.add` from `hub`.
     #[must_use]
     pub fn with_hub(mut self, hub: Arc<Hub>) -> Self {
-        self.dispatcher = Arc::new(Dispatcher::new().with_hub(hub));
+        self.hub = Some(hub);
         self
+    }
+
+    /// Serves `daemon.status` and `daemon.shutdown` from `state`.
+    #[must_use]
+    pub fn with_state(mut self, state: Arc<DaemonState>) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    fn dispatcher(&self) -> Arc<Dispatcher> {
+        let mut dispatcher = Dispatcher::new();
+        if let Some(hub) = &self.hub {
+            dispatcher = dispatcher.with_hub(Arc::clone(hub));
+        }
+        if let Some(state) = &self.state {
+            dispatcher = dispatcher.with_state(Arc::clone(state));
+        }
+        Arc::new(dispatcher)
     }
 
     /// Accepts connections until `shutdown` completes, then closes them and cleans up.
     pub async fn serve(self, shutdown: impl Future<Output = ()>) {
+        let dispatcher = self.dispatcher();
         let mut connections = JoinSet::new();
+        let (close, closing) = watch::channel(false);
         let mut shutdown = pin!(shutdown);
         loop {
             tokio::select! {
                 () = &mut shutdown => break,
                 accepted = self.listener.accept() => match accepted {
-                    Ok((stream, _)) => self.admit(stream, &mut connections),
+                    Ok((stream, _)) => self.admit(stream, &dispatcher, &closing, &mut connections),
                     Err(e) => {
                         warn!(error = %e, "accepting a connection failed");
                         tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
@@ -266,19 +291,40 @@ impl BoundServer {
             }
         }
         info!("shutting down, closing connections");
+        // Connections stop reading and flush queued replies, such as the one to
+        // `daemon.shutdown`; whatever outlasts the grace period is aborted.
+        close.send_replace(true);
+        let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            warn!("connections did not finish in time, aborting them");
+        }
         connections.shutdown().await;
     }
 
-    fn admit(&self, stream: UnixStream, connections: &mut JoinSet<()>) {
+    fn admit(
+        &self,
+        stream: UnixStream,
+        dispatcher: &Arc<Dispatcher>,
+        closing: &watch::Receiver<bool>,
+        connections: &mut JoinSet<()>,
+    ) {
         if connections.len() >= self.config.max_connections {
             warn!("rejected a connection: connection limit reached");
             return;
         }
         match stream.peer_cred() {
             Ok(cred) if cred.uid() == self.config.expected_uid => {
-                let dispatcher = Arc::clone(&self.dispatcher);
+                let dispatcher = Arc::clone(dispatcher);
                 let timing = self.config.timing;
-                connections.spawn(serve_connection(stream, dispatcher, timing));
+                connections.spawn(serve_connection(
+                    stream,
+                    dispatcher,
+                    timing,
+                    closing.clone(),
+                ));
             }
             Ok(_) => warn!("rejected a connection from an unexpected user"),
             Err(e) => warn!(error = %e, "could not read the peer credentials"),
@@ -286,13 +332,19 @@ impl BoundServer {
     }
 }
 
-async fn serve_connection(stream: UnixStream, dispatcher: Arc<Dispatcher>, timing: Timing) {
+async fn serve_connection(
+    stream: UnixStream,
+    dispatcher: Arc<Dispatcher>,
+    timing: Timing,
+    closing: watch::Receiver<bool>,
+) {
+    let _client = dispatcher.track_client();
     let (reader, writer) = stream.into_split();
     let (outbound, queued) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
     let (connection, events) = dispatcher.connect();
     let mut write = pin!(write_frames(writer, queued, events, timing.write_timeout));
     tokio::select! {
-        () = read_requests(reader, outbound, &dispatcher, &connection, timing.idle_timeout) => write.await,
+        () = read_requests(reader, outbound, &dispatcher, &connection, timing.idle_timeout, closing) => write.await,
         () = &mut write => {}
     }
 }
@@ -305,11 +357,16 @@ async fn read_requests(
     dispatcher: &Dispatcher,
     connection: &Connection,
     idle_timeout: Duration,
+    mut closing: watch::Receiver<bool>,
 ) {
     let mut decoder = FrameDecoder::new();
     let mut buf = vec![0u8; READ_BUFFER_BYTES];
     loop {
-        let read = match tokio::time::timeout(idle_timeout, reader.read(&mut buf)).await {
+        let read = tokio::select! {
+            Ok(_) = closing.wait_for(|closing| *closing) => return,
+            read = tokio::time::timeout(idle_timeout, reader.read(&mut buf)) => read,
+        };
+        let read = match read {
             Ok(Ok(0)) => return,
             Ok(Ok(n)) => n,
             Err(_) => {
@@ -412,6 +469,7 @@ mod tests {
     use coda_store::{EventRecord, NewSession, Store};
     use serde_json::{Value, json};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -866,6 +924,7 @@ mod tests {
             server_side,
             Arc::new(Dispatcher::new()),
             Timing::default(),
+            watch::channel(false).1,
         ));
         client_side.write_all(&[0, 0, 0, 9, b'{']).await.unwrap();
 
@@ -1012,5 +1071,72 @@ mod tests {
         let mut rest = Vec::new();
         client_side.read_to_end(&mut rest).await.unwrap();
         assert_eq!(rest.len(), 0);
+    }
+
+    const SHUTDOWN_ATTEMPTS: usize = 100;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_request_gets_its_reply_before_connections_close() {
+        for _ in 0..SHUTDOWN_ATTEMPTS {
+            // Arrange
+            let dir = short_dir();
+            let config = config(&dir, own_uid(&dir));
+            let state = DaemonState::new(dir.path().join("data"));
+            let bound = Server::bind(config.clone())
+                .unwrap()
+                .with_state(Arc::clone(&state));
+            let waiter = Arc::clone(&state);
+            let handle = tokio::spawn(async move {
+                bound
+                    .serve(async move { waiter.shutdown_requested().await })
+                    .await;
+            });
+            let mut client = TestClient::connect(&config).await;
+
+            // Act
+            client
+                .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "daemon.shutdown"}))
+                .await;
+            let reply = client.recv().await;
+
+            // Assert
+            let Some(Message::Response(response)) = reply else {
+                panic!("the shutdown reply was dropped: {reply:?}");
+            };
+            assert!(matches!(response.outcome, Outcome::Result(_)));
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_served_connection_is_counted_until_it_closes() {
+        // Arrange
+        let state = DaemonState::new(PathBuf::from("/data"));
+        let dispatcher = Arc::new(Dispatcher::new().with_state(Arc::clone(&state)));
+        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        let (_close, closing) = watch::channel(false);
+        let task = tokio::spawn(serve_connection(
+            server_side,
+            dispatcher,
+            Timing::default(),
+            closing,
+        ));
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "daemon.status"});
+        let frame = encode_frame(request.to_string().as_bytes()).unwrap();
+        client_side.write_all(&frame).await.unwrap();
+        let mut reply = [0u8; 1];
+        client_side.read_exact(&mut reply).await.unwrap();
+
+        // Act
+        let while_open = state.status().client_count;
+        drop(client_side);
+        tokio::time::timeout(RECV_TIMEOUT, task)
+            .await
+            .expect("connection task did not finish")
+            .unwrap();
+
+        // Assert
+        assert_eq!(while_open, 1);
+        assert_eq!(state.status().client_count, 0);
     }
 }

@@ -3,6 +3,8 @@
 //! The coda daemon: a Unix socket server that speaks the coda JSON-RPC protocol.
 
 pub mod dispatch;
+pub mod grants_rpc;
 pub mod lock;
 pub mod server;
+pub mod state;
 pub mod subscribe;

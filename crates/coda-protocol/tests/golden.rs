@@ -8,12 +8,12 @@ use std::path::PathBuf;
 
 use coda_protocol::events::Event;
 use coda_protocol::methods::{
-    DaemonStatusParams, DaemonStatusResult, GrantAddParams, GrantAddResult, InitializeParams,
-    InitializeResult, PermissionRespondParams, PermissionRespondResult, PingParams, PingResult,
-    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
-    SessionResumeParams, SessionResumeResult, SessionSendParams, SessionSendResult,
-    SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams, SessionSubscribeResult,
-    UsageSummaryParams, UsageSummaryResult,
+    DaemonShutdownParams, DaemonShutdownResult, DaemonStatusParams, DaemonStatusResult,
+    GrantAddParams, GrantAddResult, InitializeParams, InitializeResult, PermissionRespondParams,
+    PermissionRespondResult, PingParams, PingResult, SessionCancelParams, SessionCancelResult,
+    SessionCreateParams, SessionCreateResult, SessionResumeParams, SessionResumeResult,
+    SessionSendParams, SessionSendResult, SessionSetModelParams, SessionSetModelResult,
+    SessionSubscribeParams, SessionSubscribeResult, UsageSummaryParams, UsageSummaryResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -103,6 +103,8 @@ golden_tests! {
     session_set_model_result: "session.set_model.result" => SessionSetModelResult,
     daemon_status_params: "daemon.status.params" => DaemonStatusParams,
     daemon_status_result: "daemon.status.result" => DaemonStatusResult,
+    daemon_shutdown_params: "daemon.shutdown.params" => DaemonShutdownParams,
+    daemon_shutdown_result: "daemon.shutdown.result" => DaemonShutdownResult,
     daemon_ping_params: "daemon.ping.params" => PingParams,
     daemon_ping_result: "daemon.ping.result" => PingResult,
     event_approve: "event.approve" => Event,

@@ -102,6 +102,23 @@ async fn next_seq(subscription: &mut coda_client::Subscription) -> u64 {
 }
 
 #[tokio::test]
+async fn unchecked_connection_answers_requests_without_a_handshake() {
+    // Arrange
+    let daemon = TestDaemon::start(None);
+    let client = Client::connect_unchecked(&daemon.socket, timing())
+        .await
+        .unwrap();
+
+    // Act
+    let reply: Result<PingResult, ClientError> =
+        within(client.request(DAEMON_PING, &PingParams {})).await;
+
+    // Assert
+    assert_eq!(reply.unwrap(), PingResult {});
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn connect_then_ping_round_trips() {
     // Arrange
     let daemon = TestDaemon::start(None);
