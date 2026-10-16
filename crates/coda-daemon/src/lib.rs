@@ -5,3 +5,4 @@
 pub mod dispatch;
 pub mod lock;
 pub mod server;
+pub mod subscribe;

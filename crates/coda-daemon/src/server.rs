@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::dispatch::Dispatcher;
 use crate::lock::{InstanceLock, LockError};
+use crate::subscribe::{Connection, Hub, Outbox};
 
 const SOCKET_DIR_MODE: u32 = 0o700;
 const SOCKET_FILE_MODE: u32 = 0o600;
@@ -236,6 +237,13 @@ impl Drop for BoundServer {
 }
 
 impl BoundServer {
+    /// Serves `session.subscribe` from `hub`.
+    #[must_use]
+    pub fn with_hub(mut self, hub: Arc<Hub>) -> Self {
+        self.dispatcher = Arc::new(Dispatcher::new().with_hub(hub));
+        self
+    }
+
     /// Accepts connections until `shutdown` completes, then closes them and cleans up.
     pub async fn serve(self, shutdown: impl Future<Output = ()>) {
         let mut connections = JoinSet::new();
@@ -281,9 +289,10 @@ impl BoundServer {
 async fn serve_connection(stream: UnixStream, dispatcher: Arc<Dispatcher>, timing: Timing) {
     let (reader, writer) = stream.into_split();
     let (outbound, queued) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
-    let mut write = pin!(write_responses(writer, queued, timing.write_timeout));
+    let (connection, events) = dispatcher.connect();
+    let mut write = pin!(write_frames(writer, queued, events, timing.write_timeout));
     tokio::select! {
-        () = read_requests(reader, outbound, &dispatcher, timing.idle_timeout) => write.await,
+        () = read_requests(reader, outbound, &dispatcher, &connection, timing.idle_timeout) => write.await,
         () = &mut write => {}
     }
 }
@@ -294,6 +303,7 @@ async fn read_requests(
     mut reader: OwnedReadHalf,
     outbound: mpsc::Sender<Vec<u8>>,
     dispatcher: &Dispatcher,
+    connection: &Connection,
     idle_timeout: Duration,
 ) {
     let mut decoder = FrameDecoder::new();
@@ -316,7 +326,7 @@ async fn read_requests(
         while failure.is_none() {
             match decoder.next_frame() {
                 Ok(Some(frame)) => {
-                    if let Some(response) = dispatcher.handle(&frame).await
+                    if let Some(response) = dispatcher.handle(&frame, connection).await
                         && !queue(&outbound, response).await
                     {
                         return;
@@ -353,12 +363,27 @@ async fn queue(outbound: &mpsc::Sender<Vec<u8>>, response: Response) -> bool {
     }
 }
 
-async fn write_responses(
+/// Writes queued responses and event notifications until the responses end,
+/// a write fails or times out, or the hub flags the connection as too slow.
+async fn write_frames(
     mut writer: OwnedWriteHalf,
-    mut queued: mpsc::Receiver<Vec<u8>>,
+    mut responses: mpsc::Receiver<Vec<u8>>,
+    mut events: Outbox,
     write_timeout: Duration,
 ) {
-    while let Some(frame) = queued.recv().await {
+    loop {
+        let frame = tokio::select! {
+            biased;
+            () = events.kicked.notified() => {
+                warn!("dropping a connection that stopped reading events");
+                return;
+            }
+            response = responses.recv() => match response {
+                Some(frame) => frame,
+                None => break,
+            },
+            Some(event) = events.events.recv() => event,
+        };
         match tokio::time::timeout(write_timeout, writer.write_all(&frame)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -383,6 +408,8 @@ mod tests {
     use coda_protocol::jsonrpc::{
         INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, Message, Outcome, PARSE_ERROR,
     };
+    use coda_protocol::types::{BackendKind, Mode, SessionId};
+    use coda_store::{EventRecord, NewSession, Store};
     use serde_json::{Value, json};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::time::Duration;
@@ -850,5 +877,140 @@ mod tests {
             .await
             .expect("connection task did not finish")
             .unwrap();
+    }
+
+    async fn hub_with_events(capacity: usize, bodies: &[String]) -> (Arc<Hub>, SessionId, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("data")).unwrap();
+        let session = store
+            .create_session(&NewSession {
+                backend: BackendKind::ClaudeCode,
+                model: None,
+                cwd: "/work".to_owned(),
+                mode: Mode::default(),
+            })
+            .unwrap();
+        let turn = store.begin_turn(&session).unwrap();
+        let hub = Hub::new(store, capacity);
+        for body in bodies {
+            let record = EventRecord {
+                kind: "stream_delta".to_owned(),
+                body: body.clone(),
+            };
+            hub.publish(&session, &turn, record).await.unwrap();
+        }
+        (hub, session, dir)
+    }
+
+    fn subscribe_request(id: i64, session: &SessionId, since: &Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "method": "session.subscribe",
+               "params": {"session_id": session.as_str(), "since_seq": since}})
+    }
+
+    #[tokio::test]
+    async fn subscribing_over_the_socket_resumes_from_the_cursor() {
+        // Arrange
+        let dir = short_dir();
+        let config = config(&dir, own_uid(&dir));
+        let bodies: Vec<String> = (1..=5).map(|n| format!("e{n}")).collect();
+        let (hub, session, _data) = hub_with_events(8, &bodies).await;
+        let server = TestServer::serve(Server::bind(config.clone()).unwrap().with_hub(hub));
+        let mut client = TestClient::connect(&config).await;
+
+        // Act
+        client
+            .send(&subscribe_request(1, &session, &json!(3)))
+            .await;
+
+        // Assert
+        let Some(Message::Response(response)) = client.recv().await else {
+            panic!("the subscribe response must precede every event");
+        };
+        assert_eq!(response.id, Id::Number(1));
+        let mut seqs = Vec::new();
+        while seqs.len() < 2 {
+            match client.recv().await.unwrap() {
+                Message::Notification(n) => {
+                    assert_eq!(n.method, "session.event");
+                    seqs.push(n.params.unwrap()["seq"].as_u64().unwrap());
+                }
+                other => panic!("unexpected message {other:?}"),
+            }
+        }
+        assert_eq!(seqs, vec![4, 5]);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn subscribing_with_a_bad_cursor_or_session_gets_invalid_params() {
+        // Arrange
+        let dir = short_dir();
+        let config = config(&dir, own_uid(&dir));
+        let (hub, session, _data) = hub_with_events(8, &[]).await;
+        let server = TestServer::serve(Server::bind(config.clone()).unwrap().with_hub(hub));
+        let mut client = TestClient::connect(&config).await;
+
+        // Act
+        client
+            .send(&subscribe_request(1, &session, &json!(-1)))
+            .await;
+        let negative = client.recv().await;
+        client
+            .send(&subscribe_request(2, &SessionId::new("404"), &json!(0)))
+            .await;
+        let unknown = client.recv().await;
+
+        // Assert
+        assert_eq!(error_code(negative), INVALID_PARAMS);
+        assert_eq!(error_code(unknown), INVALID_PARAMS);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn subscribing_without_a_hub_gets_method_not_found() {
+        // Arrange
+        let dir = short_dir();
+        let config = config(&dir, own_uid(&dir));
+        let server = TestServer::start(config.clone());
+        let mut client = TestClient::connect(&config).await;
+
+        // Act
+        client
+            .send(&subscribe_request(1, &SessionId::new("1"), &json!(0)))
+            .await;
+
+        // Assert
+        assert_eq!(error_code(client.recv().await), METHOD_NOT_FOUND);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn kicked_connection_is_closed_without_writing_anything_more() {
+        // Arrange
+        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        let (_reader, writer) = server_side.into_split();
+        let (responses, queued) = mpsc::channel(1);
+        let (events_tx, events) = mpsc::channel(1);
+        let kicked = Arc::new(tokio::sync::Notify::new());
+        responses.send(b"unsent".to_vec()).await.unwrap();
+        events_tx.send(b"unsent".to_vec()).await.unwrap();
+        kicked.notify_one();
+        let outbox = Outbox {
+            events,
+            kicked: Arc::clone(&kicked),
+        };
+
+        // Act
+        tokio::time::timeout(
+            RECV_TIMEOUT,
+            write_frames(writer, queued, outbox, Duration::from_secs(5)),
+        )
+        .await
+        .expect("the writer ignored the disconnect signal");
+
+        // Assert
+        let mut rest = Vec::new();
+        client_side.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest.len(), 0);
     }
 }

@@ -132,6 +132,16 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Checks that `turn` exists and belongs to `session`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SessionNotFound`] or [`StoreError::TurnNotFound`].
+    pub fn ensure_turn(&self, session: &SessionId, turn: &TurnId) -> Result<(), StoreError> {
+        let session_row = self.existing_session_row(session)?;
+        owned_turn_row(&self.conn, session, session_row, turn).map(drop)
+    }
+
     pub(crate) fn existing_session_row(&self, session: &SessionId) -> Result<i64, StoreError> {
         let not_found = || StoreError::SessionNotFound {
             session: session.clone(),
