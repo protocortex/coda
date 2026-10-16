@@ -10,6 +10,7 @@ use crate::{SCHEMA_VERSION, StoreError};
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("schema.sql")),
     (2, include_str!("schema_v2.sql")),
+    (3, include_str!("schema_v3.sql")),
 ];
 
 /// Brings `conn` up to [`SCHEMA_VERSION`], applying each pending migration in

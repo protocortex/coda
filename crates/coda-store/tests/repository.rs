@@ -7,8 +7,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use coda_protocol::types::{BackendKind, Mode, SessionId, TurnId};
-use coda_store::{Clock, EventRecord, NewSession, SessionFilter, Store, StoreError};
+use coda_protocol::types::{BackendKind, Mode, PermissionDecision, RequestId, SessionId, TurnId};
+use coda_store::{
+    Clock, EventRecord, GrantKey, NewDecision, NewPending, NewSession, SessionFilter, Store,
+    StoreError, UsageRecord, UsageSummary,
+};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -477,4 +480,413 @@ fn a_panic_while_holding_a_store_releases_the_writer_lease() {
     // Assert
     assert!(outcome.is_err());
     assert_eq!(seq, 2);
+}
+
+fn session_with_turn(store: &mut Store, cwd: &str) -> (SessionId, TurnId) {
+    let session = store.create_session(&new_session(cwd)).unwrap();
+    let turn = store.begin_turn(&session).unwrap();
+    (session, turn)
+}
+
+#[test]
+fn usage_is_recorded_and_summed_per_session_and_overall() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let (one, turn_one) = session_with_turn(&mut store, "/a");
+    let (two, turn_two) = session_with_turn(&mut store, "/b");
+    for (session, turn, input, output) in [
+        (&one, &turn_one, 100, 10),
+        (&one, &turn_one, 50, 5),
+        (&two, &turn_two, 7, 3),
+    ] {
+        store
+            .record_usage(&UsageRecord {
+                session: session.clone(),
+                turn: turn.clone(),
+                input_tokens: input,
+                output_tokens: output,
+            })
+            .unwrap();
+    }
+
+    // Act
+    let for_one = store.usage_summary(Some(&one)).unwrap();
+    let overall = store.usage_summary(None).unwrap();
+
+    // Assert
+    assert_eq!(
+        for_one,
+        UsageSummary {
+            input_tokens: 150,
+            output_tokens: 15
+        }
+    );
+    assert_eq!(
+        overall,
+        UsageSummary {
+            input_tokens: 157,
+            output_tokens: 18
+        }
+    );
+}
+
+#[test]
+fn usage_summary_with_no_records_is_zero() {
+    // Arrange
+    let (_dir, store) = open_store();
+
+    // Act
+    let summary = store.usage_summary(None).unwrap();
+
+    // Assert
+    assert_eq!(summary, UsageSummary::default());
+}
+
+#[test]
+fn recording_usage_for_a_nonexistent_turn_is_turn_not_found() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = store.create_session(&new_session("/a")).unwrap();
+
+    // Act
+    let err = store
+        .record_usage(&UsageRecord {
+            session,
+            turn: TurnId::new("5"),
+            input_tokens: 1,
+            output_tokens: 1,
+        })
+        .unwrap_err();
+
+    // Assert
+    assert!(matches!(err, StoreError::TurnNotFound { .. }));
+}
+
+fn new_pending(session: &SessionId, command: &str) -> NewPending {
+    NewPending {
+        session: session.clone(),
+        repo_path: "/repo".to_owned(),
+        command: command.to_owned(),
+    }
+}
+
+#[test]
+fn pending_permissions_are_added_listed_and_resolved() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = store.create_session(&new_session("/a")).unwrap();
+    let id = store
+        .add_pending(&new_pending(&session, "cargo test"))
+        .unwrap();
+
+    // Act
+    let before = store.list_pending(&session).unwrap();
+    store
+        .resolve_pending(&id, PermissionDecision::AllowOnce)
+        .unwrap();
+    let after = store.list_pending(&session).unwrap();
+
+    // Assert
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].id, id);
+    assert_eq!(before[0].command, "cargo test");
+    assert_eq!(before[0].repo_path, "/repo");
+    assert_eq!(before[0].requested_at, T0);
+    assert_eq!(after, Vec::new());
+}
+
+#[test]
+fn resolving_a_pending_permission_twice_is_already_resolved() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = store.create_session(&new_session("/a")).unwrap();
+    let id = store.add_pending(&new_pending(&session, "ls")).unwrap();
+    store
+        .resolve_pending(&id, PermissionDecision::Deny)
+        .unwrap();
+
+    // Act
+    let err = store
+        .resolve_pending(&id, PermissionDecision::AllowOnce)
+        .unwrap_err();
+
+    // Assert
+    assert!(matches!(err, StoreError::AlreadyResolved { request } if request == id));
+    let decisions = store.list_decisions(&session).unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert!(!decisions[0].allowed);
+}
+
+#[test]
+fn non_canonical_request_ids_are_not_found() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = store.create_session(&new_session("/a")).unwrap();
+    let id = store.add_pending(&new_pending(&session, "ls")).unwrap();
+    assert_eq!(id.as_str(), "1");
+
+    for raw_id in ["01", "+1", "1 ", "-0"] {
+        // Act
+        let err = store
+            .resolve_pending(&RequestId::new(raw_id), PermissionDecision::Deny)
+            .unwrap_err();
+
+        // Assert
+        assert!(
+            matches!(err, StoreError::PendingNotFound { .. }),
+            "{raw_id:?}"
+        );
+    }
+    assert_eq!(store.list_pending(&session).unwrap().len(), 1);
+}
+
+#[test]
+fn resolving_an_unknown_pending_permission_is_pending_not_found() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+
+    // Act
+    let err = store
+        .resolve_pending(&RequestId::new("3"), PermissionDecision::Deny)
+        .unwrap_err();
+
+    // Assert
+    assert!(matches!(err, StoreError::PendingNotFound { .. }));
+}
+
+#[test]
+fn adding_a_pending_permission_to_a_nonexistent_session_is_session_not_found() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+
+    // Act
+    let err = store
+        .add_pending(&new_pending(&SessionId::new("8"), "ls"))
+        .unwrap_err();
+
+    // Assert
+    assert!(matches!(err, StoreError::SessionNotFound { .. }));
+}
+
+#[test]
+fn decisions_are_recorded_and_listed_for_a_session() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = store.create_session(&new_session("/a")).unwrap();
+    let decision = |command: &str, decision| NewDecision {
+        session: session.clone(),
+        repo_path: "/repo".to_owned(),
+        command: command.to_owned(),
+        decision,
+    };
+
+    // Act
+    store
+        .record_decision(&decision("ls", PermissionDecision::AllowAlways))
+        .unwrap();
+    store
+        .record_decision(&decision("rm -rf x", PermissionDecision::Deny))
+        .unwrap();
+    let decisions = store.list_decisions(&session).unwrap();
+
+    // Assert
+    let got: Vec<_> = decisions
+        .iter()
+        .map(|d| (d.command.as_str(), d.allowed))
+        .collect();
+    assert_eq!(got, vec![("ls", true), ("rm -rf x", false)]);
+    assert_eq!(decisions[0].decided_at, T0);
+}
+
+#[test]
+fn resolving_a_pending_permission_records_a_decision() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = store.create_session(&new_session("/a")).unwrap();
+    let id = store.add_pending(&new_pending(&session, "make")).unwrap();
+
+    // Act
+    store
+        .resolve_pending(&id, PermissionDecision::Deny)
+        .unwrap();
+
+    // Assert
+    let decisions = store.list_decisions(&session).unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].command, "make");
+    assert!(!decisions[0].allowed);
+}
+
+fn key<'a>(repo_path: &'a str, tool: &'a str, cwd: &'a str, pattern: &'a str) -> GrantKey<'a> {
+    GrantKey {
+        repo_path,
+        tool,
+        cwd,
+        pattern,
+    }
+}
+
+fn grant_count(dir: &TempDir) -> i64 {
+    Connection::open(dir.path().join("data/coda.db"))
+        .unwrap()
+        .query_row("SELECT count(*) FROM permission_grants", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn a_saved_grant_is_found_for_its_full_key() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    store
+        .save_grant(&key("/repo", "Bash", "/repo/x", "cargo test"))
+        .unwrap();
+
+    // Act
+    let found = store
+        .lookup_grant(&key("/repo", "Bash", "/repo/x", "cargo test"))
+        .unwrap();
+
+    // Assert
+    let grant = found.unwrap();
+    assert_eq!(grant.repo_path, "/repo");
+    assert_eq!(grant.tool, "Bash");
+    assert_eq!(grant.cwd, "/repo/x");
+    assert_eq!(grant.command_pattern, "cargo test");
+    assert_eq!(grant.granted_at, T0);
+}
+
+#[test]
+fn a_grant_lookup_with_no_match_is_none() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    store
+        .save_grant(&key("/repo", "Bash", "/repo", "cargo test"))
+        .unwrap();
+
+    // Act
+    let found = store
+        .lookup_grant(&key("/repo", "Bash", "/repo", "cargo publish"))
+        .unwrap();
+
+    // Assert
+    assert_eq!(found, None);
+}
+
+#[test]
+fn grants_are_scoped_to_their_repo() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    store
+        .save_grant(&key("/repo-a", "Bash", "/repo-a", "cargo test"))
+        .unwrap();
+
+    // Act
+    let other_repo = store
+        .lookup_grant(&key("/repo-b", "Bash", "/repo-a", "cargo test"))
+        .unwrap();
+
+    // Assert
+    assert_eq!(other_repo, None);
+}
+
+#[test]
+fn a_grant_in_one_cwd_does_not_match_another_cwd() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    store
+        .save_grant(&key("/repo", "Bash", "/repo/x", "cargo test"))
+        .unwrap();
+
+    // Act
+    let other_cwd = store
+        .lookup_grant(&key("/repo", "Bash", "/repo/y", "cargo test"))
+        .unwrap();
+
+    // Assert
+    assert_eq!(other_cwd, None);
+}
+
+#[test]
+fn a_grant_for_one_tool_does_not_match_another_tool() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    store
+        .save_grant(&key("/repo", "Bash", "/repo", "cargo test"))
+        .unwrap();
+
+    // Act
+    let other_tool = store
+        .lookup_grant(&key("/repo", "Edit", "/repo", "cargo test"))
+        .unwrap();
+
+    // Assert
+    assert_eq!(other_tool, None);
+}
+
+#[test]
+fn repo_paths_match_exactly_never_by_prefix() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    store
+        .save_grant(&key("/repo", "Bash", "/repo", "ls"))
+        .unwrap();
+
+    for other in ["/repo/sub", "/repo2"] {
+        // Act
+        let found = store
+            .lookup_grant(&key(other, "Bash", "/repo", "ls"))
+            .unwrap();
+
+        // Assert
+        assert_eq!(found, None, "{other}");
+    }
+}
+
+#[test]
+fn patterns_match_exactly_never_by_prefix_or_whitespace() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    store
+        .save_grant(&key("/repo", "Bash", "/repo", "cargo test"))
+        .unwrap();
+
+    for other in [
+        "cargo test; rm -rf x",
+        "cargo  test",
+        "cargo test ",
+        "cargo",
+    ] {
+        // Act
+        let found = store
+            .lookup_grant(&key("/repo", "Bash", "/repo", other))
+            .unwrap();
+
+        // Assert
+        assert_eq!(found, None, "{other:?}");
+    }
+}
+
+#[test]
+fn saving_the_same_grant_twice_keeps_one_row_and_the_first_grant_time() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let clock = Arc::new(FixedClock(AtomicI64::new(T0)));
+    let mut store = Store::open_with_clock(&dir.path().join("data"), clock.clone()).unwrap();
+    store
+        .save_grant(&key("/repo", "Bash", "/repo", "ls"))
+        .unwrap();
+    clock.0.store(T0 + 5_000, Ordering::SeqCst);
+
+    // Act
+    store
+        .save_grant(&key("/repo", "Bash", "/repo", "ls"))
+        .unwrap();
+
+    // Assert
+    assert_eq!(grant_count(&dir), 1);
+    let grant = store
+        .lookup_grant(&key("/repo", "Bash", "/repo", "ls"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(grant.granted_at, T0);
 }

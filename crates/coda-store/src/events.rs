@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use coda_protocol::types::{SessionId, TurnId};
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, ffi, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, ffi, params};
 
 use crate::sessions::{get_u64, session_row_id, to_db_int};
 use crate::{Store, StoreError};
@@ -201,8 +201,9 @@ impl Drop for Store {
     }
 }
 
-fn owned_turn_row(
-    tx: &Transaction<'_>,
+/// The row id of `turn`, checking that it belongs to `session`.
+pub(crate) fn owned_turn_row(
+    conn: &Connection,
     session: &SessionId,
     session_row: i64,
     turn: &TurnId,
@@ -212,7 +213,7 @@ fn owned_turn_row(
         turn: turn.clone(),
     };
     let turn_row = turn.as_str().parse::<i64>().map_err(|_| not_found())?;
-    tx.query_row(
+    conn.query_row(
         "SELECT 1 FROM turns WHERE id = ?1 AND session_id = ?2",
         [turn_row, session_row],
         |_| Ok(()),

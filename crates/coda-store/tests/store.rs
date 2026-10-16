@@ -11,6 +11,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 const V1_SNAPSHOT: &str = include_str!("snapshots/v1.sql");
+const V2_SNAPSHOT: &str = include_str!("snapshots/v2.sql");
 
 fn open_store() -> (TempDir, Store) {
     let dir = TempDir::new().unwrap();
@@ -78,7 +79,7 @@ fn open_records_the_schema_version() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 #[test]
@@ -95,7 +96,7 @@ fn newer_schema_version_is_refused() {
         err,
         StoreError::SchemaTooNew {
             found: 99,
-            supported: 2
+            supported: 3
         }
     ));
 }
@@ -201,6 +202,26 @@ fn v1_snapshot_migrates_forward_to_the_current_schema() {
     let mut old = Connection::open_in_memory().unwrap();
     old.execute_batch(V1_SNAPSHOT).unwrap();
     old.pragma_update(None, "user_version", 1).unwrap();
+    let mut fresh = Connection::open_in_memory().unwrap();
+    migrate::migrate(&mut fresh).unwrap();
+
+    // Act
+    migrate::migrate(&mut old).unwrap();
+
+    // Assert
+    let version: u32 = old
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    assert_eq!(master_listing(&old), master_listing(&fresh));
+}
+
+#[test]
+fn v2_snapshot_migrates_forward_to_the_current_schema() {
+    // Arrange
+    let mut old = Connection::open_in_memory().unwrap();
+    old.execute_batch(V2_SNAPSHOT).unwrap();
+    old.pragma_update(None, "user_version", 2).unwrap();
     let mut fresh = Connection::open_in_memory().unwrap();
     migrate::migrate(&mut fresh).unwrap();
 
