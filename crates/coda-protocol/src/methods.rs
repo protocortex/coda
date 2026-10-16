@@ -5,6 +5,7 @@
 //! Structs tolerate unknown fields so older peers keep working, and optional
 //! fields default so newer clients can omit them.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
@@ -39,8 +40,24 @@ pub const DAEMON_STATUS: &str = "daemon.status";
 /// Liveness check.
 pub const DAEMON_PING: &str = "daemon.ping";
 
+/// Every request method name; a test fails when a constant is missing here.
+pub const METHODS: &[&str] = &[
+    INITIALIZE,
+    SESSION_CREATE,
+    SESSION_SEND,
+    SESSION_CANCEL,
+    SESSION_SUBSCRIBE,
+    SESSION_RESUME,
+    PERMISSION_RESPOND,
+    GRANT_ADD,
+    USAGE_SUMMARY,
+    SESSION_SET_MODEL,
+    DAEMON_STATUS,
+    DAEMON_PING,
+];
+
 /// Parameters of [`INITIALIZE`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InitializeParams {
     /// Protocol version the client speaks.
     pub protocol_version: u32,
@@ -49,7 +66,7 @@ pub struct InitializeParams {
 }
 
 /// Result of [`INITIALIZE`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InitializeResult {
     /// Protocol version the daemon speaks.
     pub protocol_version: u32,
@@ -58,7 +75,7 @@ pub struct InitializeResult {
 }
 
 /// Parameters of [`SESSION_CREATE`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionCreateParams {
     /// Backend to drive the session.
     pub backend: BackendKind,
@@ -73,14 +90,14 @@ pub struct SessionCreateParams {
 }
 
 /// Result of [`SESSION_CREATE`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionCreateResult {
     /// The new session.
     pub session: SessionInfo,
 }
 
 /// Parameters of [`SESSION_SEND`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSendParams {
     /// Target session.
     pub session_id: SessionId,
@@ -89,28 +106,28 @@ pub struct SessionSendParams {
 }
 
 /// Result of [`SESSION_SEND`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSendResult {
     /// The turn the message started.
     pub turn_id: TurnId,
 }
 
 /// Parameters of [`SESSION_CANCEL`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionCancelParams {
     /// Target session.
     pub session_id: SessionId,
 }
 
 /// Result of [`SESSION_CANCEL`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionCancelResult {
     /// Whether a running turn was cancelled.
     pub cancelled: bool,
 }
 
 /// Parameters of [`SESSION_SUBSCRIBE`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSubscribeParams {
     /// Target session.
     pub session_id: SessionId,
@@ -120,28 +137,28 @@ pub struct SessionSubscribeParams {
 }
 
 /// Result of [`SESSION_SUBSCRIBE`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSubscribeResult {
     /// Whether the subscription is active.
     pub subscribed: bool,
 }
 
 /// Parameters of [`SESSION_RESUME`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionResumeParams {
     /// Session to reopen.
     pub session_id: SessionId,
 }
 
 /// Result of [`SESSION_RESUME`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionResumeResult {
     /// The reopened session.
     pub session: SessionInfo,
 }
 
 /// Parameters of [`PERMISSION_RESPOND`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PermissionRespondParams {
     /// Session that raised the request.
     pub session_id: SessionId,
@@ -152,14 +169,14 @@ pub struct PermissionRespondParams {
 }
 
 /// Result of [`PERMISSION_RESPOND`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PermissionRespondResult {
     /// Whether the request was still pending and took the decision.
     pub accepted: bool,
 }
 
 /// Parameters of [`GRANT_ADD`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GrantAddParams {
     /// Session the grant applies to.
     pub session_id: SessionId,
@@ -171,28 +188,28 @@ pub struct GrantAddParams {
 }
 
 /// Result of [`GRANT_ADD`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GrantAddResult {
     /// Identifier of the stored grant.
     pub grant_id: String,
 }
 
 /// Parameters of [`USAGE_SUMMARY`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct UsageSummaryParams {
     /// Session to summarize.
     pub session_id: SessionId,
 }
 
 /// Result of [`USAGE_SUMMARY`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct UsageSummaryResult {
     /// Total usage of the session.
     pub usage: TokenUsage,
 }
 
 /// Parameters of [`SESSION_SET_MODEL`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSetModelParams {
     /// Target session.
     pub session_id: SessionId,
@@ -201,18 +218,18 @@ pub struct SessionSetModelParams {
 }
 
 /// Result of [`SESSION_SET_MODEL`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSetModelResult {
     /// The session after the switch.
     pub session: SessionInfo,
 }
 
 /// Parameters of [`DAEMON_STATUS`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonStatusParams {}
 
 /// Result of [`DAEMON_STATUS`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonStatusResult {
     /// Version of the daemon build.
     pub version: String,
@@ -223,11 +240,11 @@ pub struct DaemonStatusResult {
 }
 
 /// Parameters of [`DAEMON_PING`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PingParams {}
 
 /// Result of [`DAEMON_PING`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PingResult {}
 
 #[cfg(test)]
@@ -271,5 +288,33 @@ mod tests {
         // Assert
         assert_eq!(params.model, None);
         assert_eq!(params.mode, crate::types::Mode::Default);
+    }
+
+    #[test]
+    fn methods_has_no_duplicates() {
+        // Arrange
+        let unique: std::collections::BTreeSet<&str> = METHODS.iter().copied().collect();
+
+        // Act and Assert
+        assert_eq!(unique.len(), METHODS.len());
+    }
+
+    #[test]
+    fn methods_lists_every_method_constant() {
+        // Arrange
+        let declared: std::collections::BTreeSet<&str> = include_str!("methods.rs")
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("pub const ")?;
+                let (_, value) = rest.split_once(": &str = \"")?;
+                value.strip_suffix("\";")
+            })
+            .collect();
+
+        // Act
+        let listed: std::collections::BTreeSet<&str> = METHODS.iter().copied().collect();
+
+        // Assert
+        assert_eq!(listed, declared);
     }
 }

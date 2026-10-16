@@ -5,6 +5,7 @@
 //! Every variant except [`Event::StreamDelta`] is content-free: it names
 //! sessions, turns and tools but never prompts, arguments or outputs.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{RequestId, SessionId, TokenUsage, TurnId};
@@ -16,7 +17,7 @@ pub const EVENT_NOTIFICATION: &str = "session.event";
 ///
 /// Adding a variant requires a `PROTOCOL_VERSION` bump: older peers reject
 /// unknown variants rather than ignoring them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Event {

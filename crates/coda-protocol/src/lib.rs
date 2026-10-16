@@ -8,4 +8,5 @@ pub mod jsonrpc;
 pub mod methods;
 pub mod paths;
 pub mod readers;
+pub mod schema;
 pub mod types;

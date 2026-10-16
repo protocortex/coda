@@ -4,12 +4,13 @@
 
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 macro_rules! string_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -55,7 +56,7 @@ string_id!(
 ///
 /// Adding a variant requires a `PROTOCOL_VERSION` bump: older peers reject
 /// unknown variants rather than ignoring them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BackendKind {
@@ -74,7 +75,7 @@ pub enum BackendKind {
 }
 
 /// The answer to a permission request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum PermissionDecision {
@@ -87,7 +88,7 @@ pub enum PermissionDecision {
 }
 
 /// How much autonomy the agent has in a session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Mode {
@@ -101,7 +102,7 @@ pub enum Mode {
 }
 
 /// Token counts for a turn or a whole session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct TokenUsage {
     /// Tokens sent to the model.
@@ -115,7 +116,7 @@ pub struct TokenUsage {
 }
 
 /// A session as listed to clients.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionInfo {
     /// Session identifier.
     pub id: SessionId,
