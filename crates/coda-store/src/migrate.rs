@@ -7,7 +7,10 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::{SCHEMA_VERSION, StoreError};
 
 /// Every migration as `(version, sql)`, in ascending version order.
-const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("schema.sql"))];
+const MIGRATIONS: &[(u32, &str)] = &[
+    (1, include_str!("schema.sql")),
+    (2, include_str!("schema_v2.sql")),
+];
 
 /// Brings `conn` up to [`SCHEMA_VERSION`], applying each pending migration in
 /// its own transaction. Running it on an up-to-date database changes nothing.

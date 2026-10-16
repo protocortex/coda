@@ -158,7 +158,10 @@ dependencies = [
 name = "coda-store"
 version = "0.0.0"
 dependencies = [
+ "coda-protocol",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
