@@ -31,16 +31,19 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use coda_protocol::types::{RequestId, SessionId, TurnId};
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
 pub const SCHEMA_VERSION: u32 = 3;
 
 const DB_FILE_NAME: &str = "coda.db";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const WAL_SWITCH_ATTEMPTS: u32 = 50;
+const WAL_SWITCH_BACKOFF: Duration = Duration::from_millis(20);
 const DATA_DIR_MODE: u32 = 0o700;
 const DB_FILE_MODE: u32 = 0o600;
 const GROUP_AND_OTHER_BITS: u32 = 0o077;
@@ -159,8 +162,7 @@ impl Store {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // Checked before switching to WAL so a refused database is left untouched.
         migrate::ensure_supported(migrate::read_version(&conn)?)?;
-        let mode: String =
-            conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
+        let mode = switch_to_wal(&conn)?;
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(StoreError::WalNotEnabled { mode });
         }
@@ -177,6 +179,26 @@ impl Store {
     /// The underlying connection.
     pub(crate) fn connection(&self) -> &Connection {
         &self.conn
+    }
+}
+
+/// Switches the journal mode to WAL and returns the mode SQLite reports.
+///
+/// SQLite can return BUSY for this pragma without consulting the busy handler
+/// when another connection is doing the same on a fresh file, so the busy
+/// timeout alone does not cover it. The switch is idempotent, so retry it.
+fn switch_to_wal(conn: &Connection) -> Result<String, StoreError> {
+    let mut attempt = 1;
+    loop {
+        match conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0)) {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == ErrorCode::DatabaseBusy && attempt < WAL_SWITCH_ATTEMPTS =>
+            {
+                attempt += 1;
+                thread::sleep(WAL_SWITCH_BACKOFF);
+            }
+            result => return Ok(result?),
+        }
     }
 }
 

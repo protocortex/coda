@@ -333,13 +333,12 @@ fn symbol_search_index_follows_inserts_updates_and_deletes() {
     assert_eq!(fts_hits(&conn, "wibble"), 0);
 }
 
-#[test]
-fn concurrent_first_opens_both_succeed() {
+fn assert_concurrent_first_opens_succeed(threads: usize) {
     // Arrange
     let dir = TempDir::new().unwrap();
     let data_dir = dir.path().join("data");
-    let barrier = Arc::new(Barrier::new(2));
-    let handles: Vec<_> = (0..2)
+    let barrier = Arc::new(Barrier::new(threads));
+    let handles: Vec<_> = (0..threads)
         .map(|_| {
             let data_dir = data_dir.clone();
             let barrier = Arc::clone(&barrier);
@@ -357,6 +356,16 @@ fn concurrent_first_opens_both_succeed() {
     for result in results {
         result.unwrap();
     }
+}
+
+#[test]
+fn concurrent_first_opens_both_succeed() {
+    assert_concurrent_first_opens_succeed(2);
+}
+
+#[test]
+fn concurrent_first_opens_of_eight_threads_all_succeed() {
+    assert_concurrent_first_opens_succeed(8);
 }
 
 #[test]
