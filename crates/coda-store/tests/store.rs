@@ -19,6 +19,12 @@ fn open_store() -> (TempDir, Store) {
     (dir, store)
 }
 
+fn raw(dir: &TempDir) -> Connection {
+    let conn = Connection::open(dir.path().join("data/coda.db")).unwrap();
+    conn.pragma_update(None, "foreign_keys", true).unwrap();
+    conn
+}
+
 fn mode(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
@@ -53,11 +59,10 @@ fn applying_migrations_twice_is_a_no_op() {
 #[test]
 fn open_enables_wal_mode() {
     // Arrange / Act
-    let (_dir, store) = open_store();
+    let (dir, _store) = open_store();
 
     // Assert
-    let mode: String = store
-        .connection()
+    let mode: String = raw(&dir)
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
@@ -66,15 +71,14 @@ fn open_enables_wal_mode() {
 #[test]
 fn open_records_the_schema_version() {
     // Arrange / Act
-    let (_dir, store) = open_store();
+    let (dir, _store) = open_store();
 
     // Assert
-    let version: u32 = store
-        .connection()
+    let version: u32 = raw(&dir)
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 }
 
 #[test]
@@ -91,7 +95,7 @@ fn newer_schema_version_is_refused() {
         err,
         StoreError::SchemaTooNew {
             found: 99,
-            supported: 1
+            supported: 2
         }
     ));
 }
@@ -99,9 +103,8 @@ fn newer_schema_version_is_refused() {
 #[test]
 fn data_dir_is_0700_and_database_files_are_0600() {
     // Arrange / Act
-    let (dir, store) = open_store();
-    store
-        .connection()
+    let (dir, _store) = open_store();
+    raw(&dir)
         .execute("INSERT INTO sessions (id, created_at) VALUES (1, 0)", [])
         .unwrap();
 
@@ -132,7 +135,7 @@ fn existing_data_dir_with_loose_mode_is_refused() {
 #[test]
 fn every_required_table_exists() {
     // Arrange
-    let (_dir, store) = open_store();
+    let (dir, _store) = open_store();
     let required = [
         "sessions",
         "turns",
@@ -149,8 +152,7 @@ fn every_required_table_exists() {
 
     for table in required {
         // Act
-        let count: u32 = store
-            .connection()
+        let count: u32 = raw(&dir)
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name = ?1",
                 [table],
@@ -166,10 +168,10 @@ fn every_required_table_exists() {
 #[test]
 fn foreign_keys_are_enforced() {
     // Arrange
-    let (_dir, store) = open_store();
+    let (dir, _store) = open_store();
 
     // Act
-    let result = store.connection().execute(
+    let result = raw(&dir).execute(
         "INSERT INTO turns (id, session_id, started_at) VALUES (1, 404, 0)",
         [],
     );
@@ -181,10 +183,10 @@ fn foreign_keys_are_enforced() {
 #[test]
 fn event_log_rejects_free_text_in_enum_columns() {
     // Arrange
-    let (_dir, store) = open_store();
+    let (dir, _store) = open_store();
 
     // Act
-    let result = store.connection().execute(
+    let result = raw(&dir).execute(
         "INSERT INTO event_log (id, kind, at) VALUES (1, 'my secret prompt text', 0)",
         [],
     );
@@ -224,9 +226,9 @@ fn seed_turn(conn: &Connection) {
 #[test]
 fn events_reject_a_duplicate_sequence_number_within_a_turn() {
     // Arrange
-    let (_dir, store) = open_store();
-    let conn = store.connection();
-    seed_turn(conn);
+    let (dir, _store) = open_store();
+    let conn = raw(&dir);
+    seed_turn(&conn);
     let insert = "INSERT INTO events (turn_id, seq, kind, body, at) VALUES (1, 1, 'k', 'b', 0)";
     conn.execute(insert, []).unwrap();
 
@@ -240,8 +242,8 @@ fn events_reject_a_duplicate_sequence_number_within_a_turn() {
 #[test]
 fn every_foreign_key_column_is_indexed() {
     // Arrange
-    let (_dir, store) = open_store();
-    let conn = store.connection();
+    let (dir, _store) = open_store();
+    let conn = raw(&dir);
     let tables = [
         ("turns", "session_id"),
         ("events", "turn_id"),
@@ -280,8 +282,8 @@ fn fts_hits(conn: &Connection, term: &str) -> u32 {
 #[test]
 fn symbol_search_index_follows_inserts_updates_and_deletes() {
     // Arrange
-    let (_dir, store) = open_store();
-    let conn = store.connection();
+    let (dir, _store) = open_store();
+    let conn = raw(&dir);
 
     // Act
     conn.execute(
@@ -292,22 +294,22 @@ fn symbol_search_index_follows_inserts_updates_and_deletes() {
     .unwrap();
 
     // Assert
-    assert_eq!(fts_hits(conn, "frobnicate"), 1);
+    assert_eq!(fts_hits(&conn, "frobnicate"), 1);
 
     // Act
     conn.execute("UPDATE symbols SET name = 'wibble' WHERE id = 1", [])
         .unwrap();
 
     // Assert
-    assert_eq!(fts_hits(conn, "frobnicate"), 0);
-    assert_eq!(fts_hits(conn, "wibble"), 1);
+    assert_eq!(fts_hits(&conn, "frobnicate"), 0);
+    assert_eq!(fts_hits(&conn, "wibble"), 1);
 
     // Act
     conn.execute("DELETE FROM symbols WHERE id = 1", [])
         .unwrap();
 
     // Assert
-    assert_eq!(fts_hits(conn, "wibble"), 0);
+    assert_eq!(fts_hits(&conn, "wibble"), 0);
 }
 
 #[test]

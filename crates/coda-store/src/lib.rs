@@ -2,18 +2,26 @@
 
 //! SQLite persistence for coda. The only crate that opens the database.
 
+mod events;
 pub mod migrate;
+mod sessions;
+
+pub use events::{EventRecord, StoredEvent};
+pub use sessions::{NewSession, SessionFilter, SessionRecord};
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use coda_protocol::types::{RequestId, SessionId, TurnId};
 use rusqlite::Connection;
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 const DB_FILE_NAME: &str = "coda.db";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -21,8 +29,9 @@ const DATA_DIR_MODE: u32 = 0o700;
 const DB_FILE_MODE: u32 = 0o600;
 const GROUP_AND_OTHER_BITS: u32 = 0o077;
 
-/// Failures opening or migrating the store.
+/// Failures opening, migrating or using the store.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StoreError {
     #[error("database schema version {found} is newer than the supported version {supported}")]
     SchemaTooNew { found: u32, supported: u32 },
@@ -34,16 +43,58 @@ pub enum StoreError {
     InsecureDbFile { path: PathBuf },
     #[error("could not enable WAL journal mode, SQLite reported {mode:?}")]
     WalNotEnabled { mode: String },
+    #[error("session {session} does not exist")]
+    SessionNotFound { session: SessionId },
+    #[error("turn {turn} does not exist in session {session}")]
+    TurnNotFound { session: SessionId, turn: TurnId },
+    #[error("event {seq} already exists in session {session}")]
+    DuplicateAppend { session: SessionId, seq: u64 },
+    #[error("session {session} already has another writer")]
+    WriterBusy { session: SessionId },
+    #[error("pending permission {request} does not exist")]
+    PendingNotFound { request: RequestId },
+    #[error("pending permission {request} is already resolved")]
+    AlreadyResolved { request: RequestId },
+    #[error("value {value} does not fit the database integer range")]
+    ValueOutOfRange { value: u64 },
+    #[error("stored value could not be encoded or decoded: {0}")]
+    Encoding(#[from] serde_json::Error),
     #[error("data directory I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
 
+/// Source of timestamps, injected so tests are deterministic.
+pub trait Clock: Send + Sync + std::fmt::Debug {
+    /// Milliseconds since the Unix epoch.
+    fn now_ms(&self) -> i64;
+}
+
+/// The wall clock.
+#[derive(Debug, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> i64 {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+    }
+}
+
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// An open, migrated coda database.
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
+    clock: Arc<dyn Clock>,
+    /// Canonical database path, part of the writer lease key.
+    db_path: PathBuf,
+    /// Identifies this handle as the owner of its writer leases.
+    id: u64,
 }
 
 impl Store {
@@ -60,6 +111,15 @@ impl Store {
     /// enabled, [`StoreError::SchemaTooNew`] when the database
     /// is newer than this binary, and I/O or SQLite errors otherwise.
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
+        Self::open_with_clock(data_dir, Arc::new(SystemClock))
+    }
+
+    /// Like [`Store::open`], taking timestamps from `clock`.
+    ///
+    /// # Errors
+    ///
+    /// Fails in the same ways as [`Store::open`].
+    pub fn open_with_clock(data_dir: &Path, clock: Arc<dyn Clock>) -> Result<Self, StoreError> {
         prepare_data_dir(data_dir)?;
         let db_path = data_dir.join(DB_FILE_NAME);
         check_existing_db_file(&db_path)?;
@@ -82,12 +142,17 @@ impl Store {
         }
         conn.pragma_update(None, "foreign_keys", true)?;
         migrate::migrate(&mut conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            clock,
+            db_path: fs::canonicalize(&db_path)?,
+            id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
+        })
     }
 
     /// The underlying connection.
-    #[must_use]
-    pub fn connection(&self) -> &Connection {
+    #[allow(dead_code)]
+    pub(crate) fn connection(&self) -> &Connection {
         &self.conn
     }
 }
