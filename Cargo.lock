@@ -132,6 +132,22 @@ name = "coda-cli"
 version = "0.0.0"
 
 [[package]]
+name = "coda-client"
+version = "0.0.0"
+dependencies = [
+ "coda-config",
+ "coda-daemon",
+ "coda-protocol",
+ "coda-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "coda-config"
 version = "0.0.0"
 dependencies = [
