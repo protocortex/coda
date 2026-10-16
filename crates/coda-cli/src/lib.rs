@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The `coda` command line: argument parsing and the commands.
+//! The `coda` command line: argument parsing, daemon start-up and the commands.
 
 pub mod autostart;
 pub mod cli;
@@ -57,7 +57,7 @@ fn report_usage(usage: &clap::Error, io: &mut Io<'_>) -> ExitCode {
 async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<(), CliError> {
     let force = cli.force;
     match cli.command {
-        None => status::start(ctx, io).await,
+        None => status::start(ctx, io, force).await,
         Some(Command::Daemon(DaemonArgs { action: None })) => daemon_cmd::serve(ctx).await,
         Some(Command::Daemon(DaemonArgs {
             action: Some(DaemonAction::Restart),
@@ -65,6 +65,6 @@ async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<(), CliErro
         Some(Command::Status) => status::show(ctx, io).await,
         Some(Command::Ping) => status::ping(ctx, io).await,
         Some(Command::Run(_)) => Err(CliError::RunUnavailable),
-        Some(Command::Grant(GrantCommand::Add(args))) => grant::add(ctx, io, args).await,
+        Some(Command::Grant(GrantCommand::Add(args))) => grant::add(ctx, io, force, args).await,
     }
 }

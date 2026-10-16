@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `coda status`, `coda ping` and the bare `coda` report.
+//! `coda status`, `coda ping` and the bare `coda` start-up report.
 
 use coda_protocol::methods::{DAEMON_PING, PingParams, PingResult};
 
@@ -38,12 +38,12 @@ pub async fn ping(ctx: &Context, io: &mut Io<'_>) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Reports the running daemon.
+/// Makes sure a daemon is running, starting one when absent.
 ///
 /// # Errors
 /// Returns the errors of [`ensure_daemon`].
-pub async fn start(ctx: &Context, io: &mut Io<'_>) -> Result<(), CliError> {
-    let client = ensure_daemon(ctx).await?;
+pub async fn start(ctx: &Context, io: &mut Io<'_>, force: bool) -> Result<(), CliError> {
+    let client = ensure_daemon(ctx, io, force).await?;
     let status = status_of(&client).await?;
     writeln!(io.out, "daemon is running (pid {})", status.pid)?;
     Ok(())
