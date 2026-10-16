@@ -1,0 +1,25 @@
+[package]
+name = "coda-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+coda-config = { path = "../coda-config" }
+coda-protocol = { path = "../coda-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+coda-daemon = { path = "../coda-daemon" }
+coda-store = { path = "../coda-store" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

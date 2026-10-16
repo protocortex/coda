@@ -87,6 +87,12 @@ impl FrameDecoder {
         Self::default()
     }
 
+    /// How many more bytes [`Self::push`] accepts before it would overflow.
+    #[must_use]
+    pub fn remaining_capacity(&self) -> usize {
+        MAX_BUFFER_BYTES - self.buffer.len()
+    }
+
     /// Appends received bytes.
     ///
     /// # Errors
@@ -306,6 +312,19 @@ mod tests {
 
         // Assert
         assert!(matches!(result, Err(CodecError::BufferOverflow { .. })));
+    }
+
+    #[test]
+    fn remaining_capacity_shrinks_with_buffered_bytes() {
+        // Arrange
+        let mut decoder = FrameDecoder::new();
+        let empty = decoder.remaining_capacity();
+
+        // Act
+        decoder.push(&[0, 0, 0]).unwrap();
+
+        // Assert
+        assert_eq!(decoder.remaining_capacity(), empty - 3);
     }
 
     #[test]
