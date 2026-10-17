@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Provider traits and backend detection.
+//! Provider traits, backend detection and the shared permission policy.
 
 pub mod backend;
 pub mod detect;
 pub mod gate;
+pub mod policy;
 pub mod tool_request;

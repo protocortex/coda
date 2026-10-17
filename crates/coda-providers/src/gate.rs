@@ -10,7 +10,7 @@ use crate::tool_request::ToolRequest;
 
 /// Answers the permission requests a backend raises.
 ///
-/// An implementation applies `decide` and, on a
+/// An implementation applies [`decide`](crate::policy::decide) and, on a
 /// prompt verdict, waits for a client. It resolves to
 /// [`PermissionDecision::Deny`] when nobody answers in time.
 pub trait PermissionGate: Send + Sync {
