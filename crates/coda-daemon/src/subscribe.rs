@@ -305,6 +305,15 @@ impl Hub {
         tokio::task::spawn_blocking(move || Ok(work(&hub.store())?)).await?
     }
 
+    /// Runs `work` against the writable store on the blocking pool.
+    pub(crate) async fn with_store_mut<T: Send + 'static>(
+        self: &Arc<Self>,
+        work: impl FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<T, HubError> {
+        let hub = Arc::clone(self);
+        tokio::task::spawn_blocking(move || Ok(work(&mut hub.store())?)).await?
+    }
+
     fn store(&self) -> MutexGuard<'_, Store> {
         // SQLite rolls an interrupted transaction back, so a poisoned guard is safe to reuse.
         self.store.lock().unwrap_or_else(PoisonError::into_inner)

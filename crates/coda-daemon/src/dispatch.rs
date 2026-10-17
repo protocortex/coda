@@ -18,8 +18,9 @@ use coda_protocol::jsonrpc::{
 };
 use coda_protocol::methods::{
     DAEMON_PING, DAEMON_SHUTDOWN, DAEMON_STATUS, DaemonShutdownResult, GRANT_ADD, INITIALIZE,
-    InitializeParams, InitializeResult, PROTOCOL_VERSION, PingResult, SESSION_SUBSCRIBE,
-    SessionSubscribeParams, SessionSubscribeResult, USAGE_SUMMARY,
+    InitializeParams, InitializeResult, PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult,
+    SESSION_CANCEL, SESSION_SEND, SESSION_SUBSCRIBE, SessionSubscribeParams,
+    SessionSubscribeResult, USAGE_SUMMARY,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -29,6 +30,7 @@ use crate::grants_rpc;
 use crate::state::{ClientGuard, DaemonState};
 use crate::subscribe::{Connection, Hub, HubError, Outbox};
 use crate::trace::{request_span, session_span};
+use crate::turn::{self, Turns};
 use crate::usage_rpc;
 
 /// `initialize` was called with a protocol version the daemon does not speak.
@@ -43,6 +45,7 @@ pub struct Dispatcher {
     handlers: HashMap<&'static str, Handler>,
     hub: Option<Arc<Hub>>,
     state: Option<Arc<DaemonState>>,
+    turns: Option<Arc<Turns>>,
 }
 
 impl Default for Dispatcher {
@@ -63,6 +66,7 @@ impl Dispatcher {
             handlers,
             hub: None,
             state: None,
+            turns: None,
         }
     }
 
@@ -83,6 +87,13 @@ impl Dispatcher {
     #[must_use]
     pub fn with_hub(mut self, hub: Arc<Hub>) -> Self {
         self.hub = Some(hub);
+        self
+    }
+
+    /// Also answers `session.send`, `session.cancel` and `permission.respond` from `turns`.
+    #[must_use]
+    pub fn with_turns(mut self, turns: Arc<Turns>) -> Self {
+        self.turns = Some(turns);
         self
     }
 
@@ -129,6 +140,9 @@ impl Dispatcher {
         let outcome = match method.as_str() {
             GRANT_ADD => grants_rpc::add_grant(self.hub.as_ref(), params).await,
             USAGE_SUMMARY => usage_rpc::summarize(self.hub.as_ref(), params).await,
+            SESSION_SEND => turn::send(self.turns.as_ref(), params).await,
+            SESSION_CANCEL => turn::cancel(self.turns.as_ref(), params),
+            PERMISSION_RESPOND => turn::respond(self.turns.as_ref(), params).await,
             DAEMON_STATUS => self.status(),
             DAEMON_SHUTDOWN => self.shutdown(),
             other => match self.handlers.get(other) {
