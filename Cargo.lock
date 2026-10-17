@@ -323,6 +323,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "coda-tools"
+version = "0.0.0"
+dependencies = [
+ "coda-protocol",
+ "regex",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "coda-tui"
 version = "0.0.0"
 dependencies = [
