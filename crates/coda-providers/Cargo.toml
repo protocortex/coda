@@ -10,9 +10,11 @@ publish = false
 [dependencies]
 coda-config = { path = "../coda-config" }
 coda-protocol = { path = "../coda-protocol" }
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+coda-testkit = { path = "../coda-testkit" }
 tempfile.workspace = true
 
 [lints]
