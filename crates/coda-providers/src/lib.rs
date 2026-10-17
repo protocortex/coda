@@ -4,6 +4,7 @@
 
 pub mod backend;
 pub mod claude_code;
+pub mod claude_session;
 pub mod detect;
 pub mod gate;
 pub mod policy;

@@ -1,3 +1,4 @@
 target/
 .env
 .claude/
+fake-claude-report.json

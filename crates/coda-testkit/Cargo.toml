@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+rustix = { workspace = true, features = ["stdio"] }
 serde_json.workspace = true
 thiserror.workspace = true
 

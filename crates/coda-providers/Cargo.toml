@@ -10,8 +10,10 @@ publish = false
 [dependencies]
 coda-config = { path = "../coda-config" }
 coda-protocol = { path = "../coda-protocol" }
+rustix = { workspace = true, features = ["process"] }
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 coda-testkit = { path = "../coda-testkit" }
