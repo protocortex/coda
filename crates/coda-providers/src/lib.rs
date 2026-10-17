@@ -2,6 +2,7 @@
 
 //! Provider traits, backend detection and the shared permission policy.
 
+pub mod anthropic;
 pub mod backend;
 pub mod claude_code;
 pub mod claude_session;
