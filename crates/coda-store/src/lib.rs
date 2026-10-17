@@ -40,7 +40,8 @@ use rusqlite::{Connection, ErrorCode};
 /// Schema version this binary reads and writes.
 pub const SCHEMA_VERSION: u32 = 3;
 
-const DB_FILE_NAME: &str = "coda.db";
+/// File name of the database inside the data directory.
+pub const DB_FILE_NAME: &str = "coda.db";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const WAL_SWITCH_ATTEMPTS: u32 = 50;
 const WAL_SWITCH_BACKOFF: Duration = Duration::from_millis(20);

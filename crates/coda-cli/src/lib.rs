@@ -9,6 +9,7 @@ mod daemon_cmd;
 mod error;
 mod grant;
 mod status;
+mod usage;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -66,5 +67,6 @@ async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<(), CliErro
         Some(Command::Ping) => status::ping(ctx, io).await,
         Some(Command::Run(_)) => Err(CliError::RunUnavailable),
         Some(Command::Grant(GrantCommand::Add(args))) => grant::add(ctx, io, force, args).await,
+        Some(Command::Usage(args)) => usage::show(ctx, io, args).await,
     }
 }

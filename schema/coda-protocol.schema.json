@@ -38,8 +38,8 @@
     "SessionSubscribeResult": {"description":"Result of [`SESSION_SUBSCRIBE`].","properties":{"subscribed":{"description":"Whether the subscription is active.","type":"boolean"}},"required":["subscribed"],"type":"object"},
     "TokenUsage": {"description":"Token counts for a turn or a whole session.","properties":{"cache_read_tokens":{"default":0,"description":"Input tokens served from the prompt cache.","format":"uint64","minimum":0,"type":"integer"},"cache_write_tokens":{"default":0,"description":"Input tokens written to the prompt cache.","format":"uint64","minimum":0,"type":"integer"},"input_tokens":{"default":0,"description":"Tokens sent to the model.","format":"uint64","minimum":0,"type":"integer"},"output_tokens":{"default":0,"description":"Tokens produced by the model.","format":"uint64","minimum":0,"type":"integer"}},"type":"object"},
     "TurnId": {"description":"Identifies one turn within a session.","type":"string"},
-    "UsageSummaryParams": {"description":"Parameters of [`USAGE_SUMMARY`].","properties":{"session_id":{"$ref":"#/$defs/SessionId","description":"Session to summarize."}},"required":["session_id"],"type":"object"},
-    "UsageSummaryResult": {"description":"Result of [`USAGE_SUMMARY`].","properties":{"usage":{"$ref":"#/$defs/TokenUsage","description":"Total usage of the session."}},"required":["usage"],"type":"object"},
+    "UsageSummaryParams": {"description":"Parameters of [`USAGE_SUMMARY`].","properties":{"session_id":{"anyOf":[{"$ref":"#/$defs/SessionId"},{"type":"null"}],"description":"Session to summarize, or every session when absent."}},"type":"object"},
+    "UsageSummaryResult": {"description":"Result of [`USAGE_SUMMARY`].","properties":{"saved_bytes":{"default":0,"description":"Bytes of tool output the token economy kept out of the context.","format":"uint64","minimum":0,"type":"integer"},"usage":{"$ref":"#/$defs/TokenUsage","description":"Total usage of the summarized sessions."}},"required":["usage"],"type":"object"},
     "Version": {"const":"2.0"}
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
