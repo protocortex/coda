@@ -298,8 +298,10 @@ version = "0.0.0"
 dependencies = [
  "coda-config",
  "coda-protocol",
+ "coda-providers",
  "coda-testkit",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
