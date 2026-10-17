@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 coda-protocol = { path = "../coda-protocol" }
 regex.workspace = true
-rustix = { workspace = true, features = ["fs"] }
+rustix = { workspace = true, features = ["fs", "pipe", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

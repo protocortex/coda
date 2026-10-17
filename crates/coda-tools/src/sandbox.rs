@@ -11,7 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use coda_protocol::paths::{Target, classify_target};
-use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, fstat, openat, statat};
+use rustix::fs::{
+    AtFlags, CWD, Dir, FileType, Mode, OFlags, fstat, openat, renameat, statat, unlinkat,
+};
 use rustix::io::Errno;
 
 const CURRENT_DIR: &str = ".";
@@ -125,6 +127,44 @@ impl SandboxDir {
         open_child(&self.fd, name, &display, Want::File).map(File::from)
     }
 
+    /// Creates a new file `name` in this directory, failing if it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Io`] when the file cannot be created.
+    pub fn create_new(&self, name: &OsStr, mode: Mode) -> Result<File, SandboxError> {
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        openat(&self.fd, name, flags, mode)
+            .map(File::from)
+            .map_err(|errno| self.io_error(name, errno))
+    }
+
+    /// Renames `from` over `to`, both directly inside this directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Io`] when the rename fails.
+    pub fn rename(&self, from: &OsStr, to: &OsStr) -> Result<(), SandboxError> {
+        renameat(&self.fd, from, &self.fd, to).map_err(|errno| self.io_error(to, errno))
+    }
+
+    /// Removes the file `name` directly inside this directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Io`] when the removal fails.
+    pub fn remove(&self, name: &OsStr) -> Result<(), SandboxError> {
+        unlinkat(&self.fd, name, AtFlags::empty()).map_err(|errno| self.io_error(name, errno))
+    }
+
+    fn io_error(&self, name: &OsStr, errno: Errno) -> SandboxError {
+        SandboxError::Io {
+            path: join_display(&self.display, name),
+            source: errno.into(),
+        }
+    }
+
     /// Opens the subdirectory `name` directly inside this directory.
     ///
     /// # Errors
@@ -179,13 +219,26 @@ impl Sandbox {
     /// Fails when the path is absolute, contains `..`, leaves the workspace,
     /// passes through a symlink, or is not a regular file.
     pub fn open_file(&self, rel: &Path) -> Result<File, SandboxError> {
-        let display = rel.display().to_string();
+        let (parent, file_name) = self.open_parent(rel)?;
+        parent.open_file(&file_name)
+    }
+
+    /// Opens the directory holding the workspace-relative file `rel`.
+    ///
+    /// Returns the directory and the file's name inside it, so a caller can
+    /// create or replace siblings without re-resolving the path.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Sandbox::open_file`], except the file itself is
+    /// not opened.
+    pub fn open_parent(&self, rel: &Path) -> Result<(SandboxDir, OsString), SandboxError> {
         let mut names = self.checked_components(rel)?;
         let Some(file_name) = names.pop() else {
-            return Err(SandboxError::NotARegularFile(display));
+            return Err(SandboxError::NotARegularFile(rel.display().to_string()));
         };
-        let parent = self.descend(&names, &display)?;
-        parent.open_file(&file_name)
+        let parent_display = names.iter().collect::<PathBuf>().display().to_string();
+        Ok((self.descend(&names, &parent_display)?, file_name))
     }
 
     /// Opens the directory at the workspace-relative `rel`.

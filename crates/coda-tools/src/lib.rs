@@ -7,6 +7,8 @@
 //! inside `spawn_blocking`. Every path a tool touches goes through
 //! [`sandbox::Sandbox`].
 
+pub mod bash;
+pub mod edit;
 pub mod grep;
 pub mod read;
 pub mod sandbox;
@@ -50,6 +52,45 @@ pub enum ToolError {
         /// The underlying error.
         source: std::io::Error,
     },
+    /// The text to replace does not occur in the file.
+    #[error("old_string was not found in {path}")]
+    NoMatch {
+        /// The workspace-relative path that was searched.
+        path: String,
+    },
+    /// The text to replace occurs more than once, so the edit is ambiguous.
+    #[error(
+        "old_string matches {count} places in {path}; add surrounding context to make it unique"
+    )]
+    NotUnique {
+        /// The workspace-relative path that was searched.
+        path: String,
+        /// How many places matched.
+        count: usize,
+    },
+    /// The file is bigger than the tool is willing to rewrite.
+    #[error("{path} is larger than the {limit} byte edit limit")]
+    TooLarge {
+        /// The workspace-relative path.
+        path: String,
+        /// The size limit in bytes.
+        limit: usize,
+    },
+    /// The shell could not be started.
+    #[error("starting the shell failed: {0}")]
+    Spawn(std::io::Error),
+    /// The file changed after it was read, so the edit was not applied.
+    #[error("{path} changed while it was being edited; read it again and retry")]
+    Conflict {
+        /// The workspace-relative path.
+        path: String,
+    },
+    /// The file is not valid UTF-8 text.
+    #[error("{path} is not valid UTF-8 text")]
+    NotUtf8 {
+        /// The workspace-relative path.
+        path: String,
+    },
 }
 
 /// A capability the model can invoke.
@@ -67,6 +108,25 @@ pub trait Tool: Send + Sync {
 }
 
 impl ToolOutput {
+    /// Cuts `bytes` to `cap`, dropping a character the cut split in half.
+    ///
+    /// Callers pass at most `cap + 1` bytes: one extra byte is how a cut is noticed.
+    pub(crate) fn from_bytes(mut bytes: Vec<u8>, cap: usize) -> Self {
+        let truncated = bytes.len() > cap;
+        if truncated {
+            bytes.truncate(cap);
+            if let Err(err) = std::str::from_utf8(&bytes)
+                && err.error_len().is_none()
+            {
+                bytes.truncate(err.valid_up_to());
+            }
+        }
+        Self {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            truncated,
+        }
+    }
+
     /// Wraps `text`, cutting it to at most `cap` bytes on a character boundary.
     pub(crate) fn capped(mut text: String, cap: usize) -> Self {
         let truncated = text.len() > cap;
