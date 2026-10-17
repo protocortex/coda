@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::model::ProviderError;
 
 pub mod events;
+pub mod provider;
 pub mod request;
 pub mod sse;
 
@@ -101,7 +102,7 @@ pub fn classify_status(status: u16, body: &str) -> ProviderError {
         Some(detail) => format!("Anthropic returned HTTP {status}: {}", shorten(&detail)),
         None => format!("Anthropic returned HTTP {status}"),
     };
-    if matches!(status, 408 | 409 | 429 | 500..) {
+    if matches!(status, 429 | 500..) {
         ProviderError::Retryable { message }
     } else {
         ProviderError::Fatal { message }
