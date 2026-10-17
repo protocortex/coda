@@ -1,0 +1,19 @@
+[package]
+name = "coda-providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+coda-config = { path = "../coda-config" }
+coda-protocol = { path = "../coda-protocol" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
