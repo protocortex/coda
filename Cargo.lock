@@ -316,11 +316,13 @@ name = "coda-daemon"
 version = "0.0.0"
 dependencies = [
  "coda-config",
+ "coda-core",
  "coda-protocol",
  "coda-providers",
  "coda-store",
  "coda-telemetry",
  "coda-testkit",
+ "coda-tools",
  "rusqlite",
  "rustix",
  "serde",

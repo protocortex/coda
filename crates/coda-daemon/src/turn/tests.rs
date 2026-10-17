@@ -80,10 +80,11 @@ impl Rig {
         let turns = Turns::new(
             Arc::clone(&hub),
             TurnConfig {
-                binary: coda_testkit::paths::fake_claude_path().unwrap(),
+                binary: Some(coda_testkit::paths::fake_claude_path().unwrap()),
                 pidfile_dir: data.path().to_path_buf(),
                 parent_env,
                 timing,
+                models: coda_config::config::Config::default(),
             },
         );
         let dispatcher = Dispatcher::new()

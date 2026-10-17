@@ -14,7 +14,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use coda_config::config::PermissionMode;
+use coda_config::config::{Config, PermissionMode};
 use coda_protocol::events::Event;
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR};
 use coda_protocol::methods::{
@@ -26,8 +26,8 @@ use coda_providers::claude_session::{ClaudeSession, TurnOutcome};
 use coda_providers::gate::PermissionGate;
 use coda_providers::tool_request::ToolRequest;
 use coda_store::{
-    EventRecord, LogEvent, LogEventKind, LogScope, PendingPermission, Store, StoreError,
-    UsageRecord,
+    EventRecord, LogEvent, LogEventKind, LogScope, PendingPermission, SessionRecord, Store,
+    StoreError, UsageRecord,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -37,6 +37,7 @@ use tracing::{Instrument, Span, info, warn};
 use crate::backends::{SessionStart, StartError, pidfile_path, start_claude_session};
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
 use crate::gate::{GateConfig, PermissionAnswers, SessionGate};
+use crate::model_session::{ModelError, ModelSessions};
 use crate::subscribe::{Hub, HubError};
 use crate::trace::{backend_span, permission_span};
 use crate::watchdog::{Phase, Timing, Watchdog};
@@ -59,13 +60,15 @@ const EVENT_QUEUE_CAPACITY: usize = 1024;
 /// How turns start their backend.
 #[derive(Debug, Clone)]
 pub struct TurnConfig {
-    /// The resolved Claude Code executable.
-    pub binary: PathBuf,
+    /// The resolved Claude Code executable, when one was found.
+    pub binary: Option<PathBuf>,
     /// Directory that holds the children's pidfiles.
     pub pidfile_dir: PathBuf,
     /// The environment the child may inherit from, after its allowlist.
     pub parent_env: Vec<(OsString, OsString)>,
     pub timing: Timing,
+    /// The configuration model-API sessions select their provider from.
+    pub models: Config,
 }
 
 /// Why a request could not be served.
@@ -81,6 +84,8 @@ pub enum TurnError {
     Hub(#[from] HubError),
     #[error(transparent)]
     Start(#[from] StartError),
+    #[error(transparent)]
+    Model(#[from] ModelError),
 }
 
 impl TurnError {
@@ -88,7 +93,9 @@ impl TurnError {
         match self {
             Self::SessionNotFound(_) => error(SESSION_NOT_FOUND, "Session not found"),
             Self::Busy(_) => error(TURN_RUNNING, "A turn is already running"),
-            Self::Unsupported(_) => error(BACKEND_UNSUPPORTED, "Backend not supported"),
+            Self::Unsupported(_) | Self::Model(ModelError::Disabled(_)) => {
+                error(BACKEND_UNSUPPORTED, "Backend not supported")
+            }
             other => {
                 tracing::error!(error = %other, "request failed");
                 error(INTERNAL_ERROR, "Internal error")
@@ -125,6 +132,7 @@ pub struct Turns {
     hub: Arc<Hub>,
     answers: Arc<PermissionAnswers>,
     config: TurnConfig,
+    pub(crate) models: Arc<ModelSessions>,
     /// A session is present from the moment a send reserves it; the cancel
     /// handle is set once the backend runs. Never held across an await.
     running: Mutex<HashMap<SessionId, Option<CancelHandle>>>,
@@ -143,10 +151,19 @@ struct Job {
 impl Turns {
     #[must_use]
     pub fn new(hub: Arc<Hub>, config: TurnConfig) -> Arc<Self> {
+        let answers = PermissionAnswers::new();
+        let models = ModelSessions::new(
+            Arc::clone(&hub),
+            Arc::clone(&answers),
+            config.models.clone(),
+            config.parent_env.clone(),
+            Arc::new(|name| std::env::var(name).ok()),
+        );
         Arc::new(Self {
             hub,
-            answers: PermissionAnswers::new(),
+            answers,
             config,
+            models,
             running: Mutex::default(),
             backend_ids: Mutex::default(),
         })
@@ -166,13 +183,26 @@ impl Turns {
             .with_store(move |store| store.load_session(&id))
             .await
             .map_err(|e| not_found_or(e, &session_id))?;
-        if record.backend != BackendKind::ClaudeCode {
-            return Err(TurnError::Unsupported(session_id));
+        match record.backend {
+            BackendKind::ClaudeCode => self.send_claude(record, text).await,
+            BackendKind::Anthropic | BackendKind::Faux => self.models.send(record, text).await,
+            _ => Err(TurnError::Unsupported(session_id)),
         }
+    }
+
+    async fn send_claude(
+        self: &Arc<Self>,
+        record: SessionRecord,
+        text: String,
+    ) -> Result<TurnId, TurnError> {
+        let session_id = record.id.clone();
+        let Some(binary) = self.config.binary.clone() else {
+            return Err(TurnError::Unsupported(session_id));
+        };
         let slot = self.reserve(&session_id)?;
         info!(session = %session_id, step = "start_backend", "starting turn");
         let mut child = start_claude_session(SessionStart {
-            binary: self.config.binary.clone(),
+            binary,
             cwd: PathBuf::from(&record.cwd),
             session_id: session_id.clone(),
             resume: self.resume_id(&session_id),
@@ -180,7 +210,7 @@ impl Turns {
             pidfile_dir: self.config.pidfile_dir.clone(),
         })
         .await?;
-        let turn = match self.begin(&session_id, &text).await {
+        let turn = match Self::begin(&self.hub, &session_id, &text).await {
             Ok(turn) => turn,
             Err(e) => {
                 stop(&mut child, &session_id).await;
@@ -223,7 +253,7 @@ impl Turns {
                 cancel.cancel();
                 true
             }
-            _ => false,
+            _ => self.models.cancel(session),
         }
     }
 
@@ -257,16 +287,21 @@ impl Turns {
         }
     }
 
+    pub async fn shutdown(&self) {
+        self.models.shutdown().await;
+    }
+
     /// Whether `session` has a turn starting or running.
     #[must_use]
     pub fn is_running(&self, session: &SessionId) -> bool {
-        self.running().contains_key(session)
+        self.running().contains_key(session) || self.models.is_running(session)
     }
 
     /// How many sessions have a turn starting or running.
     #[must_use]
     pub fn active(&self) -> u32 {
-        u32::try_from(self.running().len()).unwrap_or(u32::MAX)
+        let running = self.running().len() + self.models.active();
+        u32::try_from(running).unwrap_or(u32::MAX)
     }
 
     fn running(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, Option<CancelHandle>>> {
@@ -294,10 +329,14 @@ impl Turns {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    async fn begin(&self, session: &SessionId, text: &str) -> Result<TurnId, HubError> {
+    /// Starts a turn and stores the user's message as its first event.
+    pub(crate) async fn begin(
+        hub: &Arc<Hub>,
+        session: &SessionId,
+        text: &str,
+    ) -> Result<TurnId, HubError> {
         let id = session.clone();
-        let turn = self
-            .hub
+        let turn = hub
             .with_store_mut(move |store| {
                 let turn = store.begin_turn(&id)?;
                 store.record_log_event(&log_event(LogEventKind::TurnStarted, &id, &turn))?;
@@ -309,7 +348,7 @@ impl Turns {
             kind: USER_MESSAGE_KIND.to_owned(),
             body,
         };
-        self.hub.publish(session, &turn, record).await?;
+        hub.publish(session, &turn, record).await?;
         Ok(turn)
     }
 
@@ -377,14 +416,14 @@ impl Turns {
                 Ok(TurnOutcome::Cancelled) => false,
                 _ => true,
             };
-        self.finish(&session, &turn, failed).await;
+        Self::finish(&self.hub, &session, &turn, failed).await;
     }
 
-    async fn finish(&self, session: &SessionId, turn: &TurnId, failed: bool) {
+    /// Denies the prompts the turn left open and records how it ended.
+    pub(crate) async fn finish(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, failed: bool) {
         info!(session = %session, turn = %turn, step = "finish", "recording the end of the turn");
         let (id, turn_id) = (session.clone(), turn.clone());
-        let recorded = self
-            .hub
+        let recorded = hub
             .with_store_mut(move |store| {
                 // A prompt that was waiting when the turn ended can never be answered.
                 match store.list_pending(&id) {
@@ -450,7 +489,7 @@ impl PermissionGate for WatchedGate {
     }
 }
 
-fn record_decision(span: &Span, decision: PermissionDecision) {
+pub(crate) fn record_decision(span: &Span, decision: PermissionDecision) {
     span.record(
         coda_telemetry::attrs::CODA_PERMISSION_DECISION,
         format!("{decision:?}"),
@@ -470,7 +509,7 @@ async fn publish_events(
     }
 }
 
-async fn store_event(
+pub(crate) async fn store_event(
     hub: &Arc<Hub>,
     session: &SessionId,
     turn: &TurnId,
@@ -513,7 +552,7 @@ fn remove_pidfile(dir: &std::path::Path, session: &SessionId) {
     }
 }
 
-fn log_event(kind: LogEventKind, session: &SessionId, turn: &TurnId) -> LogEvent {
+pub(crate) fn log_event(kind: LogEventKind, session: &SessionId, turn: &TurnId) -> LogEvent {
     LogEvent {
         kind,
         session: session.as_str().parse().ok(),
@@ -523,7 +562,7 @@ fn log_event(kind: LogEventKind, session: &SessionId, turn: &TurnId) -> LogEvent
     }
 }
 
-fn permission_mode(mode: Mode) -> PermissionMode {
+pub(crate) fn permission_mode(mode: Mode) -> PermissionMode {
     match mode {
         Mode::Plan => PermissionMode::DenyAll,
         Mode::AcceptEdits => PermissionMode::AcceptEdits,

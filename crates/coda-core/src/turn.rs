@@ -16,11 +16,12 @@ use coda_providers::model::{
 };
 use coda_providers::tool_request::{Tool as RequestTool, ToolRequest};
 use coda_store::Store;
+use coda_telemetry::attrs::{CODA_SESSION_ID, CODA_TOOL_NAME};
 use coda_tools::Tool;
 use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{info, warn};
+use tracing::{Instrument, info, info_span, warn};
 
 use crate::budget::TokenBudget;
 use crate::economy::{cap_ends, compact};
@@ -34,6 +35,10 @@ const EMPTY_ARGUMENTS: &str = "{}";
 const NO_REPLY: &str = "[no reply: the turn stopped early]";
 /// What the model is told about a call whose permission prompt was cancelled.
 const PROMPT_CANCELLED: &str = "not run: the turn was cancelled while asking permission";
+/// Name of the span around one model call.
+pub const PROVIDER_CALL_SPAN: &str = "coda.provider.call";
+/// Name of the span around one tool call.
+pub const TOOL_CALL_SPAN: &str = "coda.tool.call";
 /// Longest compaction error text shown to the model.
 const MAX_ERROR_CHARS: usize = 200;
 
@@ -58,6 +63,23 @@ pub enum StopCondition {
     MaxTokens,
 }
 
+impl StopCondition {
+    /// The stable name clients see.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::MaxTurns => "max_turns",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::ContextOverflow => "context_overflow",
+            Self::Cancelled => "cancelled",
+            Self::Refused => "refused",
+            Self::Paused => "paused",
+            Self::MaxTokens => "max_tokens",
+        }
+    }
+}
+
 /// What a client can show while a send runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEvent {
@@ -70,6 +92,8 @@ pub enum TurnEvent {
         /// True when the model got an error back.
         is_error: bool,
     },
+    /// A model call finished and used these tokens.
+    Usage(Usage),
     /// The context window is full; compaction is not available.
     ContextOverflow,
 }
@@ -99,7 +123,8 @@ impl CancelToken {
         self.wake.notify_one();
     }
 
-    fn reset(&self) {
+    /// Clears a cancel; call it before a send starts, never while one runs.
+    pub fn reset(&self) {
         self.flag.store(false, Ordering::SeqCst);
     }
 
@@ -129,6 +154,14 @@ impl ToolSet {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The names of the tools, sorted.
+    #[must_use]
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut names: Vec<_> = self.tools.keys().copied().collect();
+        names.sort_unstable();
+        names
     }
 
     /// Adds `tool` under its own name.
@@ -207,15 +240,15 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
 
     /// Adds the user's message and runs the loop until it stops.
     ///
-    /// A cancel only affects the send running when it arrives. Whatever way
-    /// the send ends, the history is left ready for the next one.
+    /// A cancel that arrived before the send started stops it, so the caller
+    /// resets the token first. Whatever way the send ends, the history is left
+    /// ready for the next one.
     ///
     /// # Errors
     ///
     /// Returns [`TurnError::Provider`] for a provider failure that is not a
     /// context overflow, and [`TurnError::StreamEnded`] for a truncated stream.
     pub async fn send(&mut self, text: &str) -> Result<StopCondition, TurnError> {
-        self.cancel.reset();
         self.conversation.push(Message::User(text.to_owned()));
         let result = self.run().await;
         if !matches!(
@@ -239,7 +272,18 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                 info!(%exhausted, "model call refused");
                 return Ok(StopCondition::BudgetExhausted);
             }
-            let reply = match self.stream_reply().await? {
+            let call = info_span!(
+                PROVIDER_CALL_SPAN,
+                { CODA_SESSION_ID } = %self.config.session,
+            );
+            let mut draft = Draft::default();
+            let streamed = self.stream_reply(&mut draft).instrument(call).await;
+            // Tokens were spent even when the stream failed or was cancelled.
+            if let Some(usage) = draft.usage {
+                self.budget.record(usage);
+                self.emit(TurnEvent::Usage(usage));
+            }
+            let reply = match streamed? {
                 Streamed::Reply(reply) => reply,
                 Streamed::Overflow => {
                     self.emit(TurnEvent::ContextOverflow);
@@ -247,9 +291,6 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                 }
                 Streamed::Cancelled => return Ok(StopCondition::Cancelled),
             };
-            if let Some(usage) = reply.usage {
-                self.budget.record(usage);
-            }
             // Calls from a reply that did not stop for tools are dropped: nothing
             // would answer them, and an unanswered call poisons every later request.
             let calls = if reply.stop == StopReason::ToolUse {
@@ -310,7 +351,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     }
 
     /// Streams one model reply, giving up as soon as the user cancels.
-    async fn stream_reply(&self) -> Result<Streamed, TurnError> {
+    async fn stream_reply(&self, draft: &mut Draft) -> Result<Streamed, TurnError> {
         let opened = tokio::select! {
             opened = self.provider.stream(self.request()) => opened,
             () = self.cancel.cancelled() => return Ok(Streamed::Cancelled),
@@ -320,7 +361,6 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             Err(ProviderError::ContextWindowExceeded) => return Ok(Streamed::Overflow),
             Err(error) => return Err(error.into()),
         };
-        let mut draft = Draft::default();
         let stop = loop {
             let item = tokio::select! {
                 item = stream.next() => item,
@@ -331,16 +371,15 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                 Some(Err(ProviderError::ContextWindowExceeded)) => return Ok(Streamed::Overflow),
                 Some(Err(error)) => return Err(error.into()),
                 Some(Ok(event)) => {
-                    if let Some(stop) = self.apply(&mut draft, event) {
+                    if let Some(stop) = self.apply(draft, event) {
                         break stop;
                     }
                 }
             }
         };
         Ok(Streamed::Reply(Reply {
-            text: draft.text,
-            calls: draft.calls,
-            usage: draft.usage,
+            text: std::mem::take(&mut draft.text),
+            calls: std::mem::take(&mut draft.calls),
             stop,
         }))
     }
@@ -374,9 +413,10 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     async fn run_tools(&mut self, calls: Vec<ToolCall>) -> Option<StopCondition> {
         let mut stop = None;
         for call in calls {
-            let outcome = match stop {
-                Some(_) => ToolOutcome::error(SKIPPED.to_owned()),
-                None => self.run_tool(&call).await,
+            let outcome = if stop.is_some() {
+                ToolOutcome::error(SKIPPED.to_owned())
+            } else {
+                self.run_tool(&call).await
             };
             self.emit(TurnEvent::ToolFinished {
                 tool: call.name.clone(),
@@ -405,6 +445,15 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     }
 
     async fn run_tool(&self, call: &ToolCall) -> ToolOutcome {
+        let span = info_span!(
+            TOOL_CALL_SPAN,
+            { CODA_SESSION_ID } = %self.config.session,
+            { CODA_TOOL_NAME } = call.name.as_str(),
+        );
+        self.run_tool_inner(call).instrument(span).await
+    }
+
+    async fn run_tool_inner(&self, call: &ToolCall) -> ToolOutcome {
         let Some(tool) = self.tools.tools.get(call.name.as_str()) else {
             return ToolOutcome::error(format!("unknown tool {}", call.name));
         };
@@ -460,7 +509,6 @@ struct Draft {
 struct Reply {
     text: String,
     calls: Vec<ToolCall>,
-    usage: Option<Usage>,
     stop: StopReason,
 }
 
@@ -1287,6 +1335,7 @@ mod tests {
         // Act
         cancel.cancel();
         let (mut lp, stop) = tokio::time::timeout(BOUND, task).await.unwrap().unwrap();
+        cancel.reset();
         let next = lp.send("again").await.unwrap();
 
         // Assert
@@ -1405,5 +1454,31 @@ mod tests {
             assert!(text.len() < original.len() / 2, "{name}: {}", text.len());
             assert!(text.contains(suffix), "{name}: {text}");
         }
+    }
+
+    #[tokio::test]
+    async fn each_model_call_reports_its_usage() {
+        // Arrange
+        let fixture = Fixture::new();
+        let first = Usage {
+            input_tokens: 11,
+            output_tokens: 7,
+        };
+        let (mut lp, mut events) = fixture.allowing(
+            vec![tool_turn(&[("c1", "canned", "{}")], first), end_turn("ok")],
+            canned(Some("ran")),
+        );
+
+        // Act
+        lp.send("go").await.unwrap();
+
+        // Assert
+        let mut usages = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let TurnEvent::Usage(usage) = event {
+                usages.push(usage);
+            }
+        }
+        assert_eq!(usages, vec![first, SMALL_USAGE]);
     }
 }

@@ -9,10 +9,12 @@ publish = false
 
 [dependencies]
 coda-config = { path = "../coda-config" }
+coda-core = { path = "../coda-core" }
 coda-protocol = { path = "../coda-protocol" }
 coda-providers = { path = "../coda-providers" }
 coda-store = { path = "../coda-store" }
 coda-telemetry = { path = "../coda-telemetry" }
+coda-tools = { path = "../coda-tools" }
 rustix = { workspace = true, features = ["fs", "process"] }
 serde.workspace = true
 serde_json.workspace = true

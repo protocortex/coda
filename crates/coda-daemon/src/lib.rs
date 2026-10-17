@@ -7,6 +7,7 @@ pub mod dispatch;
 pub mod gate;
 pub mod grants_rpc;
 pub mod lock;
+pub mod model_session;
 pub mod pidfile;
 pub mod reaper;
 pub mod server;
