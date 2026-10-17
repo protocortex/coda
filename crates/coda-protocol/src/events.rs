@@ -12,6 +12,8 @@ use crate::types::{RequestId, SessionId, TokenUsage, TurnId};
 
 /// Notification method that wraps an [`Event`].
 pub const EVENT_NOTIFICATION: &str = "session.event";
+/// Stored event kind of a permission request that ended without an answer.
+pub const TIMEOUT_KIND: &str = "timeout";
 
 /// One event of a session.
 ///

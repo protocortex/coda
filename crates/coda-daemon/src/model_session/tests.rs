@@ -17,7 +17,7 @@ use tempfile::TempDir;
 
 use super::{CONVERSATION_RESET_KIND, EnvReader, ModelSessions, keep_recent, lock};
 use crate::dispatch::Dispatcher;
-use crate::gate::PermissionAnswers;
+use crate::gate::Brokers;
 use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
 use crate::trace::capture::{Spans, install};
@@ -89,6 +89,8 @@ impl Rig {
         let cwd_guard = tempfile::tempdir().unwrap();
         let cwd = std::fs::canonicalize(cwd_guard.path()).unwrap();
         std::fs::write(cwd.join("a.txt"), "one needle here\n").unwrap();
+        // Grants are scoped to a git repo, so the session works in one.
+        std::fs::create_dir(cwd.join(".git")).unwrap();
         let script_path = data.path().join("script.json");
         std::fs::write(&script_path, Value::Array(script.to_vec()).to_string()).unwrap();
         let mut models = Config::default();
@@ -505,7 +507,13 @@ async fn the_api_key_is_read_from_the_live_environment_on_every_call() {
     let live = Arc::clone(&key);
     let reader: EnvReader = Arc::new(move |_| live.lock().unwrap().clone());
     let hub = Arc::clone(&rig.hub);
-    let sessions = ModelSessions::new(hub, PermissionAnswers::new(), config, Vec::new(), reader);
+    let sessions = ModelSessions::new(
+        Arc::clone(&hub),
+        Brokers::new(hub, Vec::new()),
+        config,
+        Vec::new(),
+        reader,
+    );
     let record = SessionRecord {
         id: rig.session.clone(),
         backend: BackendKind::Anthropic,

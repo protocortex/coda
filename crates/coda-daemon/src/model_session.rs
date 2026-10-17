@@ -14,29 +14,28 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use coda_config::config::{Config, ProviderConfig};
+use coda_core::broker::BrokerError;
 use coda_core::prompt::{Conversation, Prefix, PromptError};
 use coda_core::tools::{BaseToolsConfig, StoreOriginals, ToolsError, base_tools};
 use coda_core::turn::{CancelToken, TurnConfig, TurnEvent, TurnLoop};
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, TIMEOUT_KIND};
 use coda_protocol::types::{BackendKind, PermissionDecision, SessionId, TokenUsage, TurnId};
 use coda_providers::anthropic::provider::{AnthropicOptions, AnthropicProvider};
 use coda_providers::anthropic::request::RequestSettings;
 use coda_providers::faux::{FauxError, FauxProvider};
-use coda_providers::gate::PermissionGate;
 use coda_providers::model::{
     ModelProvider, ModelRequest, ModelStream, ProviderError, SystemClock, TokioSleeper,
 };
-use coda_providers::tool_request::ToolRequest;
 use coda_store::{EventRecord, SessionRecord, StoreError};
 use coda_tools::bash::{DEFAULT_ENV_ALLOWLIST, allowlisted_env};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::{Instrument, info, warn};
 
-use crate::gate::{GateConfig, PermissionAnswers, SessionGate};
+use crate::gate::{BrokerGate, Brokers};
 use crate::subscribe::{Hub, HubError};
-use crate::trace::{backend_span, permission_span};
-use crate::turn::{TurnError, Turns, permission_mode, record_decision, store_event};
+use crate::trace::backend_span;
+use crate::turn::{TurnError, Turns, store_event};
 
 const FAUX_KEY: &str = "faux";
 const ANTHROPIC_KEY: &str = "anthropic";
@@ -60,7 +59,6 @@ pub const CONTEXT_OVERFLOW_KIND: &str = "context_overflow";
 pub const TURN_STOPPED_KIND: &str = "turn_stopped";
 /// A session whose earlier conversation was lost starts over from here.
 pub const CONVERSATION_RESET_KIND: &str = "conversation_reset";
-const TIMEOUT_KIND: &str = "timeout";
 
 /// Why a model-API session could not be started.
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +75,8 @@ pub enum ModelError {
     Tools(#[from] ToolsError),
     #[error(transparent)]
     Prompt(#[from] PromptError),
+    #[error(transparent)]
+    Broker(#[from] BrokerError),
 }
 
 /// The provider a session was configured with.
@@ -99,35 +99,9 @@ impl ModelProvider for Provider {
     }
 }
 
-/// Answers a loop's permission requests through the daemon's prompt flow.
-struct ModelGate {
-    hub: Arc<Hub>,
-    answers: Arc<PermissionAnswers>,
-    config: GateConfig,
-    turn: Arc<Mutex<TurnId>>,
-}
-
-impl PermissionGate for ModelGate {
-    async fn request(&self, request: &ToolRequest) -> PermissionDecision {
-        let turn = lock(&self.turn).clone();
-        let gate = SessionGate::new(
-            Arc::clone(&self.hub),
-            GateConfig {
-                turn,
-                ..self.config.clone()
-            },
-            Arc::clone(&self.answers),
-        );
-        let span = permission_span(&self.config.session, request.tool.name());
-        let decision = gate.request(request).instrument(span.clone()).await;
-        record_decision(&span, decision);
-        decision
-    }
-}
-
 /// One session's loop with the channel its events arrive on.
 struct ModelLoop {
-    turn_loop: TurnLoop<Provider, ModelGate>,
+    turn_loop: TurnLoop<Provider, BrokerGate>,
     events: UnboundedReceiver<TurnEvent>,
     turn: Arc<Mutex<TurnId>>,
 }
@@ -156,7 +130,7 @@ pub type EnvReader = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 /// The model-API sessions of the daemon.
 pub struct ModelSessions {
     hub: Arc<Hub>,
-    answers: Arc<PermissionAnswers>,
+    brokers: Arc<Brokers>,
     config: Config,
     env: Vec<(OsString, OsString)>,
     key_reader: EnvReader,
@@ -173,14 +147,14 @@ impl ModelSessions {
     #[must_use]
     pub fn new(
         hub: Arc<Hub>,
-        answers: Arc<PermissionAnswers>,
+        brokers: Arc<Brokers>,
         config: Config,
         env: Vec<(OsString, OsString)>,
         key_reader: EnvReader,
     ) -> Arc<Self> {
         Arc::new(Self {
             hub,
-            answers,
+            brokers,
             config,
             env: allowlisted_env(DEFAULT_ENV_ALLOWLIST, env),
             key_reader,
@@ -205,7 +179,7 @@ impl ModelSessions {
         info!(session = %session, step = "build_loop", "preparing the model session");
         let (model_loop, rebuilt) = match self.take_loop(&session) {
             Some(model_loop) => (model_loop, false),
-            None => (self.build(&record)?, self.has_history(&session).await),
+            None => (self.build(&record).await?, self.has_history(&session).await),
         };
         info!(session = %session, step = "begin_turn", "recording the user message");
         let turn = match Turns::begin(&self.hub, &session, &text).await {
@@ -380,7 +354,7 @@ impl ModelSessions {
         }
     }
 
-    fn build(&self, record: &SessionRecord) -> Result<ModelLoop, ModelError> {
+    async fn build(&self, record: &SessionRecord) -> Result<ModelLoop, ModelError> {
         let provider = self.provider(record)?;
         let tools = base_tools(
             &BaseToolsConfig {
@@ -392,19 +366,11 @@ impl ModelSessions {
         )?;
         let prefix = Prefix::new(SYSTEM_PROMPT, tools.schemas, "")?;
         let turn = Arc::new(Mutex::new(TurnId::new(NO_TURN)));
-        let gate = ModelGate {
-            hub: Arc::clone(&self.hub),
-            answers: Arc::clone(&self.answers),
-            config: GateConfig {
-                session: record.id.clone(),
-                turn: TurnId::new(NO_TURN),
-                repo: PathBuf::from(&record.cwd),
-                workspace_root: PathBuf::from(&record.cwd),
-                mode: permission_mode(record.mode),
-                prompt_timeout: self.config.timing.permission_default_deny,
-            },
-            turn: Arc::clone(&turn),
-        };
+        let broker = self
+            .brokers
+            .broker(record, self.config.timing.permission_default_deny)
+            .await?;
+        let gate = BrokerGate::new(&self.hub, broker, record, Arc::clone(&turn));
         let (sender, events) = unbounded_channel();
         let turn_loop = TurnLoop::new(
             provider,

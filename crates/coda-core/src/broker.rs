@@ -125,6 +125,7 @@ pub struct Broker {
     /// Prompts waiting for an answer, woken by [`Broker::answer`].
     waiting: Arc<Waiting>,
     notices: broadcast::Sender<PendingNotice>,
+    expired: broadcast::Sender<PendingNotice>,
 }
 
 impl Broker {
@@ -145,6 +146,7 @@ impl Broker {
             config,
             waiting: Arc::default(),
             notices: broadcast::channel(NOTICE_CAPACITY).0,
+            expired: broadcast::channel(NOTICE_CAPACITY).0,
         };
         let (repo, cwd) = (broker.repo(), lossy(&canonical(&broker.config.cwd)));
         broker
@@ -253,6 +255,12 @@ impl Broker {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<PendingNotice> {
         self.notices.subscribe()
+    }
+
+    /// Announces each request denied because no answer came in time.
+    #[must_use]
+    pub fn subscribe_expired(&self) -> broadcast::Receiver<PendingNotice> {
+        self.expired.subscribe()
     }
 
     async fn decide_request(
@@ -400,6 +408,11 @@ impl Broker {
             .with_store(move |store| store.resolve_pending(&pending, PermissionDecision::Deny))
             .await;
         if denied.is_ok() {
+            let _ = self.expired.send(PendingNotice {
+                id: id.clone(),
+                tool: request.tool.name().to_owned(),
+                command: describe(request),
+            });
             return PermissionDecision::Deny;
         }
         // A client answered first; its answer is on the way.

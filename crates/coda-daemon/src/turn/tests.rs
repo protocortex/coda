@@ -19,9 +19,10 @@ use super::{BACKEND_UNSUPPORTED, SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig, Tu
 use crate::dispatch::Dispatcher;
 use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
+use crate::trace::BACKEND_SPAN;
 use crate::trace::capture::{Spans, install};
-use crate::trace::{BACKEND_SPAN, PERMISSION_SPAN};
 use crate::watchdog::Timing;
+use coda_core::broker::DECISION_SPAN;
 
 const WAIT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(20);
@@ -588,7 +589,7 @@ async fn the_backend_process_and_each_permission_decision_have_spans() {
 
     // Assert
     let backend = spans.named(BACKEND_SPAN);
-    let permission = spans.named(PERMISSION_SPAN);
+    let permission = spans.named(DECISION_SPAN);
     assert_eq!(backend.len(), 1);
     assert_eq!(permission.len(), 1);
     assert_eq!(permission[0].fields["coda.tool.name"], "bash");
