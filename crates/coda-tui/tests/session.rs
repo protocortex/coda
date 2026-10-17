@@ -12,7 +12,7 @@ use coda_config::timing::Timing;
 use coda_daemon::server::{Server, ServerConfig};
 use coda_tui::app::ConnectionState;
 use coda_tui::logs::LogBuffer;
-use coda_tui::{KeySource, drive, run_session};
+use coda_tui::{KeySource, UserInput, drive, run_session};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -29,7 +29,7 @@ impl Script {
     fn quit_after_ticks(ticks: usize) -> Self {
         let mut polls: VecDeque<_> = std::iter::repeat_n(None, ticks).collect();
         polls.push_back(Some(KeyEvent {
-            code: KeyCode::Char('q'),
+            code: KeyCode::Esc,
             modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
@@ -39,8 +39,8 @@ impl Script {
 }
 
 impl KeySource for Script {
-    fn next_key(&mut self) -> io::Result<Option<KeyEvent>> {
-        Ok(self.0.pop_front().flatten())
+    fn next_input(&mut self) -> io::Result<Option<UserInput>> {
+        Ok(self.0.pop_front().flatten().map(UserInput::Key))
     }
 }
 
@@ -54,14 +54,16 @@ impl QuitAfter {
 }
 
 impl KeySource for QuitAfter {
-    fn next_key(&mut self) -> io::Result<Option<KeyEvent>> {
+    fn next_input(&mut self) -> io::Result<Option<UserInput>> {
         std::thread::sleep(Duration::from_millis(10));
-        Ok((Instant::now() >= self.0).then_some(KeyEvent {
-            code: KeyCode::Char('q'),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        }))
+        Ok(
+            (Instant::now() >= self.0).then_some(UserInput::Key(KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            })),
+        )
     }
 }
 

@@ -3,8 +3,14 @@
 //! Terminal UI for coda.
 
 pub mod app;
+pub mod chat;
+pub mod input;
 pub mod logs;
+pub mod status;
 pub mod terminal;
+
+#[cfg(test)]
+mod test_support;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -42,31 +48,40 @@ pub enum TuiError {
     Task(#[from] tokio::task::JoinError),
 }
 
-/// A source of key presses that gives up after a short wait so the UI can redraw.
+/// What the user did at the terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserInput {
+    Key(KeyEvent),
+    /// Text pasted in one piece, as the terminal delivers it in bracketed paste mode.
+    Paste(String),
+}
+
+/// A source of user input that gives up after a short wait so the UI can redraw.
 pub trait KeySource {
-    /// Returns `None` when no key arrived within the wait.
+    /// Returns `None` when nothing arrived within the wait.
     ///
     /// # Errors
     /// Returns the I/O error of the terminal.
-    fn next_key(&mut self) -> io::Result<Option<KeyEvent>>;
+    fn next_input(&mut self) -> io::Result<Option<UserInput>>;
 }
 
 /// Reads key presses from the real terminal.
 pub struct TerminalKeys;
 
 impl KeySource for TerminalKeys {
-    fn next_key(&mut self) -> io::Result<Option<KeyEvent>> {
+    fn next_input(&mut self) -> io::Result<Option<UserInput>> {
         if !event::poll(KEY_POLL_INTERVAL)? {
             return Ok(None);
         }
         match event::read()? {
-            Event::Key(key) => Ok(Some(key)),
+            Event::Key(key) => Ok(Some(UserInput::Key(key))),
+            Event::Paste(text) => Ok(Some(UserInput::Paste(text))),
             _ => Ok(None),
         }
     }
 }
 
-/// Applies pending link events, draws `app`, then feeds it keys from `keys`
+/// Applies pending link events, draws `app`, then feeds it input from `keys`
 /// until it asks to quit.
 ///
 /// # Errors
@@ -85,8 +100,10 @@ where
             app.handle_event(event);
         }
         draw(terminal, app)?;
-        if let Some(key) = keys.next_key()? {
-            app.handle_key(key);
+        match keys.next_input()? {
+            Some(UserInput::Key(key)) => app.handle_key(key),
+            Some(UserInput::Paste(text)) => app.handle_paste(&text),
+            None => {}
         }
     }
     Ok(())
