@@ -66,6 +66,7 @@ pub fn sanitize(text: &str) -> (String, bool) {
 pub struct PermissionPrompt {
     pub session_id: SessionId,
     pub request_id: RequestId,
+    pub tool: String,
     pub repo_path: String,
     pub command: String,
     /// Some text was cut, so the user cannot see everything they would allow.
@@ -77,14 +78,16 @@ impl PermissionPrompt {
     #[must_use]
     pub fn from_params(params: &Value) -> Option<Self> {
         let text = |key: &str| params.get(key).and_then(Value::as_str);
+        let (tool, tool_cut) = sanitize(text("tool")?);
         let (repo_path, repo_cut) = sanitize(text("repo_path")?);
         let (command, command_cut) = sanitize(text("command")?);
         Some(Self {
             session_id: SessionId::new(text("session_id")?),
             request_id: RequestId::new(text("request_id")?),
+            tool,
             repo_path,
             command,
-            truncated: repo_cut || command_cut,
+            truncated: tool_cut || repo_cut || command_cut,
         })
     }
 }
@@ -226,7 +229,7 @@ impl Overlay {
         let width = OVERLAY_WIDTH.min(screen.width);
         let inner = usize::from(width.saturating_sub(2)).max(1);
         let rows = usize::from(screen.height.saturating_sub(2));
-        let mut body = vec!["Run a command in".to_owned()];
+        let mut body = vec![format!("{} wants to run in", prompt.tool)];
         body.extend(wrap(&prompt.repo_path, inner));
         body.push(String::new());
         body.extend(wrap(&prompt.command, inner));
@@ -291,6 +294,7 @@ mod tests {
         PermissionPrompt {
             session_id: SessionId::new("s-1"),
             request_id: RequestId::new(request),
+            tool: "bash".to_owned(),
             repo_path: "/work/repo".to_owned(),
             command: command.to_owned(),
             truncated: false,
@@ -437,6 +441,7 @@ mod tests {
             json!({
                 "session_id": "s-1",
                 "request_id": "r-9",
+                "tool": "bash\u{1b}[2J",
                 "repo_path": "/work/repo",
                 "command": command
             })
@@ -449,6 +454,7 @@ mod tests {
 
         // Assert
         assert_eq!(parsed.command, "rm -rf\u{FFFD}[2J /tmp/x");
+        assert_eq!(parsed.tool, "bash\u{FFFD}[2J");
         assert!(!parsed.truncated);
         assert!(long.unwrap().truncated);
         assert_eq!(missing, None);
@@ -502,5 +508,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_overlay_names_the_tool_that_asks() {
+        // Arrange
+        let mut asking = prompt("r-1", "src/lib.rs");
+        asking.tool = "edit".to_owned();
+        let mut overlay = Overlay::default();
+        overlay.push(asking, Instant::now());
+
+        // Act
+        let shown = draw(&overlay, 80, 24);
+
+        // Assert
+        assert!(shown.contains("edit"), "{shown}");
     }
 }

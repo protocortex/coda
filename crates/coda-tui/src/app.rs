@@ -5,6 +5,7 @@
 use std::time::Instant;
 
 use coda_protocol::events::Event;
+use coda_protocol::methods::{SessionStatus, SessionSummary};
 use coda_protocol::types::{BackendKind, SessionInfo};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -22,6 +23,7 @@ use crate::status::Status;
 const TITLE: &str = " coda (Esc quits) ";
 /// Rows a page key moves the transcript.
 const PAGE_ROWS: usize = 5;
+const NO_SESSIONS: &str = "the daemon has no sessions";
 
 /// Where the link to the daemon stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,8 +47,10 @@ pub enum LinkEvent {
     Permission(PermissionPrompt),
     /// The session the UI follows changed; its history is about to replay.
     SessionStarted(SessionInfo),
-    /// Every session this client knows, for `/sessions`.
-    Sessions(Vec<SessionInfo>),
+    /// The user's own message, live or replayed from the stored history.
+    UserMessage(String),
+    /// The daemon's sessions, answering `/sessions`.
+    Sessions(Vec<SessionSummary>),
     /// Something the user should read, such as a failed request.
     Notice(String),
     /// The process was asked to stop, for example by a signal.
@@ -60,7 +64,6 @@ pub struct App {
     input: Input,
     status: Status,
     overlay: Overlay,
-    known: Vec<SessionInfo>,
     link: Option<UnboundedSender<LinkCommand>>,
     turn_running: bool,
     quit: bool,
@@ -75,7 +78,6 @@ impl App {
             input: Input::new(),
             status: Status::new(),
             overlay: Overlay::default(),
-            known: Vec::new(),
             link: None,
             turn_running: false,
             quit: false,
@@ -126,7 +128,8 @@ impl App {
                 self.overlay = Overlay::default();
                 self.turn_running = false;
             }
-            LinkEvent::Sessions(sessions) => self.known = sessions,
+            LinkEvent::UserMessage(text) => self.chat.push_user(text),
+            LinkEvent::Sessions(sessions) => self.show_sessions(&sessions),
             LinkEvent::Notice(text) => self.chat.push_notice(text),
             LinkEvent::Quit => self.quit = true,
         }
@@ -147,8 +150,8 @@ impl App {
     }
 
     /// Sends to the daemon link. A dead link can no longer answer prompts or
-    /// end turns, so the UI drops them and says so.
-    fn send(&mut self, command: LinkCommand) {
+    /// end turns, so the UI drops them and says so. Returns whether it was sent.
+    fn send(&mut self, command: LinkCommand) -> bool {
         let failed = self
             .link
             .as_ref()
@@ -160,6 +163,7 @@ impl App {
             self.overlay = Overlay::default();
             self.turn_running = false;
         }
+        !failed
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -203,18 +207,20 @@ impl App {
             KeyCode::PageDown => self.chat.scroll_down(PAGE_ROWS),
             _ => {
                 if let Some(line) = self.input.handle_key(key) {
-                    self.submit(line);
+                    self.submit(&line);
                 }
             }
         }
     }
 
-    fn submit(&mut self, line: String) {
-        match commands::parse(&line) {
+    fn submit(&mut self, line: &str) {
+        match commands::parse(line) {
             Ok(None) => {
-                self.chat.push_user(line.clone());
                 self.turn_running = true;
-                self.send(LinkCommand::Send(line));
+                if !self.send(LinkCommand::Send(line.to_string())) {
+                    // Keep the typed line so it can be sent again.
+                    self.input.handle_paste(line);
+                }
             }
             Ok(Some(command)) => self.run_command(command),
             Err(error) => self.chat.push_notice(error.to_string()),
@@ -222,16 +228,24 @@ impl App {
     }
 
     fn run_command(&mut self, command: Command) {
-        match command {
-            Command::Sessions => {
-                let lines: Vec<String> = self.known.iter().map(session_line).collect();
-                for line in lines {
-                    self.chat.push_notice(line);
-                }
+        let link_command = match command {
+            Command::Sessions => LinkCommand::ListSessions,
+            Command::New => LinkCommand::New,
+            Command::Resume(id) => LinkCommand::Resume(id),
+            Command::Quit => {
+                self.quit = true;
+                return;
             }
-            Command::New => self.send(LinkCommand::New),
-            Command::Resume(id) => self.send(LinkCommand::Resume(id)),
-            Command::Quit => self.quit = true,
+        };
+        self.send(link_command);
+    }
+
+    fn show_sessions(&mut self, sessions: &[SessionSummary]) {
+        if sessions.is_empty() {
+            self.chat.push_notice(NO_SESSIONS.to_owned());
+        }
+        for session in sessions {
+            self.chat.push_notice(session_line(session));
         }
     }
 
@@ -269,9 +283,13 @@ impl App {
     }
 }
 
-fn session_line(info: &SessionInfo) -> String {
-    let model = info.model.as_deref().unwrap_or("default model");
-    format!("{} | {model} | {}", info.id, info.cwd)
+fn session_line(session: &SessionSummary) -> String {
+    let status = match session.status {
+        SessionStatus::Running => "running",
+        SessionStatus::Idle => "idle",
+        _ => "unknown",
+    };
+    format!("{} | {status} | {}", session.id, session.cwd)
 }
 
 impl Default for App {
@@ -286,6 +304,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use coda_protocol::methods::{SessionStatus, SessionSummary};
     use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -537,6 +556,7 @@ mod tests {
         LinkEvent::Permission(PermissionPrompt {
             session_id: SessionId::new("s-1"),
             request_id: RequestId::new(request),
+            tool: "bash".to_owned(),
             repo_path: "/work/repo".to_owned(),
             command: "cargo test".to_owned(),
             truncated: false,
@@ -554,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn a_submitted_line_enters_the_transcript_and_is_sent_once() {
+    fn a_submitted_line_is_sent_once_and_enters_the_transcript_when_the_daemon_echoes_it() {
         // Arrange
         let (mut app, mut commands) = linked();
 
@@ -567,6 +587,8 @@ mod tests {
             vec![LinkCommand::Send("q hi".to_owned())]
         );
         assert!(!app.should_quit());
+        assert!(!screen(&app).contains("you: q hi"));
+        app.handle_event(LinkEvent::UserMessage("q hi".to_owned()));
         let screen = screen(&app);
         assert!(screen.contains("you: q hi"), "{screen}");
     }
@@ -712,6 +734,22 @@ mod tests {
     }
 
     #[test]
+    fn a_line_that_cannot_be_sent_stays_in_the_input_and_no_turn_is_running() {
+        // Arrange
+        let (mut app, commands) = linked();
+        drop(commands);
+
+        // Act
+        type_line(&mut app, "keep me");
+
+        // Assert
+        assert!(!app.turn_running);
+        assert_eq!(app.input.text(), "keep me");
+        let shown = screen(&app);
+        assert!(shown.contains("request was not sent"), "{shown}");
+    }
+
+    #[test]
     fn a_started_session_replaces_the_transcript_and_status() {
         // Arrange
         let mut app = App::new();
@@ -726,5 +764,29 @@ mod tests {
         assert!(!shown.contains("old text"), "{shown}");
         assert!(shown.contains("faux | m-1"), "{shown}");
         assert!(shown.contains("could not send"), "{shown}");
+    }
+
+    #[test]
+    fn a_replayed_user_message_and_a_session_list_are_shown_in_the_transcript() {
+        // Arrange
+        let mut app = App::new();
+        let summary = SessionSummary {
+            id: SessionId::new("s-7"),
+            backend: BackendKind::Faux,
+            cwd: "/work".to_owned(),
+            created_at: 1,
+            updated_at: 2,
+            status: SessionStatus::Running,
+        };
+
+        // Act
+        app.handle_event(LinkEvent::UserMessage("hello again".to_owned()));
+        app.handle_event(LinkEvent::Sessions(vec![summary]));
+
+        // Assert
+        let shown = screen(&app);
+        assert!(shown.contains("hello again"), "{shown}");
+        assert!(shown.contains("s-7"), "{shown}");
+        assert!(shown.contains("running"), "{shown}");
     }
 }

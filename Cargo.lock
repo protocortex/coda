@@ -333,6 +333,7 @@ dependencies = [
  "coda-store",
  "crossterm",
  "ratatui",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

@@ -3,7 +3,7 @@
 //! The daemon link: what the UI asks of it and how it relays sessions.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use coda_client::{Client, ClientError, Subscription};
 use coda_config::timing::Timing;
@@ -11,9 +11,10 @@ use coda_protocol::events::{EVENT_NOTIFICATION, Event};
 use coda_protocol::jsonrpc::Notification;
 use coda_protocol::methods::{
     DAEMON_PING, PERMISSION_RESPOND, PermissionRespondParams, PermissionRespondResult, PingParams,
-    PingResult, SESSION_CANCEL, SESSION_CREATE, SESSION_RESUME, SESSION_SEND, SessionCancelParams,
-    SessionCancelResult, SessionCreateParams, SessionCreateResult, SessionResumeParams,
-    SessionResumeResult, SessionSendParams, SessionSendResult,
+    PingResult, SESSION_CANCEL, SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_SEND,
+    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
+    SessionListParams, SessionListResult, SessionResumeParams, SessionResumeResult,
+    SessionSendParams, SessionSendResult, SessionSummary,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId, SessionInfo};
 use serde_json::Value;
@@ -25,11 +26,17 @@ use crate::permission::{PermissionAnswer, PermissionPrompt};
 
 /// Notification that announces a request waiting for an answer.
 const PERMISSION_REQUEST_NOTIFICATION: &str = "permission.request";
+/// Stored kind of the user's own message, which the event stream carries as well.
+const USER_MESSAGE_KIND: &str = "user_message";
 /// How often a live link is probed, since the client reports a lost link only on use.
 const LINK_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 const FALLBACK_CWD: &str = "/";
 /// Backend of sessions the UI starts itself.
 const DEFAULT_BACKEND: BackendKind = BackendKind::ClaudeCode;
+/// A session idle for longer than this is not reopened on start.
+const MAX_RESUME_AGE: Duration = Duration::from_hours(24);
+/// Newest sessions of the working directory looked at when choosing one to reopen.
+const RESUME_LOOKUP_LIMIT: u32 = 10;
 /// Replaying from the first event rebuilds the transcript of a reopened session.
 const REPLAY_FROM_START: u64 = 0;
 
@@ -46,6 +53,8 @@ pub enum LinkCommand {
     New,
     /// Reopen a stored session and follow it.
     Resume(SessionId),
+    /// Ask the daemon for its sessions.
+    ListSessions,
 }
 
 /// Reads an event notification's params; kinds the UI has no use for give `None`.
@@ -53,6 +62,60 @@ pub enum LinkCommand {
 pub fn event_from_params(params: &Value) -> Option<Event> {
     let body = params.get("body")?.as_str()?;
     serde_json::from_str(body).ok()
+}
+
+/// Reads the text of a stored user message notification; other kinds give `None`.
+#[must_use]
+pub fn user_message_from_params(params: &Value) -> Option<String> {
+    if params.get("kind")?.as_str()? != USER_MESSAGE_KIND {
+        return None;
+    }
+    let body: Value = serde_json::from_str(params.get("body")?.as_str()?).ok()?;
+    body.get("text")?.as_str().map(str::to_owned)
+}
+
+/// The newest session of `sessions` that a start with `backend` may reopen:
+/// the same backend and active within [`MAX_RESUME_AGE`] of `now_ms`.
+fn resumable(
+    sessions: Vec<SessionSummary>,
+    backend: BackendKind,
+    now_ms: i64,
+) -> Option<SessionSummary> {
+    let max_age_ms = i64::try_from(MAX_RESUME_AGE.as_millis()).unwrap_or(i64::MAX);
+    sessions
+        .into_iter()
+        .max_by_key(|session| session.updated_at)
+        .filter(|session| {
+            session.backend == backend && now_ms.saturating_sub(session.updated_at) <= max_age_ms
+        })
+}
+
+fn now_ms() -> i64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// The two ways to begin following a session.
+trait Opener {
+    async fn resume(&mut self, id: &SessionId) -> Result<(), ClientError>;
+    async fn create(&mut self) -> Result<(), ClientError>;
+}
+
+/// Reopens `candidate` when there is one and it opens, and otherwise starts a
+/// new session. Returns the error when even that fails.
+async fn open_session(
+    opener: &mut impl Opener,
+    candidate: Option<SessionId>,
+) -> Result<Option<SessionId>, ClientError> {
+    if let Some(id) = candidate {
+        match opener.resume(&id).await {
+            Ok(()) => return Ok(Some(id)),
+            Err(error) => warn!(%error, session = %id, "could not reopen the latest session"),
+        }
+    }
+    opener.create().await.map(|()| None)
 }
 
 /// What sessions the link starts.
@@ -130,10 +193,19 @@ async fn next_notification(subscription: &mut Option<Subscription>) -> Option<No
     }
 }
 
+impl Opener for Link {
+    async fn resume(&mut self, id: &SessionId) -> Result<(), ClientError> {
+        self.reopen(id).await
+    }
+
+    async fn create(&mut self) -> Result<(), ClientError> {
+        self.start_new().await
+    }
+}
+
 struct Link {
     client: Client,
     config: LinkConfig,
-    known: Vec<SessionInfo>,
     subscription: Option<Subscription>,
     events: UnboundedSender<LinkEvent>,
 }
@@ -143,7 +215,6 @@ impl Link {
         Self {
             client,
             config,
-            known: Vec::new(),
             subscription: None,
             events,
         }
@@ -158,13 +229,45 @@ impl Link {
         self.tell(LinkEvent::Notice(text));
     }
 
+    /// Reopens the recent session of the working directory that used the same
+    /// backend, so a restarted UI continues where it stopped, or starts a new one.
     async fn start(&mut self) {
-        if let Err(error) = self.create().await {
-            self.notice(format!("could not start a session: {error}"));
+        let candidate = self.resume_candidate().await;
+        match open_session(self, candidate).await {
+            Ok(Some(id)) => self.notice(format!("resumed session {id}, use /new for a fresh one")),
+            Ok(None) => {}
+            Err(error) => self.notice(format!("could not start a session: {error}")),
         }
     }
 
-    async fn create(&mut self) -> Result<(), ClientError> {
+    async fn list(
+        &self,
+        cwd: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Vec<SessionSummary>, ClientError> {
+        let listed: SessionListResult = self
+            .client
+            .request(SESSION_LIST, &SessionListParams { cwd, limit })
+            .await?;
+        Ok(listed.sessions)
+    }
+
+    async fn resume_candidate(&self) -> Option<SessionId> {
+        let listed = self
+            .list(Some(self.config.cwd.clone()), Some(RESUME_LOOKUP_LIMIT))
+            .await;
+        match listed {
+            Ok(sessions) => {
+                resumable(sessions, self.config.backend, now_ms()).map(|session| session.id)
+            }
+            Err(error) => {
+                warn!(%error, "could not list the stored sessions");
+                None
+            }
+        }
+    }
+
+    async fn start_new(&mut self) -> Result<(), ClientError> {
         let params = SessionCreateParams {
             backend: self.config.backend,
             cwd: self.config.cwd.clone(),
@@ -175,7 +278,7 @@ impl Link {
         self.follow(created.session, None).await
     }
 
-    async fn resume(&mut self, id: &SessionId) -> Result<(), ClientError> {
+    async fn reopen(&mut self, id: &SessionId) -> Result<(), ClientError> {
         let params = SessionResumeParams {
             session_id: id.clone(),
         };
@@ -192,10 +295,6 @@ impl Link {
         self.subscription = None;
         self.tell(LinkEvent::SessionStarted(info.clone()));
         self.subscription = Some(self.client.subscribe(&info.id, since_seq).await?);
-        if !self.known.iter().any(|known| known.id == info.id) {
-            self.known.push(info);
-        }
-        self.tell(LinkEvent::Sessions(self.known.clone()));
         Ok(())
     }
 
@@ -204,9 +303,14 @@ impl Link {
             LinkCommand::Send(text) => self.send(text).await,
             LinkCommand::Cancel => self.cancel().await,
             LinkCommand::Respond(answer) => self.respond(answer).await,
-            LinkCommand::New => self.create().await.map_err(|e| ("start a session", e)),
+            LinkCommand::ListSessions => self
+                .list(None, None)
+                .await
+                .map(|sessions| self.tell(LinkEvent::Sessions(sessions)))
+                .map_err(|e| ("list the sessions", e)),
+            LinkCommand::New => self.start_new().await.map_err(|e| ("start a session", e)),
             LinkCommand::Resume(id) => self
-                .resume(&id)
+                .reopen(&id)
                 .await
                 .map_err(|e| ("reopen the session", e)),
         };
@@ -266,8 +370,9 @@ impl Link {
         };
         match notification.method.as_str() {
             EVENT_NOTIFICATION => {
-                // Kinds the UI does not show, such as the user's own message, are skipped.
-                if let Some(event) = event_from_params(params) {
+                if let Some(text) = user_message_from_params(params) {
+                    self.tell(LinkEvent::UserMessage(text));
+                } else if let Some(event) = event_from_params(params) {
                     self.tell(LinkEvent::Session(event));
                 }
             }
@@ -285,9 +390,118 @@ impl Link {
 
 #[cfg(test)]
 mod tests {
+    use coda_protocol::methods::SessionStatus;
     use serde_json::json;
 
     use super::*;
+
+    const NOW: i64 = 10 * 24 * 60 * 60 * 1000;
+    const MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+
+    fn summary(id: &str, backend: BackendKind, updated_at: i64) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::new(id),
+            backend,
+            cwd: "/work".to_owned(),
+            created_at: updated_at,
+            updated_at,
+            status: SessionStatus::Idle,
+        }
+    }
+
+    #[test]
+    fn the_newest_recent_session_of_the_same_backend_is_resumable() {
+        // Arrange
+        let sessions = vec![
+            summary("1", BackendKind::Faux, NOW - 5_000),
+            summary("2", BackendKind::Faux, NOW - 1_000),
+        ];
+
+        // Act
+        let chosen = resumable(sessions, BackendKind::Faux, NOW);
+
+        // Assert
+        assert_eq!(chosen.map(|s| s.id), Some(SessionId::new("2")));
+    }
+
+    #[test]
+    fn a_session_of_another_backend_is_not_resumable() {
+        // Arrange
+        let sessions = vec![summary("1", BackendKind::Faux, NOW - 1_000)];
+
+        // Act
+        let chosen = resumable(sessions, BackendKind::ClaudeCode, NOW);
+
+        // Assert
+        assert_eq!(chosen, None);
+    }
+
+    #[test]
+    fn a_session_idle_past_the_limit_is_not_resumable_but_the_limit_itself_is() {
+        // Arrange
+        let at_limit = vec![summary("1", BackendKind::Faux, NOW - MAX_AGE_MS)];
+        let past_limit = vec![summary("1", BackendKind::Faux, NOW - MAX_AGE_MS - 1)];
+
+        // Act
+        let kept = resumable(at_limit, BackendKind::Faux, NOW);
+        let dropped = resumable(past_limit, BackendKind::Faux, NOW);
+
+        // Assert
+        assert!(kept.is_some());
+        assert_eq!(dropped, None);
+    }
+
+    #[derive(Default)]
+    struct FakeOpener {
+        resume_fails: bool,
+        calls: Vec<&'static str>,
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl Opener for FakeOpener {
+        async fn resume(&mut self, _id: &SessionId) -> Result<(), ClientError> {
+            self.calls.push("resume");
+            if self.resume_fails {
+                Err(ClientError::Disconnected)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn create(&mut self) -> Result<(), ClientError> {
+            self.calls.push("create");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_candidate_that_opens_is_resumed_without_creating() {
+        // Arrange
+        let mut opener = FakeOpener::default();
+
+        // Act
+        let outcome = open_session(&mut opener, Some(SessionId::new("4"))).await;
+
+        // Assert
+        assert_eq!(outcome.unwrap(), Some(SessionId::new("4")));
+        assert_eq!(opener.calls, ["resume"]);
+    }
+
+    #[tokio::test]
+    async fn a_candidate_that_fails_to_open_falls_back_to_a_new_session() {
+        // Arrange
+        let mut opener = FakeOpener {
+            resume_fails: true,
+            ..FakeOpener::default()
+        };
+
+        // Act
+        let outcome = open_session(&mut opener, Some(SessionId::new("4"))).await;
+
+        // Assert
+        assert_eq!(outcome.unwrap(), None);
+        assert_eq!(opener.calls, ["resume", "create"]);
+    }
 
     #[test]
     fn a_stored_event_notification_becomes_an_event() {

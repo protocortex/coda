@@ -22,7 +22,7 @@ pub use index::Symbol;
 pub use originals::MAX_ORIGINAL_BYTES;
 pub use pending::{NewPending, PendingPermission};
 pub use readers::{RepoIndex, SessionOriginals};
-pub use sessions::{NewSession, SessionFilter, SessionRecord};
+pub use sessions::{NewSession, SessionFilter, SessionRecord, SessionSummary};
 pub use usage::{UsageRecord, UsageSummary};
 
 use std::fs::{self, DirBuilder, OpenOptions};
@@ -38,7 +38,7 @@ use coda_protocol::types::{RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// File name of the database inside the data directory.
 pub const DB_FILE_NAME: &str = "coda.db";

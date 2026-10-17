@@ -370,6 +370,7 @@ mod tests {
         let session = rig.session.clone();
         let pending = NewPending {
             session: session.clone(),
+            tool: "bash".to_owned(),
             repo_path: "/work".to_owned(),
             command: "ls".to_owned(),
         };
@@ -473,6 +474,7 @@ mod tests {
         for command in ["ls", "pwd"] {
             let pending = NewPending {
                 session: session.clone(),
+                tool: "bash".to_owned(),
                 repo_path: "/work".to_owned(),
                 command: command.to_owned(),
             };

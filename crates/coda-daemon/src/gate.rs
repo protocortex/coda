@@ -234,6 +234,7 @@ impl SessionGate {
                 &self.config.turn,
                 NewPending {
                     session: self.config.session.clone(),
+                    tool: request.tool.name().to_owned(),
                     repo_path: self.config.repo.to_string_lossy().into_owned(),
                     command: describe(request),
                 },
@@ -533,6 +534,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_queued_request_carries_the_normalized_tool_name() {
+        // Arrange
+        let fixture = Fixture::new();
+        let gate = fixture.gate("/ws", PermissionMode::Prompt, ANSWER_WAIT);
+        let request = bash("cargo build");
+
+        // Act
+        let (_, queued) = tokio::join!(gate.request(&request), async {
+            let first = loop {
+                let pending = fixture.store().list_pending(&fixture.session).unwrap();
+                if let Some(first) = pending.into_iter().next() {
+                    break first;
+                }
+                tokio::time::sleep(POLL).await;
+            };
+            fixture
+                .answers
+                .answer(&fixture.hub, &first.id, PermissionDecision::Deny)
+                .await
+                .unwrap();
+            first
+        });
+
+        // Assert
+        assert_eq!(queued.tool, "bash");
+    }
+
+    #[tokio::test]
     async fn an_unanswered_prompt_is_denied_after_the_timeout_with_no_client() {
         // Arrange
         let fixture = Fixture::new();
@@ -690,6 +719,7 @@ mod tests {
                     &fixture.turn,
                     NewPending {
                         session: fixture.session.clone(),
+                        tool: "bash".to_owned(),
                         repo_path: "/ws".to_owned(),
                         command: command.to_owned(),
                     },

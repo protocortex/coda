@@ -565,6 +565,7 @@ fn recording_usage_for_a_nonexistent_turn_is_turn_not_found() {
 fn new_pending(session: &SessionId, command: &str) -> NewPending {
     NewPending {
         session: session.clone(),
+        tool: "bash".to_owned(),
         repo_path: "/repo".to_owned(),
         command: command.to_owned(),
     }
@@ -590,6 +591,7 @@ fn pending_permissions_are_added_listed_and_resolved() {
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].id, id);
     assert_eq!(before[0].command, "cargo test");
+    assert_eq!(before[0].tool, "bash");
     assert_eq!(before[0].repo_path, "/repo");
     assert_eq!(before[0].requested_at, T0);
     assert_eq!(after, Vec::new());
@@ -889,4 +891,57 @@ fn saving_the_same_grant_twice_keeps_one_row_and_the_first_grant_time() {
         .unwrap()
         .unwrap();
     assert_eq!(grant.granted_at, T0);
+}
+
+#[test]
+fn summaries_report_the_last_activity_and_filter_by_cwd() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let clock = Arc::new(FixedClock(AtomicI64::new(T0)));
+    let mut store = Store::open_with_clock(&dir.path().join("data"), clock.clone()).unwrap();
+    let quiet = store.create_session(&new_session("/a")).unwrap();
+    let busy = store.create_session(&new_session("/a")).unwrap();
+    let other = store.create_session(&new_session("/b")).unwrap();
+    let turn = store.begin_turn(&busy).unwrap();
+    clock.0.store(T0 + 7_000, Ordering::SeqCst);
+    store
+        .append_event(&busy, &turn, &event("user_message", "{}"))
+        .unwrap();
+
+    // Act
+    let in_a = store
+        .list_session_summaries(
+            &SessionFilter {
+                cwd: Some("/a".to_owned()),
+            },
+            10,
+        )
+        .unwrap();
+    let all = store
+        .list_session_summaries(&SessionFilter::default(), 10)
+        .unwrap();
+
+    // Assert
+    let seen: Vec<_> = in_a.iter().map(|s| (&s.record.id, s.updated_at)).collect();
+    assert_eq!(seen, vec![(&busy, T0 + 7_000), (&quiet, T0)]);
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].record.id, other);
+}
+
+#[test]
+fn summaries_keep_only_the_newest_sessions_within_the_limit() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let ids: Vec<_> = (0..4)
+        .map(|_| store.create_session(&new_session("/a")).unwrap())
+        .collect();
+
+    // Act
+    let capped = store
+        .list_session_summaries(&SessionFilter::default(), 2)
+        .unwrap();
+
+    // Assert
+    let seen: Vec<_> = capped.iter().map(|s| &s.record.id).collect();
+    assert_eq!(seen, vec![&ids[3], &ids[2]]);
 }

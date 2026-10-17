@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use coda_protocol::codec::{CodecError, encode_message};
 use coda_protocol::events::EVENT_NOTIFICATION;
 use coda_protocol::jsonrpc::{Message, Notification, Version};
+use coda_protocol::methods::PermissionRequestParams;
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
 use coda_store::{
     EventRecord, Grant, GrantKey, NewDecision, NewPending, PendingPermission, Store, StoreError,
@@ -84,14 +85,6 @@ struct EventParams<'a> {
     body: &'a str,
 }
 
-#[derive(Serialize)]
-struct PendingParams<'a> {
-    session_id: &'a SessionId,
-    request_id: &'a RequestId,
-    repo_path: &'a str,
-    command: &'a str,
-}
-
 fn frame(method: &str, params: &impl Serialize) -> Result<Vec<u8>, HubError> {
     let params = serde_json::to_value(params).map_err(CodecError::from)?;
     let message = Message::Notification(Notification {
@@ -115,15 +108,16 @@ fn event_frame(session: &SessionId, seq: u64, record: &EventRecord) -> Result<Ve
 }
 
 fn pending_frame(pending: &PendingPermission) -> Result<Vec<u8>, HubError> {
-    permission_frame(&PendingParams {
-        session_id: &pending.session,
-        request_id: &pending.id,
-        repo_path: &pending.repo_path,
-        command: &pending.command,
+    permission_frame(&PermissionRequestParams {
+        session_id: pending.session.clone(),
+        request_id: pending.id.clone(),
+        tool: pending.tool.clone(),
+        repo_path: pending.repo_path.clone(),
+        command: pending.command.clone(),
     })
 }
 
-fn permission_frame(params: &PendingParams<'_>) -> Result<Vec<u8>, HubError> {
+fn permission_frame(params: &PermissionRequestParams) -> Result<Vec<u8>, HubError> {
     frame(PERMISSION_REQUEST_NOTIFICATION, params)
 }
 
@@ -231,11 +225,12 @@ impl Hub {
                 kind: PERMISSION_REQUEST_KIND.to_owned(),
                 body: serde_json::json!({ "request_id": request }).to_string(),
             };
-            let announcement = permission_frame(&PendingParams {
-                session_id: &pending.session,
-                request_id: &request,
-                repo_path: &pending.repo_path,
-                command: &pending.command,
+            let announcement = permission_frame(&PermissionRequestParams {
+                session_id: pending.session.clone(),
+                request_id: request.clone(),
+                tool: pending.tool.clone(),
+                repo_path: pending.repo_path.clone(),
+                command: pending.command.clone(),
             })
             .inspect_err(
                 |e| warn!(request = %request, error = %e, "request stored but not announced"),
@@ -710,6 +705,7 @@ mod tests {
         fn pending(&self, command: &str) -> NewPending {
             NewPending {
                 session: self.session.clone(),
+                tool: "bash".to_owned(),
                 repo_path: "/work".to_owned(),
                 command: command.to_owned(),
             }
@@ -948,6 +944,7 @@ mod tests {
         assert_eq!(method, PERMISSION_REQUEST_NOTIFICATION);
         assert_eq!(params["request_id"], request.as_str());
         assert_eq!(params["command"], "rm -rf build");
+        assert_eq!(params["tool"], "bash");
     }
 
     #[tokio::test]

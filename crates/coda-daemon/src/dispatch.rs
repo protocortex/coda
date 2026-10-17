@@ -19,9 +19,10 @@ use coda_protocol::jsonrpc::{
 use coda_protocol::methods::{
     DAEMON_PING, DAEMON_SHUTDOWN, DAEMON_STATUS, DaemonShutdownResult, GRANT_ADD, INITIALIZE,
     InitializeParams, InitializeResult, PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult,
-    SESSION_CANCEL, SESSION_CREATE, SESSION_RESUME, SESSION_SEND, SESSION_SUBSCRIBE,
+    SESSION_CANCEL, SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_SEND, SESSION_SUBSCRIBE,
     SessionSubscribeParams, SessionSubscribeResult, USAGE_SUMMARY,
 };
+use coda_protocol::types::SessionId;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tracing::{Instrument, error};
@@ -144,6 +145,11 @@ impl Dispatcher {
             USAGE_SUMMARY => usage_rpc::summarize(self.hub.as_ref(), params).await,
             SESSION_CREATE => session_rpc::create(self.hub.as_ref(), params).await,
             SESSION_RESUME => session_rpc::resume(self.hub.as_ref(), params).await,
+            SESSION_LIST => {
+                let turns = self.turns.as_ref();
+                let running = |id: &SessionId| turns.is_some_and(|t| t.is_running(id));
+                session_rpc::list(self.hub.as_ref(), running, params).await
+            }
             SESSION_SEND => turn::send(self.turns.as_ref(), params).await,
             SESSION_CANCEL => turn::cancel(self.turns.as_ref(), params),
             PERMISSION_RESPOND => turn::respond(self.turns.as_ref(), params).await,
