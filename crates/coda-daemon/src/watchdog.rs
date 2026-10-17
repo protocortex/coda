@@ -39,6 +39,16 @@ impl Default for Timing {
     }
 }
 
+impl From<&coda_config::timing::Timing> for Timing {
+    fn from(config: &coda_config::timing::Timing) -> Self {
+        Self {
+            idle: config.idle_timeout,
+            tool_execution: config.tool_execution,
+            permission: config.permission_default_deny,
+        }
+    }
+}
+
 /// What the backend is doing, as far as the daemon can tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {

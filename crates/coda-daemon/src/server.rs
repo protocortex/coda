@@ -26,6 +26,7 @@ use crate::dispatch::Dispatcher;
 use crate::lock::{InstanceLock, LockError};
 use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
+use crate::turn::Turns;
 
 const SOCKET_DIR_MODE: u32 = 0o700;
 const SOCKET_FILE_MODE: u32 = 0o600;
@@ -156,6 +157,7 @@ impl Server {
             listener,
             hub: None,
             state: None,
+            turns: None,
             _lock: lock,
         })
     }
@@ -228,6 +230,7 @@ pub struct BoundServer {
     listener: UnixListener,
     hub: Option<Arc<Hub>>,
     state: Option<Arc<DaemonState>>,
+    turns: Option<Arc<Turns>>,
     _lock: InstanceLock,
 }
 
@@ -256,6 +259,13 @@ impl BoundServer {
         self
     }
 
+    /// Serves `session.send`, `session.cancel` and `permission.respond` from `turns`.
+    #[must_use]
+    pub fn with_turns(mut self, turns: Arc<Turns>) -> Self {
+        self.turns = Some(turns);
+        self
+    }
+
     fn dispatcher(&self) -> Arc<Dispatcher> {
         let mut dispatcher = Dispatcher::new();
         if let Some(hub) = &self.hub {
@@ -263,6 +273,9 @@ impl BoundServer {
         }
         if let Some(state) = &self.state {
             dispatcher = dispatcher.with_state(Arc::clone(state));
+        }
+        if let Some(turns) = &self.turns {
+            dispatcher = dispatcher.with_turns(Arc::clone(turns));
         }
         Arc::new(dispatcher)
     }
@@ -1128,7 +1141,7 @@ mod tests {
         client_side.read_exact(&mut reply).await.unwrap();
 
         // Act
-        let while_open = state.status().client_count;
+        let while_open = state.status(0).client_count;
         drop(client_side);
         tokio::time::timeout(RECV_TIMEOUT, task)
             .await
@@ -1137,6 +1150,6 @@ mod tests {
 
         // Assert
         assert_eq!(while_open, 1);
-        assert_eq!(state.status().client_count, 0);
+        assert_eq!(state.status(0).client_count, 0);
     }
 }

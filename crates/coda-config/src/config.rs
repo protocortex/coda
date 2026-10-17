@@ -284,10 +284,16 @@ impl Dirs {
         self.base.join(DATA_DIR_NAME)
     }
 
+    /// Directory holding the daemon's socket, lock and backend pidfiles.
+    #[must_use]
+    pub fn run_dir(&self) -> PathBuf {
+        self.base.join(RUN_DIR_NAME)
+    }
+
     /// Path of the daemon's Unix socket, in a directory only this user can enter.
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
-        self.base.join(RUN_DIR_NAME).join(SOCKET_FILE_NAME)
+        self.run_dir().join(SOCKET_FILE_NAME)
     }
 }
 

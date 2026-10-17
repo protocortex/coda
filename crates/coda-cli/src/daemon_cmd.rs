@@ -4,13 +4,18 @@
 
 use std::io;
 use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use coda_config::config::{Config, ConfigError, Dirs};
+use coda_daemon::backends::locate_claude_code;
 use coda_daemon::lock::LockError;
+use coda_daemon::reaper::reap;
 use coda_daemon::server::{BoundServer, Server, ServerConfig, ServerError};
 use coda_daemon::state::DaemonState;
 use coda_daemon::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
+use coda_daemon::turn::{TurnConfig, Turns};
 use coda_store::Store;
 use coda_telemetry::init::{TelemetryConfig, init};
 use tokio::signal::unix::{SignalKind, signal};
@@ -43,13 +48,19 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
     let uid = own_uid(&data_dir)?;
     info!("step 3: binding the socket");
     let state = DaemonState::new(data_dir);
-    let bound = bind(ServerConfig::new(ctx.dirs.socket_path(), uid))
-        .await?
-        .with_hub(Hub::new(store, DEFAULT_QUEUE_CAPACITY))
-        .with_state(state.clone());
+    let bound = bind(ServerConfig::new(ctx.dirs.socket_path(), uid)).await?;
+    let hub = Hub::new(store, DEFAULT_QUEUE_CAPACITY);
+    // The instance lock is held now, so whatever the pidfiles name is an orphan.
+    info!("step 4: cleaning up after a previous daemon");
+    let report = reap(&ctx.dirs.run_dir(), &hub).await;
+    info!(?report, "startup cleanup finished");
+    let mut bound = bound.with_hub(Arc::clone(&hub)).with_state(state.clone());
+    if let Some(turns) = build_turns(&config, &ctx.dirs, &hub) {
+        bound = bound.with_turns(turns);
+    }
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signal)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(CliError::Signal)?;
-    info!("step 4: serving");
+    info!("step 5: serving");
     bound
         .serve(async {
             tokio::select! {
@@ -61,6 +72,32 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
         .await;
     info!("daemon stopped");
     Ok(())
+}
+
+/// Turns need the Claude Code binary; without it the daemon still serves
+/// sessions and history, and `session.send` is unavailable.
+fn build_turns(config: &Config, dirs: &Dirs, hub: &Arc<Hub>) -> Option<Arc<Turns>> {
+    let search_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    match locate_claude_code(config, &search_dirs) {
+        Ok(binary) => {
+            info!(path = %binary.path.display(), version = %binary.version, verified = binary.verified, "claude code backend ready");
+            Some(Turns::new(
+                Arc::clone(hub),
+                TurnConfig {
+                    binary: binary.path,
+                    pidfile_dir: dirs.run_dir(),
+                    parent_env: std::env::vars_os().collect(),
+                    timing: (&config.timing).into(),
+                },
+            ))
+        }
+        Err(e) => {
+            warn!(error = %e, "no agent backend; sessions can be stored but not run");
+            None
+        }
+    }
 }
 
 fn load_config(dirs: &Dirs) -> Result<Config, CliError> {

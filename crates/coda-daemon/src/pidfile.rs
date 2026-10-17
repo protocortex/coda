@@ -22,6 +22,20 @@ pub struct PidRecord {
     /// The process start time as `ps` reports it.
     pub started_at: String,
     pub exe: PathBuf,
+    /// The executable name the live process showed when the file was written.
+    /// It can differ from `exe` for a symlink or an interpreter launcher.
+    pub process_name: String,
+}
+
+/// What a recorded pid refers to now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessState {
+    /// No process has this pid.
+    Gone,
+    /// The process the record describes.
+    Same,
+    /// A different process reuses the pid.
+    Other,
 }
 
 /// Why a pidfile could not be written or read.
@@ -37,8 +51,32 @@ pub enum PidfileError {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("the start time of process {pid} is unavailable")]
+    #[error("the start time or name of process {pid} is unavailable")]
     StartTimeUnavailable { pid: u32 },
+}
+
+/// Reads one `ps` field for `pid`: `None` when no such process exists, an
+/// error when `ps` itself could not tell.
+async fn ps_field(field: &str, pid: u32) -> io::Result<Option<String>> {
+    let output = Command::new("ps")
+        .args(["-o", &format!("{field}="), "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    if output.status.success() && !text.is_empty() {
+        Ok(Some(text.to_owned()))
+    } else if output.status.code() == Some(1) {
+        Ok(None)
+    } else {
+        Err(io::Error::other(format!(
+            "ps exited with {}",
+            output.status
+        )))
+    }
 }
 
 /// The start time of `pid`, or `None` when no such process exists.
@@ -46,17 +84,7 @@ pub enum PidfileError {
 /// Read through `ps`, which reports whole seconds; a pid recycled within the
 /// same second as the original start would pass the check in [`is_same_process`].
 pub async fn process_start_time(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .ok()?;
-    let started = String::from_utf8(output.stdout).ok()?;
-    let started = started.trim();
-    (output.status.success() && !started.is_empty()).then(|| started.to_owned())
+    ps_field("lstart", pid).await.ok().flatten()
 }
 
 /// Writes the pidfile for a running child.
@@ -65,13 +93,18 @@ pub async fn process_start_time(pid: u32) -> Option<String> {
 /// Returns [`PidfileError::StartTimeUnavailable`] when the process is gone and
 /// [`PidfileError::Io`] when the file cannot be written.
 pub async fn write(path: &Path, pid: u32, exe: &Path) -> Result<PidRecord, PidfileError> {
-    let started_at = process_start_time(pid)
+    let unavailable = || PidfileError::StartTimeUnavailable { pid };
+    let started_at = process_start_time(pid).await.ok_or_else(unavailable)?;
+    let process_name = process_name(pid)
         .await
-        .ok_or(PidfileError::StartTimeUnavailable { pid })?;
+        .ok()
+        .flatten()
+        .ok_or_else(unavailable)?;
     let record = PidRecord {
         pid,
         started_at,
         exe: exe.to_path_buf(),
+        process_name,
     };
     let io = |source| PidfileError::Io {
         path: path.to_path_buf(),
@@ -117,33 +150,39 @@ pub fn read(path: &Path) -> Result<PidRecord, PidfileError> {
 }
 
 /// The file name of the executable `pid` runs, or `None` when no such process exists.
-///
-/// Only the name is compared: `ps` may report just the name, and a launcher
-/// script or symlink can make the full paths differ for the same program.
-async fn process_exe_name(pid: u32) -> Option<std::ffi::OsString> {
+async fn process_name(pid: u32) -> io::Result<Option<String>> {
     if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) {
-        return exe.file_name().map(ToOwned::to_owned);
+        return Ok(exe.file_name().map(|n| n.to_string_lossy().into_owned()));
     }
-    let output = Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .ok()?;
-    let comm = String::from_utf8(output.stdout).ok()?;
-    let comm = comm.trim();
-    (output.status.success() && !comm.is_empty())
-        .then(|| Path::new(comm).file_name().map(ToOwned::to_owned))
-        .flatten()
+    Ok(ps_field("comm", pid).await?.and_then(|comm| {
+        Path::new(&comm)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    }))
+}
+
+/// Compares the recorded pid with the live process.
+///
+/// # Errors
+/// Returns the I/O error when `ps` cannot answer, so the caller can tell
+/// "could not check" from "not the same process".
+pub async fn check_process(record: &PidRecord) -> io::Result<ProcessState> {
+    match ps_field("lstart", record.pid).await? {
+        None => return Ok(ProcessState::Gone),
+        Some(started) if started != record.started_at => return Ok(ProcessState::Other),
+        Some(_) => {}
+    }
+    Ok(match process_name(record.pid).await? {
+        None => ProcessState::Gone,
+        Some(name) if name == record.process_name => ProcessState::Same,
+        Some(_) => ProcessState::Other,
+    })
 }
 
 /// Whether the recorded pid is alive, started when the record says, and still
-/// runs the recorded executable.
+/// runs the executable it ran when recorded.
 pub async fn is_same_process(record: &PidRecord) -> bool {
-    process_start_time(record.pid).await.as_deref() == Some(record.started_at.as_str())
-        && process_exe_name(record.pid).await.as_deref() == record.exe.file_name()
+    check_process(record).await.ok() == Some(ProcessState::Same)
 }
 
 #[cfg(all(test, unix))]
@@ -288,19 +327,65 @@ mod tests {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
         let child = sleeper();
-        let record = write(
+        let mut record = write(
             &dir.path().join("a.pid"),
             child.id().unwrap(),
-            Path::new(EXE),
+            Path::new(SLEEP),
         )
         .await
         .unwrap();
+        record.process_name = "claude".to_owned();
 
         // Act
         let same = is_same_process(&record).await;
 
         // Assert
         assert!(!same);
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_launcher_is_still_the_same_process() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("claude");
+        std::os::unix::fs::symlink(SLEEP, &link).unwrap();
+        let child = Command::new(&link)
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let record = write(&dir.path().join("a.pid"), child.id().unwrap(), &link)
+            .await
+            .unwrap();
+
+        // Act
+        let same = is_same_process(&record).await;
+
+        // Assert
+        assert!(same);
+    }
+
+    #[tokio::test]
+    async fn a_shebang_launcher_is_still_the_same_process() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("claude");
+        fs::write(&script, "#!/bin/sh\nread line\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let child = Command::new(&script)
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let record = write(&dir.path().join("a.pid"), child.id().unwrap(), &script)
+            .await
+            .unwrap();
+
+        // Act
+        let same = is_same_process(&record).await;
+
+        // Assert
+        assert!(same);
     }
 
     #[tokio::test]

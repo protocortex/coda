@@ -257,6 +257,12 @@ impl Turns {
         }
     }
 
+    /// How many sessions have a turn starting or running.
+    #[must_use]
+    pub fn active(&self) -> u32 {
+        u32::try_from(self.running().len()).unwrap_or(u32::MAX)
+    }
+
     fn running(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, Option<CancelHandle>>> {
         self.running.lock().unwrap_or_else(PoisonError::into_inner)
     }

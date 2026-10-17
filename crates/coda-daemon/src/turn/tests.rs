@@ -17,6 +17,7 @@ use tempfile::TempDir;
 
 use super::{BACKEND_UNSUPPORTED, SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig, Turns};
 use crate::dispatch::Dispatcher;
+use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
 use crate::trace::capture::{Spans, install};
 use crate::trace::{BACKEND_SPAN, PERMISSION_SPAN};
@@ -81,6 +82,7 @@ impl Rig {
         );
         let dispatcher = Dispatcher::new()
             .with_hub(Arc::clone(&hub))
+            .with_state(DaemonState::new(data.path().to_path_buf()))
             .with_turns(Arc::clone(&turns));
         let (connection, outbox) = dispatcher.connect();
         Self {
@@ -243,6 +245,85 @@ async fn a_sent_message_runs_a_turn_that_ends_with_a_result() {
             "missing {expected} in {kinds:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_denied_request_is_stored_as_a_deny_event() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.send("hello").await;
+    let request = rig.wait_for_pending().await;
+
+    // Act
+    let answered = rig.respond(&request, "deny").await;
+    let event = rig.wait_for("deny").await;
+
+    // Assert
+    assert_eq!(answered["result"]["accepted"], true);
+    let body: Value = serde_json::from_str(&event.body).unwrap();
+    assert_eq!(body["tool"], "bash");
+    assert!(!rig.kinds().await.contains(&"approve".to_owned()));
+}
+
+#[tokio::test]
+async fn the_pidfile_exists_while_the_turn_runs_and_is_gone_after_it() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+
+    // Act
+    rig.send("hello").await;
+    let request = rig.wait_for_pending().await;
+    let during = rig.pidfile().exists();
+    rig.respond(&request, "allow_once").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert!(during);
+    assert!(!rig.pidfile().exists());
+}
+
+#[tokio::test]
+async fn a_second_send_while_a_turn_runs_is_refused() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.send("hello").await;
+    rig.wait_for_pending().await;
+
+    // Act
+    let second = rig.send("again").await;
+
+    // Assert
+    assert_eq!(second["error"]["code"], TURN_RUNNING);
+}
+
+#[tokio::test]
+async fn answering_an_unknown_request_is_not_accepted() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+
+    // Act
+    let answered = rig.respond("999", "allow_once").await;
+
+    // Assert
+    assert_eq!(answered["result"]["accepted"], false);
+}
+
+#[tokio::test]
+async fn daemon_status_counts_the_running_turn() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.send("hello").await;
+    let request = rig.wait_for_pending().await;
+
+    // Act
+    let during = rig.call("daemon.status", json!({})).await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_until_idle().await;
+    let after = rig.call("daemon.status", json!({})).await;
+
+    // Assert
+    assert_eq!(during["result"]["active_turns"], 1);
+    assert_eq!(after["result"]["active_turns"], 0);
 }
 
 #[tokio::test]
