@@ -175,11 +175,7 @@ mod tests {
         assert!(poisoned.is_err());
 
         // Act
-        let result = provider
-            .stream(ModelRequest {
-                prompt: String::new(),
-            })
-            .await;
+        let result = provider.stream(ModelRequest::default()).await;
 
         // Assert
         let Err(ProviderError::Fatal { message }) = result else {

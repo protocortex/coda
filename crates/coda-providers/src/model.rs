@@ -6,15 +6,79 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-/// One request to a model.
+/// A tool the model may call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolSchema {
+    /// The tool name.
+    pub name: String,
+    /// What the tool does.
+    pub description: String,
+    /// JSON Schema of the arguments.
+    pub input_schema: Value,
+}
+
+/// A tool call the model made earlier in the conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestToolCall {
+    /// Identifies the call so its result can be matched.
+    pub id: String,
+    /// The tool called.
+    pub name: String,
+    /// The raw JSON arguments as the model wrote them.
+    pub arguments: String,
+}
+
+/// One entry of the conversation history sent with a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestMessage {
+    /// What the user said.
+    User(String),
+    /// What the model answered, with the tool calls it made.
+    Assistant {
+        /// The answer text.
+        text: String,
+        /// The calls it made.
+        tool_calls: Vec<RequestToolCall>,
+    },
+    /// The outcome of one tool call.
+    ToolResult {
+        /// The call this answers.
+        call_id: String,
+        /// What the model sees.
+        text: String,
+        /// True when the call failed or was denied.
+        is_error: bool,
+    },
+}
+
+/// One request to a model.
+///
+/// `system` and `tools` form the stable prefix. When either is empty the
+/// provider's own configured value is used instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelRequest {
-    /// The user prompt.
-    pub prompt: String,
+    /// The system prompt.
+    pub system: String,
+    /// The tools on offer.
+    pub tools: Vec<ToolSchema>,
+    /// The conversation so far, oldest first.
+    pub messages: Vec<RequestMessage>,
+}
+
+impl ModelRequest {
+    /// A request that carries only one user prompt.
+    #[must_use]
+    pub fn user_prompt(prompt: impl Into<String>) -> Self {
+        Self {
+            messages: vec![RequestMessage::User(prompt.into())],
+            ..Self::default()
+        }
+    }
 }
 
 /// Token counts reported by a provider.

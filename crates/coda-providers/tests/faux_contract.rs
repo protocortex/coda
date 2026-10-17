@@ -18,9 +18,7 @@ use coda_providers::testing::contract::{
 const SHORT_TIMEOUT: Duration = Duration::from_millis(200);
 
 fn request() -> ModelRequest {
-    ModelRequest {
-        prompt: "hello".to_owned(),
-    }
+    ModelRequest::user_prompt("hello")
 }
 
 fn text(piece: &str) -> ModelEvent {
