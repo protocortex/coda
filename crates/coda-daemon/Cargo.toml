@@ -8,16 +8,20 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+coda-config = { path = "../coda-config" }
 coda-protocol = { path = "../coda-protocol" }
+coda-providers = { path = "../coda-providers" }
 coda-store = { path = "../coda-store" }
 coda-telemetry = { path = "../coda-telemetry" }
+rustix = { workspace = true, features = ["fs"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 tracing.workspace = true
 
 [dev-dependencies]
+coda-testkit = { path = "../coda-testkit" }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 

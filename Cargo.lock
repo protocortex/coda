@@ -220,9 +220,13 @@ dependencies = [
 name = "coda-daemon"
 version = "0.0.0"
 dependencies = [
+ "coda-config",
  "coda-protocol",
+ "coda-providers",
  "coda-store",
  "coda-telemetry",
+ "coda-testkit",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
