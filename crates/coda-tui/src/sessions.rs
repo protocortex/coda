@@ -2,6 +2,7 @@
 
 //! The daemon link: what the UI asks of it and how it relays sessions.
 
+use std::cmp::Reverse;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -76,6 +77,7 @@ pub fn user_message_from_params(params: &Value) -> Option<String> {
 
 /// The newest session of `sessions` that a start with `backend` may reopen:
 /// the same backend and active within [`MAX_RESUME_AGE`] of `now_ms`.
+/// `sessions` come newest first, which settles ties on the activity time.
 fn resumable(
     sessions: Vec<SessionSummary>,
     backend: BackendKind,
@@ -84,7 +86,7 @@ fn resumable(
     let max_age_ms = i64::try_from(MAX_RESUME_AGE.as_millis()).unwrap_or(i64::MAX);
     sessions
         .into_iter()
-        .max_by_key(|session| session.updated_at)
+        .min_by_key(|session| Reverse(session.updated_at))
         .filter(|session| {
             session.backend == backend && now_ms.saturating_sub(session.updated_at) <= max_age_ms
         })
@@ -415,6 +417,21 @@ mod tests {
         let sessions = vec![
             summary("1", BackendKind::Faux, NOW - 5_000),
             summary("2", BackendKind::Faux, NOW - 1_000),
+        ];
+
+        // Act
+        let chosen = resumable(sessions, BackendKind::Faux, NOW);
+
+        // Assert
+        assert_eq!(chosen.map(|s| s.id), Some(SessionId::new("2")));
+    }
+
+    #[test]
+    fn the_listed_first_session_wins_a_tie_on_activity_time() {
+        // Arrange
+        let sessions = vec![
+            summary("2", BackendKind::Faux, NOW - 1_000),
+            summary("1", BackendKind::Faux, NOW - 1_000),
         ];
 
         // Act

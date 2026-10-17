@@ -215,7 +215,7 @@ impl Rig {
     async fn wait_until_idle(&self) {
         let path = self.pidfile();
         tokio::time::timeout(WAIT, async {
-            while path.exists() {
+            while path.exists() || self.turns.is_running(&self.session) {
                 tokio::time::sleep(POLL).await;
             }
         })
@@ -292,13 +292,13 @@ async fn the_pidfile_exists_while_the_turn_runs_and_is_gone_after_it() {
 async fn a_second_send_while_a_turn_runs_is_refused() {
     // Arrange
     let mut rig = Rig::new(relaxed(), Vec::new());
-    rig.send("hello").await;
-    rig.wait_for_pending().await;
+    let first = rig.send("hello").await;
 
     // Act
     let second = rig.send("again").await;
 
     // Assert
+    assert!(first.get("error").is_none(), "{first}");
     assert_eq!(second["error"]["code"], TURN_RUNNING);
 }
 
