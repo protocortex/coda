@@ -1,0 +1,7 @@
+{"type":"coda_recording","label":"synthetic"}
+{"type":"system","subtype":"init","session_id":"sess-1"}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}
+{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}
+{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"deny","message":"denied"}}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"denied"}]}}
+{"type":"result","is_error":false}
