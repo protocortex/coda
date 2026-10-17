@@ -1,0 +1,3 @@
+{"type":"coda_recording","label":"synthetic"}
+{"type":"system","subtype":"init","session_id":"sess-1"}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}
