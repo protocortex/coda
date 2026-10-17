@@ -3,6 +3,7 @@
 //! Provider traits, backend detection and the shared permission policy.
 
 pub mod backend;
+pub mod claude_code;
 pub mod detect;
 pub mod gate;
 pub mod policy;
