@@ -9,6 +9,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -82,7 +83,15 @@ impl Tool for BashTool {
     }
 
     fn call(&self, input: &Value) -> Result<ToolOutput, ToolError> {
-        self.execute(input, Capture::start)
+        self.execute(input, &AtomicBool::new(false), Capture::start)
+    }
+
+    fn call_cancellable(
+        &self,
+        input: &Value,
+        cancel: &AtomicBool,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute(input, cancel, Capture::start)
     }
 }
 
@@ -92,6 +101,7 @@ impl BashTool {
     fn execute(
         &self,
         input: &Value,
+        cancel: &AtomicBool,
         start_capture: impl FnOnce(OwnedFd, usize) -> io::Result<Capture>,
     ) -> Result<ToolOutput, ToolError> {
         let args: BashArgs = parse_args(NAME, input)?;
@@ -107,7 +117,7 @@ impl BashTool {
         let capture =
             start_capture(reader, self.config.max_output_bytes).map_err(ToolError::Spawn)?;
 
-        let outcome = running.wait(timeout).map_err(ToolError::Spawn)?;
+        let outcome = running.wait(timeout, cancel).map_err(ToolError::Spawn)?;
         let captured = capture.finish();
 
         let mut output = ToolOutput::from_bytes(captured, self.config.max_output_bytes);
@@ -163,6 +173,7 @@ static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 enum Outcome {
     Exited(ExitStatus),
     TimedOut,
+    Cancelled,
 }
 
 impl Outcome {
@@ -173,6 +184,7 @@ impl Outcome {
                 "\n[timed out after {} ms, process group killed]",
                 timeout.as_millis()
             ),
+            Self::Cancelled => "\n[cancelled, process group killed]".to_owned(),
             Self::Exited(status) => match status.code() {
                 Some(0) => String::new(),
                 Some(code) => format!("\n[exit status {code}]"),
@@ -199,11 +211,12 @@ impl RunningCommand {
         Self { child, group }
     }
 
-    /// Waits for the shell to exit, killing its group once `timeout` passes.
+    /// Waits for the shell to exit, killing its group once `timeout` passes
+    /// or `cancel` is set.
     ///
     /// Either way the group is killed first, which also ends stragglers that
     /// would keep the output pipe open, and only then is the shell reaped.
-    fn wait(&mut self, timeout: Duration) -> io::Result<Outcome> {
+    fn wait(&mut self, timeout: Duration, cancel: &AtomicBool) -> io::Result<Outcome> {
         let deadline = Instant::now() + timeout;
         loop {
             if self.has_exited()? {
@@ -212,11 +225,16 @@ impl RunningCommand {
                 self.group = None;
                 return Ok(Outcome::Exited(status));
             }
-            if Instant::now() >= deadline {
+            let cancelled = cancel.load(Ordering::SeqCst);
+            if cancelled || Instant::now() >= deadline {
                 self.kill_group();
                 self.child.wait()?;
                 self.group = None;
-                return Ok(Outcome::TimedOut);
+                return Ok(if cancelled {
+                    Outcome::Cancelled
+                } else {
+                    Outcome::TimedOut
+                });
             }
             thread::sleep(POLL_INTERVAL);
         }
@@ -554,7 +572,7 @@ mod tests {
         let mut running = RunningCommand::new(child);
 
         // Act
-        let outcome = running.wait(BOUND).unwrap();
+        let outcome = running.wait(BOUND, &AtomicBool::new(false)).unwrap();
 
         // Assert
         assert!(matches!(outcome, Outcome::Exited(_)));
@@ -577,7 +595,11 @@ mod tests {
         };
 
         // Act
-        let result = tool.execute(&json!({"command": "echo $$ > pid; sleep 300"}), failing);
+        let result = tool.execute(
+            &json!({"command": "echo $$ > pid; sleep 300"}),
+            &AtomicBool::new(false),
+            failing,
+        );
 
         // Assert
         assert!(matches!(result, Err(ToolError::Spawn(_))));

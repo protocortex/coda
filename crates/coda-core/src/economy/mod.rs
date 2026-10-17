@@ -144,7 +144,7 @@ fn record_oversize(
 }
 
 /// Keeps the first and last [`OVERSIZE_KEEP_BYTES`] of `text`, cut on char boundaries.
-fn cap_ends(text: &str) -> String {
+pub(crate) fn cap_ends(text: &str) -> String {
     if text.len() <= 2 * OVERSIZE_KEEP_BYTES {
         return text.to_owned();
     }

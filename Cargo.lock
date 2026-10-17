@@ -301,6 +301,7 @@ dependencies = [
  "coda-providers",
  "coda-store",
  "coda-telemetry",
+ "coda-tools",
  "serde",
  "serde_json",
  "tempfile",

@@ -56,6 +56,8 @@ fn sort_keys(value: Value) -> Value {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prefix {
     bytes: Vec<u8>,
+    system: String,
+    tools: Vec<ToolSchema>,
 }
 
 impl Prefix {
@@ -80,7 +82,29 @@ impl Prefix {
             tools: &tools,
             project_instructions,
         })?;
-        Ok(Self { bytes })
+        let system = if project_instructions.is_empty() {
+            system.to_owned()
+        } else {
+            format!("{system}\n\n{project_instructions}")
+        };
+        Ok(Self {
+            bytes,
+            system,
+            tools,
+        })
+    }
+
+    /// The system prompt followed by the project instructions, as sent to the
+    /// model.
+    #[must_use]
+    pub fn system(&self) -> &str {
+        &self.system
+    }
+
+    /// The tool schemas in their sorted order.
+    #[must_use]
+    pub fn tools(&self) -> &[ToolSchema] {
+        &self.tools
     }
 
     /// The serialized prefix.

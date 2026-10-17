@@ -14,6 +14,8 @@ pub mod read;
 pub mod retrieve;
 pub mod sandbox;
 
+use std::sync::atomic::AtomicBool;
+
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -109,6 +111,21 @@ pub trait Tool: Send + Sync {
     /// Returns [`ToolError`] when the arguments are invalid, the sandbox
     /// rejects a path, or reading fails.
     fn call(&self, input: &Value) -> Result<ToolOutput, ToolError>;
+
+    /// Like [`call`](Tool::call), but a long-running tool should stop soon
+    /// after `cancel` becomes true. Tools that finish quickly keep this default.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`call`](Tool::call).
+    fn call_cancellable(
+        &self,
+        input: &Value,
+        cancel: &AtomicBool,
+    ) -> Result<ToolOutput, ToolError> {
+        let _ = cancel;
+        self.call(input)
+    }
 }
 
 impl ToolOutput {
