@@ -202,15 +202,19 @@ pub struct GrantAddResult {
 /// Parameters of [`USAGE_SUMMARY`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct UsageSummaryParams {
-    /// Session to summarize.
-    pub session_id: SessionId,
+    /// Session to summarize, or every session when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
 }
 
 /// Result of [`USAGE_SUMMARY`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct UsageSummaryResult {
-    /// Total usage of the session.
+    /// Total usage of the summarized sessions.
     pub usage: TokenUsage,
+    /// Bytes of tool output the token economy kept out of the context.
+    #[serde(default)]
+    pub saved_bytes: u64,
 }
 
 /// Parameters of [`SESSION_SET_MODEL`].

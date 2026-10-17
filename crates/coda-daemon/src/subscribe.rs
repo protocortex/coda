@@ -286,7 +286,7 @@ impl Hub {
     }
 
     /// Runs `work` against the store on the blocking pool.
-    async fn with_store<T: Send + 'static>(
+    pub(crate) async fn with_store<T: Send + 'static>(
         self: &Arc<Self>,
         work: impl FnOnce(&Store) -> Result<T, StoreError> + Send + 'static,
     ) -> Result<T, HubError> {

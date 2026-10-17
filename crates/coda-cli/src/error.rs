@@ -26,6 +26,8 @@ pub enum CliError {
     Client(#[from] ClientError),
     #[error("no daemon is running; run `coda` to start one")]
     NotRunning,
+    #[error("the running daemon is older than this coda; restart it with `coda daemon restart`")]
+    DaemonTooOld,
     #[error("the daemon did not answer within {} ms", waited.as_millis())]
     StartTimeout { waited: Duration },
     #[error("the old daemon did not stop within {} ms", waited.as_millis())]

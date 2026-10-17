@@ -222,12 +222,14 @@ version = "0.0.0"
 dependencies = [
  "coda-protocol",
  "coda-store",
+ "coda-telemetry",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

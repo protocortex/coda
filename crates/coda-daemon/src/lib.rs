@@ -8,3 +8,5 @@ pub mod lock;
 pub mod server;
 pub mod state;
 pub mod subscribe;
+pub mod trace;
+pub mod usage_rpc;

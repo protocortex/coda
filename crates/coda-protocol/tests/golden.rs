@@ -98,6 +98,7 @@ golden_tests! {
     grant_add_params: "grant.add.params" => GrantAddParams,
     grant_add_result: "grant.add.result" => GrantAddResult,
     usage_summary_params: "usage.summary.params" => UsageSummaryParams,
+    usage_summary_params_all_sessions: "usage.summary.params.all_sessions" => UsageSummaryParams,
     usage_summary_result: "usage.summary.result" => UsageSummaryResult,
     session_set_model_params: "session.set_model.params" => SessionSetModelParams,
     session_set_model_result: "session.set_model.result" => SessionSetModelResult,
@@ -146,4 +147,17 @@ fn absent_optional_fields_stay_absent_when_serialized() {
         crashed_json,
         json!({"type": "backend_crashed", "session_id": "s-1"})
     );
+}
+
+#[test]
+fn usage_summary_result_without_savings_reads_as_zero_saved() {
+    // Arrange
+    let legacy = golden("usage.summary.result.legacy");
+
+    // Act
+    let result: UsageSummaryResult = serde_json::from_value(legacy).unwrap();
+
+    // Assert
+    assert_eq!(result.saved_bytes, 0);
+    assert_eq!(result.usage.input_tokens, 100);
 }

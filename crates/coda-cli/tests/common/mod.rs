@@ -80,15 +80,25 @@ pub struct TestDaemon {
 
 impl TestDaemon {
     pub fn start(base: &Path) -> Self {
+        Self::serve(base, true)
+    }
+
+    /// A daemon without a store, which answers store-backed methods with
+    /// "method not found" like a daemon built before they existed.
+    pub fn start_without_store(base: &Path) -> Self {
+        Self::serve(base, false)
+    }
+
+    fn serve(base: &Path, with_store: bool) -> Self {
         let dirs = Dirs::from_base(base);
         let uid = std::fs::metadata(base).unwrap().uid();
-        let store = Store::open(&dirs.data_dir()).unwrap();
-        let hub = Hub::new(store, DEFAULT_QUEUE_CAPACITY);
         let state = DaemonState::new(dirs.data_dir());
-        let bound = Server::bind(ServerConfig::new(dirs.socket_path(), uid))
-            .unwrap()
-            .with_hub(hub)
-            .with_state(Arc::clone(&state));
+        let mut bound = Server::bind(ServerConfig::new(dirs.socket_path(), uid)).unwrap();
+        if with_store {
+            let store = Store::open(&dirs.data_dir()).unwrap();
+            bound = bound.with_hub(Hub::new(store, DEFAULT_QUEUE_CAPACITY));
+        }
+        let bound = bound.with_state(Arc::clone(&state));
         let (shutdown, stop) = oneshot::channel();
         let handle = tokio::spawn(bound.serve(async move {
             tokio::select! {

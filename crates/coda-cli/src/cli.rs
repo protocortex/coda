@@ -34,6 +34,15 @@ pub enum Command {
     /// Manage standing permission grants.
     #[command(subcommand)]
     Grant(GrantCommand),
+    /// Show token usage and savings.
+    Usage(UsageArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct UsageArgs {
+    /// Only this session; defaults to every session.
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, Args)]
