@@ -13,6 +13,8 @@ coda-config = { path = "../coda-config" }
 coda-protocol = { path = "../coda-protocol" }
 crossterm = { version = "=0.29.0", default-features = false, features = ["events", "bracketed-paste"] }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
@@ -22,6 +24,7 @@ unicode-width = "=0.2.2"
 
 [dev-dependencies]
 coda-daemon = { path = "../coda-daemon" }
+coda-store = { path = "../coda-store" }
 tempfile.workspace = true
 
 [lints]

@@ -100,6 +100,16 @@ impl Chat {
         self.top.set(None);
     }
 
+    pub fn push_notice(&mut self, text: impl Into<String>) {
+        self.push(Entry::Notice(text.into()));
+        self.top.set(None);
+    }
+
+    /// Forgets everything shown, for a different session.
+    pub fn clear(&mut self) {
+        *self = Self::new();
+    }
+
     /// Streamed text extends the message of its turn; crashes and interruptions
     /// leave a notice; every other event has nothing to show.
     pub fn apply(&mut self, event: &Event) {

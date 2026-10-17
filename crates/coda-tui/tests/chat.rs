@@ -129,7 +129,8 @@ fn a_one_cell_screen_survives_a_busy_session() {
 fn a_paste_with_newlines_fills_the_prompt_and_only_enter_submits_it() {
     // Arrange
     let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
-    let mut app = App::new();
+    let (link, mut commands) = mpsc::unbounded_channel();
+    let mut app = App::with_link(link);
     let (_sender, mut events) = mpsc::unbounded_channel();
     let mut keys = Keys(
         [
@@ -143,7 +144,7 @@ fn a_paste_with_newlines_fills_the_prompt_and_only_enter_submits_it() {
     coda_tui::drive(&mut terminal, &mut app, &mut keys, &mut events).unwrap();
 
     // Assert
-    assert_eq!(app.take_submitted(), Vec::<String>::new());
+    assert!(commands.try_recv().is_err());
     let rows = rows(&terminal);
     assert!(rows.iter().any(|row| row == "> first second"), "{rows:?}");
 }

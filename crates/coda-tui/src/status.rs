@@ -29,6 +29,7 @@ impl Status {
     pub fn set_session(&mut self, backend: BackendKind, model: Option<String>) {
         self.backend = Some(backend);
         self.model = model;
+        self.usage = TokenUsage::default();
     }
 
     /// Adds the tokens of a usage report to the running total.
