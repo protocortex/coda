@@ -196,6 +196,12 @@ impl ClaudeSession {
         CancelHandle(Arc::clone(&self.cancel))
     }
 
+    /// The child's process id, until it has been reaped.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Claude Code's own session id, once it has reported one.
     #[must_use]
     pub fn session_id_from_backend(&self) -> Option<&str> {

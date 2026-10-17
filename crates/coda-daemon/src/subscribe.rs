@@ -15,7 +15,9 @@ use coda_protocol::codec::{CodecError, encode_message};
 use coda_protocol::events::EVENT_NOTIFICATION;
 use coda_protocol::jsonrpc::{Message, Notification, Version};
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
-use coda_store::{EventRecord, Grant, GrantKey, NewPending, PendingPermission, Store, StoreError};
+use coda_store::{
+    EventRecord, Grant, GrantKey, NewDecision, NewPending, PendingPermission, Store, StoreError,
+};
 use serde::Serialize;
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, warn};
@@ -283,6 +285,15 @@ impl Hub {
             Ok(store.lookup_grant(&key)?)
         })
         .await?
+    }
+
+    /// Records a permission answer that did not go through a pending request.
+    ///
+    /// # Errors
+    /// Returns [`HubError::Store`] when the session is unknown.
+    pub async fn record_decision(self: &Arc<Self>, new: NewDecision) -> Result<(), HubError> {
+        let hub = Arc::clone(self);
+        tokio::task::spawn_blocking(move || Ok(hub.store().record_decision(&new)?)).await?
     }
 
     /// Runs `work` against the store on the blocking pool.
