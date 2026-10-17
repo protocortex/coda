@@ -1,318 +1,328 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The session permission gate: applies the shared policy with the stored
-//! per-repo grants, and waits for a client on a prompt verdict.
+//! Wires sessions to the permission broker: one broker per session, and a gate
+//! that announces its prompts to subscribers.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-use coda_config::config::PermissionMode;
-use coda_protocol::paths::classify_target;
+use coda_core::broker::{Broker, BrokerConfig, BrokerError, PendingNotice, resolve_repo};
+use coda_protocol::events::{Event, TIMEOUT_KIND};
+use coda_protocol::methods::PermissionRespondParams;
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
 use coda_providers::gate::PermissionGate;
-use coda_providers::policy::{ClassifiedTarget, PolicyInput, Verdict, decide, grant_pattern};
 use coda_providers::tool_request::ToolRequest;
-use coda_store::{GrantKey, NewDecision, NewPending};
-use tokio::sync::oneshot;
-use tokio::time::timeout;
+use coda_store::{EventRecord, NewPending, SessionRecord};
+use tokio::sync::broadcast::Receiver;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::task::JoinHandle;
+use tracing::warn;
 
-use crate::subscribe::{Hub, HubError};
+use crate::subscribe::Hub;
+use crate::turn::permission_mode;
 
-/// How long a prompt waits for an answer before it is denied.
-pub const PERMISSION_TIMEOUT: Duration = Duration::from_mins(5);
-/// How long a timed-out prompt waits for an answer that is already being stored.
-const ANSWER_HANDOFF: Duration = Duration::from_secs(1);
+pub use coda_core::broker::PERMISSION_TIMEOUT;
 
-/// What the gate needs to know about the turn it guards.
-#[derive(Debug, Clone)]
-pub struct GateConfig {
-    pub session: SessionId,
-    pub turn: TurnId,
-    /// Canonical git root, the repo identity of grants.
-    pub repo: PathBuf,
-    pub workspace_root: PathBuf,
-    pub mode: PermissionMode,
-    pub prompt_timeout: Duration,
+/// The brokers of the sessions the daemon serves.
+pub struct Brokers {
+    hub: Arc<Hub>,
+    /// `tool:pattern` grants from the config, stored for every session's repo.
+    grants: Vec<String>,
+    /// Never held across an await.
+    by_session: Mutex<HashMap<SessionId, Arc<Broker>>>,
 }
 
-/// Why the gate could not reach a verdict.
-#[derive(Debug, thiserror::Error)]
-pub enum GateError {
-    #[error("the permission store failed: {0}")]
-    Store(#[from] HubError),
-}
-
-/// Hands client answers to the gates waiting for them.
-#[derive(Debug)]
-pub struct PermissionAnswers {
-    slots: Mutex<HashMap<RequestId, Slot>>,
-    /// How long an answer nobody collected is kept.
-    stale_after: Duration,
-}
-
-#[derive(Debug)]
-enum Slot {
-    Waiting(oneshot::Sender<PermissionDecision>),
-    Answered(PermissionDecision, Instant),
-}
-
-impl PermissionAnswers {
+impl Brokers {
     #[must_use]
-    pub fn new() -> Arc<Self> {
+    pub fn new(hub: Arc<Hub>, grants: Vec<String>) -> Arc<Self> {
         Arc::new(Self {
-            slots: Mutex::default(),
-            stale_after: ANSWER_HANDOFF,
+            hub,
+            grants,
+            by_session: Mutex::default(),
         })
     }
 
-    /// Records a client's answer and wakes the gate waiting on it.
+    /// The broker of `record`'s session, created on first use. Creating it
+    /// denies the prompts a previous run left unanswered.
     ///
     /// # Errors
-    /// Returns [`GateError::Store`] for an unknown or already answered request.
-    pub async fn answer(
+    /// Returns [`BrokerError`] when a configured grant is malformed or the
+    /// store refuses.
+    pub async fn broker(
         &self,
-        hub: &Arc<Hub>,
-        request: &RequestId,
-        decision: PermissionDecision,
-    ) -> Result<(), GateError> {
-        hub.resolve_pending(request, decision).await?;
-        let slot = self.slots().remove(request);
-        if let Some(Slot::Waiting(tx)) = slot {
-            // The gate may have timed out and gone away; the stored answer stands.
-            let _ = tx.send(decision);
-        } else {
-            // Answered before the gate started waiting. A gate that already
-            // gave up never collects it, so older answers are dropped.
-            let mut slots = self.slots();
-            let stale_after = self.stale_after;
-            slots.retain(|_, slot| match slot {
-                Slot::Answered(_, at) => at.elapsed() < stale_after,
-                Slot::Waiting(_) => true,
-            });
-            slots.insert(request.clone(), Slot::Answered(decision, Instant::now()));
+        record: &SessionRecord,
+        prompt_timeout: Duration,
+    ) -> Result<Arc<Broker>, BrokerError> {
+        if let Some(broker) = self.known(&record.id) {
+            return Ok(broker);
         }
-        Ok(())
-    }
-
-    fn wait_for(&self, request: &RequestId) -> Wait<'_> {
-        let mut slots = self.slots();
-        if let Some(Slot::Answered(decision, _)) = slots.remove(request) {
-            return Wait::Ready(decision);
-        }
-        let (tx, rx) = oneshot::channel();
-        slots.insert(request.clone(), Slot::Waiting(tx));
-        // Built last: its drop locks the slots this function still holds.
-        let guard = SlotGuard {
-            answers: self,
-            request: request.clone(),
-        };
-        Wait::Pending(rx, guard)
-    }
-
-    fn slots(&self) -> MutexGuard<'_, HashMap<RequestId, Slot>> {
-        // Plain data, so a panic elsewhere cannot leave it invalid.
-        self.slots.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-enum Wait<'a> {
-    Ready(PermissionDecision),
-    Pending(oneshot::Receiver<PermissionDecision>, SlotGuard<'a>),
-}
-
-/// Frees a request's slot when its gate stops waiting, however it stops.
-struct SlotGuard<'a> {
-    answers: &'a PermissionAnswers,
-    request: RequestId,
-}
-
-impl Drop for SlotGuard<'_> {
-    fn drop(&mut self) {
-        self.answers.slots().remove(&self.request);
-    }
-}
-
-/// Decides the permission requests of one turn.
-pub struct SessionGate {
-    hub: Arc<Hub>,
-    config: GateConfig,
-    answers: Arc<PermissionAnswers>,
-}
-
-impl SessionGate {
-    #[must_use]
-    pub fn new(hub: Arc<Hub>, config: GateConfig, answers: Arc<PermissionAnswers>) -> Self {
-        Self {
-            hub,
-            config,
-            answers,
-        }
-    }
-
-    /// Applies the policy to `request` without waiting for anyone.
-    ///
-    /// # Errors
-    /// Returns [`GateError::Store`] when the grant lookup fails.
-    pub async fn verdict(&self, request: &ToolRequest) -> Result<Verdict, GateError> {
-        let targets: Vec<ClassifiedTarget> = request
-            .target_paths
-            .iter()
-            .map(|path| ClassifiedTarget {
-                path: path.clone(),
-                target: classify_target(&self.config.workspace_root, path),
-            })
-            .collect();
-        let granted = self.is_granted(request).await?;
-        Ok(decide(&PolicyInput {
-            mode: self.config.mode,
-            tool: &request.tool,
-            workspace_root: &self.config.workspace_root,
-            targets: &targets,
-            granted,
-        }))
-    }
-
-    async fn is_granted(&self, request: &ToolRequest) -> Result<bool, GateError> {
-        let key = self.grant_fields(request);
-        let found = self
-            .hub
-            .with_store(move |store| {
-                store.lookup_grant(&GrantKey {
-                    repo_path: &key.0,
-                    tool: &key.1,
-                    cwd: &key.2,
-                    pattern: &key.3,
-                })
-            })
-            .await?;
-        Ok(found.is_some())
-    }
-
-    /// Repo, tool, cwd and pattern, the exact fields a grant is keyed by.
-    fn grant_fields(&self, request: &ToolRequest) -> (String, String, String, String) {
-        (
-            self.config.repo.to_string_lossy().into_owned(),
-            request.tool.name().to_owned(),
-            request.cwd.to_string_lossy().into_owned(),
-            grant_pattern(
-                &request.tool,
-                request.command.as_deref(),
-                &request.target_paths,
-            ),
-        )
-    }
-
-    async fn decide_request(&self, request: &ToolRequest) -> Result<PermissionDecision, GateError> {
-        let decision = match self.verdict(request).await? {
-            Verdict::Allow => PermissionDecision::AllowOnce,
-            Verdict::Deny => PermissionDecision::Deny,
-            Verdict::Prompt => return self.prompt(request).await,
-        };
-        self.record_decision(request, decision).await?;
-        Ok(decision)
-    }
-
-    async fn record_decision(
-        &self,
-        request: &ToolRequest,
-        decision: PermissionDecision,
-    ) -> Result<(), GateError> {
-        self.hub
-            .record_decision(NewDecision {
-                session: self.config.session.clone(),
-                repo_path: self.config.repo.to_string_lossy().into_owned(),
-                command: describe(request),
-                decision,
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Queues the request, then waits for a client or the timeout; the timeout denies.
-    async fn prompt(&self, request: &ToolRequest) -> Result<PermissionDecision, GateError> {
-        let id = self
-            .hub
-            .register_pending(
-                &self.config.turn,
-                NewPending {
-                    session: self.config.session.clone(),
-                    tool: request.tool.name().to_owned(),
-                    repo_path: self.config.repo.to_string_lossy().into_owned(),
-                    command: describe(request),
+        let cwd = PathBuf::from(&record.cwd);
+        let broker = Arc::new(
+            Broker::new(
+                self.hub.store_handle(),
+                BrokerConfig {
+                    session: record.id.clone(),
+                    repo: resolve_repo(&cwd),
+                    workspace_root: cwd.clone(),
+                    cwd,
+                    mode: permission_mode(record.mode),
+                    prompt_timeout,
+                    grants: self.grants.clone(),
                 },
             )
-            .await?;
-        let decision = match self.answers.wait_for(&id) {
-            Wait::Ready(decision) => decision,
-            Wait::Pending(mut rx, _slot) => {
-                match timeout(self.config.prompt_timeout, &mut rx).await {
-                    Ok(answer) => answer.unwrap_or(PermissionDecision::Deny),
-                    Err(_) => self.deny_unanswered(request, &id, &mut rx).await,
+            .await?,
+        );
+        // A concurrent first use may have won; keep its broker so prompts share one waiter table.
+        Ok(Arc::clone(
+            self.map()
+                .entry(record.id.clone())
+                .or_insert_with(|| broker),
+        ))
+    }
+
+    /// Hands a client's answer to the broker waiting for it; `false` when the
+    /// request is unknown, already answered, or belongs to another session.
+    pub async fn respond(&self, params: &PermissionRespondParams) -> bool {
+        let Some(broker) = self.known(&params.session_id) else {
+            warn!(session = %params.session_id, "permission answer for a session with no broker");
+            return false;
+        };
+        let owned = broker
+            .pending()
+            .await
+            .is_ok_and(|open| open.iter().any(|p| p.id == params.request_id));
+        if !owned {
+            warn!(
+                session = %params.session_id,
+                request = %params.request_id,
+                "permission answer names no open request of this session"
+            );
+            return false;
+        }
+        match broker.answer(&params.request_id, params.decision).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(request = %params.request_id, error = %e, "permission answer not accepted");
+                false
+            }
+        }
+    }
+
+    fn known(&self, session: &SessionId) -> Option<Arc<Broker>> {
+        self.map().get(session).cloned()
+    }
+
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, Arc<Broker>>> {
+        self.by_session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A broker whose prompts are also announced to the session's subscribers,
+/// under the turn that is current when they start waiting.
+pub struct BrokerGate {
+    broker: Arc<Broker>,
+    announcer: JoinHandle<()>,
+    hub: Arc<Hub>,
+    session: SessionId,
+    turn: Arc<Mutex<TurnId>>,
+}
+
+impl BrokerGate {
+    #[must_use]
+    pub fn new(
+        hub: &Arc<Hub>,
+        broker: Arc<Broker>,
+        record: &SessionRecord,
+        turn: Arc<Mutex<TurnId>>,
+    ) -> Self {
+        let announce = Announce {
+            hub: Arc::clone(hub),
+            broker: Arc::clone(&broker),
+            session: record.id.clone(),
+            repo: resolve_repo(&PathBuf::from(&record.cwd))
+                .to_string_lossy()
+                .into_owned(),
+            turn: Arc::clone(&turn),
+        };
+        // Subscribed before the task starts, so no prompt is missed.
+        let (notices, expired) = (broker.subscribe(), broker.subscribe_expired());
+        Self {
+            announcer: tokio::spawn(announce.run(notices, expired)),
+            broker,
+            hub: Arc::clone(hub),
+            session: record.id.clone(),
+            turn,
+        }
+    }
+}
+
+impl Drop for BrokerGate {
+    fn drop(&mut self) {
+        self.announcer.abort();
+    }
+}
+
+impl PermissionGate for BrokerGate {
+    async fn request(&self, request: &ToolRequest) -> PermissionDecision {
+        Watched {
+            inner: Box::pin(self.broker.request(request)),
+            gate: self,
+            done: false,
+        }
+        .await
+    }
+}
+
+/// A request that tells subscribers about its prompt when it is dropped
+/// unanswered, for example by a cancelled turn.
+struct Watched<'a, F> {
+    inner: Pin<Box<F>>,
+    gate: &'a BrokerGate,
+    done: bool,
+}
+
+impl<F: Future<Output = PermissionDecision>> Future for Watched<'_, F> {
+    type Output = PermissionDecision;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let polled = self.inner.as_mut().poll(cx);
+        self.done = polled.is_ready();
+        polled
+    }
+}
+
+impl<F> Drop for Watched<'_, F> {
+    // Runs before `inner` is dropped, while the broker has not yet denied the prompt.
+    fn drop(&mut self) {
+        if !self.done {
+            self.gate.record_abandoned();
+        }
+    }
+}
+
+impl BrokerGate {
+    /// Writes a timeout event for each prompt still open. Blocking, on purpose:
+    /// the broker denies the rows as soon as the dropped request is released,
+    /// and the events must precede the end of the turn.
+    fn record_abandoned(&self) {
+        let open = lock(&self.hub.store_handle()).list_pending(&self.session);
+        let turn = lock(&self.turn).clone();
+        for pending in open.into_iter().flatten() {
+            let Some(record) = timeout_record(&self.session, &pending.id, pending.tool) else {
+                continue;
+            };
+            if let Err(e) = self.hub.append_and_fan_out(&self.session, &turn, &record) {
+                warn!(session = %self.session, error = %e, "could not record an abandoned prompt");
+            }
+        }
+    }
+}
+
+fn lock<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    cell.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The timeout event of a prompt; `None` (logged) when it cannot be serialized.
+fn timeout_record(
+    session: &SessionId,
+    request_id: &RequestId,
+    tool: String,
+) -> Option<EventRecord> {
+    let event = Event::Timeout {
+        session_id: session.clone(),
+        request_id: request_id.clone(),
+        tool,
+    };
+    match serde_json::to_string(&event) {
+        Ok(body) => Some(EventRecord {
+            kind: TIMEOUT_KIND.to_owned(),
+            body,
+        }),
+        Err(e) => {
+            warn!(session = %session, request = %request_id, error = %e, "timeout event not recorded");
+            None
+        }
+    }
+}
+
+struct Announce {
+    hub: Arc<Hub>,
+    broker: Arc<Broker>,
+    session: SessionId,
+    repo: String,
+    turn: Arc<Mutex<TurnId>>,
+}
+
+impl Announce {
+    async fn run(self, mut notices: Receiver<PendingNotice>, mut expired: Receiver<PendingNotice>) {
+        loop {
+            tokio::select! {
+                notice = notices.recv() => match notice {
+                    Ok(notice) => self.announce(notice).await,
+                    Err(RecvError::Lagged(missed)) => {
+                        warn!(session = %self.session, missed, "missed permission announcements");
+                        self.deny_open().await;
+                    }
+                    Err(RecvError::Closed) => return,
+                },
+                notice = expired.recv() => match notice {
+                    Ok(notice) => self.record_timeout(notice).await,
+                    Err(RecvError::Lagged(missed)) => {
+                        warn!(session = %self.session, missed, "missed permission timeouts");
+                    }
+                    Err(RecvError::Closed) => return,
+                },
+            }
+        }
+    }
+
+    /// A prompt no client can see would wait out its whole timeout, so it is denied instead.
+    async fn announce(&self, notice: PendingNotice) {
+        let turn = lock(&self.turn).clone();
+        let pending = NewPending {
+            session: self.session.clone(),
+            tool: notice.tool,
+            repo_path: self.repo.clone(),
+            command: notice.command,
+        };
+        if let Err(e) = self.hub.announce_pending(&turn, &notice.id, pending).await {
+            warn!(session = %self.session, request = %notice.id, error = %e, "could not announce a permission request; denying it");
+            self.deny(&notice.id).await;
+        }
+    }
+
+    /// Missed announcements cannot be told apart from the open prompts, so all are denied.
+    async fn deny_open(&self) {
+        match self.broker.pending().await {
+            Ok(open) => {
+                for notice in open {
+                    self.deny(&notice.id).await;
                 }
             }
+            Err(e) => warn!(session = %self.session, error = %e, "could not list the open prompts"),
+        }
+    }
+
+    async fn deny(&self, request: &RequestId) {
+        if let Err(e) = self.broker.answer(request, PermissionDecision::Deny).await {
+            warn!(session = %self.session, request = %request, error = %e, "could not deny an unannounced prompt");
+        }
+    }
+
+    async fn record_timeout(&self, notice: PendingNotice) {
+        let Some(record) = timeout_record(&self.session, &notice.id, notice.tool) else {
+            return;
         };
-        if decision == PermissionDecision::AllowAlways {
-            let (repo, tool, cwd, pattern) = self.grant_fields(request);
-            self.hub.add_grant(repo, tool, cwd, pattern).await?;
-        }
-        Ok(decision)
-    }
-
-    async fn deny_unanswered(
-        &self,
-        request: &ToolRequest,
-        id: &RequestId,
-        rx: &mut oneshot::Receiver<PermissionDecision>,
-    ) -> PermissionDecision {
-        if self
-            .hub
-            .resolve_pending(id, PermissionDecision::Deny)
-            .await
-            .is_ok()
-        {
-            return PermissionDecision::Deny;
-        }
-        // A client answered first; its answer is on the way.
-        if let Ok(Ok(decision)) = timeout(ANSWER_HANDOFF, rx).await {
-            return decision;
-        }
-        // The stored answer never reached the gate, so the denial is what applied.
-        if let Err(e) = self
-            .record_decision(request, PermissionDecision::Deny)
-            .await
-        {
-            tracing::error!(
-                session = %self.config.session,
-                error = %e,
-                "could not record the denial of a late answer"
-            );
-        }
-        PermissionDecision::Deny
-    }
-}
-
-/// The text a decision is recorded under: the command, or the tool name.
-fn describe(request: &ToolRequest) -> String {
-    request
-        .command
-        .clone()
-        .unwrap_or_else(|| request.tool.name().to_owned())
-}
-
-impl PermissionGate for SessionGate {
-    async fn request(&self, request: &ToolRequest) -> PermissionDecision {
-        match self.decide_request(request).await {
-            Ok(decision) => decision,
-            Err(e) => {
-                tracing::error!(
-                    session = %self.config.session,
-                    error = %e,
-                    "permission gate failed; denying the request"
-                );
-                PermissionDecision::Deny
-            }
+        let turn = lock(&self.turn).clone();
+        if let Err(e) = self.hub.publish(&self.session, &turn, record).await {
+            warn!(session = %self.session, error = %e, "could not record a prompt timeout");
         }
     }
 }
@@ -320,75 +330,144 @@ impl PermissionGate for SessionGate {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use coda_config::config::PermissionMode;
-    use coda_protocol::paths::Target;
-    use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
+    use coda_core::broker::Broker;
+    use coda_protocol::methods::PermissionRespondParams;
+    use coda_protocol::paths::{Target, classify_target};
+    use coda_protocol::types::{BackendKind, Mode, PermissionDecision, RequestId, TurnId};
     use coda_providers::gate::PermissionGate;
-    use coda_providers::policy::{TableRow, Verdict, decision_table};
+    use coda_providers::policy::{
+        ClassifiedTarget, PolicyInput, TableRow, Verdict, decide, decision_table, grant_pattern,
+    };
     use coda_providers::tool_request::{Tool, ToolRequest};
-    use coda_store::{GrantKey, NewPending, NewSession, Store};
+    use coda_store::{GrantKey, NewSession, SessionRecord, Store};
     use tempfile::TempDir;
+    use tokio::task::JoinHandle;
 
-    use super::{GateConfig, PermissionAnswers, SessionGate, Slot, Wait};
-    use crate::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
+    use super::{BrokerGate, Brokers};
+    use crate::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub, Outbox};
 
     const SHORT_TIMEOUT: Duration = Duration::from_millis(100);
     const ANSWER_WAIT: Duration = Duration::from_secs(10);
-    const POLL: Duration = Duration::from_millis(10);
     const ESCAPE_LINK: &str = "link";
 
     struct Fixture {
         dir: TempDir,
+        /// Canonical root holding the `ws` and `other` repositories.
+        root: PathBuf,
         hub: Arc<Hub>,
-        session: SessionId,
-        turn: TurnId,
-        answers: Arc<PermissionAnswers>,
+        brokers: Arc<Brokers>,
     }
 
     impl Fixture {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let mut store = Store::open(&dir.path().join("data")).unwrap();
-            let session = store
-                .create_session(&NewSession {
-                    backend: BackendKind::ClaudeCode,
-                    model: None,
-                    cwd: "/ws".to_owned(),
-                    mode: Mode::default(),
-                })
-                .unwrap();
-            let turn = store.begin_turn(&session).unwrap();
-            std::fs::create_dir(dir.path().join("ws")).unwrap();
-            std::os::unix::fs::symlink("/etc", dir.path().join("ws").join(ESCAPE_LINK)).unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            for repo_dir in ["ws/.git", "ws/x", "other/.git", "other/x"] {
+                std::fs::create_dir_all(root.join(repo_dir)).unwrap();
+            }
+            std::os::unix::fs::symlink("/etc", root.join("ws").join(ESCAPE_LINK)).unwrap();
+            let store = Store::open(&dir.path().join("data")).unwrap();
+            let hub = Hub::new(store, DEFAULT_QUEUE_CAPACITY);
             Self {
-                hub: Hub::new(store, DEFAULT_QUEUE_CAPACITY),
+                brokers: Brokers::new(Arc::clone(&hub), Vec::new()),
                 dir,
-                session,
-                turn,
-                answers: PermissionAnswers::new(),
+                root,
+                hub,
             }
         }
 
-        fn workspace(&self) -> PathBuf {
-            self.dir.path().join("ws")
+        /// The real directory standing for a table path such as `/ws/x`.
+        fn real(&self, path: &str) -> PathBuf {
+            self.root.join(path.trim_start_matches('/'))
         }
 
-        fn gate(&self, repo: &str, mode: PermissionMode, timeout: Duration) -> SessionGate {
-            SessionGate::new(
-                Arc::clone(&self.hub),
-                GateConfig {
-                    session: self.session.clone(),
-                    turn: self.turn.clone(),
-                    repo: PathBuf::from(repo),
-                    workspace_root: self.workspace(),
-                    mode,
-                    prompt_timeout: timeout,
-                },
-                Arc::clone(&self.answers),
-            )
+        async fn session(&self, cwd: &str, mode: Mode) -> SessionRecord {
+            let new = NewSession {
+                backend: BackendKind::ClaudeCode,
+                model: None,
+                cwd: self.real(cwd).to_string_lossy().into_owned(),
+                mode,
+            };
+            let id = self
+                .hub
+                .with_store_mut(move |store| store.create_session(&new))
+                .await
+                .unwrap();
+            self.hub
+                .with_store(move |store| store.load_session(&id))
+                .await
+                .unwrap()
+        }
+
+        async fn broker(&self, cwd: &str, mode: Mode) -> (SessionRecord, Arc<Broker>) {
+            self.broker_waiting(cwd, mode, SHORT_TIMEOUT).await
+        }
+
+        async fn broker_waiting(
+            &self,
+            cwd: &str,
+            mode: Mode,
+            prompt_timeout: Duration,
+        ) -> (SessionRecord, Arc<Broker>) {
+            let record = self.session(cwd, mode).await;
+            let broker = self.brokers.broker(&record, prompt_timeout).await.unwrap();
+            (record, broker)
+        }
+
+        /// A gate asking for one edit, and the id of the prompt it raises.
+        async fn ask(
+            &self,
+            record: &SessionRecord,
+            broker: &Arc<Broker>,
+        ) -> (JoinHandle<PermissionDecision>, RequestId) {
+            let gate = self.gate(record, broker);
+            let mut notices = broker.subscribe();
+            let request = edit(self, "src/a.rs", "/ws");
+            let asking = tokio::spawn(async move { gate.request(&request).await });
+            let notice = tokio::time::timeout(ANSWER_WAIT, notices.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            (asking, notice.id)
+        }
+
+        async fn answer(
+            &self,
+            record: &SessionRecord,
+            id: &RequestId,
+            decision: PermissionDecision,
+        ) -> bool {
+            self.brokers
+                .respond(&PermissionRespondParams {
+                    session_id: record.id.clone(),
+                    request_id: id.clone(),
+                    decision,
+                })
+                .await
+        }
+
+        /// Waits for the first event of `kind` that the session's subscribers get.
+        async fn event_of_kind(outbox: &mut Outbox, kind: &str) -> String {
+            tokio::time::timeout(ANSWER_WAIT, async {
+                loop {
+                    let frame =
+                        String::from_utf8_lossy(&outbox.events.recv().await.unwrap()).into_owned();
+                    if frame.contains(&format!("\"kind\":\"{kind}\"")) {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .expect("the event never reached the subscriber")
+        }
+
+        fn gate(&self, record: &SessionRecord, broker: &Arc<Broker>) -> BrokerGate {
+            let turn = self.store().begin_turn(&record.id).unwrap();
+            let turn = Arc::new(Mutex::new(turn));
+            BrokerGate::new(&self.hub, Arc::clone(broker), record, turn)
         }
 
         fn store(&self) -> Store {
@@ -396,16 +475,16 @@ mod tests {
         }
     }
 
-    fn bash(command: &str) -> ToolRequest {
+    fn edit(fixture: &Fixture, path: &str, cwd: &str) -> ToolRequest {
         ToolRequest {
-            tool: Tool::Bash,
-            target_paths: Vec::new(),
-            command: Some(command.to_owned()),
-            cwd: PathBuf::from("/ws/x"),
+            tool: Tool::Edit,
+            target_paths: vec![PathBuf::from(path)],
+            command: None,
+            cwd: fixture.real(cwd),
         }
     }
 
-    fn request_of(row: &TableRow) -> ToolRequest {
+    fn request_of(fixture: &Fixture, row: &TableRow) -> ToolRequest {
         ToolRequest {
             tool: row.tool.clone(),
             target_paths: row
@@ -417,356 +496,395 @@ mod tests {
                 })
                 .collect(),
             command: row.command.clone(),
-            cwd: row.cwd.clone(),
+            cwd: fixture.real(&row.cwd.to_string_lossy()),
         }
     }
 
-    #[tokio::test]
-    async fn the_gate_passes_the_shared_decision_table() {
-        // Arrange
-        let rows: Vec<TableRow> = decision_table()
-            .into_iter()
-            .filter(|r| !r.pending)
+    /// The verdict of the pre-broker session gate: the shared policy over a
+    /// grant looked up by the literal repo, tool, cwd and pattern.
+    fn session_gate_verdict(fixture: &Fixture, row: &TableRow) -> Verdict {
+        let request = request_of(fixture, row);
+        let workspace_root = fixture.real("/ws");
+        let targets: Vec<ClassifiedTarget> = request
+            .target_paths
+            .iter()
+            .map(|path| ClassifiedTarget {
+                path: path.clone(),
+                target: classify_target(&workspace_root, path),
+            })
             .collect();
+        let pattern = grant_pattern(
+            &request.tool,
+            request.command.as_deref(),
+            &request.target_paths,
+        );
+        let (repo, cwd) = (
+            fixture.real(&row.repo.to_string_lossy()),
+            request.cwd.to_string_lossy().into_owned(),
+        );
+        let granted = fixture
+            .store()
+            .lookup_grant(&GrantKey {
+                repo_path: &repo.to_string_lossy(),
+                tool: request.tool.name(),
+                cwd: &cwd,
+                pattern: &pattern,
+            })
+            .unwrap()
+            .is_some();
+        decide(&PolicyInput {
+            mode: row.mode,
+            tool: &request.tool,
+            workspace_root: &workspace_root,
+            targets: &targets,
+            granted,
+        })
+    }
 
-        for row in rows {
+    #[tokio::test]
+    async fn the_session_gate_and_the_broker_agree_on_every_row_of_the_decision_table() {
+        for row in decision_table() {
+            // Arrange
             let fixture = Fixture::new();
             if let Some(stored) = &row.stored {
+                let (repo, cwd) = (
+                    fixture.real(&stored.repo.to_string_lossy()),
+                    fixture.real(&stored.cwd.to_string_lossy()),
+                );
                 fixture
                     .hub
                     .add_grant(
-                        stored.repo.to_string_lossy().into_owned(),
+                        repo.to_string_lossy().into_owned(),
                         stored.tool.clone(),
-                        stored.cwd.to_string_lossy().into_owned(),
+                        cwd.to_string_lossy().into_owned(),
                         stored.pattern.clone(),
                     )
                     .await
                     .unwrap();
             }
-            let gate = fixture.gate(&row.repo.to_string_lossy(), row.mode, SHORT_TIMEOUT);
+            let record = fixture.session("/ws/x", Mode::default()).await;
+            let config = coda_core::broker::BrokerConfig {
+                session: record.id.clone(),
+                repo: fixture.real(&row.repo.to_string_lossy()),
+                cwd: fixture.real("/ws/x"),
+                workspace_root: fixture.real("/ws"),
+                mode: row.mode,
+                prompt_timeout: SHORT_TIMEOUT,
+                grants: Vec::new(),
+            };
+            let broker = Broker::new(fixture.hub.store_handle(), config)
+                .await
+                .unwrap();
 
             // Act
-            let verdict = gate.verdict(&request_of(&row)).await.unwrap();
+            let old = session_gate_verdict(&fixture, &row);
+            let new = broker.verdict(&request_of(&fixture, &row)).await.unwrap();
 
             // Assert
-            assert_eq!(verdict, row.expected, "row: {} ({:?})", row.name, row.mode);
+            assert_eq!(new, old, "row: {} ({:?})", row.name, row.mode);
+            assert_eq!(new, row.expected, "row: {} ({:?})", row.name, row.mode);
         }
     }
 
     #[tokio::test]
-    async fn a_grant_of_cargo_test_does_not_cover_a_chained_command() {
+    async fn a_decision_is_recorded_for_the_session_and_survives_a_restart() {
         // Arrange
         let fixture = Fixture::new();
-        fixture
-            .hub
-            .add_grant(
-                "/ws".into(),
-                "bash".into(),
-                "/ws/x".into(),
-                "cargo test".into(),
-            )
-            .await
-            .unwrap();
-        let gate = fixture.gate("/ws", PermissionMode::Prompt, SHORT_TIMEOUT);
+        let (record, broker) = fixture.broker("/ws/x", Mode::AcceptEdits).await;
+        let gate = fixture.gate(&record, &broker);
 
         // Act
-        let exact = gate.verdict(&bash("cargo test")).await.unwrap();
-        let chained = gate.verdict(&bash("cargo test; rm -rf x")).await.unwrap();
-
-        // Assert
-        assert_eq!(exact, Verdict::Allow);
-        assert_eq!(chained, Verdict::Prompt);
-    }
-
-    #[tokio::test]
-    async fn an_edit_grant_covers_only_the_exact_file() {
-        // Arrange
-        let fixture = Fixture::new();
-        let edit = |path: &str| ToolRequest {
-            tool: Tool::Edit,
-            target_paths: vec![PathBuf::from(path)],
-            command: None,
-            cwd: PathBuf::from("/ws"),
-        };
-        fixture
-            .hub
-            .add_grant("/ws".into(), "edit".into(), "/ws".into(), "src/a.rs".into())
-            .await
-            .unwrap();
-        let gate = fixture.gate("/ws", PermissionMode::Prompt, SHORT_TIMEOUT);
-
-        // Act
-        let same = gate.verdict(&edit("src/a.rs")).await.unwrap();
-        let other = gate.verdict(&edit("src/b.rs")).await.unwrap();
-        let manifest = gate.verdict(&edit("Cargo.toml")).await.unwrap();
-
-        // Assert
-        assert_eq!(same, Verdict::Allow);
-        assert_eq!(other, Verdict::Prompt);
-        assert_eq!(manifest, Verdict::Prompt);
-    }
-
-    #[tokio::test]
-    async fn automatic_verdicts_are_answered_and_recorded() {
-        // Arrange
-        let fixture = Fixture::new();
-        let read = |path: &str| ToolRequest {
-            tool: Tool::Read,
-            target_paths: vec![PathBuf::from(path)],
-            command: None,
-            cwd: PathBuf::from("/ws"),
-        };
-        let gate = fixture.gate("/ws", PermissionMode::Prompt, SHORT_TIMEOUT);
-
-        // Act
-        let inside = gate.request(&read("src/a.rs")).await;
-        let outside = gate.request(&read("/etc/passwd")).await;
-
-        // Assert
-        assert_eq!(inside, PermissionDecision::AllowOnce);
-        assert_eq!(outside, PermissionDecision::Deny);
-        let recorded: Vec<bool> = fixture
-            .store()
-            .list_decisions(&fixture.session)
-            .unwrap()
-            .iter()
-            .map(|d| d.allowed)
-            .collect();
-        assert_eq!(recorded, [true, false]);
-    }
-
-    #[tokio::test]
-    async fn a_prompt_returns_the_clients_answer_and_records_it_once() {
-        // Arrange
-        let fixture = Fixture::new();
-        let gate = fixture.gate("/ws", PermissionMode::Prompt, ANSWER_WAIT);
-        let request = bash("cargo build");
-
-        // Act
-        let (decision, ()) = tokio::join!(gate.request(&request), async {
-            let id = loop {
-                let pending = fixture.store().list_pending(&fixture.session).unwrap();
-                if let Some(first) = pending.first() {
-                    break first.id.clone();
-                }
-                tokio::time::sleep(POLL).await;
-            };
-            fixture
-                .answers
-                .answer(&fixture.hub, &id, PermissionDecision::AllowOnce)
-                .await
-                .unwrap();
-        });
+        let decision = gate.request(&edit(&fixture, "src/a.rs", "/ws")).await;
 
         // Assert
         assert_eq!(decision, PermissionDecision::AllowOnce);
-        let store = fixture.store();
-        assert_eq!(store.list_pending(&fixture.session).unwrap().len(), 0);
-        assert_eq!(store.list_decisions(&fixture.session).unwrap().len(), 1);
+        let reopened = fixture.store().list_decisions(&record.id).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert!(reopened[0].allowed);
+        assert_eq!(reopened[0].repo_path, fixture.real("/ws").to_string_lossy());
     }
 
     #[tokio::test]
-    async fn a_queued_request_carries_the_normalized_tool_name() {
+    async fn an_always_allow_reaches_later_sessions_of_the_repo_and_no_other_repo() {
         // Arrange
         let fixture = Fixture::new();
-        let gate = fixture.gate("/ws", PermissionMode::Prompt, ANSWER_WAIT);
-        let request = bash("cargo build");
+        let (first, broker) = fixture.broker("/ws/x", Mode::Default).await;
+        let gate = fixture.gate(&first, &broker);
+        let mut notices = broker.subscribe();
+        let asking = tokio::spawn({
+            let request = edit(&fixture, "src/a.rs", "/ws");
+            async move { gate.request(&request).await }
+        });
+        let notice = tokio::time::timeout(ANSWER_WAIT, notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
 
         // Act
-        let (_, queued) = tokio::join!(gate.request(&request), async {
-            let first = loop {
-                let pending = fixture.store().list_pending(&fixture.session).unwrap();
-                if let Some(first) = pending.into_iter().next() {
-                    break first;
-                }
-                tokio::time::sleep(POLL).await;
-            };
-            fixture
-                .answers
-                .answer(&fixture.hub, &first.id, PermissionDecision::Deny)
-                .await
-                .unwrap();
-            first
-        });
+        broker
+            .answer(&notice.id, PermissionDecision::AllowAlways)
+            .await
+            .unwrap();
+        asking.await.unwrap();
+        let (_, later) = fixture.broker("/ws/x", Mode::Default).await;
+        let (_, elsewhere) = fixture.broker("/other/x", Mode::Default).await;
+        let same_repo = later
+            .verdict(&edit(&fixture, "src/a.rs", "/ws"))
+            .await
+            .unwrap();
+        let other_repo = elsewhere
+            .verdict(&edit(&fixture, "src/a.rs", "/other"))
+            .await
+            .unwrap();
 
         // Assert
-        assert_eq!(queued.tool, "bash");
+        assert_eq!(same_repo, Verdict::Allow);
+        assert_eq!(other_repo, Verdict::Prompt);
     }
 
     #[tokio::test]
-    async fn an_unanswered_prompt_is_denied_after_the_timeout_with_no_client() {
+    async fn a_prompt_is_announced_to_subscribers_and_answered_through_respond() {
         // Arrange
         let fixture = Fixture::new();
-        let gate = fixture.gate("/ws", PermissionMode::Prompt, SHORT_TIMEOUT);
+        let (record, broker) = fixture.broker("/ws/x", Mode::Default).await;
+        let gate = fixture.gate(&record, &broker);
+        let (conn, mut outbox) = fixture.hub.connect();
+        conn.subscribe(&record.id, Some(0), None).await.unwrap();
+        let mut notices = broker.subscribe();
+        let asking = tokio::spawn({
+            let request = edit(&fixture, "src/a.rs", "/ws");
+            async move { gate.request(&request).await }
+        });
+        let notice = tokio::time::timeout(ANSWER_WAIT, notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
 
         // Act
-        let decision = gate.request(&bash("cargo build")).await;
+        let announced = tokio::time::timeout(ANSWER_WAIT, async {
+            loop {
+                let frame = outbox.events.recv().await.unwrap();
+                if String::from_utf8_lossy(&frame).contains("permission.request") {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let answered = fixture
+            .brokers
+            .respond(&PermissionRespondParams {
+                session_id: record.id.clone(),
+                request_id: notice.id.clone(),
+                decision: PermissionDecision::AllowOnce,
+            })
+            .await;
+
+        // Assert
+        assert!(String::from_utf8_lossy(&announced).contains(notice.id.as_str()));
+        assert!(answered);
+        assert_eq!(asking.await.unwrap(), PermissionDecision::AllowOnce);
+    }
+
+    #[tokio::test]
+    async fn an_answer_naming_another_sessions_request_is_refused() {
+        // Arrange
+        let fixture = Fixture::new();
+        let (record, broker) = fixture.broker("/ws/x", Mode::Default).await;
+        let (stranger, _) = fixture.broker("/other/x", Mode::Default).await;
+        let gate = fixture.gate(&record, &broker);
+        let mut notices = broker.subscribe();
+        let asking = tokio::spawn({
+            let request = edit(&fixture, "src/a.rs", "/ws");
+            async move { gate.request(&request).await }
+        });
+        let notice = tokio::time::timeout(ANSWER_WAIT, notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Act
+        let answered = fixture
+            .brokers
+            .respond(&PermissionRespondParams {
+                session_id: stranger.id.clone(),
+                request_id: notice.id.clone(),
+                decision: PermissionDecision::AllowAlways,
+            })
+            .await;
+
+        // Assert
+        assert!(!answered);
+        assert_eq!(asking.await.unwrap(), PermissionDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn a_session_keeps_one_broker() {
+        // Arrange
+        let fixture = Fixture::new();
+        let (record, first) = fixture.broker("/ws/x", Mode::Default).await;
+
+        // Act
+        let second = fixture
+            .brokers
+            .broker(&record, SHORT_TIMEOUT)
+            .await
+            .unwrap();
+
+        // Assert
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_left_by_a_previous_run_is_denied_when_the_broker_starts() {
+        // Arrange
+        let fixture = Fixture::new();
+        let record = fixture.session("/ws/x", Mode::Default).await;
+        let id = record.id.clone();
+        fixture
+            .hub
+            .with_store_mut(move |store| {
+                store.add_pending(&coda_store::NewPending {
+                    session: id,
+                    tool: "bash".to_owned(),
+                    repo_path: "/r".to_owned(),
+                    command: "ls".to_owned(),
+                })
+            })
+            .await
+            .unwrap();
+
+        // Act
+        let broker = fixture
+            .brokers
+            .broker(&record, Duration::ZERO)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(broker.pending().await.unwrap(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn a_prompt_that_cannot_be_announced_is_denied_at_once() {
+        // Arrange
+        let fixture = Fixture::new();
+        let (record, broker) = fixture
+            .broker_waiting("/ws/x", Mode::Default, ANSWER_WAIT)
+            .await;
+        let gate = fixture.gate(&record, &broker);
+        *gate.turn.lock().unwrap() = TurnId::new("999");
+
+        // Act
+        let decision = tokio::time::timeout(
+            Duration::from_secs(5),
+            gate.request(&edit(&fixture, "src/a.rs", "/ws")),
+        )
+        .await
+        .expect("an invisible prompt kept waiting");
 
         // Assert
         assert_eq!(decision, PermissionDecision::Deny);
-        let store = fixture.store();
-        assert_eq!(store.list_pending(&fixture.session).unwrap().len(), 0);
-        let recorded = store.list_decisions(&fixture.session).unwrap();
-        assert_eq!(recorded.len(), 1);
+        assert_eq!(broker.pending().await.unwrap().len(), 0);
+        let recorded = fixture.store().list_decisions(&record.id).unwrap();
         assert!(!recorded[0].allowed);
     }
 
     #[tokio::test]
-    async fn an_unanswered_prompt_is_denied_after_the_timeout_with_a_silent_client() {
+    async fn an_answer_after_the_deadline_is_refused_and_the_denial_stands() {
         // Arrange
         let fixture = Fixture::new();
-        let (_connection, mut outbox) = fixture.hub.connect();
-        let gate = fixture.gate("/ws", PermissionMode::Prompt, SHORT_TIMEOUT);
+        let (record, broker) = fixture.broker("/ws/x", Mode::Default).await;
+        let (asking, id) = fixture.ask(&record, &broker).await;
+        let decision = asking.await.unwrap();
 
         // Act
-        let decision = gate.request(&bash("cargo build")).await;
+        let accepted = fixture
+            .answer(&record, &id, PermissionDecision::AllowAlways)
+            .await;
 
         // Assert
         assert_eq!(decision, PermissionDecision::Deny);
-        assert!(outbox.events.try_recv().is_err());
-        let recorded = fixture.store().list_decisions(&fixture.session).unwrap();
+        assert!(!accepted);
+        let recorded = fixture.store().list_decisions(&record.id).unwrap();
         assert_eq!(recorded.len(), 1);
         assert!(!recorded[0].allowed);
+        let later = broker.verdict(&edit(&fixture, "src/a.rs", "/ws")).await;
+        assert_eq!(later.unwrap(), Verdict::Prompt);
     }
 
     #[tokio::test]
-    async fn allow_always_stores_an_exact_grant_for_later_requests() {
+    async fn a_duplicate_or_stale_answer_is_refused_without_changing_the_outcome() {
         // Arrange
         let fixture = Fixture::new();
-        let gate = fixture.gate("/ws", PermissionMode::Prompt, ANSWER_WAIT);
-        let request = bash("cargo build");
+        let (record, broker) = fixture
+            .broker_waiting("/ws/x", Mode::Default, ANSWER_WAIT)
+            .await;
+        let (asking, id) = fixture.ask(&record, &broker).await;
+        let first = fixture
+            .answer(&record, &id, PermissionDecision::AllowOnce)
+            .await;
 
         // Act
-        let (first, ()) = tokio::join!(gate.request(&request), async {
-            let id = loop {
-                let pending = fixture.store().list_pending(&fixture.session).unwrap();
-                if let Some(first) = pending.first() {
-                    break first.id.clone();
-                }
-                tokio::time::sleep(POLL).await;
-            };
-            fixture
-                .answers
-                .answer(&fixture.hub, &id, PermissionDecision::AllowAlways)
-                .await
-                .unwrap();
-        });
-        let again = gate.verdict(&request).await.unwrap();
-        let other = gate.verdict(&bash("cargo build --release")).await.unwrap();
+        let duplicate = fixture.answer(&record, &id, PermissionDecision::Deny).await;
+        let stale = fixture
+            .answer(
+                &record,
+                &RequestId::new("424242"),
+                PermissionDecision::AllowOnce,
+            )
+            .await;
 
         // Assert
-        assert_eq!(first, PermissionDecision::AllowAlways);
-        assert_eq!(again, Verdict::Allow);
-        assert_eq!(other, Verdict::Prompt);
-        let key = GrantKey {
-            repo_path: "/ws",
-            tool: "bash",
-            cwd: "/ws/x",
-            pattern: "cargo build",
-        };
-        assert!(fixture.store().lookup_grant(&key).unwrap().is_some());
-    }
-
-    #[test]
-    fn an_answer_that_arrived_before_the_wait_is_returned_without_deadlock() {
-        // Arrange
-        let answers = PermissionAnswers::new();
-        let id = coda_protocol::types::RequestId::new("r-1");
-        answers.slots().insert(
-            id.clone(),
-            Slot::Answered(PermissionDecision::AllowOnce, Instant::now()),
-        );
-        let (done, finished) = std::sync::mpsc::channel();
-
-        // Act
-        let waiting = Arc::clone(&answers);
-        std::thread::spawn(move || {
-            let ready = matches!(
-                waiting.wait_for(&id),
-                Wait::Ready(PermissionDecision::AllowOnce)
-            );
-            let _ = done.send(ready);
-        });
-
-        // Assert
-        assert_eq!(finished.recv_timeout(ANSWER_WAIT), Ok(true));
+        assert!(first);
+        assert!(!duplicate);
+        assert!(!stale);
+        assert_eq!(asking.await.unwrap(), PermissionDecision::AllowOnce);
+        let recorded = fixture.store().list_decisions(&record.id).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].allowed);
     }
 
     #[tokio::test]
-    async fn an_answer_that_misses_the_handoff_is_recorded_as_the_denial_that_applied() {
+    async fn a_timeout_with_a_silent_client_denies_and_records_the_timeout_event() {
         // Arrange
         let fixture = Fixture::new();
-        let gate = fixture.gate("/ws", PermissionMode::Prompt, SHORT_TIMEOUT);
-        let request = bash("cargo build");
+        let (record, broker) = fixture.broker("/ws/x", Mode::Default).await;
+        let (conn, mut outbox) = fixture.hub.connect();
+        conn.subscribe(&record.id, Some(0), None).await.unwrap();
+
+        let gate = fixture.gate(&record, &broker);
+        let mut notices = broker.subscribe();
 
         // Act
-        let (decision, ()) = tokio::join!(gate.request(&request), async {
-            let id = loop {
-                let pending = fixture.store().list_pending(&fixture.session).unwrap();
-                if let Some(first) = pending.first() {
-                    break first.id.clone();
-                }
-                tokio::time::sleep(POLL).await;
-            };
-            // Stored, but never handed to the waiting gate.
-            fixture
-                .hub
-                .resolve_pending(&id, PermissionDecision::AllowOnce)
-                .await
-                .unwrap();
-        });
+        let decision = gate.request(&edit(&fixture, "src/a.rs", "/ws")).await;
 
         // Assert
         assert_eq!(decision, PermissionDecision::Deny);
-        let recorded = fixture.store().list_decisions(&fixture.session).unwrap();
-        assert!(!recorded.last().unwrap().allowed);
+        let id = notices.recv().await.unwrap().id;
+        let event = Fixture::event_of_kind(&mut outbox, "timeout").await;
+        assert!(event.contains(id.as_str()));
+        assert_eq!(broker.pending().await.unwrap().len(), 0);
     }
 
     #[tokio::test]
-    async fn a_cancelled_gate_frees_its_slot() {
+    async fn a_dropped_prompt_records_the_timeout_event_and_denies_the_row() {
         // Arrange
         let fixture = Fixture::new();
-        let gate = fixture.gate("/ws", PermissionMode::Prompt, ANSWER_WAIT);
+        let (record, broker) = fixture
+            .broker_waiting("/ws/x", Mode::Default, ANSWER_WAIT)
+            .await;
+        let (conn, mut outbox) = fixture.hub.connect();
+        conn.subscribe(&record.id, Some(0), None).await.unwrap();
+        let (asking, id) = fixture.ask(&record, &broker).await;
 
         // Act
-        let outcome = tokio::time::timeout(SHORT_TIMEOUT, gate.request(&bash("cargo build"))).await;
+        asking.abort();
+        let _ = asking.await;
 
         // Assert
-        assert!(outcome.is_err());
-        assert!(fixture.answers.slots().is_empty());
-    }
-
-    #[tokio::test]
-    async fn answers_nobody_collected_do_not_pile_up() {
-        // Arrange
-        let fixture = Fixture::new();
-        let answers = Arc::new(PermissionAnswers {
-            slots: std::sync::Mutex::default(),
-            stale_after: Duration::ZERO,
-        });
-        for command in ["a", "b"] {
-            let id = fixture
-                .hub
-                .register_pending(
-                    &fixture.turn,
-                    NewPending {
-                        session: fixture.session.clone(),
-                        tool: "bash".to_owned(),
-                        repo_path: "/ws".to_owned(),
-                        command: command.to_owned(),
-                    },
-                )
-                .await
-                .unwrap();
-
-            // Act
-            answers
-                .answer(&fixture.hub, &id, PermissionDecision::AllowOnce)
-                .await
-                .unwrap();
-        }
-
-        // Assert
-        assert_eq!(answers.slots().len(), 1);
+        let event = Fixture::event_of_kind(&mut outbox, "timeout").await;
+        assert!(event.contains(id.as_str()));
+        assert_eq!(broker.pending().await.unwrap().len(), 0);
     }
 }

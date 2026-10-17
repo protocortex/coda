@@ -6,7 +6,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, TIMEOUT_KIND};
 use coda_protocol::types::{PermissionDecision, SessionId, TurnId};
 use coda_store::{EventRecord, PendingPermission, SessionFilter, StoreError};
 use rustix::io::Errno;
@@ -17,8 +17,6 @@ use crate::backends::PIDFILE_EXTENSION;
 use crate::pidfile::{self, PidRecord, ProcessState};
 use crate::subscribe::{Hub, HubError};
 
-/// Stored event kind of an expired permission request.
-const TIMEOUT_KIND: &str = "timeout";
 /// The pending row keeps the command but not the tool, so the event cannot name it.
 const UNKNOWN_TOOL: &str = "unknown";
 

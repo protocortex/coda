@@ -32,14 +32,14 @@ use coda_store::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{Instrument, Span, info, warn};
+use tracing::{Instrument, info, warn};
 
 use crate::backends::{SessionStart, StartError, pidfile_path, start_claude_session};
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
-use crate::gate::{GateConfig, PermissionAnswers, SessionGate};
+use crate::gate::{BrokerGate, Brokers};
 use crate::model_session::{ModelError, ModelSessions};
 use crate::subscribe::{Hub, HubError};
-use crate::trace::{backend_span, permission_span};
+use crate::trace::backend_span;
 use crate::watchdog::{Phase, Timing, Watchdog};
 
 /// The session named in a request does not exist.
@@ -130,7 +130,7 @@ impl Drop for TurnSlot {
 /// The turns of every session the daemon serves.
 pub struct Turns {
     hub: Arc<Hub>,
-    answers: Arc<PermissionAnswers>,
+    brokers: Arc<Brokers>,
     config: TurnConfig,
     pub(crate) models: Arc<ModelSessions>,
     /// A session is present from the moment a send reserves it; the cancel
@@ -145,23 +145,23 @@ struct Job {
     turn: TurnId,
     text: String,
     child: ClaudeSession,
-    gate: SessionGate,
+    gate: BrokerGate,
 }
 
 impl Turns {
     #[must_use]
     pub fn new(hub: Arc<Hub>, config: TurnConfig) -> Arc<Self> {
-        let answers = PermissionAnswers::new();
+        let brokers = Brokers::new(Arc::clone(&hub), config.models.permissions.grants.clone());
         let models = ModelSessions::new(
             Arc::clone(&hub),
-            Arc::clone(&answers),
+            Arc::clone(&brokers),
             config.models.clone(),
             config.parent_env.clone(),
             Arc::new(|name| std::env::var(name).ok()),
         );
         Arc::new(Self {
             hub,
-            answers,
+            brokers,
             config,
             models,
             running: Mutex::default(),
@@ -200,6 +200,11 @@ impl Turns {
             return Err(TurnError::Unsupported(session_id));
         };
         let slot = self.reserve(&session_id)?;
+        let broker = self
+            .brokers
+            .broker(&record, self.config.timing.permission)
+            .await
+            .map_err(ModelError::from)?;
         info!(session = %session_id, step = "start_backend", "starting turn");
         let mut child = start_claude_session(SessionStart {
             binary,
@@ -219,17 +224,11 @@ impl Turns {
             }
         };
         let cancel = child.cancel_handle();
-        let gate = SessionGate::new(
-            Arc::clone(&self.hub),
-            GateConfig {
-                session: session_id.clone(),
-                turn: turn.clone(),
-                repo: PathBuf::from(&record.cwd),
-                workspace_root: PathBuf::from(&record.cwd),
-                mode: permission_mode(record.mode),
-                prompt_timeout: self.config.timing.permission,
-            },
-            Arc::clone(&self.answers),
+        let gate = BrokerGate::new(
+            &self.hub,
+            broker,
+            &record,
+            Arc::new(Mutex::new(turn.clone())),
         );
         slot.arm(cancel);
         let job = Job {
@@ -260,31 +259,7 @@ impl Turns {
     /// Hands a client's answer to the gate waiting for it; `false` when the
     /// request is unknown, already answered, or belongs to another session.
     pub async fn respond(&self, params: &PermissionRespondParams) -> bool {
-        let session = params.session_id.clone();
-        let open = self
-            .hub
-            .with_store(move |store| store.list_pending(&session))
-            .await;
-        let owned = open.is_ok_and(|open| open.iter().any(|p| p.id == params.request_id));
-        if !owned {
-            warn!(
-                session = %params.session_id,
-                request = %params.request_id,
-                "permission answer names no open request of this session"
-            );
-            return false;
-        }
-        match self
-            .answers
-            .answer(&self.hub, &params.request_id, params.decision)
-            .await
-        {
-            Ok(()) => true,
-            Err(e) => {
-                warn!(request = %params.request_id, error = %e, "permission answer not accepted");
-                false
-            }
-        }
+        self.brokers.respond(params).await
     }
 
     pub async fn shutdown(&self) {
@@ -373,7 +348,6 @@ impl Turns {
         let watched = WatchedGate {
             inner: gate,
             watchdog: Arc::clone(&watchdog),
-            session: session.clone(),
         };
         let observer = Arc::clone(&watchdog);
         let emit_session = session.clone();
@@ -474,26 +448,15 @@ async fn stop(child: &mut ClaudeSession, session: &SessionId) {
 
 /// Counts a permission prompt as the user's time, not the backend's.
 struct WatchedGate {
-    inner: SessionGate,
+    inner: BrokerGate,
     watchdog: Arc<Watchdog>,
-    session: SessionId,
 }
 
 impl PermissionGate for WatchedGate {
     async fn request(&self, request: &ToolRequest) -> PermissionDecision {
         self.watchdog.set(Phase::PermissionPending);
-        let span = permission_span(&self.session, request.tool.name());
-        let decision = self.inner.request(request).instrument(span.clone()).await;
-        record_decision(&span, decision);
-        decision
+        self.inner.request(request).await
     }
-}
-
-pub(crate) fn record_decision(span: &Span, decision: PermissionDecision) {
-    span.record(
-        coda_telemetry::attrs::CODA_PERMISSION_DECISION,
-        format!("{decision:?}"),
-    );
 }
 
 async fn publish_events(

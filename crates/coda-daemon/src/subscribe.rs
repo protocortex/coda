@@ -16,9 +16,7 @@ use coda_protocol::events::EVENT_NOTIFICATION;
 use coda_protocol::jsonrpc::{Message, Notification, Version};
 use coda_protocol::methods::PermissionRequestParams;
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
-use coda_store::{
-    EventRecord, Grant, GrantKey, NewDecision, NewPending, PendingPermission, Store, StoreError,
-};
+use coda_store::{EventRecord, Grant, GrantKey, NewPending, PendingPermission, Store, StoreError};
 use serde::Serialize;
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, warn};
@@ -203,24 +201,32 @@ impl Hub {
             .await?
     }
 
-    /// Persists a permission request and announces it to subscribers, as an
-    /// event and as a `permission.request` notification.
+    /// Announces a stored permission request, as an event and as a
+    /// `permission.request` notification. A request resolved in the meantime
+    /// is skipped, so subscribers never see a prompt nobody can answer.
     ///
     /// # Errors
-    /// Returns [`HubError::Store`] when the session or turn is unknown; nothing
-    /// is stored then.
-    pub async fn register_pending(
+    /// Returns [`HubError::Store`] when the session or turn is unknown.
+    pub async fn announce_pending(
         self: &Arc<Self>,
         turn: &TurnId,
+        request: &RequestId,
         pending: NewPending,
-    ) -> Result<RequestId, HubError> {
-        let (hub, turn) = (Arc::clone(self), turn.clone());
+    ) -> Result<(), HubError> {
+        let (hub, turn, request) = (Arc::clone(self), turn.clone(), request.clone());
         tokio::task::spawn_blocking(move || {
             // One guard for the whole sequence: subscribers never see the
-            // event without its pending row, or the reverse.
+            // event for a request that was resolved first.
             let mut store = hub.store();
             store.ensure_turn(&pending.session, &turn)?;
-            let request = store.add_pending(&pending)?;
+            if !store
+                .list_pending(&pending.session)?
+                .iter()
+                .any(|open| open.id == request)
+            {
+                debug!(request = %request, "request resolved before its announcement; not announced");
+                return Ok(());
+            }
             let record = EventRecord {
                 kind: PERMISSION_REQUEST_KIND.to_owned(),
                 body: serde_json::json!({ "request_id": request }).to_string(),
@@ -237,7 +243,7 @@ impl Hub {
             )
             .ok();
             hub.append_locked(&mut store, &pending.session, &turn, &record, announcement)?;
-            Ok(request)
+            Ok(())
         })
         .await?
     }
@@ -282,15 +288,6 @@ impl Hub {
         .await?
     }
 
-    /// Records a permission answer that did not go through a pending request.
-    ///
-    /// # Errors
-    /// Returns [`HubError::Store`] when the session is unknown.
-    pub async fn record_decision(self: &Arc<Self>, new: NewDecision) -> Result<(), HubError> {
-        let hub = Arc::clone(self);
-        tokio::task::spawn_blocking(move || Ok(hub.store().record_decision(&new)?)).await?
-    }
-
     /// Runs `work` against the store on the blocking pool.
     pub(crate) async fn with_store<T: Send + 'static>(
         self: &Arc<Self>,
@@ -325,7 +322,7 @@ impl Hub {
     }
 
     /// Appends and delivers under the store lock so subscribers see sequence order.
-    fn append_and_fan_out(
+    pub(crate) fn append_and_fan_out(
         &self,
         session: &SessionId,
         turn: &TurnId,
@@ -707,6 +704,14 @@ mod tests {
             }
         }
 
+        /// Stores a request and announces it, as the broker's announcer does.
+        async fn register(&self, turn: &TurnId, command: &str) -> Result<RequestId, HubError> {
+            let pending = self.pending(command);
+            let request = self.hub.store().add_pending(&pending)?;
+            self.hub.announce_pending(turn, &request, pending).await?;
+            Ok(request)
+        }
+
         fn pending(&self, command: &str) -> NewPending {
             NewPending {
                 session: self.session.clone(),
@@ -931,11 +936,7 @@ mod tests {
     async fn pending_request_is_persisted_and_resent_on_resume() {
         // Arrange
         let f = fixture(8);
-        let request = f
-            .hub
-            .register_pending(&f.turn, f.pending("rm -rf build"))
-            .await
-            .unwrap();
+        let request = f.register(&f.turn, "rm -rf build").await.unwrap();
         let (conn, mut outbox) = f.hub.connect();
 
         // Act
@@ -956,11 +957,7 @@ mod tests {
     async fn resolved_request_is_not_resent() {
         // Arrange
         let f = fixture(8);
-        let request = f
-            .hub
-            .register_pending(&f.turn, f.pending("ls"))
-            .await
-            .unwrap();
+        let request = f.register(&f.turn, "ls").await.unwrap();
         f.hub
             .resolve_pending(&request, PermissionDecision::AllowOnce)
             .await
@@ -1133,11 +1130,7 @@ mod tests {
         conn.subscribe(&f.session, None, None).await.unwrap();
 
         // Act
-        let request = f
-            .hub
-            .register_pending(&f.turn, f.pending("rm -rf build"))
-            .await
-            .unwrap();
+        let request = f.register(&f.turn, "rm -rf build").await.unwrap();
 
         // Assert
         let (method, params) = next_params(&mut outbox).await;
@@ -1150,22 +1143,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_request_for_an_unknown_turn_leaves_nothing_behind() {
+    async fn announcing_for_an_unknown_turn_is_refused() {
         // Arrange
         let f = fixture(8);
 
         // Act
-        let result = f
-            .hub
-            .register_pending(&TurnId::new("999"), f.pending("ls"))
-            .await;
+        let result = f.register(&TurnId::new("999"), "ls").await;
 
         // Assert
         assert!(matches!(
             result,
             Err(HubError::Store(StoreError::TurnNotFound { .. }))
         ));
-        let open = f.hub.store().list_pending(&f.session).unwrap();
-        assert_eq!(open.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_request_resolved_before_its_announcement_is_not_announced() {
+        // Arrange
+        let f = fixture(8);
+        let pending = f.pending("ls");
+        let request = f.hub.store().add_pending(&pending).unwrap();
+        f.hub
+            .resolve_pending(&request, PermissionDecision::Deny)
+            .await
+            .unwrap();
+        let (conn, mut outbox) = f.hub.connect();
+        conn.subscribe(&f.session, None, None).await.unwrap();
+
+        // Act
+        f.hub
+            .announce_pending(&f.turn, &request, pending)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_quiet(&mut outbox).await;
+        let events = f.hub.store().load_events(&f.session, 0, 10).unwrap();
+        assert_eq!(events.len(), 0);
     }
 }
