@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, RequestId, SessionId, TurnId};
 use coda_store::{
-    Clock, EventRecord, GrantKey, NewDecision, NewPending, NewSession, SessionFilter, Store,
-    StoreError, UsageRecord, UsageSummary,
+    Clock, EventRecord, GrantKey, NewDecision, NewPending, NewSession, SavingRecord, SessionFilter,
+    Store, StoreError, UsageRecord, UsageSummary,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -944,4 +944,82 @@ fn summaries_keep_only_the_newest_sessions_within_the_limit() {
     // Assert
     let seen: Vec<_> = capped.iter().map(|s| &s.record.id).collect();
     assert_eq!(seen, vec![&ids[3], &ids[2]]);
+}
+
+fn saving(session: &SessionId, original_bytes: u64, compressed_bytes: u64) -> SavingRecord {
+    SavingRecord {
+        session: session.clone(),
+        original_bytes,
+        compressed_bytes,
+    }
+}
+
+#[test]
+fn saved_bytes_are_summed_per_session_and_overall() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let (one, _) = session_with_turn(&mut store, "/a");
+    let (two, _) = session_with_turn(&mut store, "/b");
+    for record in [
+        saving(&one, 1000, 300),
+        saving(&one, 500, 100),
+        saving(&two, 200, 150),
+    ] {
+        store.record_saving(&record).unwrap();
+    }
+
+    // Act
+    let sums = (
+        store.saved_bytes(Some(&one)).unwrap(),
+        store.saved_bytes(Some(&two)).unwrap(),
+        store.saved_bytes(None).unwrap(),
+    );
+
+    // Assert
+    assert_eq!(sums, (1100, 50, 1150));
+}
+
+#[test]
+fn saved_bytes_with_no_records_is_zero() {
+    // Arrange
+    let (_dir, store) = open_store();
+
+    // Act
+    let saved = store.saved_bytes(None).unwrap();
+
+    // Assert
+    assert_eq!(saved, 0);
+}
+
+#[test]
+fn a_saving_larger_than_its_original_is_rejected() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let (session, _) = session_with_turn(&mut store, "/a");
+
+    // Act
+    let err = store.record_saving(&saving(&session, 10, 11)).unwrap_err();
+
+    // Assert
+    assert!(matches!(
+        err,
+        StoreError::SavingExceedsOriginal {
+            original: 10,
+            compressed: 11
+        }
+    ));
+}
+
+#[test]
+fn a_saving_for_an_unknown_session_is_rejected() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+
+    // Act
+    let err = store
+        .record_saving(&saving(&SessionId::new("999"), 10, 5))
+        .unwrap_err();
+
+    // Assert
+    assert!(matches!(err, StoreError::SessionNotFound { .. }));
 }

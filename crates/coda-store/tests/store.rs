@@ -13,6 +13,7 @@ use tempfile::TempDir;
 const V1_SNAPSHOT: &str = include_str!("snapshots/v1.sql");
 const V2_SNAPSHOT: &str = include_str!("snapshots/v2.sql");
 const V3_SNAPSHOT: &str = include_str!("snapshots/v3.sql");
+const V4_SNAPSHOT: &str = include_str!("snapshots/v4.sql");
 
 fn open_store() -> (TempDir, Store) {
     let dir = TempDir::new().unwrap();
@@ -80,7 +81,7 @@ fn open_records_the_schema_version() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 #[test]
@@ -97,7 +98,7 @@ fn newer_schema_version_is_refused() {
         err,
         StoreError::SchemaTooNew {
             found: 99,
-            supported: 4
+            supported: 5
         }
     ));
 }
@@ -269,7 +270,45 @@ fn v3_snapshot_migrates_forward_keeping_unresolved_pending_requests() {
         .filter(|entry| !before.contains(entry))
         .map(|(_, name, _)| name.as_str())
         .collect();
-    assert_eq!(changed, ["events_by_turn_and_time", "pending_permissions"]);
+    assert_eq!(
+        changed,
+        [
+            "events_by_turn_and_time",
+            "savings_by_session",
+            "pending_permissions",
+            "savings"
+        ]
+    );
+}
+
+#[test]
+fn v4_snapshot_migrates_forward_keeping_originals_and_adding_savings() {
+    // Arrange
+    let mut old = Connection::open_in_memory().unwrap();
+    old.execute_batch(V4_SNAPSHOT).unwrap();
+    old.pragma_update(None, "user_version", 4).unwrap();
+    old.execute_batch(
+        "INSERT INTO sessions (id, created_at) VALUES (1, 0);
+         INSERT INTO originals (id, session_id, content, at) VALUES (9, 1, x'6162', 5);",
+    )
+    .unwrap();
+    let mut fresh = Connection::open_in_memory().unwrap();
+    migrate::migrate(&mut fresh).unwrap();
+
+    // Act
+    migrate::migrate(&mut old).unwrap();
+
+    // Assert
+    let kept: Vec<u8> = old
+        .query_row("SELECT content FROM originals WHERE id = 9", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let saving_rows: i64 = old
+        .query_row("SELECT COUNT(*) FROM savings", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!((kept, saving_rows), (b"ab".to_vec(), 0));
+    assert_eq!(master_listing(&old), master_listing(&fresh));
 }
 
 fn seed_turn(conn: &Connection) {

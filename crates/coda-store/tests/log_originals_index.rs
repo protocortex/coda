@@ -3,8 +3,8 @@
 use coda_protocol::readers::{IndexReader, OriginalsReader, ReaderError, SymbolLocation};
 use coda_protocol::types::{BackendKind, Mode, OriginalId, SessionId};
 use coda_store::{
-    LogEvent, LogEventKind, LogScope, MAX_LOG_ID, MAX_ORIGINAL_BYTES, NewSession, Store,
-    StoreError, Symbol,
+    LogEvent, LogEventKind, LogScope, MAX_LOG_ID, MAX_ORIGINAL_BYTES, MAX_SESSION_ORIGINAL_BYTES,
+    NewSession, Store, StoreError, Symbol,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -363,6 +363,35 @@ fn originals_reader_fetches_only_from_its_own_session() {
     assert_eq!(found.unwrap(), "via trait");
     assert!(matches!(foreign, Err(ReaderError::NotFound(n)) if n == id.to_string()));
     assert!(matches!(missing, Err(ReaderError::NotFound(n)) if n == "777"));
+}
+
+#[test]
+fn originals_over_the_session_cap_evict_the_oldest_first() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let owner = new_session(&mut store);
+    let other = new_session(&mut store);
+    let chunk = "x".repeat(MAX_ORIGINAL_BYTES);
+    let kept_elsewhere = store.store_original(&other, &chunk).unwrap();
+    let per_session = MAX_SESSION_ORIGINAL_BYTES / MAX_ORIGINAL_BYTES;
+    let ids: Vec<OriginalId> = (0..=per_session)
+        .map(|_| store.store_original(&owner, &chunk).unwrap())
+        .collect();
+    let reader = store.originals_reader(&owner);
+
+    // Act
+    let oldest = reader.fetch_original(&ids[0]);
+    let second = reader.fetch_original(&ids[1]);
+    let newest = reader.fetch_original(ids.last().unwrap());
+    let elsewhere = store
+        .originals_reader(&other)
+        .fetch_original(&kept_elsewhere);
+
+    // Assert
+    assert!(matches!(oldest, Err(ReaderError::Evicted(n)) if n == ids[0].to_string()));
+    assert_eq!(second.unwrap().len(), MAX_ORIGINAL_BYTES);
+    assert_eq!(newest.unwrap().len(), MAX_ORIGINAL_BYTES);
+    assert_eq!(elsewhere.unwrap().len(), MAX_ORIGINAL_BYTES);
 }
 
 #[test]

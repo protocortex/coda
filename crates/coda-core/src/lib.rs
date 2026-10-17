@@ -3,3 +3,4 @@
 //! The engine behind a session: the permission broker.
 
 pub mod broker;
+pub mod economy;
