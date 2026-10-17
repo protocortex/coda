@@ -386,8 +386,8 @@ fn request_body_omits_empty_system_and_tools() {
 #[test]
 fn statuses_are_classified_by_retryability() {
     // Arrange
-    let retryable = [408, 409, 429, 500, 502, 503, 504, 529];
-    let fatal = [400, 401, 403, 404];
+    let retryable = [429, 500, 502, 503, 504, 529];
+    let fatal = [400, 401, 403, 404, 408, 409];
 
     for status in retryable {
         // Act
