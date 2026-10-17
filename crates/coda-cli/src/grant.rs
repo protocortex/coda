@@ -18,7 +18,12 @@ use crate::error::CliError;
 /// # Errors
 /// Returns [`CliError::NoGitRoot`] outside a repository, [`CliError::Path`] if a
 /// directory cannot be resolved, or the errors of reaching the daemon.
-pub async fn add(ctx: &Context, io: &mut Io<'_>, args: GrantAddArgs) -> Result<(), CliError> {
+pub async fn add(
+    ctx: &Context,
+    io: &mut Io<'_>,
+    force: bool,
+    args: GrantAddArgs,
+) -> Result<(), CliError> {
     let repo = ctx.cwd.join(&args.repo);
     let repo_path = repo_identity(&repo).ok_or(CliError::NoGitRoot)?;
     let cwd = args
@@ -32,7 +37,7 @@ pub async fn add(ctx: &Context, io: &mut Io<'_>, args: GrantAddArgs) -> Result<(
         cwd: cwd.display().to_string(),
         pattern: args.command,
     };
-    let client = ensure_daemon(ctx).await?;
+    let client = ensure_daemon(ctx, io, force).await?;
     let _: GrantAddResult = client.request(GRANT_ADD, &params).await?;
     writeln!(
         io.out,

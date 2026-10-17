@@ -13,10 +13,10 @@ const DEFAULT_TOOL: &str = "bash";
 #[derive(Debug, Parser)]
 #[command(name = "coda", version)]
 pub struct Cli {
-    /// Stop a daemon that is busy without asking.
+    /// Restart a daemon that is busy without asking.
     #[arg(long, global = true)]
     pub force: bool,
-    /// What to do; without one, report the running daemon.
+    /// What to do; without one, make sure the daemon is running.
     #[command(subcommand)]
     pub command: Option<Command>,
 }

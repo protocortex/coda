@@ -16,7 +16,9 @@ use coda_telemetry::init::{TelemetryConfig, init};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
-use crate::autostart::{Activity, connect_unchecked, describe, status_of, stop_daemon};
+use crate::autostart::{
+    Activity, connect_unchecked, describe, start_daemon, status_of, stop_daemon,
+};
 use crate::context::{Context, Io};
 use crate::error::CliError;
 
@@ -99,21 +101,31 @@ async fn bind(config: ServerConfig) -> Result<BoundServer, CliError> {
     }
 }
 
-/// Stops the running daemon. A busy daemon is only stopped with `force`.
+/// Stops the running daemon, if any, and starts a new one. A busy daemon is
+/// only replaced with `force`.
 ///
 /// # Errors
-/// Returns [`CliError::NotRunning`] when no daemon answers, [`CliError::DaemonBusy`]
-/// when turns or clients would be cut off, or the errors of stopping the daemon.
+/// Returns [`CliError::DaemonBusy`] when turns or clients would be cut off, or the
+/// errors of stopping and starting a daemon.
 pub async fn restart(ctx: &Context, io: &mut Io<'_>, force: bool) -> Result<(), CliError> {
-    let client = connect_unchecked(ctx).await?;
-    // A daemon that cannot report its state may be mid-turn, so it counts as busy.
-    let activity = status_of(&client).await.ok().map(|s| Activity::of(&s));
-    if !activity.is_some_and(Activity::is_idle) && !force {
-        return Err(CliError::DaemonBusy {
-            activity: describe(activity),
-        });
+    match connect_unchecked(ctx).await {
+        Ok(client) => {
+            // A daemon that cannot report its state may be mid-turn, so it counts as busy.
+            let activity = status_of(&client).await.ok().map(|s| Activity::of(&s));
+            if !activity.is_some_and(Activity::is_idle) && !force {
+                return Err(CliError::DaemonBusy {
+                    activity: describe(activity),
+                });
+            }
+            stop_daemon(ctx, client).await?;
+            start_daemon(ctx).await?;
+            writeln!(io.out, "daemon restarted")?;
+        }
+        Err(CliError::NotRunning) => {
+            start_daemon(ctx).await?;
+            writeln!(io.out, "daemon was not running; started it")?;
+        }
+        Err(e) => return Err(e),
     }
-    stop_daemon(ctx, client).await?;
-    writeln!(io.out, "daemon stopped; start it with `coda daemon`")?;
     Ok(())
 }

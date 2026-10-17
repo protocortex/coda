@@ -9,8 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::ExitCode;
 
-use coda_cli::CliError;
-use coda_cli::autostart::connect_unchecked;
+use coda_cli::autostart::{DAEMON_LOG_FILE, connect_unchecked, stop_daemon};
 use coda_client::Client;
 use coda_config::config::Dirs;
 use coda_config::timing::Timing;
@@ -236,6 +235,32 @@ async fn daemon_restart_refuses_while_other_clients_are_attached() {
     daemon.stop().await;
 }
 
+#[tokio::test]
+async fn a_daemon_that_exits_at_startup_is_reported_with_its_log() {
+    // Arrange
+    let dir = short_dir();
+    fs::write(dir.path().join("config.toml"), "this is = [not valid").unwrap();
+    let ctx = context(dir.path());
+
+    // Act
+    let outcome = cli(&ctx, &["coda"], "").await;
+
+    // Assert
+    assert_ne!(outcome.code, ExitCode::SUCCESS);
+    assert!(outcome.err.contains("exited"), "{}", outcome.err);
+    let log = dir.path().join(DAEMON_LOG_FILE);
+    assert!(
+        outcome.err.contains(log.to_str().unwrap()),
+        "{}",
+        outcome.err
+    );
+    assert_ne!(fs::read_to_string(&log).unwrap(), "");
+    assert_eq!(
+        fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
 /// Answers `daemon.status` with an error and `daemon.shutdown` by going away.
 fn serve_failing_status(base: &Path) {
     let socket = Dirs::from_base(base).socket_path();
@@ -290,7 +315,7 @@ async fn daemon_restart_treats_a_failed_status_as_busy() {
 }
 
 #[tokio::test]
-async fn forced_daemon_restart_stops_a_daemon_whose_status_fails() {
+async fn forced_daemon_restart_replaces_a_daemon_whose_status_fails() {
     // Arrange
     let dir = short_dir();
     serve_failing_status(dir.path());
@@ -301,8 +326,6 @@ async fn forced_daemon_restart_stops_a_daemon_whose_status_fails() {
 
     // Assert
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
-    assert!(matches!(
-        connect_unchecked(&ctx).await,
-        Err(CliError::NotRunning)
-    ));
+    let started = connect_unchecked(&ctx).await.unwrap();
+    stop_daemon(&ctx, started).await.unwrap();
 }
