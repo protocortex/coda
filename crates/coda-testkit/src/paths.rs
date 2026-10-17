@@ -3,11 +3,15 @@
 //! Builds the `fake-claude` binary once per test process and returns where it is.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// Attempts at the post-build smoke run, see [`ensure_runnable`].
 const SMOKE_ATTEMPTS: u32 = 5;
+/// How long one smoke run may take before it is killed and retried.
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const BIN_NAME: &str = "fake-claude";
 const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 /// A private target dir, so a nested build never rewrites a binary that a
@@ -82,10 +86,9 @@ fn build() -> Result<PathBuf, BuildError> {
 fn ensure_runnable(path: &Path) -> Result<(), BuildError> {
     let mut last = String::new();
     for _ in 0..SMOKE_ATTEMPTS {
-        match Command::new(path).arg("--version").status() {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => last = status.to_string(),
-            Err(source) => last = source.to_string(),
+        match smoke_attempt(path, SMOKE_TIMEOUT) {
+            Ok(()) => return Ok(()),
+            Err(reason) => last = reason,
         }
     }
     Err(BuildError::Failed(format!(
@@ -93,10 +96,53 @@ fn ensure_runnable(path: &Path) -> Result<(), BuildError> {
     )))
 }
 
+/// Runs `--version` with null stdio and kills the child once `timeout` passes,
+/// so a binary that hangs on exec cannot block the test process.
+fn smoke_attempt(path: &Path, timeout: Duration) -> Result<(), String> {
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| source.to_string())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(status.to_string()),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {timeout:?}"));
+            }
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(source) => return Err(source.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_hanging_binary_is_killed_and_reported_as_a_failed_attempt() {
+        // Arrange
+        let script = std::env::temp_dir().join(format!("hang-{}.sh", std::process::id()));
+        std::fs::write(&script, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+
+        // Act
+        let outcome = smoke_attempt(&script, Duration::from_millis(200));
+
+        // Assert
+        std::fs::remove_file(&script).unwrap();
+        assert!(outcome.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 
     #[test]
     fn the_returned_path_is_an_executable_that_reports_a_version() {
@@ -104,7 +150,12 @@ mod tests {
         let path = fake_claude_path().unwrap();
 
         // Act
-        let output = Command::new(&path).arg("--version").output().unwrap();
+        let output = Command::new(&path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
 
         // Assert
         assert!(output.status.success());
