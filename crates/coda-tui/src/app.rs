@@ -2,15 +2,21 @@
 
 //! UI state, key handling and rendering.
 
+use std::time::Instant;
+
 use coda_protocol::events::Event;
-use coda_protocol::types::BackendKind;
+use coda_protocol::types::{BackendKind, SessionInfo};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Paragraph};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chat::Chat;
+use crate::commands::{self, Command};
 use crate::input::Input;
+use crate::permission::{Overlay, PermissionPrompt};
+use crate::sessions::LinkCommand;
 use crate::status::Status;
 
 const TITLE: &str = " coda (Esc quits) ";
@@ -35,6 +41,14 @@ pub enum LinkEvent {
     Disconnected(String),
     /// A session event from the daemon.
     Session(Event),
+    /// A tool is waiting for the user's permission.
+    Permission(PermissionPrompt),
+    /// The session the UI follows changed; its history is about to replay.
+    SessionStarted(SessionInfo),
+    /// Every session this client knows, for `/sessions`.
+    Sessions(Vec<SessionInfo>),
+    /// Something the user should read, such as a failed request.
+    Notice(String),
     /// The process was asked to stop, for example by a signal.
     Quit,
 }
@@ -45,7 +59,10 @@ pub struct App {
     chat: Chat,
     input: Input,
     status: Status,
-    submitted: Vec<String>,
+    overlay: Overlay,
+    known: Vec<SessionInfo>,
+    link: Option<UnboundedSender<LinkCommand>>,
+    turn_running: bool,
     quit: bool,
 }
 
@@ -57,8 +74,20 @@ impl App {
             chat: Chat::new(),
             input: Input::new(),
             status: Status::new(),
-            submitted: Vec::new(),
+            overlay: Overlay::default(),
+            known: Vec::new(),
+            link: None,
+            turn_running: false,
             quit: false,
+        }
+    }
+
+    /// An app whose messages, cancels and answers go to `link`.
+    #[must_use]
+    pub fn with_link(link: UnboundedSender<LinkCommand>) -> Self {
+        Self {
+            link: Some(link),
+            ..Self::new()
         }
     }
 
@@ -68,11 +97,6 @@ impl App {
 
     pub fn set_session(&mut self, backend: BackendKind, model: Option<String>) {
         self.status.set_session(backend, model);
-    }
-
-    /// Lines the user submitted since the last call, oldest first.
-    pub fn take_submitted(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.submitted)
     }
 
     #[must_use]
@@ -91,12 +115,50 @@ impl App {
             LinkEvent::Failed(reason) => self.connection = ConnectionState::Failed(reason),
             LinkEvent::Disconnected(reason) => {
                 self.connection = ConnectionState::Disconnected(reason);
+                self.overlay = Overlay::default();
+                self.turn_running = false;
             }
-            LinkEvent::Session(event) => {
-                self.chat.apply(&event);
-                self.status.apply(&event);
+            LinkEvent::Session(event) => self.apply_session_event(&event),
+            LinkEvent::Permission(prompt) => self.overlay.push(prompt, Instant::now()),
+            LinkEvent::SessionStarted(info) => {
+                self.chat.clear();
+                self.status.set_session(info.backend, info.model);
+                self.overlay = Overlay::default();
+                self.turn_running = false;
             }
+            LinkEvent::Sessions(sessions) => self.known = sessions,
+            LinkEvent::Notice(text) => self.chat.push_notice(text),
             LinkEvent::Quit => self.quit = true,
+        }
+    }
+
+    fn apply_session_event(&mut self, event: &Event) {
+        match event {
+            Event::Approve { request_id, .. }
+            | Event::Deny { request_id, .. }
+            | Event::Timeout { request_id, .. } => self.overlay.resolve(request_id),
+            Event::Result { .. } | Event::TurnInterrupted { .. } | Event::BackendCrashed { .. } => {
+                self.turn_running = false;
+            }
+            _ => {}
+        }
+        self.chat.apply(event);
+        self.status.apply(event);
+    }
+
+    /// Sends to the daemon link. A dead link can no longer answer prompts or
+    /// end turns, so the UI drops them and says so.
+    fn send(&mut self, command: LinkCommand) {
+        let failed = self
+            .link
+            .as_ref()
+            .is_some_and(|link| link.send(command).is_err());
+        if failed {
+            self.chat.push_notice(
+                "the link to the daemon is closed, the request was not sent".to_owned(),
+            );
+            self.overlay = Overlay::default();
+            self.turn_running = false;
         }
     }
 
@@ -106,19 +168,70 @@ impl App {
         }
         let ctrl_c =
             key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl_c || key.code == KeyCode::Esc {
+        if ctrl_c {
+            self.interrupt();
+        } else if self.overlay.is_active() {
+            if let Some(answer) = self.overlay.handle_key(key, Instant::now()) {
+                self.send(LinkCommand::Respond(answer));
+            }
+        } else if key.code == KeyCode::Esc {
             self.quit = true;
-            return;
+        } else {
+            self.handle_prompt_key(key);
         }
+    }
+
+    /// Denies pending prompts and cancels the running turn; idle, quits. The
+    /// turn counts as over only when the daemon says so.
+    fn interrupt(&mut self) {
+        let denials = self.overlay.deny_all();
+        let busy = self.turn_running || !denials.is_empty();
+        for answer in denials {
+            self.send(LinkCommand::Respond(answer));
+        }
+        if self.turn_running {
+            self.send(LinkCommand::Cancel);
+        }
+        if !busy {
+            self.quit = true;
+        }
+    }
+
+    fn handle_prompt_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::PageUp => self.chat.scroll_up(PAGE_ROWS),
             KeyCode::PageDown => self.chat.scroll_down(PAGE_ROWS),
             _ => {
                 if let Some(line) = self.input.handle_key(key) {
-                    self.chat.push_user(line.clone());
-                    self.submitted.push(line);
+                    self.submit(line);
                 }
             }
+        }
+    }
+
+    fn submit(&mut self, line: String) {
+        match commands::parse(&line) {
+            Ok(None) => {
+                self.chat.push_user(line.clone());
+                self.turn_running = true;
+                self.send(LinkCommand::Send(line));
+            }
+            Ok(Some(command)) => self.run_command(command),
+            Err(error) => self.chat.push_notice(error.to_string()),
+        }
+    }
+
+    fn run_command(&mut self, command: Command) {
+        match command {
+            Command::Sessions => {
+                let lines: Vec<String> = self.known.iter().map(session_line).collect();
+                for line in lines {
+                    self.chat.push_notice(line);
+                }
+            }
+            Command::New => self.send(LinkCommand::New),
+            Command::Resume(id) => self.send(LinkCommand::Resume(id)),
+            Command::Quit => self.quit = true,
         }
     }
 
@@ -141,6 +254,7 @@ impl App {
         self.input.render(frame, input);
         frame.render_widget(Paragraph::new(self.connection_text()), connection);
         self.status.render(frame, status);
+        self.overlay.render(frame, frame.area());
     }
 
     fn connection_text(&self) -> String {
@@ -155,6 +269,11 @@ impl App {
     }
 }
 
+fn session_line(info: &SessionInfo) -> String {
+    let model = info.model.as_deref().unwrap_or("default model");
+    format!("{} | {model} | {}", info.id, info.cwd)
+}
+
 impl Default for App {
     fn default() -> Self {
         Self::new()
@@ -167,12 +286,15 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use coda_protocol::types::{SessionId, TokenUsage, TurnId};
+    use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    use crate::permission::PermissionAnswer;
 
     use super::*;
 
     const WIDTH: u16 = 40;
-    const HEIGHT: u16 = 8;
+    const HEIGHT: u16 = 12;
 
     fn key(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> KeyEvent {
         KeyEvent {
@@ -380,41 +502,229 @@ mod tests {
         assert!(screen.contains("faux | m-1 | in 7 out 3"), "{screen}");
     }
 
+    fn linked() -> (App, UnboundedReceiver<LinkCommand>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (App::with_link(sender), receiver)
+    }
+
+    fn sent(commands: &mut UnboundedReceiver<LinkCommand>) -> Vec<LinkCommand> {
+        std::iter::from_fn(|| commands.try_recv().ok()).collect()
+    }
+
+    /// An app whose prompts take answers at once, as after the grace period.
+    fn armed() -> (App, UnboundedReceiver<LinkCommand>) {
+        let (mut app, commands) = linked();
+        app.overlay = Overlay::with_grace(std::time::Duration::ZERO);
+        (app, commands)
+    }
+
+    fn turn_ended() -> LinkEvent {
+        LinkEvent::Session(Event::TurnInterrupted {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new("t-1"),
+        })
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )
+    }
+
+    fn prompt(request: &str) -> LinkEvent {
+        LinkEvent::Permission(PermissionPrompt {
+            session_id: SessionId::new("s-1"),
+            request_id: RequestId::new(request),
+            repo_path: "/work/repo".to_owned(),
+            command: "cargo test".to_owned(),
+            truncated: false,
+        })
+    }
+
+    fn session(id: &str) -> SessionInfo {
+        SessionInfo {
+            id: SessionId::new(id),
+            backend: BackendKind::Faux,
+            model: Some("m-1".to_owned()),
+            cwd: "/work".to_owned(),
+            mode: coda_protocol::types::Mode::Default,
+        }
+    }
+
     #[test]
-    fn a_submitted_line_enters_the_transcript_and_the_outbox_once() {
+    fn a_submitted_line_enters_the_transcript_and_is_sent_once() {
         // Arrange
-        let mut app = App::new();
+        let (mut app, mut commands) = linked();
 
         // Act
         type_line(&mut app, "q hi");
-        let first = app.take_submitted();
-        let second = app.take_submitted();
 
         // Assert
-        assert_eq!(first, vec!["q hi".to_owned()]);
-        assert_eq!(second, Vec::<String>::new());
+        assert_eq!(
+            sent(&mut commands),
+            vec![LinkCommand::Send("q hi".to_owned())]
+        );
         assert!(!app.should_quit());
         let screen = screen(&app);
         assert!(screen.contains("you: q hi"), "{screen}");
     }
 
     #[test]
-    fn the_page_keys_scroll_the_transcript() {
+    fn ctrl_c_cancels_a_running_turn_and_quits_only_once_the_daemon_ended_it() {
         // Arrange
-        let mut app = App::new();
-        let lines: Vec<String> = (1..=30).map(|n| format!("row{n:02}")).collect();
-        app.handle_event(delta(&lines.join("\n")));
-        let bottom = screen(&app);
+        let (mut app, mut commands) = linked();
+        type_line(&mut app, "go");
+        sent(&mut commands);
 
         // Act
-        app.handle_key(press(KeyCode::PageUp));
-        let scrolled = screen(&app);
-        app.handle_key(press(KeyCode::PageDown));
-        let back = screen(&app);
+        app.handle_key(ctrl_c());
+        app.handle_key(ctrl_c());
+        let before_end = (app.should_quit(), sent(&mut commands));
+        app.handle_event(turn_ended());
+        app.handle_key(ctrl_c());
 
         // Assert
-        assert!(bottom.contains("row30"), "{bottom}");
-        assert!(!scrolled.contains("row30"), "{scrolled}");
-        assert_eq!(back, bottom);
+        assert_eq!(
+            before_end,
+            (false, vec![LinkCommand::Cancel, LinkCommand::Cancel])
+        );
+        assert!(app.should_quit());
+        assert_eq!(sent(&mut commands), vec![]);
+    }
+
+    #[test]
+    fn ctrl_c_denies_every_pending_prompt_and_clears_the_overlay() {
+        // Arrange
+        let (mut app, mut commands) = armed();
+        app.handle_event(prompt("r-1"));
+        app.handle_event(prompt("r-2"));
+
+        // Act
+        app.handle_key(ctrl_c());
+
+        // Assert
+        let denied: Vec<_> = sent(&mut commands)
+            .into_iter()
+            .map(|c| match c {
+                LinkCommand::Respond(a) => (a.request_id, a.decision),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            denied,
+            vec![
+                (RequestId::new("r-1"), PermissionDecision::Deny),
+                (RequestId::new("r-2"), PermissionDecision::Deny)
+            ]
+        );
+        assert!(!app.overlay.is_active());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn a_dead_link_clears_the_overlay_and_the_running_turn_and_says_so() {
+        // Arrange
+        let (mut app, commands) = armed();
+        app.handle_event(prompt("r-1"));
+        screen(&app);
+        drop(commands);
+
+        // Act
+        app.handle_key(press(KeyCode::Char('y')));
+        type_line(&mut app, "go");
+
+        // Assert
+        assert!(!app.overlay.is_active());
+        assert!(!app.turn_running);
+        let shown = screen(&app);
+        assert!(shown.contains("link to the daemon"), "{shown}");
+    }
+
+    #[test]
+    fn a_permission_request_takes_the_keys_and_the_answer_carries_both_ids() {
+        // Arrange
+        let (mut app, mut commands) = armed();
+        app.handle_event(prompt("r-1"));
+        let drawn = screen(&app);
+
+        // Act
+        app.handle_key(press(KeyCode::Char('q')));
+        app.handle_key(press(KeyCode::Char('a')));
+        app.handle_key(press(KeyCode::Enter));
+
+        // Assert
+        assert!(drawn.contains("cargo test"), "{drawn}");
+        let shown = screen(&app);
+        assert!(!shown.contains("cargo test"), "{shown}");
+        assert!(!app.should_quit());
+        assert_eq!(
+            sent(&mut commands),
+            vec![LinkCommand::Respond(PermissionAnswer {
+                session_id: SessionId::new("s-1"),
+                request_id: RequestId::new("r-1"),
+                decision: PermissionDecision::AllowAlways,
+            })]
+        );
+    }
+
+    #[test]
+    fn the_overlay_goes_when_the_request_is_decided_elsewhere_or_the_link_or_session_ends() {
+        for event in [
+            LinkEvent::Session(Event::Timeout {
+                session_id: SessionId::new("s-1"),
+                request_id: RequestId::new("r-1"),
+                tool: "Bash".to_owned(),
+            }),
+            LinkEvent::Disconnected("EOF".to_owned()),
+            LinkEvent::SessionStarted(session("s-2")),
+        ] {
+            // Arrange
+            let mut app = App::new();
+            app.handle_event(prompt("r-1"));
+
+            // Act
+            app.handle_event(event);
+
+            // Assert
+            assert!(!app.overlay.is_active());
+        }
+    }
+
+    #[test]
+    fn slash_commands_go_to_the_link_and_never_to_the_model() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+
+        // Act
+        for line in ["/new", "/resume s-2", "/bogus"] {
+            type_line(&mut app, line);
+        }
+
+        // Assert
+        assert_eq!(
+            sent(&mut commands),
+            vec![LinkCommand::New, LinkCommand::Resume(SessionId::new("s-2"))]
+        );
+        let shown = screen(&app);
+        assert!(shown.contains("unknown command /bogus"), "{shown}");
+    }
+
+    #[test]
+    fn a_started_session_replaces_the_transcript_and_status() {
+        // Arrange
+        let mut app = App::new();
+        app.handle_event(delta("old text"));
+
+        // Act
+        app.handle_event(LinkEvent::SessionStarted(session("s-2")));
+        app.handle_event(LinkEvent::Notice("could not send".to_owned()));
+
+        // Assert
+        let shown = screen(&app);
+        assert!(!shown.contains("old text"), "{shown}");
+        assert!(shown.contains("faux | m-1"), "{shown}");
+        assert!(shown.contains("could not send"), "{shown}");
     }
 }

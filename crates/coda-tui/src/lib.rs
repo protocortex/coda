@@ -4,8 +4,11 @@
 
 pub mod app;
 pub mod chat;
+pub mod commands;
 pub mod input;
 pub mod logs;
+pub mod permission;
+pub mod sessions;
 pub mod status;
 pub mod terminal;
 
@@ -13,12 +16,10 @@ pub mod terminal;
 mod test_support;
 
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use coda_client::Client;
 use coda_config::timing::Timing;
-use coda_protocol::methods::{DAEMON_PING, PingParams, PingResult};
 use crossterm::event::{self, Event, KeyEvent};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -29,11 +30,10 @@ use tracing::{Dispatch, warn};
 
 use app::{App, LinkEvent};
 use logs::LogBuffer;
+use sessions::{LinkConfig, run_link};
 use terminal::{AnsiMode, SystemRawMode, TerminalGuard, install_panic_hook, restore_stdout};
 
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// How often a live link is probed, since the client reports a lost link only on use.
-const LINK_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -119,34 +119,6 @@ where
         .map_err(|error| TuiError::Draw(Box::new(error)))
 }
 
-/// Connects, reports the outcome, then holds the client open and reports when it is lost.
-async fn watch_link(
-    socket_path: PathBuf,
-    timing: Timing,
-    events: mpsc::UnboundedSender<LinkEvent>,
-) {
-    let client = match Client::connect(&socket_path, timing).await {
-        Ok(client) => client,
-        Err(error) => {
-            warn!(%error, "could not connect to the daemon");
-            let _ = events.send(LinkEvent::Failed(error.to_string()));
-            return;
-        }
-    };
-    let _ = events.send(LinkEvent::Connected);
-    loop {
-        tokio::time::sleep(LINK_PROBE_INTERVAL).await;
-        if let Err(error) = client
-            .request::<_, PingResult>(DAEMON_PING, &PingParams {})
-            .await
-        {
-            warn!(%error, "lost the link to the daemon");
-            let _ = events.send(LinkEvent::Disconnected(error.to_string()));
-            return;
-        }
-    }
-}
-
 /// Shows the connection state and runs until the user quits or `shutdown`
 /// completes. The connection is made in the background, so the keys work while
 /// it is pending; a failed or lost connection is shown, not returned.
@@ -165,12 +137,20 @@ where
     B: Backend + Send + 'static,
     K: KeySource + Send + 'static,
 {
-    let mut app = App::new();
+    let (commands, command_rx) = mpsc::unbounded_channel();
+    let mut app = App::with_link(commands);
     draw(&mut terminal, &app)?;
     let (sender, mut events) = mpsc::unbounded_channel();
     let dispatch = tracing::dispatcher::get_default(Dispatch::clone);
     let link = tokio::spawn(
-        watch_link(socket_path.to_path_buf(), timing, sender.clone()).with_subscriber(dispatch),
+        run_link(
+            socket_path.to_path_buf(),
+            timing,
+            LinkConfig::default(),
+            command_rx,
+            sender.clone(),
+        )
+        .with_subscriber(dispatch),
     );
     let stop = tokio::spawn(async move {
         shutdown.await;
