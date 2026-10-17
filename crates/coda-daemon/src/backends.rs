@@ -5,9 +5,11 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use coda_config::config::Config;
 use coda_protocol::types::{BackendKind, SessionId};
-use coda_providers::backend::{AgentBackend, VERIFIED_CLAUDE_CODE_VERSIONS};
+use coda_providers::backend::{AgentBackend, BackendError, VERIFIED_CLAUDE_CODE_VERSIONS, locate};
 use coda_providers::claude_session::{AdapterError, ClaudeSession, SessionSpec};
+use coda_providers::detect::DetectedBinary;
 
 use crate::pidfile::{self, PidfileError};
 
@@ -34,6 +36,17 @@ impl AgentBackend for ClaudeCodeBackend {
     fn verified_versions(&self) -> &'static [&'static str] {
         VERIFIED_CLAUDE_CODE_VERSIONS
     }
+}
+
+/// Finds the Claude Code binary once the backend is enabled in `config`.
+///
+/// # Errors
+/// Returns the [`BackendError`] of [`locate`].
+pub fn locate_claude_code(
+    config: &Config,
+    search_dirs: &[PathBuf],
+) -> Result<DetectedBinary, BackendError> {
+    locate(&ClaudeCodeBackend, config, search_dirs)
 }
 
 /// Why a session could not be started.

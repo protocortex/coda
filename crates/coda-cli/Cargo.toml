@@ -29,6 +29,7 @@ tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 
 [dev-dependencies]
+coda-testkit = { path = "../coda-testkit" }
 serde_json.workspace = true
 
 [lints]

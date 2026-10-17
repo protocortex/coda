@@ -19,14 +19,15 @@ use coda_protocol::jsonrpc::{
 use coda_protocol::methods::{
     DAEMON_PING, DAEMON_SHUTDOWN, DAEMON_STATUS, DaemonShutdownResult, GRANT_ADD, INITIALIZE,
     InitializeParams, InitializeResult, PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult,
-    SESSION_CANCEL, SESSION_SEND, SESSION_SUBSCRIBE, SessionSubscribeParams,
-    SessionSubscribeResult, USAGE_SUMMARY,
+    SESSION_CANCEL, SESSION_CREATE, SESSION_RESUME, SESSION_SEND, SESSION_SUBSCRIBE,
+    SessionSubscribeParams, SessionSubscribeResult, USAGE_SUMMARY,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tracing::{Instrument, error};
 
 use crate::grants_rpc;
+use crate::session_rpc;
 use crate::state::{ClientGuard, DaemonState};
 use crate::subscribe::{Connection, Hub, HubError, Outbox};
 use crate::trace::{request_span, session_span};
@@ -83,7 +84,8 @@ impl Dispatcher {
         self.state.as_ref().map(DaemonState::track_client)
     }
 
-    /// Also answers `session.subscribe`, `grant.add` and `usage.summary` from `hub`.
+    /// Also answers `session.create`, `session.resume`, `session.subscribe`,
+    /// `grant.add` and `usage.summary` from `hub`.
     #[must_use]
     pub fn with_hub(mut self, hub: Arc<Hub>) -> Self {
         self.hub = Some(hub);
@@ -140,6 +142,8 @@ impl Dispatcher {
         let outcome = match method.as_str() {
             GRANT_ADD => grants_rpc::add_grant(self.hub.as_ref(), params).await,
             USAGE_SUMMARY => usage_rpc::summarize(self.hub.as_ref(), params).await,
+            SESSION_CREATE => session_rpc::create(self.hub.as_ref(), params).await,
+            SESSION_RESUME => session_rpc::resume(self.hub.as_ref(), params).await,
             SESSION_SEND => turn::send(self.turns.as_ref(), params).await,
             SESSION_CANCEL => turn::cancel(self.turns.as_ref(), params),
             PERMISSION_RESPOND => turn::respond(self.turns.as_ref(), params).await,
@@ -160,7 +164,8 @@ impl Dispatcher {
 impl Dispatcher {
     fn status(&self) -> HandlerResult {
         let state = self.state.as_ref().ok_or_else(not_found)?;
-        to_value(&state.status())
+        let active = self.turns.as_ref().map_or(0, |turns| turns.active());
+        to_value(&state.status(active))
     }
 
     fn shutdown(&self) -> HandlerResult {
@@ -520,6 +525,71 @@ mod tests {
 
         // Act
         let (_, error) = error_of(call(request).await.unwrap());
+
+        // Assert
+        assert_eq!(error.code, METHOD_NOT_FOUND);
+    }
+
+    fn dispatcher_with_empty_store(dir: &tempfile::TempDir) -> Dispatcher {
+        let store = coda_store::Store::open(&dir.path().join("data")).unwrap();
+        Dispatcher::new().with_hub(Hub::new(store, crate::subscribe::DEFAULT_QUEUE_CAPACITY))
+    }
+
+    const CREATE_REQUEST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"session.create","params":{"backend":"claude_code","cwd":"/","model":"m-1","mode":"plan"}}"#;
+
+    #[tokio::test]
+    async fn session_create_stores_the_session_and_returns_it() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = dispatcher_with_empty_store(&dir);
+
+        // Act
+        let response = call_on(&dispatcher, CREATE_REQUEST).await;
+
+        // Assert
+        let session = &result_of(response)["session"];
+        assert_eq!(session["backend"], json!("claude_code"));
+        assert_eq!(session["cwd"], json!("/"));
+        assert_eq!(session["model"], json!("m-1"));
+        assert_eq!(session["mode"], json!("plan"));
+        assert!(session["id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn session_resume_returns_the_stored_session() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = dispatcher_with_empty_store(&dir);
+        let created = result_of(call_on(&dispatcher, CREATE_REQUEST).await);
+        let request = json!({"jsonrpc": "2.0", "id": 2, "method": "session.resume",
+            "params": {"session_id": created["session"]["id"]}});
+
+        // Act
+        let response = call_on(&dispatcher, &request.to_string()).await;
+
+        // Assert
+        assert_eq!(result_of(response), created);
+    }
+
+    #[tokio::test]
+    async fn session_resume_of_an_unknown_session_is_session_not_found() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = dispatcher_with_empty_store(&dir);
+        let request =
+            r#"{"jsonrpc":"2.0","id":1,"method":"session.resume","params":{"session_id":"999"}}"#;
+
+        // Act
+        let (_, error) = error_of(call_on(&dispatcher, request).await);
+
+        // Assert
+        assert_eq!(error.code, crate::turn::SESSION_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn session_create_without_a_hub_is_method_not_found() {
+        // Act
+        let (_, error) = error_of(call(CREATE_REQUEST).await.unwrap());
 
         // Assert
         assert_eq!(error.code, METHOD_NOT_FOUND);

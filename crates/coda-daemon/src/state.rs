@@ -52,17 +52,16 @@ impl DaemonState {
         }
     }
 
-    /// Snapshot answered to `daemon.status`.
+    /// Snapshot answered to `daemon.status`; the caller knows how many turns run.
     #[must_use]
-    pub fn status(&self) -> DaemonStatusResult {
+    pub fn status(&self, active_turns: u32) -> DaemonStatusResult {
         DaemonStatusResult {
             pid: std::process::id(),
             protocol_version: PROTOCOL_VERSION,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             uptime_secs: self.started.elapsed().as_secs(),
             client_count: self.clients.load(Ordering::Relaxed),
-            // No turn loop exists yet, so nothing can be running.
-            active_turns: 0,
+            active_turns,
             data_dir: self.data_dir.display().to_string(),
         }
     }
@@ -95,7 +94,7 @@ mod tests {
         let state = DaemonState::new(PathBuf::from("/data"));
 
         // Act
-        let status = state.status();
+        let status = state.status(0);
 
         // Assert
         assert_eq!(status.pid, std::process::id());
@@ -112,10 +111,10 @@ mod tests {
         let second = state.track_client();
 
         // Act
-        let while_open = state.status().client_count;
+        let while_open = state.status(0).client_count;
         drop(first);
         drop(second);
-        let after_close = state.status().client_count;
+        let after_close = state.status(0).client_count;
 
         // Assert
         assert_eq!(while_open, 2);

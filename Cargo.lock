@@ -182,6 +182,7 @@ dependencies = [
  "coda-protocol",
  "coda-store",
  "coda-telemetry",
+ "coda-testkit",
  "serde_json",
  "tempfile",
  "thiserror",

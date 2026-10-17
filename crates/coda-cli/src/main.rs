@@ -20,7 +20,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (mut out, mut err) = (stdout().lock(), stderr().lock());
+    // Unlocked: the daemon logs to stdout from worker threads, which a lock held
+    // here for the whole run would block forever.
+    let (mut out, mut err) = (stdout(), stderr());
     let mut input = stdin().lock();
     let mut io = Io {
         out: &mut out,
