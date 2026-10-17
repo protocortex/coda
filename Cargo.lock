@@ -351,6 +351,7 @@ dependencies = [
  "coda-protocol",
  "coda-providers",
  "coda-testkit",
+ "httpdate",
  "reqwest",
  "rustix",
  "serde",

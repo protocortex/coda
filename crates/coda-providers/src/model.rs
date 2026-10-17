@@ -37,6 +37,10 @@ pub enum StopReason {
     ToolUse,
     /// The output limit was reached.
     MaxTokens,
+    /// The model declined to answer.
+    Refusal,
+    /// The provider paused a long turn; the caller may resume it.
+    Paused,
 }
 
 /// One item of a model response stream.
