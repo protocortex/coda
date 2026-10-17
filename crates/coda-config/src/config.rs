@@ -99,6 +99,8 @@ pub struct Permissions {
 pub struct ProviderConfig {
     /// Whether the backend may be used.
     pub enabled: bool,
+    /// Explicit path of the backend binary; searched on the path when unset.
+    pub binary: Option<PathBuf>,
     /// Name of the environment variable holding the API key.
     pub api_key_env: Option<String>,
     /// Extra environment variables forwarded to the backend process.
@@ -292,7 +294,7 @@ impl Dirs {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
 
@@ -336,6 +338,7 @@ enabled = true
 api_key_env = "ANTHROPIC_API_KEY"
 env_passthrough = ["HTTPS_PROXY"]
 verified_versions = ["2.1.0", "2.2.0"]
+binary = "/opt/claude/bin/claude"
 
 [telemetry]
 otlp_endpoint = "http://localhost:4318"
@@ -359,6 +362,10 @@ idle_timeout_ms = 1500
         assert_eq!(p.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(p.env_passthrough, vec!["HTTPS_PROXY"]);
         assert_eq!(p.verified_versions, vec!["2.1.0", "2.2.0"]);
+        assert_eq!(
+            p.binary.as_deref(),
+            Some(Path::new("/opt/claude/bin/claude"))
+        );
         assert_eq!(p.script, None);
         assert_eq!(
             c.telemetry.otlp_endpoint.as_deref(),

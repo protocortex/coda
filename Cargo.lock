@@ -245,6 +245,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "coda-providers"
+version = "0.0.0"
+dependencies = [
+ "coda-config",
+ "coda-protocol",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "coda-store"
 version = "0.0.0"
 dependencies = [
