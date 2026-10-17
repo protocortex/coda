@@ -24,6 +24,7 @@ tracing.workspace = true
 coda-testkit = { path = "../coda-testkit" }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 
 [lints]

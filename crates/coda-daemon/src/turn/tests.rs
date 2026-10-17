@@ -26,6 +26,12 @@ use crate::watchdog::Timing;
 const WAIT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(20);
 const QUIET_PERIOD: Duration = Duration::from_millis(400);
+/// Far above the backend start-up latency, so the idle limit cannot trip before the pause.
+const PAUSE_TEST_IDLE_MS: u64 = 5_000;
+/// Virtual time to skip: many idle limits, but short of the permission timeout.
+const PAUSE_TEST_SKIP: Duration = Duration::from_millis(3 * PAUSE_TEST_IDLE_MS);
+const PAUSE_TEST_PERMISSION_MS: u64 = 60_000;
+const YIELDS_AFTER_SKIP: usize = 50;
 const QUEUE: usize = 256;
 const STORE_DIR: &str = "store";
 const PROMPT_CANARY: &str = "CANARY-PROMPT-7f3a91";
@@ -390,13 +396,23 @@ async fn a_silent_backend_is_aborted_by_the_idle_timeout() {
 #[tokio::test]
 async fn a_pending_permission_pauses_the_idle_timeout() {
     // Arrange
-    let mut rig = Rig::new(timing(100, 20_000), Vec::new());
+    let mut rig = Rig::new(
+        timing(PAUSE_TEST_IDLE_MS, PAUSE_TEST_PERMISSION_MS),
+        Vec::new(),
+    );
     rig.send("hello").await;
     let request = rig.wait_for_pending().await;
 
     // Act
-    tokio::time::sleep(QUIET_PERIOD).await;
+    // Freeze the clock only now: skipping virtual time trips the idle limit
+    // if the pending permission did not pause the watchdog.
+    tokio::time::pause();
+    tokio::time::advance(PAUSE_TEST_SKIP).await;
+    for _ in 0..YIELDS_AFTER_SKIP {
+        tokio::task::yield_now().await;
+    }
     let interrupted_while_waiting = rig.kinds().await.contains(&"turn_interrupted".to_owned());
+    tokio::time::resume();
     rig.respond(&request, "allow_once").await;
     rig.wait_for("result").await;
 
