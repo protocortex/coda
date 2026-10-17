@@ -91,19 +91,19 @@ fn decide_edit(input: &PolicyInput<'_>) -> Verdict {
     if !all_inside(input.targets) {
         return Verdict::Deny;
     }
-    if input.granted {
-        return Verdict::Allow;
-    }
-    let auto_allowed = input.mode == PermissionMode::AcceptEdits
-        && !input
+    if input.mode == PermissionMode::AcceptEdits {
+        // A grant never overrides the prompt for a path that changes what runs.
+        let affecting = input
             .targets
             .iter()
             .any(|t| is_execution_affecting(input.workspace_root, &t.path));
-    if auto_allowed {
-        Verdict::Allow
-    } else {
-        Verdict::Prompt
+        return if affecting {
+            Verdict::Prompt
+        } else {
+            Verdict::Allow
+        };
     }
+    grant_or_prompt(input.granted)
 }
 
 /// Whether editing `path` can change what a build or hook executes.
@@ -165,24 +165,50 @@ pub struct StoredGrant {
     pub tool: String,
     /// Working directory the grant was given in.
     pub cwd: PathBuf,
-    /// The normalized command line; empty for tools without one.
+    /// What the grant covers, see [`grant_pattern`].
     pub pattern: String,
 }
 
+/// Separates target paths in an edit grant pattern; no path component holds it.
+const PATH_SEPARATOR: char = '\u{1f}';
+
+/// The exact argument a grant covers: the normalized, sorted target paths for
+/// an edit, the command line for other tools, empty when there is none.
+#[must_use]
+pub fn grant_pattern(tool: &Tool, command: Option<&str>, target_paths: &[PathBuf]) -> String {
+    if *tool != Tool::Edit {
+        return command.unwrap_or_default().to_owned();
+    }
+    let mut paths: Vec<String> = target_paths.iter().map(|p| normalized(p)).collect();
+    paths.sort();
+    paths.dedup();
+    paths.join(&PATH_SEPARATOR.to_string())
+}
+
+/// `path` with `.` dropped and `..` applied; spelled as given when a `..`
+/// climbs above its start.
+fn normalized(path: &Path) -> String {
+    let Some(parts) = lexical_components(path) else {
+        return path.to_string_lossy().into_owned();
+    };
+    let root = if path.is_absolute() { "/" } else { "" };
+    format!("{root}{}", parts.join("/"))
+}
+
 /// Whether `stored` covers this request. Every field must match exactly:
-/// a grant never extends to another repo, directory or command text.
+/// a grant never extends to another repo, directory or argument.
 #[must_use]
 pub fn grant_matches(
     stored: &StoredGrant,
     repo: &Path,
     tool: &Tool,
     cwd: &Path,
-    command: Option<&str>,
+    pattern: &str,
 ) -> bool {
     stored.repo == repo
         && stored.tool == tool.name()
         && stored.cwd == cwd
-        && stored.pattern == command.unwrap_or_default()
+        && stored.pattern == pattern
 }
 
 /// One row of the decision table.
@@ -214,17 +240,17 @@ pub struct TableRow {
 }
 
 impl TableRow {
+    /// The grant pattern of this row's request.
+    fn pattern(&self) -> String {
+        let paths: Vec<PathBuf> = self.targets.iter().map(|t| t.path.clone()).collect();
+        grant_pattern(&self.tool, self.command.as_deref(), &paths)
+    }
+
     /// Whether the stored grant covers this row's request.
     #[must_use]
     pub fn granted(&self) -> bool {
         self.stored.as_ref().is_some_and(|stored| {
-            grant_matches(
-                stored,
-                &self.repo,
-                &self.tool,
-                &self.cwd,
-                self.command.as_deref(),
-            )
+            grant_matches(stored, &self.repo, &self.tool, &self.cwd, &self.pattern())
         })
     }
 }
@@ -263,11 +289,28 @@ impl Rows {
         granted: bool,
         expected: Verdict,
     ) {
-        let stored = granted.then(|| StoredGrant {
-            repo: PathBuf::from(TABLE_REPO),
-            tool: tool.name().to_owned(),
-            cwd: PathBuf::from(TABLE_CWD),
-            pattern: String::new(),
+        let grant = granted.then(|| targets.clone());
+        self.add_granting(name, mode, tool, targets, grant, expected);
+    }
+
+    /// Like [`Rows::add`], with a grant for exactly the `granted` targets.
+    fn add_granting(
+        &mut self,
+        name: &'static str,
+        mode: PermissionMode,
+        tool: Tool,
+        targets: Vec<ClassifiedTarget>,
+        granted: Option<Vec<ClassifiedTarget>>,
+        expected: Verdict,
+    ) {
+        let stored = granted.map(|granted| {
+            let paths: Vec<PathBuf> = granted.into_iter().map(|t| t.path).collect();
+            StoredGrant {
+                repo: PathBuf::from(TABLE_REPO),
+                tool: tool.name().to_owned(),
+                cwd: PathBuf::from(TABLE_CWD),
+                pattern: grant_pattern(&tool, None, &paths),
+            }
         });
         self.push(
             name,
@@ -646,6 +689,38 @@ fn edit_prompt_and_allow_rows(rows: &mut Rows) {
         false,
         Verdict::Allow,
     );
+    rows.add_granting(
+        "a grant for one file does not allow another",
+        Prompt,
+        Tool::Edit,
+        inside("src/b.rs"),
+        Some(inside("src/a.rs")),
+        Verdict::Prompt,
+    );
+    rows.add_granting(
+        "a grant for one file does not allow Cargo.toml",
+        Prompt,
+        Tool::Edit,
+        inside("Cargo.toml"),
+        Some(inside("src/a.rs")),
+        Verdict::Prompt,
+    );
+    rows.add_granting(
+        "ask allows an exactly granted execution-affecting edit",
+        Prompt,
+        Tool::Edit,
+        inside("Cargo.toml"),
+        Some(inside("Cargo.toml")),
+        Verdict::Allow,
+    );
+    rows.add_granting(
+        "a grant does not override accept-edits on an execution-affecting edit",
+        AcceptEdits,
+        Tool::Edit,
+        inside("Cargo.toml"),
+        Some(inside("Cargo.toml")),
+        Verdict::Prompt,
+    );
     let affecting = [
         "Cargo.toml",
         "crates/x/build.rs",
@@ -747,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_matches_only_the_exact_repo_tool_cwd_and_command() {
+    fn a_grant_matches_only_the_exact_repo_tool_cwd_and_pattern() {
         // Arrange
         let stored = StoredGrant {
             repo: PathBuf::from("/a"),
@@ -773,11 +848,28 @@ mod tests {
 
         for (repo, tool, cwd, command, expected) in cases {
             // Act
-            let matched = grant_matches(&stored, Path::new(repo), &tool, Path::new(cwd), command);
+            let pattern = grant_pattern(&tool, command, &[]);
+            let matched = grant_matches(&stored, Path::new(repo), &tool, Path::new(cwd), &pattern);
 
             // Assert
             assert_eq!(matched, expected, "{repo} {tool:?} {cwd} {command:?}");
         }
+    }
+
+    #[test]
+    fn an_edit_pattern_is_the_sorted_normalized_target_paths() {
+        // Arrange
+        let paths = [
+            PathBuf::from("src/./b.rs"),
+            PathBuf::from("src/x/../a.rs"),
+            PathBuf::from("src/a.rs"),
+        ];
+
+        // Act
+        let pattern = grant_pattern(&Tool::Edit, Some("ignored"), &paths);
+
+        // Assert
+        assert_eq!(pattern, "src/a.rs\u{1f}src/b.rs");
     }
 
     #[test]

@@ -242,6 +242,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "coda-core"
+version = "0.0.0"
+dependencies = [
+ "coda-config",
+ "coda-protocol",
+ "coda-providers",
+ "coda-store",
+ "coda-telemetry",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "coda-daemon"
 version = "0.0.0"
 dependencies = [

@@ -12,7 +12,7 @@ use coda_config::config::PermissionMode;
 use coda_protocol::paths::classify_target;
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
 use coda_providers::gate::PermissionGate;
-use coda_providers::policy::{ClassifiedTarget, PolicyInput, Verdict, decide};
+use coda_providers::policy::{ClassifiedTarget, PolicyInput, Verdict, decide, grant_pattern};
 use coda_providers::tool_request::ToolRequest;
 use coda_store::{GrantKey, NewDecision, NewPending};
 use tokio::sync::oneshot;
@@ -196,7 +196,11 @@ impl SessionGate {
             self.config.repo.to_string_lossy().into_owned(),
             request.tool.name().to_owned(),
             request.cwd.to_string_lossy().into_owned(),
-            request.command.clone().unwrap_or_default(),
+            grant_pattern(
+                &request.tool,
+                request.command.as_deref(),
+                &request.target_paths,
+            ),
         )
     }
 
@@ -472,6 +476,34 @@ mod tests {
         // Assert
         assert_eq!(exact, Verdict::Allow);
         assert_eq!(chained, Verdict::Prompt);
+    }
+
+    #[tokio::test]
+    async fn an_edit_grant_covers_only_the_exact_file() {
+        // Arrange
+        let fixture = Fixture::new();
+        let edit = |path: &str| ToolRequest {
+            tool: Tool::Edit,
+            target_paths: vec![PathBuf::from(path)],
+            command: None,
+            cwd: PathBuf::from("/ws"),
+        };
+        fixture
+            .hub
+            .add_grant("/ws".into(), "edit".into(), "/ws".into(), "src/a.rs".into())
+            .await
+            .unwrap();
+        let gate = fixture.gate("/ws", PermissionMode::Prompt, SHORT_TIMEOUT);
+
+        // Act
+        let same = gate.verdict(&edit("src/a.rs")).await.unwrap();
+        let other = gate.verdict(&edit("src/b.rs")).await.unwrap();
+        let manifest = gate.verdict(&edit("Cargo.toml")).await.unwrap();
+
+        // Assert
+        assert_eq!(same, Verdict::Allow);
+        assert_eq!(other, Verdict::Prompt);
+        assert_eq!(manifest, Verdict::Prompt);
     }
 
     #[tokio::test]
