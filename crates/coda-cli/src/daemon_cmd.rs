@@ -54,10 +54,11 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
     info!("step 4: cleaning up after a previous daemon");
     let report = reap(&ctx.dirs.run_dir(), &hub).await;
     info!(?report, "startup cleanup finished");
-    let mut bound = bound.with_hub(Arc::clone(&hub)).with_state(state.clone());
-    if let Some(turns) = build_turns(&config, &ctx.dirs, &hub) {
-        bound = bound.with_turns(turns);
-    }
+    let turns = build_turns(&config, &ctx.dirs, &hub);
+    let bound = bound
+        .with_hub(Arc::clone(&hub))
+        .with_state(state.clone())
+        .with_turns(Arc::clone(&turns));
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signal)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(CliError::Signal)?;
     info!("step 5: serving");
@@ -70,34 +71,37 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
             }
         })
         .await;
+    turns.shutdown().await;
     info!("daemon stopped");
     Ok(())
 }
 
-/// Turns need the Claude Code binary; without it the daemon still serves
-/// sessions and history, and `session.send` is unavailable.
-fn build_turns(config: &Config, dirs: &Dirs, hub: &Arc<Hub>) -> Option<Arc<Turns>> {
+/// Without the Claude Code binary the daemon still runs model-API sessions;
+/// only Claude Code sessions are unavailable.
+fn build_turns(config: &Config, dirs: &Dirs, hub: &Arc<Hub>) -> Arc<Turns> {
     let search_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
-    match locate_claude_code(config, &search_dirs) {
+    let binary = match locate_claude_code(config, &search_dirs) {
         Ok(binary) => {
             info!(path = %binary.path.display(), version = %binary.version, verified = binary.verified, "claude code backend ready");
-            Some(Turns::new(
-                Arc::clone(hub),
-                TurnConfig {
-                    binary: binary.path,
-                    pidfile_dir: dirs.run_dir(),
-                    parent_env: std::env::vars_os().collect(),
-                    timing: (&config.timing).into(),
-                },
-            ))
+            Some(binary.path)
         }
         Err(e) => {
-            warn!(error = %e, "no agent backend; sessions can be stored but not run");
+            warn!(error = %e, "no claude code backend; its sessions can be stored but not run");
             None
         }
-    }
+    };
+    Turns::new(
+        Arc::clone(hub),
+        TurnConfig {
+            binary,
+            pidfile_dir: dirs.run_dir(),
+            parent_env: std::env::vars_os().collect(),
+            timing: (&config.timing).into(),
+            models: config.clone(),
+        },
+    )
 }
 
 fn load_config(dirs: &Dirs) -> Result<Config, CliError> {

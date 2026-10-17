@@ -309,6 +309,11 @@ impl Hub {
         tokio::task::spawn_blocking(move || Ok(work(&mut hub.store())?)).await?
     }
 
+    /// The shared store handle, for engines that run their own blocking work against it.
+    pub(crate) fn store_handle(&self) -> Arc<Mutex<Store>> {
+        Arc::clone(&self.store)
+    }
+
     fn store(&self) -> MutexGuard<'_, Store> {
         // SQLite rolls an interrupted transaction back, so a poisoned guard is safe to reuse.
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
