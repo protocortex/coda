@@ -11,7 +11,8 @@
 //! type. `stall` parks the process after the text delta, `grandchild` first
 //! starts a `sleep` process, `orphan` also closes stdout so the reader sees
 //! end of file while the process lives on, and `open-credentials` opens
-//! `$HOME/.claude/.credentials.json` for writing and writes one byte.
+//! `$HOME/.claude/.credentials.json` for writing and writes one byte, and
+//! `echo-text` sends the control file's `echo_text` back as a text delta.
 //!
 //! Test controls come from `fake-claude-control.json` in the working
 //! directory, because the adapter passes the child only an allowlisted
@@ -38,6 +39,7 @@ const STALL_TRIGGER: &str = "stall";
 const GRANDCHILD_TRIGGER: &str = "grandchild";
 const ORPHAN_TRIGGER: &str = "orphan";
 const CREDENTIALS_TRIGGER: &str = "open-credentials";
+const ECHO_TRIGGER: &str = "echo-text";
 const PARK_INTERVAL: Duration = Duration::from_secs(3600);
 const CRASH_TRIGGER: &str = "crash";
 const NOISE_TRIGGER: &str = "noise";
@@ -66,6 +68,10 @@ impl Control {
 
     fn path(&self, key: &str) -> Option<PathBuf> {
         self.0[key].as_str().map(PathBuf::from)
+    }
+
+    fn text(&self, key: &str) -> Option<&str> {
+        self.0[key].as_str()
     }
 
     fn flood(&self) -> bool {
@@ -128,6 +134,15 @@ fn run_turn(
         &serde_json::json!({"type":"stream_event","event":{"type":"content_block_delta",
             "delta":{"type":"text_delta","text":"working"}}}),
     )?;
+    if user_line.contains(ECHO_TRIGGER)
+        && let Some(text) = control.text("echo_text")
+    {
+        emit(
+            out,
+            &serde_json::json!({"type":"stream_event","event":{"type":"content_block_delta",
+                "delta":{"type":"text_delta","text":text}}}),
+        )?;
+    }
     if user_line.contains(CRASH_TRIGGER) {
         std::process::exit(CRASH_EXIT_CODE);
     }

@@ -226,6 +226,7 @@ dependencies = [
  "coda-store",
  "coda-telemetry",
  "coda-testkit",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

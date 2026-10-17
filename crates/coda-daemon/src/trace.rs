@@ -4,14 +4,20 @@
 //!
 //! Spans carry identifiers only, never message content.
 
-use coda_protocol::types::SessionId;
-use coda_telemetry::attrs::CODA_SESSION_ID;
-use tracing::{Span, info_span};
+use coda_protocol::types::{SessionId, TurnId};
+use coda_telemetry::attrs::{
+    CODA_BACKEND_KIND, CODA_PERMISSION_DECISION, CODA_SESSION_ID, CODA_TOOL_NAME, CODA_TURN_ID,
+};
+use tracing::{Span, field, info_span};
 
 /// Name of the span that wraps one request.
 pub const REQUEST_SPAN: &str = "coda.request";
 /// Name of the span that wraps work on one session.
 pub const SESSION_SPAN: &str = "coda.session";
+/// Name of the span that wraps one backend child process.
+pub const BACKEND_SPAN: &str = "coda.backend.process";
+/// Name of the span that wraps one permission decision.
+pub const PERMISSION_SPAN: &str = "coda.permission.decision";
 /// Attribute holding the JSON-RPC method of a request.
 pub const RPC_METHOD: &str = "rpc.method";
 
@@ -25,6 +31,29 @@ pub fn request_span(method: &str) -> Span {
 #[must_use]
 pub fn session_span(session: &SessionId) -> Span {
     info_span!(SESSION_SPAN, { CODA_SESSION_ID } = %session)
+}
+
+/// Opens the span for the backend process that runs `turn`.
+#[must_use]
+pub fn backend_span(session: &SessionId, turn: &TurnId, backend: &str) -> Span {
+    info_span!(
+        BACKEND_SPAN,
+        { CODA_SESSION_ID } = %session,
+        { CODA_TURN_ID } = %turn,
+        { CODA_BACKEND_KIND } = backend,
+    )
+}
+
+/// Opens the span for a permission decision about `tool`; the decision is
+/// recorded on it once known.
+#[must_use]
+pub fn permission_span(session: &SessionId, tool: &str) -> Span {
+    info_span!(
+        PERMISSION_SPAN,
+        { CODA_SESSION_ID } = %session,
+        { CODA_TOOL_NAME } = tool,
+        { CODA_PERMISSION_DECISION } = field::Empty,
+    )
 }
 
 #[cfg(test)]
