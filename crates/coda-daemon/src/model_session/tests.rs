@@ -9,12 +9,15 @@ use std::time::Duration;
 use coda_config::config::{Config, ProviderConfig};
 use coda_protocol::jsonrpc::Response;
 use coda_protocol::types::{BackendKind, Mode, SessionId};
-use coda_store::{NewSession, Store, StoredEvent};
+use coda_providers::model::{ModelProvider, ModelRequest};
+use coda_store::{NewSession, SessionRecord, Store, StoredEvent};
 use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+use super::{CONVERSATION_RESET_KIND, EnvReader, ModelSessions, keep_recent, lock};
 use crate::dispatch::Dispatcher;
+use crate::gate::PermissionAnswers;
 use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
 use crate::trace::capture::{Spans, install};
@@ -71,6 +74,17 @@ impl Rig {
     }
 
     fn with(mode: Mode, script: &[Value], enabled: bool) -> Self {
+        Self::custom(mode, script, enabled, None, |_| {})
+    }
+
+    /// A session on `model`, with `tune` applied to the daemon's configuration.
+    fn custom(
+        mode: Mode,
+        script: &[Value],
+        enabled: bool,
+        model: Option<&str>,
+        tune: impl FnOnce(&mut Config),
+    ) -> Self {
         let data = tempfile::tempdir().unwrap();
         let cwd_guard = tempfile::tempdir().unwrap();
         let cwd = std::fs::canonicalize(cwd_guard.path()).unwrap();
@@ -86,11 +100,12 @@ impl Rig {
                 ..ProviderConfig::default()
             },
         );
+        tune(&mut models);
         let mut store = Store::open(&data.path().join("store")).unwrap();
         let session = store
             .create_session(&NewSession {
                 backend: BackendKind::Faux,
-                model: None,
+                model: model.map(str::to_owned),
                 cwd: cwd.to_string_lossy().into_owned(),
                 mode,
             })
@@ -179,6 +194,28 @@ impl Rig {
             .with_store(move |store| store.list_pending(&session))
             .await
             .unwrap()
+    }
+
+    async fn wait_for_results(&self, count: usize) {
+        tokio::time::timeout(WAIT, async {
+            while self.bodies("result").await.len() < count {
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("fewer than {count} result events were stored in time"));
+    }
+
+    /// A second session in the same store.
+    async fn other_session(&self) -> SessionId {
+        let new = NewSession {
+            backend: BackendKind::Faux,
+            model: None,
+            cwd: self.cwd.to_string_lossy().into_owned(),
+            mode: Mode::Default,
+        };
+        let created = self.hub.with_store_mut(move |s| s.create_session(&new));
+        created.await.unwrap()
     }
 
     async fn wait_for_pending(&self) -> String {
@@ -386,4 +423,302 @@ async fn the_prompt_canary_is_content_in_events_and_originals_and_nowhere_else()
     assert!(!span_text(&spans).contains(PROMPT_CANARY));
     assert_eq!(spans.named(PROVIDER_CALL_SPAN).len(), 2);
     assert_eq!(spans.named(TOOL_CALL_SPAN).len(), 1);
+}
+
+/// The shell's pid, once the command has written it.
+async fn shell_pid(cwd: &std::path::Path) -> String {
+    let pid_file = cwd.join("shell.pid");
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match std::fs::read_to_string(&pid_file) {
+                Ok(pid) if pid.ends_with('\n') => return pid.trim().to_owned(),
+                _ => tokio::time::sleep(POLL).await,
+            }
+        }
+    })
+    .await
+    .expect("the command did not start in time")
+}
+
+fn process_alive(pid: &str) -> bool {
+    let probe = std::process::Command::new("kill")
+        .args(["-0", pid])
+        .output();
+    probe.unwrap().status.success()
+}
+
+#[tokio::test]
+async fn shutdown_kills_a_running_bash_group_and_closes_its_turn() {
+    // Arrange
+    let command = "echo $$ > shell.pid; sleep 300";
+    let calls = tool_turn(&[("c1", "bash", json!({ "command": command }))]);
+    let mut rig = Rig::new(Mode::Default, &[calls]);
+    rig.send("go").await;
+    let request = rig.wait_for_pending().await;
+    rig.respond(&request, "allow_once").await;
+    let pid = shell_pid(&rig.cwd).await;
+    assert!(process_alive(&pid), "the command control");
+
+    // Act
+    rig.turns.shutdown().await;
+
+    // Assert
+    rig.wait_for("result").await;
+    assert!(!process_alive(&pid));
+    assert!(!rig.turns.is_running(&rig.session));
+}
+
+#[tokio::test]
+async fn a_turn_that_outlasts_the_grace_period_is_closed_as_failed() {
+    // Arrange
+    let command = "echo $$ > shell.pid; sleep 300";
+    let calls = tool_turn(&[("c1", "bash", json!({ "command": command }))]);
+    let mut rig = Rig::new(Mode::Default, &[calls]);
+    rig.send("go").await;
+    let request = rig.wait_for_pending().await;
+    rig.respond(&request, "allow_once").await;
+    shell_pid(&rig.cwd).await;
+
+    // Act
+    rig.turns.models.shutdown_within(Duration::ZERO).await;
+
+    // Assert
+    let results = rig.bodies("result").await;
+    assert_eq!(results[0]["is_error"], true, "{results:?}");
+    rig.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn the_api_key_is_read_from_the_live_environment_on_every_call() {
+    // Arrange
+    let rig = Rig::new(Mode::Default, &[]);
+    let mut config = Config::default();
+    config.providers.insert(
+        "anthropic".to_owned(),
+        ProviderConfig {
+            enabled: true,
+            api_key_env: Some("CODA_TEST_KEY".to_owned()),
+            ..ProviderConfig::default()
+        },
+    );
+    let key = Arc::new(std::sync::Mutex::new(Some("first".to_owned())));
+    let live = Arc::clone(&key);
+    let reader: EnvReader = Arc::new(move |_| live.lock().unwrap().clone());
+    let hub = Arc::clone(&rig.hub);
+    let sessions = ModelSessions::new(hub, PermissionAnswers::new(), config, Vec::new(), reader);
+    let record = SessionRecord {
+        id: rig.session.clone(),
+        backend: BackendKind::Anthropic,
+        model: None,
+        cwd: rig.cwd.to_string_lossy().into_owned(),
+        mode: Mode::Default,
+        created_at: 0,
+    };
+    let provider = sessions.provider(&record).unwrap();
+    let request = ModelRequest {
+        system: String::new(),
+        tools: Vec::new(),
+        messages: Vec::new(),
+    };
+
+    // Act
+    *key.lock().unwrap() = None;
+    let outcome = tokio::time::timeout(WAIT, async {
+        match provider.stream(request).await {
+            Ok(mut stream) => stream.next().await.and_then(Result::err),
+            Err(e) => Some(e),
+        }
+    })
+    .await;
+
+    // Assert
+    let message = format!("{:?}", outcome.expect("the call did not return in time"));
+    assert!(
+        message.contains("CODA_TEST_KEY holding the API key is not set"),
+        "the provider kept the key it first saw: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_panic_in_the_session_task_ends_the_turn_and_the_next_send_starts_over() {
+    // Arrange
+    let mut rig = Rig::custom(Mode::Default, &[], true, Some("panic"), |_| {});
+
+    // Act
+    rig.send("one").await;
+    rig.wait_for_results(1).await;
+    rig.wait_until_idle().await;
+    let idle_loops = lock(&rig.turns.models.loops).len();
+    let after_first = (
+        rig.pending().await.len(),
+        idle_loops,
+        rig.bodies(CONVERSATION_RESET_KIND).await.len(),
+    );
+    rig.send("two").await;
+    rig.wait_for_results(2).await;
+
+    // Assert
+    assert_eq!(rig.bodies("result").await[0]["is_error"], true);
+    assert_eq!(after_first, (0, 0, 0));
+    assert_eq!(rig.bodies(CONVERSATION_RESET_KIND).await.len(), 1);
+}
+
+#[test]
+fn the_oldest_conversation_is_evicted_once_more_than_the_maximum_are_kept() {
+    // Arrange
+    let mut kept = Vec::new();
+    let id = |n: &str| SessionId::new(n);
+
+    // Act
+    let evictions: Vec<Option<SessionId>> = ["1", "2", "3"]
+        .into_iter()
+        .map(|n| keep_recent(&mut kept, id(n), n, 2))
+        .collect();
+
+    // Assert
+    assert_eq!(evictions, [None, None, Some(id("1"))]);
+    let names: Vec<_> = kept.iter().map(|(_, n)| *n).collect();
+    assert_eq!(names, ["2", "3"]);
+}
+
+#[tokio::test]
+async fn only_a_rebuilt_session_with_history_stores_a_conversation_reset() {
+    // Arrange
+    let mut rig = Rig::new(Mode::Default, &[text_turn("one"), text_turn("two")]);
+
+    // Act
+    rig.send("first").await;
+    rig.wait_for_results(1).await;
+    rig.wait_until_idle().await;
+    let after_first = rig.bodies(CONVERSATION_RESET_KIND).await.len();
+    lock(&rig.turns.models.loops).clear();
+    rig.send("second").await;
+    rig.wait_for_results(2).await;
+
+    // Assert
+    assert_eq!(after_first, 0, "a new session has nothing to reset");
+    assert_eq!(rig.bodies(CONVERSATION_RESET_KIND).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_gate_that_errors_never_runs_the_tool() {
+    // Arrange
+    let calls = tool_turn(&[("c1", "bash", json!({"command": "touch ran.txt"}))]);
+    let mut rig = Rig::new(Mode::Default, &[calls, text_turn("ok")]);
+    rig.db()
+        .execute_batch("DROP TABLE permission_grants")
+        .unwrap();
+
+    // Act
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert!(!rig.cwd.join("ran.txt").exists());
+    assert_eq!(rig.bodies("tool_finished").await[0]["is_error"], true);
+}
+
+#[tokio::test]
+async fn an_answer_naming_another_session_is_refused_and_leaves_the_request_open() {
+    // Arrange
+    let calls = tool_turn(&[("c1", "bash", json!({"command": "touch ran.txt"}))]);
+    let mut rig = Rig::new(Mode::Default, &[calls, text_turn("ok")]);
+    let other = rig.other_session().await;
+    rig.send("go").await;
+    let request = rig.wait_for_pending().await;
+
+    // Act
+    let params = json!({"session_id": other, "request_id": request, "decision": "allow_once"});
+    let refused = rig.call("permission.respond", params).await;
+
+    // Assert
+    assert_eq!(refused["result"]["accepted"], false);
+    assert_eq!(rig.pending().await.len(), 1);
+    assert!(!rig.cwd.join("ran.txt").exists());
+    let own = rig.respond(&request, "deny").await;
+    assert_eq!(own["result"]["accepted"], true, "the owner control");
+    rig.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn an_unanswered_prompt_is_denied_after_the_default_deny_timeout() {
+    // Arrange
+    let calls = tool_turn(&[("c1", "bash", json!({"command": "touch ran.txt"}))]);
+    let script = [calls, text_turn("ok")];
+    let mut rig = Rig::custom(Mode::Default, &script, true, None, |config| {
+        config.timing.permission_default_deny = Duration::from_millis(100);
+    });
+
+    // Act
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert!(!rig.cwd.join("ran.txt").exists());
+    assert_eq!(rig.bodies("tool_finished").await[0]["is_error"], true);
+    assert_eq!(rig.pending().await.len(), 0);
+}
+
+#[tokio::test]
+async fn a_grant_covers_only_the_exact_command_in_a_model_session() {
+    // Arrange
+    let granted = "touch ok.txt";
+    let calls = tool_turn(&[
+        ("c1", "bash", json!({"command": granted})),
+        (
+            "c2",
+            "bash",
+            json!({"command": format!("{granted}; touch evil.txt")}),
+        ),
+    ]);
+    let mut rig = Rig::new(Mode::Default, &[calls, text_turn("ok")]);
+    let repo = rig.cwd.to_string_lossy().into_owned();
+    let (tool, pattern) = ("bash".to_owned(), granted.to_owned());
+    rig.hub
+        .add_grant(repo.clone(), tool, repo, pattern)
+        .await
+        .unwrap();
+
+    // Act
+    rig.send("go").await;
+    let request = rig.wait_for_pending().await;
+
+    // Assert
+    assert!(
+        rig.cwd.join("ok.txt").exists(),
+        "the granted command control"
+    );
+    assert!(!rig.cwd.join("evil.txt").exists());
+    assert_eq!(rig.pending().await.len(), 1);
+    rig.respond(&request, "deny").await;
+    rig.wait_until_idle().await;
+    assert!(!rig.cwd.join("evil.txt").exists());
+}
+
+#[tokio::test]
+async fn the_tool_output_canary_is_content_in_originals_and_nowhere_else() {
+    // Arrange
+    let canary = "CANARY-TOOL-OUTPUT-5c2e84";
+    let (spans, _guard) = install();
+    let calls = tool_turn(&[("c1", "read", json!({"path": "big.txt"}))]);
+    let mut rig = Rig::new(Mode::Default, &[calls, text_turn("done")]);
+    let big = format!("{canary}\n{}", "padding line\n".repeat(3000));
+    std::fs::write(rig.cwd.join("big.txt"), big).unwrap();
+
+    // Act
+    rig.send("read it").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let db = rig.db();
+    assert!(dump(&db, "originals").contains(canary), "originals control");
+    assert!(!dump(&db, "usage").is_empty(), "usage control");
+    for table in ["events", "event_log", "usage", "turns"] {
+        assert!(!dump(&db, table).contains(canary), "{table} holds the file");
+    }
+    assert!(!span_text(&spans).contains(canary));
+    assert_eq!(rig.bodies("tool_finished").await[0]["is_error"], false);
 }

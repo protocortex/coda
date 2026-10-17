@@ -1481,4 +1481,39 @@ mod tests {
         }
         assert_eq!(usages, vec![first, SMALL_USAGE]);
     }
+
+    #[tokio::test]
+    async fn a_cancel_that_arrived_before_the_send_polls_stops_it() {
+        // Arrange
+        let fixture = Fixture::new();
+        let (mut lp, _events) = fixture.allowing(vec![end_turn("never")], canned(None));
+        lp.cancel_token().cancel();
+
+        // Act
+        let stop = lp.send("go").await.unwrap();
+
+        // Assert
+        assert_eq!(stop, StopCondition::Cancelled);
+        assert_eq!(fixture.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn usage_reported_before_a_stream_failure_is_still_emitted() {
+        // Arrange
+        let fixture = Fixture::new();
+        let partial = Turn {
+            events: vec![ModelEvent::Usage(SMALL_USAGE)],
+            error: Some(ProviderError::Fatal {
+                message: "dropped".into(),
+            }),
+        };
+        let (mut lp, mut events) = fixture.allowing(vec![partial], canned(None));
+
+        // Act
+        let result = lp.send("go").await;
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(events.try_recv(), Ok(TurnEvent::Usage(SMALL_USAGE)));
+    }
 }
