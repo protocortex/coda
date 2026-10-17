@@ -9,11 +9,12 @@ use std::path::PathBuf;
 use coda_protocol::events::Event;
 use coda_protocol::methods::{
     DaemonShutdownParams, DaemonShutdownResult, DaemonStatusParams, DaemonStatusResult,
-    GrantAddParams, GrantAddResult, InitializeParams, InitializeResult, PermissionRespondParams,
-    PermissionRespondResult, PingParams, PingResult, SessionCancelParams, SessionCancelResult,
-    SessionCreateParams, SessionCreateResult, SessionResumeParams, SessionResumeResult,
-    SessionSendParams, SessionSendResult, SessionSetModelParams, SessionSetModelResult,
-    SessionSubscribeParams, SessionSubscribeResult, UsageSummaryParams, UsageSummaryResult,
+    GrantAddParams, GrantAddResult, InitializeParams, InitializeResult, PermissionRequestParams,
+    PermissionRespondParams, PermissionRespondResult, PingParams, PingResult, SessionCancelParams,
+    SessionCancelResult, SessionCreateParams, SessionCreateResult, SessionListParams,
+    SessionListResult, SessionResumeParams, SessionResumeResult, SessionSendParams,
+    SessionSendResult, SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams,
+    SessionSubscribeResult, UsageSummaryParams, UsageSummaryResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -91,8 +92,12 @@ golden_tests! {
     session_cancel_result: "session.cancel.result" => SessionCancelResult,
     session_subscribe_params: "session.subscribe.params" => SessionSubscribeParams,
     session_subscribe_result: "session.subscribe.result" => SessionSubscribeResult,
+    session_list_params: "session.list.params" => SessionListParams,
+    session_list_params_all: "session.list.params.all" => SessionListParams,
+    session_list_result: "session.list.result" => SessionListResult,
     session_resume_params: "session.resume.params" => SessionResumeParams,
     session_resume_result: "session.resume.result" => SessionResumeResult,
+    permission_request_params: "permission.request.params" => PermissionRequestParams,
     permission_respond_params: "permission.respond.params" => PermissionRespondParams,
     permission_respond_result: "permission.respond.result" => PermissionRespondResult,
     grant_add_params: "grant.add.params" => GrantAddParams,

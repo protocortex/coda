@@ -1,0 +1,1 @@
+{"sessions":[{"id":"s-1","backend":"claude_code","cwd":"/work/repo","created_at":1700000000000,"updated_at":1700000007000,"status":"running"},{"id":"s-2","backend":"faux","cwd":"/work/repo","created_at":1700000001000,"updated_at":1700000001000,"status":"idle"}]}

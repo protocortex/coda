@@ -13,6 +13,8 @@ use crate::{Store, StoreError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewPending {
     pub session: SessionId,
+    /// Normalized name of the tool that asks.
+    pub tool: String,
     pub repo_path: String,
     pub command: String,
 }
@@ -22,6 +24,8 @@ pub struct NewPending {
 pub struct PendingPermission {
     pub id: RequestId,
     pub session: SessionId,
+    /// Normalized name of the tool that asks; empty for requests stored before it was kept.
+    pub tool: String,
     pub repo_path: String,
     pub command: String,
     /// Request time in milliseconds since the Unix epoch.
@@ -44,9 +48,15 @@ impl Store {
     pub fn add_pending(&mut self, new: &NewPending) -> Result<RequestId, StoreError> {
         let session_row = self.existing_session_row(&new.session)?;
         self.connection().execute(
-            "INSERT INTO pending_permissions (session_id, repo_path, command, requested_at) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session_row, new.repo_path, new.command, self.clock.now_ms()],
+            "INSERT INTO pending_permissions (session_id, tool, repo_path, command, requested_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session_row,
+                new.tool,
+                new.repo_path,
+                new.command,
+                self.clock.now_ms()
+            ],
         )?;
         Ok(RequestId::new(
             self.connection().last_insert_rowid().to_string(),
@@ -103,16 +113,17 @@ impl Store {
     pub fn list_pending(&self, session: &SessionId) -> Result<Vec<PendingPermission>, StoreError> {
         let session_row = self.existing_session_row(session)?;
         let mut stmt = self.connection().prepare(
-            "SELECT id, repo_path, command, requested_at FROM pending_permissions \
+            "SELECT id, tool, repo_path, command, requested_at FROM pending_permissions \
              WHERE session_id = ?1 AND resolved_at IS NULL ORDER BY id",
         )?;
         let rows = stmt.query_map([session_row], |row| {
             Ok(PendingPermission {
                 id: RequestId::new(row.get::<_, i64>(0)?.to_string()),
                 session: session_id(session_row),
-                repo_path: row.get(1)?,
-                command: row.get(2)?,
-                requested_at: row.get(3)?,
+                tool: row.get(1)?,
+                repo_path: row.get(2)?,
+                command: row.get(3)?,
+                requested_at: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

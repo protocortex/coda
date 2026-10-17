@@ -25,6 +25,7 @@ unicode-width = "=0.2.2"
 [dev-dependencies]
 coda-daemon = { path = "../coda-daemon" }
 coda-store = { path = "../coda-store" }
+rustix = { workspace = true, features = ["pty", "termios"] }
 tempfile.workspace = true
 
 [lints]

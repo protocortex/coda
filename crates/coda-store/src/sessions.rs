@@ -28,6 +28,15 @@ pub struct SessionRecord {
     pub created_at: i64,
 }
 
+/// A stored session with the time of its last event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub record: SessionRecord,
+    /// Time of the last event, or the creation time when there is none, in
+    /// milliseconds since the Unix epoch.
+    pub updated_at: i64,
+}
+
 /// Narrows [`Store::list_sessions`]; the default matches every session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionFilter {
@@ -140,6 +149,32 @@ impl Store {
              WHERE (?1 IS NULL OR cwd = ?1) ORDER BY id"
         ))?;
         let rows = stmt.query_map([&filter.cwd], read_session)?;
+        rows.map(|row| row?).collect()
+    }
+
+    /// Lists at most `limit` sessions matching `filter` with their last
+    /// activity, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the query fails.
+    pub fn list_session_summaries(
+        &self,
+        filter: &SessionFilter,
+        limit: u32,
+    ) -> Result<Vec<SessionSummary>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.backend, s.model, s.cwd, s.mode, s.created_at, \
+                    COALESCE((SELECT MAX(e.at) FROM events e \
+                              JOIN turns t ON t.id = e.turn_id \
+                              WHERE t.session_id = s.id), s.created_at) \
+             FROM sessions s WHERE (?1 IS NULL OR s.cwd = ?1) \
+             ORDER BY s.id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![filter.cwd, limit], |row| {
+            let updated_at = row.get(6)?;
+            Ok(read_session(row)?.map(|record| SessionSummary { record, updated_at }))
+        })?;
         rows.map(|row| row?).collect()
     }
 

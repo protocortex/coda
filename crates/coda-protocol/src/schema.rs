@@ -63,6 +63,11 @@ pub fn protocol_schema() -> Value {
         &mut methods,
         m::SESSION_RESUME,
     );
+    add_method::<m::SessionListParams, m::SessionListResult>(
+        &mut generator,
+        &mut methods,
+        m::SESSION_LIST,
+    );
     add_method::<m::PermissionRespondParams, m::PermissionRespondResult>(
         &mut generator,
         &mut methods,

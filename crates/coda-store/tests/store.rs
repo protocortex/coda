@@ -12,6 +12,7 @@ use tempfile::TempDir;
 
 const V1_SNAPSHOT: &str = include_str!("snapshots/v1.sql");
 const V2_SNAPSHOT: &str = include_str!("snapshots/v2.sql");
+const V3_SNAPSHOT: &str = include_str!("snapshots/v3.sql");
 
 fn open_store() -> (TempDir, Store) {
     let dir = TempDir::new().unwrap();
@@ -79,7 +80,7 @@ fn open_records_the_schema_version() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 #[test]
@@ -96,7 +97,7 @@ fn newer_schema_version_is_refused() {
         err,
         StoreError::SchemaTooNew {
             found: 99,
-            supported: 3
+            supported: 4
         }
     ));
 }
@@ -234,6 +235,41 @@ fn v2_snapshot_migrates_forward_to_the_current_schema() {
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
     assert_eq!(master_listing(&old), master_listing(&fresh));
+}
+
+#[test]
+fn v3_snapshot_migrates_forward_keeping_unresolved_pending_requests() {
+    // Arrange
+    let mut old = Connection::open_in_memory().unwrap();
+    old.execute_batch(V3_SNAPSHOT).unwrap();
+    old.pragma_update(None, "user_version", 3).unwrap();
+    old.execute_batch(
+        "INSERT INTO sessions (id, created_at) VALUES (1, 0);
+         INSERT INTO pending_permissions (id, session_id, repo_path, command, requested_at)
+         VALUES (7, 1, '/repo', 'cargo test', 5);",
+    )
+    .unwrap();
+    let before = master_listing(&old);
+
+    // Act
+    migrate::migrate(&mut old).unwrap();
+
+    // Assert
+    let row: (i64, String, String, Option<i64>) = old
+        .query_row(
+            "SELECT id, tool, command, resolved_at FROM pending_permissions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (7, String::new(), "cargo test".to_owned(), None));
+    let after = master_listing(&old);
+    let changed: Vec<_> = after
+        .iter()
+        .filter(|entry| !before.contains(entry))
+        .map(|(_, name, _)| name.as_str())
+        .collect();
+    assert_eq!(changed, ["events_by_turn_and_time", "pending_permissions"]);
 }
 
 fn seed_turn(conn: &Connection) {

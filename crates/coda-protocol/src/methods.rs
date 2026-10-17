@@ -27,6 +27,8 @@ pub const SESSION_CANCEL: &str = "session.cancel";
 pub const SESSION_SUBSCRIBE: &str = "session.subscribe";
 /// Reopens a stored session.
 pub const SESSION_RESUME: &str = "session.resume";
+/// Lists stored sessions, without their content.
+pub const SESSION_LIST: &str = "session.list";
 /// Answers a pending permission request.
 pub const PERMISSION_RESPOND: &str = "permission.respond";
 /// Adds a standing permission grant.
@@ -50,6 +52,7 @@ pub const METHODS: &[&str] = &[
     SESSION_CANCEL,
     SESSION_SUBSCRIBE,
     SESSION_RESUME,
+    SESSION_LIST,
     PERMISSION_RESPOND,
     GRANT_ADD,
     USAGE_SUMMARY,
@@ -158,6 +161,68 @@ pub struct SessionResumeParams {
 pub struct SessionResumeResult {
     /// The reopened session.
     pub session: SessionInfo,
+}
+
+/// Parameters of [`SESSION_LIST`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionListParams {
+    /// Only sessions started in this working directory, or every session when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Most sessions to return; the daemon applies its own default and ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Whether a session has a turn running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionStatus {
+    /// No turn is running.
+    Idle,
+    /// A turn is starting or running.
+    Running,
+}
+
+/// Metadata of one stored session; never its content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionSummary {
+    /// Session identifier.
+    pub id: SessionId,
+    /// Backend driving the session.
+    pub backend: BackendKind,
+    /// Working directory of the session.
+    pub cwd: String,
+    /// Creation time, in milliseconds since the Unix epoch.
+    pub created_at: i64,
+    /// Time of the last event, or the creation time when there is none.
+    pub updated_at: i64,
+    /// Whether a turn is running.
+    pub status: SessionStatus,
+}
+
+/// Result of [`SESSION_LIST`], newest session first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionListResult {
+    /// The matching sessions.
+    pub sessions: Vec<SessionSummary>,
+}
+
+/// Params of the `permission.request` notification that asks a client to
+/// answer a tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PermissionRequestParams {
+    /// Session that raised the request.
+    pub session_id: SessionId,
+    /// The request to answer with [`PERMISSION_RESPOND`].
+    pub request_id: RequestId,
+    /// Normalized name of the tool that asks.
+    pub tool: String,
+    /// Canonical root of the git repository the call runs in.
+    pub repo_path: String,
+    /// The command line, or the tool name when the call has none.
+    pub command: String,
 }
 
 /// Parameters of [`PERMISSION_RESPOND`].
@@ -286,6 +351,7 @@ mod tests {
             (SESSION_CANCEL, "session.cancel"),
             (SESSION_SUBSCRIBE, "session.subscribe"),
             (SESSION_RESUME, "session.resume"),
+            (SESSION_LIST, "session.list"),
             (PERMISSION_RESPOND, "permission.respond"),
             (GRANT_ADD, "grant.add"),
             (USAGE_SUMMARY, "usage.summary"),

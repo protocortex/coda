@@ -257,6 +257,12 @@ impl Turns {
         }
     }
 
+    /// Whether `session` has a turn starting or running.
+    #[must_use]
+    pub fn is_running(&self, session: &SessionId) -> bool {
+        self.running().contains_key(session)
+    }
+
     /// How many sessions have a turn starting or running.
     #[must_use]
     pub fn active(&self) -> u32 {
