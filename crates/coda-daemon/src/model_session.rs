@@ -83,6 +83,9 @@ pub enum ModelError {
 enum Provider {
     Faux(FauxProvider),
     Anthropic(AnthropicProvider<TokioSleeper, SystemClock>),
+    /// Fails the task that drives it, to exercise panic handling.
+    #[cfg(test)]
+    Panicking,
 }
 
 impl ModelProvider for Provider {
@@ -90,6 +93,8 @@ impl ModelProvider for Provider {
         match self {
             Self::Faux(provider) => provider.stream(request).await,
             Self::Anthropic(provider) => provider.stream(request).await,
+            #[cfg(test)]
+            Self::Panicking => panic!("the test provider panics on purpose"),
         }
     }
 }
@@ -253,6 +258,10 @@ impl ModelSessions {
 
     /// Cancels every running send and closes the turns of any that outlast the grace period.
     pub async fn shutdown(&self) {
+        self.shutdown_within(SHUTDOWN_GRACE).await;
+    }
+
+    async fn shutdown_within(&self, grace: Duration) {
         for (cancel, _) in self.running().values().flatten() {
             cancel.cancel();
         }
@@ -261,7 +270,7 @@ impl ModelSessions {
                 tokio::time::sleep(SHUTDOWN_POLL).await;
             }
         };
-        if tokio::time::timeout(SHUTDOWN_GRACE, idle).await.is_err() {
+        if tokio::time::timeout(grace, idle).await.is_err() {
             let stuck: Vec<_> = self
                 .running()
                 .iter()
@@ -292,9 +301,7 @@ impl ModelSessions {
 
     fn keep_loop(&self, session: SessionId, model_loop: ModelLoop) {
         let mut loops = lock(&self.loops);
-        loops.push((session, model_loop));
-        if loops.len() > MAX_IDLE_LOOPS {
-            let (evicted, _) = loops.remove(0);
+        if let Some(evicted) = keep_recent(&mut loops, session, model_loop, MAX_IDLE_LOOPS) {
             info!(session = %evicted, "dropped the least recently used idle conversation");
         }
     }
@@ -342,6 +349,10 @@ impl ModelSessions {
         match record.backend {
             BackendKind::Faux => {
                 self.section(FAUX_KEY)?;
+                #[cfg(test)]
+                if record.model.as_deref() == Some("panic") {
+                    return Ok(Provider::Panicking);
+                }
                 Ok(Provider::Faux(FauxProvider::from_config(&self.config)?))
             }
             BackendKind::Anthropic => {
@@ -473,6 +484,18 @@ impl Slot {
             .running()
             .insert(self.session.clone(), Some(armed));
     }
+}
+
+/// Appends `item`, then drops the oldest entry when more than `max` are kept
+/// and returns the session it belonged to.
+fn keep_recent<T>(
+    items: &mut Vec<(SessionId, T)>,
+    session: SessionId,
+    item: T,
+    max: usize,
+) -> Option<SessionId> {
+    items.push((session, item));
+    (items.len() > max).then(|| items.remove(0).0)
 }
 
 /// Ends a turn: expires its open prompts, records its result, finishes it.
