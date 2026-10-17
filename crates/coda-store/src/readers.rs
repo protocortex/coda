@@ -97,7 +97,12 @@ impl OriginalsReader for SessionOriginals<'_> {
     fn fetch_original(&self, id: &OriginalId) -> Result<String, ReaderError> {
         self.store
             .load_original(&self.session, id)
-            .map_err(unavailable)?
+            .map_err(|e| match e {
+                StoreError::OriginalEvicted { original } => {
+                    ReaderError::Evicted(original.to_string())
+                }
+                other => unavailable(other),
+            })?
             .ok_or_else(|| ReaderError::NotFound(id.to_string()))
     }
 }

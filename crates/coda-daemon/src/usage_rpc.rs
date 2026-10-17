@@ -17,7 +17,7 @@ use crate::trace::session_span;
 
 /// Reads the usage summary from `store`, for one session or for all of them.
 ///
-/// The store records no cache counts or savings yet, so those report zero.
+/// The store records no cache counts yet, so those report zero.
 ///
 /// # Errors
 /// Returns [`StoreError::SessionNotFound`] for an unknown session, or the
@@ -27,13 +27,14 @@ pub fn report(
     session: Option<&SessionId>,
 ) -> Result<UsageSummaryResult, StoreError> {
     let summary = store.usage_summary(session)?;
+    let saved_bytes = store.saved_bytes(session)?;
     Ok(UsageSummaryResult {
         usage: TokenUsage {
             input_tokens: summary.input_tokens,
             output_tokens: summary.output_tokens,
             ..TokenUsage::default()
         },
-        saved_bytes: 0,
+        saved_bytes,
     })
 }
 

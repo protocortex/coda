@@ -11,6 +11,7 @@ pub mod bash;
 pub mod edit;
 pub mod grep;
 pub mod read;
+pub mod retrieve;
 pub mod sandbox;
 
 use serde::de::DeserializeOwned;
@@ -85,6 +86,9 @@ pub enum ToolError {
         /// The workspace-relative path.
         path: String,
     },
+    /// The original could not be retrieved.
+    #[error(transparent)]
+    Original(#[from] coda_protocol::readers::ReaderError),
     /// The file is not valid UTF-8 text.
     #[error("{path} is not valid UTF-8 text")]
     NotUtf8 {

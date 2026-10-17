@@ -15,6 +15,9 @@ pub enum ReaderError {
     /// No stored item has the requested identifier.
     #[error("original `{0}` was not found")]
     NotFound(String),
+    /// The item existed but was dropped to keep the session within its storage limit.
+    #[error("original `{0}` was evicted to keep the session within its storage limit")]
+    Evicted(String),
     /// The backing store cannot answer right now.
     #[error("index is unavailable: {0}")]
     Unavailable(String),
@@ -49,7 +52,8 @@ pub trait OriginalsReader {
     /// Returns the untruncated output stored under `id`.
     ///
     /// # Errors
-    /// [`ReaderError::NotFound`] when nothing is stored under `id`.
+    /// [`ReaderError::NotFound`] when nothing is stored under `id` and
+    /// [`ReaderError::Evicted`] when it was dropped to make room.
     fn fetch_original(&self, id: &OriginalId) -> Result<String, ReaderError>;
 }
 

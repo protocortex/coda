@@ -9,16 +9,16 @@ use std::process::ExitCode;
 
 use coda_config::config::Dirs;
 use coda_protocol::types::{BackendKind, Mode, SessionId};
-use coda_store::{NewSession, Store, UsageRecord};
+use coda_store::{NewSession, SavingRecord, Store, UsageRecord};
 use common::{TestDaemon, cli, context, short_dir};
 
 const SUMMED_OUTPUT: &str = "input tokens: 107\n\
 output tokens: 23\n\
 cache read tokens: 0\n\
 cache write tokens: 0\n\
-saved bytes: 0\n";
+saved bytes: 1100\n";
 
-/// Stores one session with two usage records (100 + 7 in, 20 + 3 out), then
+/// Stores one session with two usage records (100 + 7 in, 20 + 3 out) and two savings, then
 /// releases the database so a daemon can open it.
 fn seed_usage(base: &Path) -> SessionId {
     let mut store = Store::open(&Dirs::from_base(base).data_dir()).unwrap();
@@ -38,6 +38,15 @@ fn seed_usage(base: &Path) -> SessionId {
                 turn: turn.clone(),
                 input_tokens,
                 output_tokens,
+            })
+            .unwrap();
+    }
+    for (original_bytes, compressed_bytes) in [(1000, 300), (500, 100)] {
+        store
+            .record_saving(&SavingRecord {
+                session: session.clone(),
+                original_bytes,
+                compressed_bytes,
             })
             .unwrap();
     }

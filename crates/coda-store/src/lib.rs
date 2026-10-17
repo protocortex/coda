@@ -11,6 +11,7 @@ pub mod migrate;
 mod originals;
 mod pending;
 mod readers;
+mod savings;
 mod sessions;
 mod usage;
 
@@ -19,9 +20,10 @@ pub use event_log::{LogEvent, LogEventKind, LogScope, MAX_LOG_ID};
 pub use events::{EventRecord, StoredEvent};
 pub use grants::{Grant, GrantKey};
 pub use index::Symbol;
-pub use originals::MAX_ORIGINAL_BYTES;
+pub use originals::{MAX_ORIGINAL_BYTES, MAX_SESSION_ORIGINAL_BYTES};
 pub use pending::{NewPending, PendingPermission};
 pub use readers::{RepoIndex, SessionOriginals};
+pub use savings::SavingRecord;
 pub use sessions::{NewSession, SessionFilter, SessionRecord, SessionSummary};
 pub use usage::{UsageRecord, UsageSummary};
 
@@ -34,11 +36,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use coda_protocol::types::{RequestId, SessionId, TurnId};
+use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// File name of the database inside the data directory.
 pub const DB_FILE_NAME: &str = "coda.db";
@@ -83,6 +85,10 @@ pub enum StoreError {
     },
     #[error("original of {size} bytes exceeds the {max} byte limit")]
     OriginalTooLarge { size: usize, max: usize },
+    #[error("original {original} was evicted to keep its session within the storage limit")]
+    OriginalEvicted { original: OriginalId },
+    #[error("compressed size {compressed} exceeds original size {original}")]
+    SavingExceedsOriginal { original: u64, compressed: u64 },
     #[error("value {value} does not fit the database integer range")]
     ValueOutOfRange { value: u64 },
     #[error("stored value could not be encoded or decoded: {0}")]

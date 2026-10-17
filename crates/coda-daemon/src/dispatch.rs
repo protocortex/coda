@@ -466,6 +466,15 @@ mod tests {
                 })
                 .unwrap();
         }
+        for (original_bytes, compressed_bytes) in [(1000, 300), (500, 100)] {
+            store
+                .record_saving(&coda_store::SavingRecord {
+                    session: session.clone(),
+                    original_bytes,
+                    compressed_bytes,
+                })
+                .unwrap();
+        }
         (
             Hub::new(store, crate::subscribe::DEFAULT_QUEUE_CAPACITY),
             session,
@@ -490,7 +499,7 @@ mod tests {
         let result = result_of(response);
         assert_eq!(result["usage"]["input_tokens"], json!(107));
         assert_eq!(result["usage"]["output_tokens"], json!(23));
-        assert_eq!(result["saved_bytes"], json!(0));
+        assert_eq!(result["saved_bytes"], json!(1100));
     }
 
     #[tokio::test]
