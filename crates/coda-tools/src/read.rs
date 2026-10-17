@@ -59,24 +59,7 @@ impl Tool for ReadTool {
         let want = args.length.map_or(cap_plus_one, |n| n.min(cap_plus_one));
         let mut bytes = Vec::new();
         file.take(want).read_to_end(&mut bytes).map_err(io_err)?;
-        Ok(into_output(bytes, self.max_output_bytes))
-    }
-}
-
-/// Cuts `bytes` to `cap`, dropping a character the cut split in half.
-fn into_output(mut bytes: Vec<u8>, cap: usize) -> ToolOutput {
-    let truncated = bytes.len() > cap;
-    if truncated {
-        bytes.truncate(cap);
-        if let Err(err) = std::str::from_utf8(&bytes)
-            && err.error_len().is_none()
-        {
-            bytes.truncate(err.valid_up_to());
-        }
-    }
-    ToolOutput {
-        text: String::from_utf8_lossy(&bytes).into_owned(),
-        truncated,
+        Ok(ToolOutput::from_bytes(bytes, self.max_output_bytes))
     }
 }
 
