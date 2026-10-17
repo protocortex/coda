@@ -9,7 +9,9 @@ use coda_providers::anthropic::events::EventMapper;
 use coda_providers::anthropic::request::{RequestSettings, ToolSchema, build_body};
 use coda_providers::anthropic::sse::{MAX_EVENT_BYTES, SseError, SseParser};
 use coda_providers::anthropic::{Timing, classify_status};
-use coda_providers::model::{ModelEvent, ModelRequest, ProviderError, StopReason, Usage};
+use coda_providers::model::{
+    ModelEvent, ModelRequest, ProviderError, RequestMessage, RequestToolCall, StopReason, Usage,
+};
 use serde_json::json;
 
 fn frame(data: &serde_json::Value) -> String {
@@ -58,9 +60,7 @@ fn run(stream: &str) -> (Vec<ModelEvent>, Result<bool, ProviderError>, bool) {
 }
 
 fn request() -> ModelRequest {
-    ModelRequest {
-        prompt: "hello".to_owned(),
-    }
+    ModelRequest::user_prompt("hello")
 }
 
 fn settings(system: &str, tools: Vec<ToolSchema>) -> RequestSettings {
@@ -627,4 +627,133 @@ fn sse_many_small_data_lines_still_hit_the_event_limit() {
 
     // Assert
     assert_eq!(result, Err(SseError::EventTooLarge));
+}
+
+fn call(id: &str, name: &str, arguments: &str) -> RequestToolCall {
+    RequestToolCall {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        arguments: arguments.to_owned(),
+    }
+}
+
+fn tool_result(call_id: &str, text: &str, is_error: bool) -> RequestMessage {
+    RequestMessage::ToolResult {
+        call_id: call_id.to_owned(),
+        text: text.to_owned(),
+        is_error,
+    }
+}
+
+fn tool_history() -> Vec<RequestMessage> {
+    vec![
+        RequestMessage::User("list files".to_owned()),
+        RequestMessage::Assistant {
+            text: "looking".to_owned(),
+            tool_calls: vec![
+                call("t1", "ls", r#"{"path":"."}"#),
+                call("t2", "cat", r#"{"path":"a"}"#),
+            ],
+        },
+        tool_result("t1", "a b", false),
+        tool_result("t2", "denied", true),
+    ]
+}
+
+#[test]
+fn request_body_encodes_tool_history_with_results_in_one_user_message() {
+    // Arrange
+    let request = ModelRequest {
+        messages: tool_history(),
+        ..ModelRequest::default()
+    };
+
+    // Act
+    let body = build_body(&settings("", Vec::new()), &request);
+
+    // Assert
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "user", "content": "list files"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "looking"},
+                {"type": "tool_use", "id": "t1", "name": "ls", "input": {"path": "."}},
+                {"type": "tool_use", "id": "t2", "name": "cat", "input": {"path": "a"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "a b"},
+                {"type": "tool_result", "tool_use_id": "t2", "content": "denied", "is_error": true},
+            ]},
+        ])
+    );
+}
+
+#[test]
+fn request_body_omits_empty_assistant_text_and_survives_invalid_arguments() {
+    // Arrange
+    let request = ModelRequest {
+        messages: vec![RequestMessage::Assistant {
+            text: String::new(),
+            tool_calls: vec![call("t1", "ls", "{not json")],
+        }],
+        ..ModelRequest::default()
+    };
+
+    // Act
+    let body = build_body(&settings("", Vec::new()), &request);
+
+    // Assert
+    assert_eq!(
+        body["messages"],
+        json!([{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "ls", "input": {}},
+        ]}])
+    );
+}
+
+#[test]
+fn request_prefix_overrides_provider_settings_and_sorts_tools() {
+    // Arrange
+    let request = ModelRequest {
+        system: "from request".to_owned(),
+        tools: vec![tool("write"), tool("read")],
+        ..ModelRequest::user_prompt("hi")
+    };
+
+    // Act
+    let body = build_body(&settings("from settings", vec![tool("other")]), &request);
+
+    // Assert
+    assert_eq!(body["system"][0]["text"], "from request");
+    assert_eq!(body["tools"][0]["name"], "read");
+    assert_eq!(body["tools"][1]["name"], "write");
+    assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
+}
+
+#[test]
+fn appending_a_message_leaves_earlier_message_bytes_unchanged() {
+    // Arrange
+    let history = tool_history();
+    let shorter = ModelRequest {
+        system: "s".to_owned(),
+        tools: vec![tool("ls")],
+        messages: history[..3].to_vec(),
+    };
+    let mut longer = shorter.clone();
+    longer.messages.push(history[3].clone());
+    longer
+        .messages
+        .push(RequestMessage::User("next".to_owned()));
+
+    // Act
+    let before = build_body(&settings("", Vec::new()), &shorter);
+    let after = build_body(&settings("", Vec::new()), &longer);
+
+    // Assert
+    assert_eq!(before["system"], after["system"]);
+    assert_eq!(before["tools"], after["tools"]);
+    assert_eq!(before["messages"][0], after["messages"][0]);
+    assert_eq!(before["messages"][1]["role"], "assistant");
+    assert_eq!(before["messages"][1], after["messages"][1]);
 }

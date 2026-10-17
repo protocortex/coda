@@ -7,7 +7,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::model::{ModelEvent, ModelProvider, ModelRequest, ProviderError, StopReason};
+use crate::model::{
+    ModelEvent, ModelProvider, ModelRequest, ProviderError, RequestMessage, RequestToolCall,
+    StopReason, ToolSchema,
+};
 
 /// A situation the suite puts a provider in. The factory passed to
 /// [`run_contract`] must return a provider that will act it out.
@@ -102,13 +105,38 @@ where
 {
     for scenario in Scenario::ALL {
         let provider = factory(scenario);
-        let request = ModelRequest {
-            prompt: "contract".to_owned(),
-        };
-        let collected = collect(&provider, request, timeout).await;
+        let collected = collect(&provider, structured_request(), timeout).await;
         check(scenario, &collected).map_err(|reason| ContractViolation { scenario, reason })?;
     }
     Ok(())
+}
+
+/// A request with a prefix and a tool round trip, which every provider must accept.
+fn structured_request() -> ModelRequest {
+    ModelRequest {
+        system: "contract".to_owned(),
+        tools: vec![ToolSchema {
+            name: "echo".to_owned(),
+            description: "echoes".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }],
+        messages: vec![
+            RequestMessage::User("contract".to_owned()),
+            RequestMessage::Assistant {
+                text: String::new(),
+                tool_calls: vec![RequestToolCall {
+                    id: "call-1".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: "{}".to_owned(),
+                }],
+            },
+            RequestMessage::ToolResult {
+                call_id: "call-1".to_owned(),
+                text: "done".to_owned(),
+                is_error: false,
+            },
+        ],
+    }
 }
 
 fn check(scenario: Scenario, collected: &Collected) -> Result<(), String> {
@@ -256,9 +284,7 @@ where
     };
     let probe = Arc::new(ActivityProbe::default());
     let provider = factory(Arc::clone(&probe));
-    let request = ModelRequest {
-        prompt: "contract".to_owned(),
-    };
+    let request = ModelRequest::user_prompt("contract");
     let mut stream = tokio::time::timeout(timeout, provider.stream(request))
         .await
         .map_err(|_| violation("the stream did not open in time"))?

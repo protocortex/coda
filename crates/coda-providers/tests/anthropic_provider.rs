@@ -370,9 +370,7 @@ fn provider(mock: &Mock) -> (TestProvider, RecordingSleeper, DrivenClock) {
 }
 
 fn request() -> ModelRequest {
-    ModelRequest {
-        prompt: "hello".to_owned(),
-    }
+    ModelRequest::user_prompt("hello")
 }
 
 async fn run(mock: &Mock) -> (Collected, RecordingSleeper) {
