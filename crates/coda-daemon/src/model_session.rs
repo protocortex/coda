@@ -99,6 +99,13 @@ impl ModelProvider for Provider {
     }
 }
 
+/// Per-send overrides of the configured loop limits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Limits {
+    pub max_turns: Option<u32>,
+    pub token_cap: Option<u64>,
+}
+
 /// One session's loop with the channel its events arrive on.
 struct ModelLoop {
     turn_loop: TurnLoop<Provider, BrokerGate>,
@@ -164,6 +171,8 @@ impl ModelSessions {
     }
 
     /// Starts a send with `text` and returns without waiting for it to end.
+    /// `limits` apply only when this send has to build the session's loop; a
+    /// loop kept from an earlier send keeps its own.
     ///
     /// # Errors
     /// Returns [`TurnError::Busy`] when the session is running,
@@ -173,13 +182,17 @@ impl ModelSessions {
         self: &Arc<Self>,
         record: SessionRecord,
         text: String,
+        limits: Limits,
     ) -> Result<TurnId, TurnError> {
         let session = record.id.clone();
         let slot = self.reserve(&session)?;
         info!(session = %session, step = "build_loop", "preparing the model session");
         let (model_loop, rebuilt) = match self.take_loop(&session) {
             Some(model_loop) => (model_loop, false),
-            None => (self.build(&record).await?, self.has_history(&session).await),
+            None => (
+                self.build(&record, limits).await?,
+                self.has_history(&session).await,
+            ),
         };
         info!(session = %session, step = "begin_turn", "recording the user message");
         let turn = match Turns::begin(&self.hub, &session, &text).await {
@@ -354,7 +367,7 @@ impl ModelSessions {
         }
     }
 
-    async fn build(&self, record: &SessionRecord) -> Result<ModelLoop, ModelError> {
+    async fn build(&self, record: &SessionRecord, limits: Limits) -> Result<ModelLoop, ModelError> {
         let provider = self.provider(record)?;
         let tools = base_tools(
             &BaseToolsConfig {
@@ -381,8 +394,8 @@ impl ModelSessions {
             TurnConfig {
                 session: record.id.clone(),
                 cwd: PathBuf::from(&record.cwd),
-                max_turns: self.config.max_turns,
-                token_limit: self.config.token_cap,
+                max_turns: limits.max_turns.unwrap_or(self.config.max_turns),
+                token_limit: limits.token_cap.unwrap_or(self.config.token_cap),
                 compact_threshold_bytes: COMPACT_THRESHOLD_BYTES,
             },
             sender,

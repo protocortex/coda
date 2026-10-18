@@ -155,6 +155,8 @@ async fn a_session_runs_a_turn_with_a_permission_prompt_through_the_real_daemon(
             &SessionSendParams {
                 session_id: session.clone(),
                 text: "hello".to_owned(),
+                max_turns: None,
+                token_cap: None,
             },
         )
         .await

@@ -124,34 +124,6 @@ async fn bare_coda_with_a_running_daemon_reports_it() {
 }
 
 #[tokio::test]
-async fn run_parses_its_flags_then_reports_it_is_not_available() {
-    // Arrange
-    let dir = short_dir();
-    let ctx = context(dir.path());
-    let args = [
-        "coda",
-        "run",
-        "--prompt",
-        "hi",
-        "--cwd",
-        "/x",
-        "--mode",
-        "plan",
-        "--max-turns",
-        "3",
-        "--token-cap",
-        "100",
-    ];
-
-    // Act
-    let outcome = cli(&ctx, &args, "").await;
-
-    // Assert
-    assert_ne!(outcome.code, ExitCode::SUCCESS);
-    assert!(outcome.err.contains("not yet available"), "{}", outcome.err);
-}
-
-#[tokio::test]
 async fn run_with_an_unknown_mode_is_a_usage_error() {
     // Arrange
     let dir = short_dir();
@@ -161,7 +133,7 @@ async fn run_with_an_unknown_mode_is_a_usage_error() {
     let outcome = cli(&ctx, &["coda", "run", "--mode", "chaos"], "").await;
 
     // Assert
-    assert_eq!(outcome.code, ExitCode::from(2));
+    assert_eq!(outcome.code, ExitCode::from(64));
     assert!(outcome.err.contains("chaos"), "{}", outcome.err);
 }
 

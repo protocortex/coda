@@ -38,8 +38,10 @@ pub enum CliError {
     DaemonExited { status: ExitStatus, log: PathBuf },
     #[error("cannot grant outside a git repository; you will be prompted each time")]
     NoGitRoot,
-    #[error("`coda run` is not yet available")]
-    RunUnavailable,
+    #[error("no prompt: pass --prompt or write it to standard input")]
+    EmptyPrompt,
+    #[error("the connection to the daemon was lost before the run ended")]
+    RunInterrupted,
     #[error("the daemon has {activity}; use --force to restart it anyway")]
     DaemonBusy { activity: String },
     #[error("the running daemon was left alone")]

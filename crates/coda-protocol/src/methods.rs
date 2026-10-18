@@ -109,6 +109,12 @@ pub struct SessionSendParams {
     pub session_id: SessionId,
     /// User message text.
     pub text: String,
+    /// Most agent turns the session's loop may take, when it is built for this send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    /// Most tokens the session's loop may spend, when it is built for this send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_cap: Option<u64>,
 }
 
 /// Result of [`SESSION_SEND`].

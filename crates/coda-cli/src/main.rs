@@ -3,6 +3,7 @@
 use std::io::{stderr, stdin, stdout};
 use std::process::ExitCode;
 
+use coda_cli::exit::FAILURE;
 use coda_cli::{Context, Io, run};
 
 fn main() -> ExitCode {
@@ -10,14 +11,14 @@ fn main() -> ExitCode {
         Ok(runtime) => runtime,
         Err(e) => {
             eprintln!("coda: could not start the async runtime: {e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(FAILURE);
         }
     };
     let ctx = match Context::from_env() {
         Ok(ctx) => ctx,
         Err(e) => {
             eprintln!("coda: {e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(FAILURE);
         }
     };
     // Unlocked: the daemon logs to stdout from worker threads, which a lock held
