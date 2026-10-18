@@ -156,7 +156,10 @@ fn collect(receiver: Option<mpsc::Receiver<String>>, deadline: Instant) -> Strin
         .unwrap_or_default()
 }
 
-/// Extracts the first dotted version number from `--version` output.
+/// Extracts the first dotted version number from `--version` output, keeping a
+/// prerelease or build suffix such as `-alpha.3`. The allowlist matches the whole
+/// string exactly, and the Codex app-server's `serverInfo.version` is checked
+/// against the same list, so list the text both print.
 #[must_use]
 pub fn parse_version(output: &str) -> Option<String> {
     output
@@ -167,11 +170,20 @@ pub fn parse_version(output: &str) -> Option<String> {
 }
 
 fn is_dotted_number(word: &str) -> bool {
-    let mut parts = word.split('.');
-    let all_numeric = parts
-        .clone()
-        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
-    all_numeric && parts.nth(1).is_some()
+    let (core, suffix) = match word.split_once(['-', '+']) {
+        Some((core, suffix)) => (core, Some(suffix)),
+        None => (word, None),
+    };
+    let numeric = core.contains('.')
+        && core
+            .split('.')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    let valid_suffix = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+    };
+    numeric && suffix.is_none_or(valid_suffix)
 }
 
 #[cfg(all(test, unix))]
@@ -216,6 +228,9 @@ mod tests {
             ("2.1.292 (Claude Code)", Some("2.1.292")),
             ("codex-cli 0.9.1\n", Some("0.9.1")),
             ("v1.2.3", Some("1.2.3")),
+            ("codex-cli 0.1.0-alpha.3", Some("0.1.0-alpha.3")),
+            ("tool 1.2.3+build.5 (x)", Some("1.2.3+build.5")),
+            ("1.2.3- 1.2.4", Some("1.2.4")),
             ("no version here", None),
             ("", None),
         ];

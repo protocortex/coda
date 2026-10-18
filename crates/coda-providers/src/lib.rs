@@ -6,6 +6,7 @@ pub mod anthropic;
 pub mod backend;
 pub mod claude_code;
 pub mod claude_session;
+pub mod codex;
 pub mod codex_app_server;
 pub mod codex_exec;
 pub mod detect;

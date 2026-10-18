@@ -34,7 +34,7 @@ use crate::claude_session::{
     CancelHandle, EXIT_GRACE, READ_CHUNK_BYTES, REAP_TIMEOUT, TurnOutcome, allowlisted, cancelled,
     kill_group,
 };
-use crate::codex_exec::SandboxMode;
+use crate::codex_exec::{SandboxMode, SpawnHook};
 use crate::gate::PermissionGate;
 use crate::tool_request::{Tool, ToolRequest};
 use crate::websocket::{
@@ -105,6 +105,9 @@ pub enum AppServerError {
         /// The request method.
         method: &'static str,
     },
+    /// The caller could not record the started server.
+    #[error("could not record the started Codex app-server: {0}")]
+    SpawnHook(String),
     /// Talking to the server failed.
     #[error("I/O with the Codex app-server failed: {0}")]
     Io(#[from] std::io::Error),
@@ -226,11 +229,17 @@ pub struct CodexAppServerSession {
 impl CodexAppServerSession {
     /// Starts the server and opens the thread: socket, upgrade, `initialize`,
     /// `initialized` and `thread/start`. Must be called inside a tokio runtime.
+    /// `on_spawn` sees the server's pid right after it starts, before the
+    /// handshake, so a crash mid-start still leaves it recorded.
     ///
     /// # Errors
-    /// Fails when the server cannot start, refuses the upgrade, breaks the protocol
-    /// or is not ready in time; the child is stopped on every failure.
-    pub async fn start(spec: AppServerSpec) -> Result<Self, AppServerError> {
+    /// Fails when the server cannot start, `on_spawn` fails, the server refuses the
+    /// upgrade, breaks the protocol or is not ready in time; the child is stopped on
+    /// every failure.
+    pub async fn start(
+        spec: AppServerSpec,
+        on_spawn: Option<SpawnHook>,
+    ) -> Result<Self, AppServerError> {
         let socket_dir = tempfile::Builder::new()
             .prefix(SOCKET_DIR_PREFIX)
             .permissions(std::fs::Permissions::from_mode(SOCKET_DIR_MODE))
@@ -242,6 +251,9 @@ impl CodexAppServerSession {
         }
         let mut child = spawn_server(&spec, &socket)?;
         let mut guard = ChildGuard(child.id());
+        if let (Some(hook), Some(pid)) = (on_spawn, child.id()) {
+            hook(pid).await.map_err(AppServerError::SpawnHook)?;
+        }
         let handshake = timeout(START_TIMEOUT, Self::handshake(&spec, &socket, &mut child)).await;
         let (stream, reader, version, thread_id) = match handshake {
             Ok(result) => result?,

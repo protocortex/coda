@@ -12,6 +12,10 @@ use crate::detect::{DEFAULT_PROBE_TIMEOUT, DetectRequest, DetectedBinary, Detect
 /// Claude Code versions verified to work; extended by `verified_versions` in config.
 pub const VERIFIED_CLAUDE_CODE_VERSIONS: &[&str] = &["2.1.292"];
 
+/// Codex versions verified to work. None are verified against a live `codex` yet,
+/// so every version comes from `verified_versions` in config.
+pub const VERIFIED_CODEX_VERSIONS: &[&str] = &[];
+
 /// Why a backend cannot be used.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BackendError {

@@ -7,8 +7,8 @@
 //! watchdog aborts a silent backend, and the child is stopped and its pidfile
 //! removed however the turn ends.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::PathBuf;
@@ -22,7 +22,7 @@ use coda_protocol::methods::{
     SessionSendParams, SessionSendResult,
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
-use coda_providers::claude_session::{ClaudeSession, TurnOutcome};
+use coda_providers::claude_session::TurnOutcome;
 use coda_providers::gate::PermissionGate;
 use coda_providers::registry::RegistryError;
 use coda_providers::tool_request::ToolRequest;
@@ -35,7 +35,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, info, warn};
 
-use crate::backends::{SessionStart, StartError, pidfile_path, start_claude_session};
+use crate::backends::{
+    AgentSession, CodexStart, SessionStart, StartError, pidfile_path, resolve_codex_off_worker,
+    start_claude_session, start_codex_session,
+};
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
 use crate::gate::{BrokerGate, Brokers};
 use crate::model_session::{Limits, ModelError, ModelSessions};
@@ -52,7 +55,8 @@ pub const BACKEND_UNSUPPORTED: i64 = -32004;
 
 /// Stored event kind of the user's message.
 pub const USER_MESSAGE_KIND: &str = "user_message";
-const BACKEND_NAME: &str = "claude_code";
+const CLAUDE_BACKEND_NAME: &str = "claude_code";
+const CODEX_BACKEND_NAME: &str = "codex";
 /// Events buffered between the adapter and the store writer. The adapter's
 /// emit callback is synchronous and must not block, so when the store falls
 /// this far behind, further events are dropped with a warning.
@@ -61,7 +65,8 @@ const EVENT_QUEUE_CAPACITY: usize = 1024;
 /// How turns start their backend.
 #[derive(Debug, Clone)]
 pub struct TurnConfig {
-    /// The resolved Claude Code executable, when one was found.
+    /// The resolved Claude Code executable, when one was found. Codex is
+    /// located per turn from `models` and the `PATH` of `parent_env`.
     pub binary: Option<PathBuf>,
     /// Directory that holds the children's pidfiles.
     pub pidfile_dir: PathBuf,
@@ -139,15 +144,17 @@ pub struct Turns {
     /// A session is present from the moment a send reserves it; the cancel
     /// handle is set once the backend runs. Never held across an await.
     running: Mutex<HashMap<SessionId, Option<CancelHandle>>>,
-    /// Claude Code's own session ids, so the next turn resumes the conversation.
+    /// The backends' own session ids, so the next turn resumes the conversation.
     backend_ids: Mutex<HashMap<SessionId, String>>,
+    /// Sessions that have run an app-server turn, whose next thread starts empty.
+    codex_threads: Mutex<HashSet<SessionId>>,
 }
 
 struct Job {
     session: SessionId,
     turn: TurnId,
     text: String,
-    child: ClaudeSession,
+    child: AgentSession,
     gate: BrokerGate,
 }
 
@@ -169,6 +176,7 @@ impl Turns {
             models,
             running: Mutex::default(),
             backend_ids: Mutex::default(),
+            codex_threads: Mutex::default(),
         })
     }
 
@@ -192,7 +200,9 @@ impl Turns {
             .await
             .map_err(|e| not_found_or(e, &session_id))?;
         match record.backend {
-            BackendKind::ClaudeCode => self.send_claude(record, text).await,
+            BackendKind::ClaudeCode | BackendKind::CodexAppServer | BackendKind::CodexExec => {
+                self.send_agent(record, text).await
+            }
             BackendKind::Anthropic | BackendKind::OpenaiCompat | BackendKind::Faux => {
                 let limits = Limits {
                     max_turns,
@@ -204,15 +214,16 @@ impl Turns {
         }
     }
 
-    async fn send_claude(
+    async fn send_agent(
         self: &Arc<Self>,
         record: SessionRecord,
         text: String,
     ) -> Result<TurnId, TurnError> {
         let session_id = record.id.clone();
-        let Some(binary) = self.config.binary.clone() else {
+        let is_claude = record.backend == BackendKind::ClaudeCode;
+        if is_claude && self.config.binary.is_none() {
             return Err(TurnError::Unsupported(session_id));
-        };
+        }
         let slot = self.reserve(&session_id)?;
         let broker = self
             .brokers
@@ -220,15 +231,12 @@ impl Turns {
             .await
             .map_err(ModelError::from)?;
         info!(session = %session_id, step = "start_backend", "starting turn");
-        let mut child = start_claude_session(SessionStart {
-            binary,
-            cwd: PathBuf::from(&record.cwd),
-            session_id: session_id.clone(),
-            resume: self.resume_id(&session_id),
-            parent_env: self.config.parent_env.clone(),
-            pidfile_dir: self.config.pidfile_dir.clone(),
-        })
-        .await?;
+        let backend_name = if is_claude {
+            CLAUDE_BACKEND_NAME
+        } else {
+            CODEX_BACKEND_NAME
+        };
+        let mut child = self.start_child(&record).await?;
         let turn = match Self::begin(&self.hub, &session_id, &text).await {
             Ok(turn) => turn,
             Err(e) => {
@@ -253,9 +261,45 @@ impl Turns {
             gate,
         };
         let turns = Arc::clone(self);
-        let span = backend_span(&job.session, &job.turn, BACKEND_NAME);
+        let span = backend_span(&job.session, &job.turn, backend_name);
         spawn_guarded(slot, async move { turns.run(job).await }.instrument(span));
         Ok(turn)
+    }
+
+    /// Starts the backend child of `record`'s session, with its pidfile.
+    async fn start_child(&self, record: &SessionRecord) -> Result<AgentSession, StartError> {
+        let session_id = record.id.clone();
+        let cwd = PathBuf::from(&record.cwd);
+        let resume = self.resume_id(&session_id);
+        let parent_env = self.config.parent_env.clone();
+        let pidfile_dir = self.config.pidfile_dir.clone();
+        if let (BackendKind::ClaudeCode, Some(binary)) = (record.backend, &self.config.binary) {
+            let session = start_claude_session(SessionStart {
+                binary: binary.clone(),
+                cwd,
+                session_id,
+                resume,
+                parent_env,
+                pidfile_dir,
+            })
+            .await?;
+            return Ok(AgentSession::Claude(Box::new(session)));
+        }
+        let search_dirs = path_dirs(&parent_env);
+        let settings = resolve_codex_off_worker(self.config.models.clone(), search_dirs).await?;
+        let continued = self.codex_threads().contains(&session_id);
+        let session = start_codex_session(CodexStart {
+            settings,
+            cwd,
+            session_id: session_id.clone(),
+            resume,
+            continued,
+            parent_env,
+            pidfile_dir,
+        })
+        .await?;
+        self.codex_threads().insert(session_id);
+        Ok(AgentSession::Codex(Box::new(session)))
     }
 
     /// Cancels the running turn of `session`; `false` when none is running.
@@ -310,6 +354,12 @@ impl Turns {
 
     fn resume_id(&self, session: &SessionId) -> Option<String> {
         self.backend_ids().get(session).cloned()
+    }
+
+    fn codex_threads(&self) -> std::sync::MutexGuard<'_, HashSet<SessionId>> {
+        self.codex_threads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn backend_ids(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, String>> {
@@ -454,7 +504,15 @@ fn deny_unanswered(store: &mut Store, open: &[PendingPermission]) {
     }
 }
 
-async fn stop(child: &mut ClaudeSession, session: &SessionId) {
+/// The directories on the `PATH` of `env`.
+fn path_dirs(env: &[(OsString, OsString)]) -> Vec<PathBuf> {
+    env.iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| std::env::split_paths(value).collect())
+        .unwrap_or_default()
+}
+
+async fn stop(child: &mut AgentSession, session: &SessionId) {
     if let Err(e) = child.shutdown().await {
         warn!(session = %session, error = %e, "could not reap the backend");
     }

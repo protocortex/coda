@@ -7,7 +7,9 @@
 //! them against a live `codex` is still open.
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +34,23 @@ const RESUME_ARG: &str = "resume";
 /// Tells `codex exec` to read the prompt from stdin, which keeps it out of the process list.
 const STDIN_PROMPT_ARG: &str = "-";
 const MAX_THREAD_ID_BYTES: usize = 128;
+
+/// The future a [`SpawnHook`] returns; `Err` carries the reason it failed.
+pub type SpawnHookFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+/// Called with the process id of each child right after it starts, so the caller
+/// can record it; a failure stops the child and fails the turn.
+pub type SpawnHook = Arc<dyn Fn(u32) -> SpawnHookFuture + Send + Sync>;
+
+/// Gives the hook the `Debug` the session derives.
+#[derive(Clone)]
+struct HookSlot(SpawnHook);
+
+impl std::fmt::Debug for HookSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpawnHook")
+    }
+}
 
 /// A thread id is passed as a command-line argument, so it must never parse as a flag.
 fn is_valid_thread_id(id: &str) -> bool {
@@ -88,6 +107,9 @@ pub enum CodexError {
     /// The thread id to resume is not a plain identifier.
     #[error("the Codex thread id to resume is not a valid identifier")]
     InvalidThreadId,
+    /// The caller could not record the started child.
+    #[error("could not record the started Codex child: {0}")]
+    SpawnHook(String),
 }
 
 /// What it takes to start a session.
@@ -215,6 +237,7 @@ pub struct CodexExecSession {
     parser: CodexParser,
     cancel: Arc<watch::Sender<bool>>,
     backend_session_id: Option<String>,
+    spawn_hook: Option<HookSlot>,
     closed: bool,
 }
 
@@ -228,8 +251,16 @@ impl CodexExecSession {
             child: None,
             parser: CodexParser::new(),
             cancel: Arc::new(watch::channel(false).0),
+            spawn_hook: None,
             closed: false,
         }
+    }
+
+    /// Calls `hook` with the pid of every child this session starts.
+    #[must_use]
+    pub fn with_spawn_hook(mut self, hook: SpawnHook) -> Self {
+        self.spawn_hook = Some(HookSlot(hook));
+        self
     }
 
     /// A handle that cancels this session from another task.
@@ -264,7 +295,8 @@ impl CodexExecSession {
     /// # Errors
     /// Returns [`CodexError::Closed`] on a shut down session,
     /// [`CodexError::Spawn`] when the binary cannot start and
-    /// [`CodexError::Io`] when the child cannot be read, and
+    /// [`CodexError::Io`] when the child cannot be read, [`CodexError::SpawnHook`] when its
+    /// start cannot be recorded, and
     /// [`CodexError::InvalidThreadId`] when the thread to resume is not a plain identifier.
     pub async fn run_turn(
         &mut self,
@@ -280,7 +312,19 @@ impl CodexExecSession {
         }
         self.parser = CodexParser::new();
         let spawned = self.spawn()?;
+        self.announce_spawn().await?;
         self.supervise(turn_id, text, emit, spawned).await
+    }
+
+    async fn announce_spawn(&mut self) -> Result<(), CodexError> {
+        let (Some(HookSlot(hook)), Some(pid)) = (self.spawn_hook.clone(), self.pid()) else {
+            return Ok(());
+        };
+        if let Err(reason) = hook(pid).await {
+            let _ = self.reap(Duration::ZERO).await;
+            return Err(CodexError::SpawnHook(reason));
+        }
+        Ok(())
     }
 
     /// Runs the exchange; an I/O error also stops the group so no descendant leaks.

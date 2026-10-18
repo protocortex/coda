@@ -1,17 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Registration of the Claude Code session adapter with the daemon.
+//! Registration of the delegated agent backends with the daemon, and how their
+//! children are started with a pidfile the startup reaper can find.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use coda_config::config::Config;
-use coda_protocol::types::{BackendKind, SessionId};
+use coda_protocol::events::Event;
+use coda_protocol::types::{BackendKind, SessionId, TurnId};
 use coda_providers::backend::{
-    AgentBackend, BackendError, VERIFIED_CLAUDE_CODE_VERSIONS, locate, require_enabled,
+    AgentBackend, BackendError, VERIFIED_CLAUDE_CODE_VERSIONS, VERIFIED_CODEX_VERSIONS, locate,
+    require_enabled,
 };
-use coda_providers::claude_session::{AdapterError, ClaudeSession, SessionSpec};
+use coda_providers::claude_session::{
+    AdapterError, CancelHandle, ClaudeSession, SessionSpec, TurnOutcome,
+};
+use coda_providers::codex::{
+    CodexLaunch, CodexSession, CodexSessionError, SandboxError, SandboxMode, SpawnHook,
+    resolve_sandbox,
+};
 use coda_providers::detect::DetectedBinary;
+use coda_providers::gate::PermissionGate;
 
 use crate::pidfile::{self, PidfileError};
 
@@ -20,6 +31,8 @@ pub const PIDFILE_EXTENSION: &str = "pid";
 
 const CONFIG_KEY: &str = "claude_code";
 const BINARY_NAME: &str = "claude";
+const CODEX_CONFIG_KEY: &str = "codex";
+const CODEX_BINARY_NAME: &str = "codex";
 
 /// Claude Code as the daemon's delegated agent.
 #[derive(Debug, Clone, Copy)]
@@ -40,8 +53,28 @@ impl AgentBackend for ClaudeCodeBackend {
     }
 }
 
-/// The delegated agent backends the daemon registers; a Codex backend joins here.
-const AGENT_BACKENDS: &[&dyn AgentBackend] = &[&ClaudeCodeBackend];
+/// Codex as a delegated agent. It registers as the app-server backend; a session
+/// that falls back to `exec` reports [`BackendKind::CodexExec`] itself.
+#[derive(Debug, Clone, Copy)]
+pub struct CodexBackend;
+
+impl AgentBackend for CodexBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::CodexAppServer
+    }
+    fn config_key(&self) -> &'static str {
+        CODEX_CONFIG_KEY
+    }
+    fn binary_name(&self) -> &'static str {
+        CODEX_BINARY_NAME
+    }
+    fn verified_versions(&self) -> &'static [&'static str] {
+        VERIFIED_CODEX_VERSIONS
+    }
+}
+
+/// The delegated agent backends the daemon registers.
+const AGENT_BACKENDS: &[&dyn AgentBackend] = &[&ClaudeCodeBackend, &CodexBackend];
 
 /// The registered agent backends that `config` enables.
 #[must_use]
@@ -78,6 +111,14 @@ pub enum StartError {
         pidfile: String,
         source: AdapterError,
     },
+    #[error(transparent)]
+    Backend(#[from] BackendError),
+    #[error(transparent)]
+    Sandbox(#[from] SandboxError),
+    #[error(transparent)]
+    Codex(#[from] CodexSessionError),
+    #[error("the Codex version check could not run: {0}")]
+    Probe(#[from] tokio::task::JoinError),
 }
 
 /// What it takes to start one Claude Code session.
@@ -126,6 +167,167 @@ pub async fn start_claude_session(start: SessionStart) -> Result<ClaudeSession, 
     Ok(session)
 }
 
+/// What a Codex session runs with, resolved from the `providers.codex` config.
+#[derive(Debug, Clone)]
+pub struct CodexSettings {
+    pub binary: PathBuf,
+    pub sandbox: SandboxMode,
+    pub verified_versions: Vec<String>,
+    /// Whether the binary's own `--version` is on the verified list.
+    pub binary_verified: bool,
+}
+
+/// Finds the Codex binary and the sandbox its sessions run under.
+///
+/// # Errors
+/// Returns [`StartError::Backend`] when Codex is disabled or not installed and
+/// [`StartError::Sandbox`] when the sandbox is wider than read-only without
+/// `allow_wider_sandbox`.
+pub fn resolve_codex(
+    config: &Config,
+    search_dirs: &[PathBuf],
+) -> Result<CodexSettings, StartError> {
+    let binary = locate(&CodexBackend, config, search_dirs)?;
+    let section = require_enabled(&CodexBackend, config)?;
+    let sandbox = resolve_sandbox(section.sandbox.as_deref(), section.allow_wider_sandbox)?;
+    let verified_versions = CodexBackend
+        .verified_versions()
+        .iter()
+        .map(|version| (*version).to_owned())
+        .chain(section.verified_versions.iter().cloned())
+        .collect();
+    Ok(CodexSettings {
+        binary: binary.path,
+        sandbox,
+        verified_versions,
+        binary_verified: binary.verified,
+    })
+}
+
+/// [`resolve_codex`] on a blocking thread, because probing `--version` waits on a
+/// child process and must not hold up a runtime worker.
+///
+/// # Errors
+/// Returns what [`resolve_codex`] returns, or [`StartError::Probe`] when the
+/// blocking task does not finish.
+pub async fn resolve_codex_off_worker(
+    config: Config,
+    search_dirs: Vec<PathBuf>,
+) -> Result<CodexSettings, StartError> {
+    tokio::task::spawn_blocking(move || resolve_codex(&config, &search_dirs)).await?
+}
+
+/// What it takes to start one Codex session.
+#[derive(Debug, Clone)]
+pub struct CodexStart {
+    pub settings: CodexSettings,
+    pub cwd: PathBuf,
+    pub session_id: SessionId,
+    pub resume: Option<String>,
+    /// Whether earlier turns exist that an app-server thread cannot see.
+    pub continued: bool,
+    pub parent_env: Vec<(OsString, OsString)>,
+    /// Directory that holds the child's pidfile.
+    pub pidfile_dir: PathBuf,
+}
+
+/// Starts the Codex session, recording a pidfile for every child it spawns
+/// (the app-server once, the exec fallback on each turn).
+///
+/// # Errors
+/// Returns [`StartError::Codex`] when the session cannot start, including when
+/// a pidfile cannot be written.
+pub async fn start_codex_session(start: CodexStart) -> Result<CodexSession, StartError> {
+    let path = pidfile_path(&start.pidfile_dir, &start.session_id);
+    let exe = start.settings.binary.clone();
+    let record_pid: SpawnHook = Arc::new(move |pid| {
+        let (path, exe) = (path.clone(), exe.clone());
+        Box::pin(async move {
+            pidfile::write(&path, pid, &exe)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+    });
+    let launch = CodexLaunch {
+        binary: start.settings.binary,
+        cwd: start.cwd,
+        session_id: start.session_id,
+        resume: start.resume,
+        sandbox: start.settings.sandbox,
+        verified_versions: start.settings.verified_versions,
+        binary_verified: start.settings.binary_verified,
+        continued: start.continued,
+        parent_env: start.parent_env,
+    };
+    Ok(CodexSession::start(launch, Some(record_pid)).await?)
+}
+
+/// The session of whichever agent backend a turn runs on.
+#[derive(Debug)]
+pub enum AgentSession {
+    Claude(Box<ClaudeSession>),
+    Codex(Box<CodexSession>),
+}
+
+/// Why a turn on an [`AgentSession`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum AgentError {
+    #[error(transparent)]
+    Claude(#[from] AdapterError),
+    #[error(transparent)]
+    Codex(#[from] CodexSessionError),
+}
+
+impl AgentSession {
+    /// A handle that cancels the session from another task.
+    #[must_use]
+    pub fn cancel_handle(&self) -> CancelHandle {
+        match self {
+            Self::Claude(session) => session.cancel_handle(),
+            Self::Codex(session) => session.cancel_handle(),
+        }
+    }
+
+    /// The backend's own conversation id, so the next turn can resume it.
+    #[must_use]
+    pub fn session_id_from_backend(&self) -> Option<&str> {
+        match self {
+            Self::Claude(session) => session.session_id_from_backend(),
+            Self::Codex(session) => session.session_id_from_backend(),
+        }
+    }
+
+    /// Runs one prompt to the end of the turn.
+    ///
+    /// # Errors
+    /// Returns the error of the backend that ran the turn.
+    pub async fn run_turn<G: PermissionGate>(
+        &mut self,
+        turn_id: &TurnId,
+        text: &str,
+        gate: &G,
+        emit: &mut impl FnMut(Event),
+    ) -> Result<TurnOutcome, AgentError> {
+        Ok(match self {
+            Self::Claude(session) => session.run_turn(turn_id, text, gate, emit).await?,
+            Self::Codex(session) => session.run_turn(turn_id, text, gate, emit).await?,
+        })
+    }
+
+    /// Stops the backend's process group.
+    ///
+    /// # Errors
+    /// Returns the error of the backend.
+    pub async fn shutdown(&mut self) -> Result<(), AgentError> {
+        match self {
+            Self::Claude(session) => session.shutdown().await?,
+            Self::Codex(session) => session.shutdown().await?,
+        }
+        Ok(())
+    }
+}
+
 /// The pidfile path of `session` under `dir`.
 #[must_use]
 pub fn pidfile_path(dir: &Path, session: &SessionId) -> PathBuf {
@@ -137,16 +339,26 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    use std::time::Duration;
+
     use coda_protocol::types::{BackendKind, SessionId};
     use coda_providers::backend::AgentBackend;
+    use coda_providers::codex::SandboxError;
+    use coda_providers::codex_exec::SandboxMode;
+    use coda_store::Store;
 
     use coda_config::config::Config;
 
     use super::{
-        ClaudeCodeBackend, SessionStart, StartError, enabled_agent_backends, pidfile_path,
-        start_claude_session,
+        ClaudeCodeBackend, CodexStart, SessionStart, StartError, enabled_agent_backends,
+        pidfile_path, resolve_codex, resolve_codex_off_worker, start_claude_session,
+        start_codex_session,
     };
     use crate::pidfile::{is_same_process, read};
+    use crate::reaper::reap;
+    use crate::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
+
+    const WAIT: Duration = Duration::from_secs(30);
 
     fn start(dir: &tempfile::TempDir, binary: std::path::PathBuf) -> SessionStart {
         SessionStart {
@@ -242,5 +454,176 @@ mod tests {
         // Assert
         assert!(matches!(result, Err(StartError::Spawn(_))));
         assert!(!pidfile_path(dir.path(), &SessionId::new("s-1")).exists());
+    }
+
+    fn codex_config(extra: &str) -> Config {
+        let binary = coda_testkit::paths::fake_codex_path().unwrap();
+        let toml = format!(
+            "[providers.codex]\nenabled = true\nbinary = \"{}\"\nverified_versions = [\"0.0.0-fake\"]\n{extra}",
+            binary.display()
+        );
+        Config::from_toml_str(&toml).unwrap().config
+    }
+
+    fn codex_start(dir: &tempfile::TempDir, config: &Config) -> CodexStart {
+        CodexStart {
+            settings: resolve_codex(config, &[]).unwrap(),
+            cwd: dir.path().to_path_buf(),
+            session_id: SessionId::new("s-1"),
+            resume: None,
+            continued: false,
+            parent_env: Vec::new(),
+            pidfile_dir: dir.path().to_path_buf(),
+        }
+    }
+
+    fn control(dir: &tempfile::TempDir, value: &serde_json::Value) {
+        fs::write(
+            dir.path().join("fake-codex-control.json"),
+            value.to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn codex_is_registered_only_when_its_section_is_enabled() {
+        // Arrange
+        let both = Config::from_toml_str(
+            "[providers.claude_code]\nenabled = true\n[providers.codex]\nenabled = true\n",
+        )
+        .unwrap()
+        .config;
+        let disabled = Config::from_toml_str("[providers.codex]\nenabled = false\n")
+            .unwrap()
+            .config;
+
+        // Act
+        let (on, off) = (
+            enabled_agent_backends(&both),
+            enabled_agent_backends(&disabled),
+        );
+
+        // Assert
+        assert_eq!(on, [BackendKind::ClaudeCode, BackendKind::CodexAppServer]);
+        assert_eq!(off, Vec::<BackendKind>::new());
+    }
+
+    #[test]
+    fn a_wider_sandbox_is_refused_without_the_opt_in_and_accepted_with_it() {
+        // Arrange
+        let refused = codex_config("sandbox = \"workspace-write\"\n");
+        let accepted = codex_config("sandbox = \"workspace-write\"\nallow_wider_sandbox = true\n");
+        let default = codex_config("");
+
+        // Act
+        let (refused, accepted, default) = (
+            resolve_codex(&refused, &[]),
+            resolve_codex(&accepted, &[]),
+            resolve_codex(&default, &[]),
+        );
+
+        // Assert
+        assert!(matches!(
+            refused,
+            Err(StartError::Sandbox(SandboxError::WiderRefused { .. }))
+        ));
+        assert_eq!(accepted.unwrap().sandbox, SandboxMode::WorkspaceWrite);
+        let default = default.unwrap();
+        assert_eq!(default.sandbox, SandboxMode::ReadOnly);
+        assert!(
+            default.binary_verified,
+            "a prerelease version is matched whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_codex_app_server_has_an_owner_only_pidfile_until_it_stops() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let config = codex_config("");
+
+        // Act
+        let mut session = start_codex_session(codex_start(&dir, &config))
+            .await
+            .unwrap();
+
+        // Assert
+        let path = pidfile_path(dir.path(), &SessionId::new("s-1"));
+        let record = read(&path).unwrap();
+        assert_eq!(session.kind(), BackendKind::CodexAppServer);
+        assert_eq!(Some(record.pid), session.pid());
+        assert!(is_same_process(&record).await);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_finishes_starting_still_has_a_pidfile_the_reaper_kills() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        control(&dir, &serde_json::json!({"hang_start": true}));
+        let config = codex_config("");
+        let starting = tokio::spawn(start_codex_session(codex_start(&dir, &config)));
+        let path = pidfile_path(dir.path(), &SessionId::new("s-1"));
+        tokio::time::timeout(WAIT, async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("no pidfile appeared while the server was starting");
+        let hub = Hub::new(
+            Store::open(&dir.path().join("store")).unwrap(),
+            DEFAULT_QUEUE_CAPACITY,
+        );
+
+        // Act
+        let report = reap(dir.path(), &hub).await;
+        let result = tokio::time::timeout(WAIT, starting)
+            .await
+            .expect("the killed server did not end the start in time")
+            .unwrap();
+
+        // Assert
+        assert_eq!(report.killed, 1);
+        assert!(!path.exists());
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_slow_version_probe_does_not_block_other_tasks() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("codex");
+        fs::write(&binary, "#!/bin/sh\nsleep 0.5\necho 'codex-cli 1.0.0'\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let toml = format!(
+            "[providers.codex]\nenabled = true\nbinary = \"{}\"\n",
+            binary.display()
+        );
+        let config = Config::from_toml_str(&toml).unwrap().config;
+        let mut ticks = 0_u32;
+
+        // Act
+        let settings = tokio::time::timeout(WAIT, async {
+            tokio::select! {
+                settings = resolve_codex_off_worker(config, Vec::new()) => settings,
+                () = async {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        ticks += 1;
+                    }
+                } => unreachable!("the ticker never ends"),
+            }
+        })
+        .await
+        .expect("the probe did not finish in time");
+
+        // Assert
+        assert_eq!(settings.unwrap().binary, binary);
+        assert!(ticks >= 5, "only {ticks} ticks ran during the probe");
     }
 }
