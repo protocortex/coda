@@ -8,7 +8,9 @@ use std::path::Path;
 use coda_store::{Store, StoreError, Symbol as StoredSymbol};
 
 use crate::symbols::Symbol;
-use crate::walk::{IndexedFile, SkipReason, Skipped, WalkError, WalkLimits, index_workspace};
+use crate::walk::{
+    IndexedFile, SkipReason, Skipped, WalkError, WalkLimits, WalkReport, index_workspace,
+};
 
 /// A file the store refused to update; its previous rows are untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,25 +47,39 @@ pub enum UpdateError {
     Store(#[from] StoreError),
 }
 
-/// Brings the index of the repo at `root` in line with the files on disk.
-///
-/// The repo is keyed by `root` as given. A file whose content hash is
-/// unchanged is left alone, a changed one has its rows replaced in one
-/// transaction, and one no longer on disk is cleared. A file the walk skipped
-/// or the store rejected keeps its previous rows, except one that is too large
-/// or binary, which is cleared.
+/// Walks `root` and applies the result with [`apply_walk`].
 ///
 /// # Errors
 ///
-/// Returns [`UpdateError`] when the walk cannot start or the stored state
-/// cannot be read. A failure on one file is reported in [`UpdateReport::failed`].
+/// Returns [`UpdateError`] when the walk cannot start or [`apply_walk`] fails.
 pub fn update_index(
     store: &mut Store,
     root: &Path,
     limits: WalkLimits,
 ) -> Result<UpdateReport, UpdateError> {
+    apply_walk(store, root, index_workspace(root, limits)?)
+}
+
+/// Brings the index of the repo at `root` in line with a finished `walk`.
+///
+/// Taking a finished walk lets a caller walk without holding the store.
+///
+/// The repo is keyed by `root` as given. A file whose content hash is
+/// unchanged keeps its rows and has its index time renewed, a changed one has
+/// its rows replaced in one transaction, and one no longer on disk is cleared.
+/// A file the walk skipped or the store rejected keeps its previous rows,
+/// except one that is too large or binary, which is cleared.
+///
+/// # Errors
+///
+/// Returns [`UpdateError`] when the stored state cannot be read or renewed. A
+/// failure on one file is reported in [`UpdateReport::failed`].
+pub fn apply_walk(
+    store: &mut Store,
+    root: &Path,
+    walk: WalkReport,
+) -> Result<UpdateReport, UpdateError> {
     let repo = root.to_string_lossy();
-    let walk = index_workspace(root, limits)?;
     let stored: BTreeMap<String, String> = store
         .indexed_files(&repo)?
         .into_iter()
@@ -107,6 +123,7 @@ pub fn update_index(
             Err(err) => report.failed.push(failure(path, &err)),
         }
     }
+    store.restamp_files(&repo, &report.unchanged)?;
     Ok(report)
 }
 
@@ -239,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_files_are_skipped_by_content_hash() {
+    fn unchanged_files_are_skipped_by_content_hash_and_restamped() {
         // Arrange
         let mut f = fixture();
         write(f.repo.path(), "src/a.rs", "fn alpha() {}\n");
@@ -257,7 +274,7 @@ mod tests {
             .store
             .indexed_files(&f.repo.path().to_string_lossy())
             .unwrap();
-        assert_eq!(files[0].indexed_at, 100);
+        assert_eq!(files[0].indexed_at, 900);
     }
 
     #[test]
@@ -278,6 +295,22 @@ mod tests {
             find(&f.store, f.repo.path(), "new_name"),
             [("src/a.rs".to_owned(), 3)]
         );
+    }
+
+    #[test]
+    fn a_finished_walk_applies_without_touching_the_disk_again() {
+        // Arrange
+        let mut f = fixture();
+        write(f.repo.path(), "src/a.rs", "fn walked() {}\n");
+        let walk = index_workspace(f.repo.path(), WalkLimits::default()).unwrap();
+        fs::remove_file(f.repo.path().join("src/a.rs")).unwrap();
+
+        // Act
+        let report = apply_walk(&mut f.store, f.repo.path(), walk).unwrap();
+
+        // Assert
+        assert_eq!(report.indexed, strings(&["src/a.rs"]));
+        assert_eq!(find(&f.store, f.repo.path(), "walked").len(), 1);
     }
 
     #[test]

@@ -66,6 +66,27 @@ impl Store {
         Ok(())
     }
 
+    /// Records the current time as the index time of each of `files` in `repo`,
+    /// for files confirmed unchanged, in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when a write fails; no time is changed then.
+    pub fn restamp_files(&mut self, repo: &str, files: &[String]) -> Result<(), StoreError> {
+        let now = self.clock.now_ms();
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE index_files SET indexed_at = ?3 WHERE repo_path = ?1 AND file_path = ?2",
+            )?;
+            for file in files {
+                stmt.execute(params![repo, file, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Removes every symbol and the recorded hash stored for `file` in `repo`.
     ///
     /// # Errors

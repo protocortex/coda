@@ -91,6 +91,38 @@ pub fn index_workspace(root: &Path, limits: WalkLimits) -> Result<WalkReport, Wa
     walk(root, limits, extract)
 }
 
+/// Lists the supported source files under `root` that a walk would read,
+/// relative to `root`, without opening them. Errors are skipped.
+#[must_use]
+pub fn list_sources(root: &Path, limits: WalkLimits) -> Vec<PathBuf> {
+    let is_source = |entry: &ignore::DirEntry| {
+        Language::from_path(entry.path()).is_some()
+            && entry.file_type().is_some_and(|t| t.is_file())
+            && entry
+                .metadata()
+                .is_ok_and(|m| m.len() <= limits.max_file_bytes)
+    };
+    walker(root)
+        .filter_map(Result::ok)
+        .filter(is_source)
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(root)
+                .unwrap_or(entry.path())
+                .to_path_buf()
+        })
+        .collect()
+}
+
+/// `require_git(false)` so .gitignore applies in unpacked or non-repo trees.
+fn walker(root: &Path) -> ignore::Walk {
+    WalkBuilder::new(root)
+        .require_git(false)
+        .sort_by_file_path(Ord::cmp)
+        .build()
+}
+
 type Extractor = fn(Language, &[u8]) -> Result<Vec<Symbol>, SymbolError>;
 
 fn walk(root: &Path, limits: WalkLimits, extractor: Extractor) -> Result<WalkReport, WalkError> {
@@ -98,12 +130,7 @@ fn walk(root: &Path, limits: WalkLimits, extractor: Extractor) -> Result<WalkRep
         return Err(WalkError::NotADirectory(root.to_path_buf()));
     }
     let mut report = WalkReport::default();
-    // `require_git(false)` so .gitignore applies in unpacked or non-repo trees.
-    let walker = WalkBuilder::new(root)
-        .require_git(false)
-        .sort_by_file_path(Ord::cmp)
-        .build();
-    for entry in walker {
+    for entry in walker(root) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
@@ -213,6 +240,23 @@ mod tests {
         assert_eq!(paths(&report), ["src/a.rs", "web/b.ts"]);
         assert_eq!(report.files[0].symbols[0].name, "a");
         assert_eq!(report.files[1].symbols[0].name, "B");
+    }
+
+    #[test]
+    fn lists_only_supported_files_within_the_size_limit() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".gitignore", b"ignored/\n");
+        write(dir.path(), "ignored/x.rs", b"fn x() {}\n");
+        write(dir.path(), "src/a.rs", b"fn a() {}\n");
+        write(dir.path(), "big.rs", &[b'a'; 64]);
+        write(dir.path(), "notes.md", b"# hi\n");
+
+        // Act
+        let listed = list_sources(dir.path(), WalkLimits { max_file_bytes: 32 });
+
+        // Assert
+        assert_eq!(listed, [PathBuf::from("src/a.rs")]);
     }
 
     #[test]

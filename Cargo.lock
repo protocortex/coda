@@ -318,6 +318,7 @@ name = "coda-core"
 version = "0.0.0"
 dependencies = [
  "coda-config",
+ "coda-index",
  "coda-protocol",
  "coda-providers",
  "coda-store",

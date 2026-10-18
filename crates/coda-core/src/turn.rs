@@ -585,6 +585,10 @@ fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
         "read" => RequestTool::Read,
         "grep" => RequestTool::Grep,
         "retrieve" => RequestTool::Retrieve,
+        "code_search" => RequestTool::CodeSearch,
+        "code_symbol" => RequestTool::CodeSymbol,
+        "code_outline" => RequestTool::CodeOutline,
+        "code_read_range" => RequestTool::CodeReadRange,
         other => RequestTool::Unknown(other.to_owned()),
     };
     ToolRequest {
@@ -631,6 +635,26 @@ fn request_message(message: &Message) -> RequestMessage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn code_tools_map_to_their_own_permission_tools() {
+        // Arrange
+        let names = [
+            ("code_search", RequestTool::CodeSearch),
+            ("code_symbol", RequestTool::CodeSymbol),
+            ("code_outline", RequestTool::CodeOutline),
+            ("code_read_range", RequestTool::CodeReadRange),
+        ];
+
+        for (name, expected) in names {
+            // Act
+            let request =
+                super::tool_request(name, &serde_json::json!({"path": "a.rs"}), Path::new("/ws"));
+
+            // Assert
+            assert_eq!(request.tool, expected, "{name}");
+        }
+    }
+
     use std::ffi::OsString;
     use std::future::Future;
     use std::path::Path;
