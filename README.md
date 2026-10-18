@@ -6,14 +6,149 @@ Status: early development. The previous TypeScript implementation lives in `prot
 
 License: AGPL-3.0-only. See `LICENSE`.
 
+## Account risk notice
+
+Coda can drive the `claude` and `codex` programs you have installed. If you sign in to them with a subscription, Coda uses that subscription on your behalf.
+
+Coda has not verified that the Anthropic terms allow this use of the `claude` binary. Coda has not verified that the OpenAI terms allow this use of the `codex` binary. You must check the terms for your account yourself. A mistake can put your account at risk.
+
+The claude_code and codex backends stay disabled until you enable them. Set `enabled = true` under `[providers.claude_code]` or `[providers.codex]` only after you have read the terms. The `anthropic`, `openai_compat` and `faux` providers use an API key or a script, not a subscription.
+
 ## Build
+
+You need a stable Rust toolchain. The repository pins one in `rust-toolchain.toml`.
 
 ```sh
 cargo build --workspace
 ```
+
+The binary is `target/debug/coda`. Put it on your `PATH` for the commands below.
+
+## Quickstart with the faux provider
+
+The faux provider replays a script you write. It needs no network and no account, so it is the safest way to try Coda.
+
+Use a new, short `CODA_HOME`. The daemon socket lives inside it, and macOS limits socket paths to 104 bytes.
+
+```sh
+export CODA_HOME="$(mktemp -d /tmp/coda.XXXXXX)"
+```
+
+Write a script with one turn, and a config that enables the faux provider.
+
+```sh coda-test
+mkdir -p "$CODA_HOME"
+cat > "$CODA_HOME/script.json" <<EOF
+[{"events": [
+  {"type": "text_delta", "text": "hello from faux"},
+  {"type": "usage", "input_tokens": 11, "output_tokens": 7},
+  {"type": "stop", "reason": "end_turn"}
+]}]
+EOF
+cat > "$CODA_HOME/config.toml" <<EOF
+[providers.faux]
+enabled = true
+script = "$CODA_HOME/script.json"
+EOF
+```
+
+Run a prompt. `coda run` starts a daemon if none is running. With the faux provider enabled it answers from the script.
+
+```sh coda-test
+coda run --prompt "say hello" --cwd "$PWD"
+```
+
+```text coda-output
+hello from faux
+```
+
+Check the daemon and the token counts.
+
+```sh coda-test
+coda ping
+coda usage
+```
+
+```text coda-output
+pong
+input tokens: 11
+output tokens: 7
+cache read tokens: 0
+cache write tokens: 0
+saved bytes: 0
+```
+
+Run the health check. It exits 0 when every check passes.
+
+```sh coda-test
+coda doctor --json | grep -q '"healthy":true'
+```
+
+A grant lets one exact command run without a prompt. It applies to the git repository you name. This block makes a new repository in a new directory, so it leaves your own working directory alone.
+
+```sh coda-test
+cd "$(mktemp -d)"
+git init -q .
+coda grant add --repo . "cargo test"
+```
+
+Stop the daemon when you are done.
+
+```sh coda-test
+kill "$(coda status | sed -n 's/^pid: //p')"
+```
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `coda daemon` | Run the daemon in the foreground. `coda daemon restart` replaces a running one. |
+| `coda status` | Show the daemon pid, version and uptime. It fails if no daemon runs. |
+| `coda ping` | Print `pong` if a daemon answers. It fails if no daemon runs. |
+| `coda run` | Run one prompt to completion. Flags: `--prompt`, `--cwd`, `--mode`, `--max-turns`, `--token-cap`. Without `--prompt` it reads the prompt from standard input. |
+| `coda grant add` | Allow one command in a repository permanently. Flags: `--repo`, `--cwd`, `--tool`. |
+| `coda usage` | Show token usage and savings. `--session` limits it to one session. It asks a running daemon, or reads the database when none runs. |
+| `coda doctor` | Check the socket, lock, orphaned backends, database, schema, database release, config and backends. `--repair` removes a stale socket and kills orphaned backends. `--json` prints JSON. |
+
+`coda run`, `coda grant add` and bare `coda` start a daemon if none is running. `coda daemon restart` starts one too. `coda status`, `coda ping`, `coda usage` and `coda doctor` do not start one.
+
+`coda run` picks its backend from the config. It uses the faux provider if `[providers.faux]` is enabled, and the anthropic provider otherwise. It does not pick `openai_compat`, `claude_code` or `codex`.
+
+Every command accepts `--force`, but it only matters in two cases. A command that starts a daemon (`coda run`, `coda grant add`, bare `coda`) asks before it replaces a busy daemon that speaks another protocol version, and `--force` skips that question. `coda daemon restart` refuses to replace a busy daemon unless you pass `--force`.
+
+## Exit codes
+
+`coda run`:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | The turn ended. |
+| 1 | The turn limit was reached. |
+| 2 | The token budget was used up. |
+| 3 | The context window is full. |
+| 4 | The run was cancelled. |
+| 5 | Any other stop, or a failed turn. |
+| 64 | Bad usage. |
+| 70 | The run itself failed. |
+
+`coda doctor`: 0 healthy, 20 at least one check failed, 21 only warnings, 64 bad usage, 70 the check itself failed.
+
+## Configuration
+
+Settings live in `config.toml` under `CODA_HOME`. Without `CODA_HOME`, Coda uses `$HOME/.config/coda`. See [docs/config.md](docs/config.md) for every key, its default and its checks.
+
+Backends: `claude_code`, `codex`, `anthropic`, `openai_compat` and `faux`. Each is a `[providers.<name>]` section.
 
 ## Permissions
 
 The permission broker decides tool requests in three modes: `prompt`, `accept-edits` and `deny-all`. Always-allow grants are stored per repository and match the exact tool, working directory and command text.
 
 For delegated sessions the broker is not authoritative for tools that Claude Code auto-allows through its own settings.
+
+## Upgrades and the database
+
+Every database migration is tied to the release that introduced it. A database written by a newer release is refused, not guessed at. Move to a newer release, not back to an older one.
+
+## More
+
+Self-hosting acceptance: [docs/selfhost.md](docs/selfhost.md).
