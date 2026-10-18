@@ -36,16 +36,17 @@ const CLAUDE_FLAGS: &[&str] = &[
     "stdio",
 ];
 const RESUME_FLAG: &str = "--resume";
-/// Parent variables the child may inherit. Credentials and `CLAUDECODE` are absent by design.
-const ENV_ALLOWLIST: &[&str] = &[
+/// Parent variables a delegated agent may inherit. Credentials such as
+/// `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, and `CLAUDECODE`, are absent by design.
+pub const ENV_ALLOWLIST: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR",
     "TZ",
 ];
-const READ_CHUNK_BYTES: usize = 16 * 1024;
+pub(crate) const READ_CHUNK_BYTES: usize = 16 * 1024;
 /// How long a child whose output ended gets to exit on its own, so its exit code survives.
-const EXIT_GRACE: Duration = Duration::from_millis(500);
+pub(crate) const EXIT_GRACE: Duration = Duration::from_millis(500);
 /// How long to wait for a killed child to be reaped before giving up on its status.
-const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why the adapter could not do what was asked.
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +113,10 @@ pub struct SessionSpec {
 pub struct CancelHandle(Arc<watch::Sender<bool>>);
 
 impl CancelHandle {
+    pub(crate) fn new(flag: Arc<watch::Sender<bool>>) -> Self {
+        Self(flag)
+    }
+
     /// Requests cancellation.
     pub fn cancel(&self) {
         self.0.send_replace(true);
@@ -151,12 +156,7 @@ impl ClaudeSession {
         }
         command
             .env_clear()
-            .envs(
-                spec.parent_env
-                    .iter()
-                    .filter(|(name, _)| ENV_ALLOWLIST.iter().any(|allowed| name == allowed))
-                    .map(|(name, value)| (name, value)),
-            )
+            .envs(allowlisted(&spec.parent_env))
             .current_dir(&spec.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -459,15 +459,25 @@ impl Drop for ClaudeSession {
     }
 }
 
+/// The parent variables a child may inherit.
+pub(crate) fn allowlisted(
+    parent_env: &[(OsString, OsString)],
+) -> impl Iterator<Item = (&OsString, &OsString)> {
+    parent_env
+        .iter()
+        .filter(|(name, _)| ENV_ALLOWLIST.iter().any(|allowed| name == allowed))
+        .map(|(name, value)| (name, value))
+}
+
 /// Sends SIGKILL to the process group led by `pid`; the group may already be gone.
-fn kill_group(pid: u32) {
+pub(crate) fn kill_group(pid: u32) {
     let group = i32::try_from(pid).ok().and_then(Pid::from_raw);
     if let Some(group) = group {
         let _ = kill_process_group(group, Signal::KILL);
     }
 }
 
-async fn cancelled(mut flag: watch::Receiver<bool>) {
+pub(crate) async fn cancelled(mut flag: watch::Receiver<bool>) {
     // An error means every sender is gone; the session owns one, so treat it as not cancelled.
     if flag.wait_for(|cancelled| *cancelled).await.is_err() {
         std::future::pending::<()>().await;
