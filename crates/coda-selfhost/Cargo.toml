@@ -1,0 +1,27 @@
+[package]
+name = "coda-selfhost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "coda_selfhost"
+path = "src/lib.rs"
+
+[[bin]]
+name = "coda-selfhost"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

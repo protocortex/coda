@@ -1,0 +1,6 @@
+# Two self-hosting tests build the workspace in a temporary copy; running them
+# alone keeps that load from tripping the timing-sensitive tests beside them.
+[[profile.default.overrides]]
+filter = 'binary(selfhost) & (test(the_scripted_attempt) | test(the_verifier_rejects))'
+threads-required = 'num-cpus'
+slow-timeout = { period = "300s", terminate-after = 6 }
