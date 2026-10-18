@@ -12,7 +12,8 @@ use coda_providers::anthropic::Timing;
 use coda_providers::anthropic::provider::IDLE_CHECK_INTERVAL;
 use coda_providers::anthropic::request::{RequestSettings, ToolSchema};
 use coda_providers::model::{
-    Clock, ModelEvent, ModelProvider, ModelRequest, ProviderError, Sleeper, StopReason, Usage,
+    Clock, ModelEvent, ModelProvider, ModelRequest, ProviderError, RequestMessage, RequestToolCall,
+    Sleeper, StopReason, Usage,
 };
 use coda_providers::openai_compat::classify_status;
 use coda_providers::openai_compat::provider::{OpenAiCompatOptions, OpenAiCompatProvider};
@@ -20,6 +21,7 @@ use coda_providers::testing::contract::{Collected, Scenario, collect, run_contra
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 const WAIT: Duration = Duration::from_secs(5);
 const SECRET: &str = "sk-test-secret";
@@ -64,6 +66,8 @@ struct Mock {
     url: String,
     requests: Arc<Mutex<Vec<Captured>>>,
     flooded: Arc<AtomicUsize>,
+    /// Notified when the client closes a connection the server holds open.
+    closed: Arc<Notify>,
 }
 
 impl Mock {
@@ -81,17 +85,23 @@ fn start(replies: Vec<Reply>) -> Mock {
         url: format!("http://127.0.0.1:{port}"),
         requests: Arc::default(),
         flooded: Arc::default(),
+        closed: Arc::default(),
     };
     let replies = Arc::new(Mutex::new(replies));
     let requests = Arc::clone(&mock.requests);
     let flooded = Arc::clone(&mock.flooded);
+    let closed = Arc::clone(&mock.closed);
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             let reply = {
                 let mut queue = replies.lock().expect("lock");
                 (!queue.is_empty()).then(|| queue.remove(0))
             };
-            let shared = (Arc::clone(&requests), Arc::clone(&flooded));
+            let shared = (
+                Arc::clone(&requests),
+                Arc::clone(&flooded),
+                Arc::clone(&closed),
+            );
             tokio::spawn(serve(socket, reply, shared));
         }
     });
@@ -156,10 +166,10 @@ async fn write_http(socket: &mut TcpStream, status: u16, headers: &[(&str, Strin
     socket.write_all(body.as_bytes()).await.expect("body");
 }
 
-type Shared = (Arc<Mutex<Vec<Captured>>>, Arc<AtomicUsize>);
+type Shared = (Arc<Mutex<Vec<Captured>>>, Arc<AtomicUsize>, Arc<Notify>);
 
 async fn serve(mut socket: TcpStream, reply: Option<Reply>, shared: Shared) {
-    let (requests, flooded) = shared;
+    let (requests, flooded, closed) = shared;
     let captured = read_request(&mut socket).await;
     let echoed = captured
         .header("authorization")
@@ -186,6 +196,7 @@ async fn serve(mut socket: TcpStream, reply: Option<Reply>, shared: Shared) {
             socket.flush().await.expect("flush");
             let mut sink = [0u8; 64];
             while hang && socket.read(&mut sink).await.is_ok_and(|read| read > 0) {}
+            closed.notify_one();
         }
     }
     let _ = socket.shutdown().await;
@@ -734,4 +745,362 @@ async fn the_provider_passes_the_shared_contract_suite() {
 
     // Assert
     assert_eq!(result, Ok(()));
+}
+
+#[tokio::test]
+async fn dropping_the_stream_closes_the_connection() {
+    // Arrange
+    let first = chunk(&json!({"content": "a"}), None);
+    let mock = start(vec![Reply::Sse {
+        body: first,
+        hang: true,
+    }]);
+    let (provider, _sleeper, _clock) = provider(&mock);
+    let mut stream = provider.stream(request()).await.expect("stream");
+    tokio::time::timeout(WAIT, stream.next())
+        .await
+        .expect("event");
+
+    // Act
+    drop(stream);
+
+    // Assert
+    tokio::time::timeout(WAIT, mock.closed.notified())
+        .await
+        .expect("the server saw the client disconnect");
+}
+
+fn stream_error(kind: &str) -> Reply {
+    sse(&frame(&json!({"error": {"type": kind, "message": "nope"}})))
+}
+
+#[tokio::test]
+async fn an_error_object_inside_the_stream_ends_it_with_the_classified_error() {
+    // Arrange
+    let overflow = frame(&json!({"error": {"code": "context_length_exceeded"}}));
+    let cases: Vec<(&str, Vec<Reply>, ProviderError, usize)> = vec![
+        (
+            "a server error is retried, then reported",
+            vec![
+                stream_error("server_error"),
+                stream_error("server_error"),
+                stream_error("server_error"),
+            ],
+            retryable_error(),
+            3,
+        ),
+        (
+            "an unknown kind is fatal at once",
+            vec![
+                stream_error("invalid_request_error"),
+                sse(&text_stream(&["x"])),
+            ],
+            fatal_error(),
+            1,
+        ),
+        (
+            "an overflow is a context window overflow",
+            vec![sse(&overflow), sse(&text_stream(&["x"]))],
+            ProviderError::ContextWindowExceeded,
+            1,
+        ),
+    ];
+    for (name, replies, expected, attempts) in cases {
+        let mock = start(replies);
+
+        // Act
+        let (collected, _sleeper) = run(&mock).await;
+
+        // Assert
+        let error = collected.error.expect(name);
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected),
+            "{name}: {error}"
+        );
+        assert_eq!(mock.attempts(), attempts, "{name}");
+        assert_eq!(collected.events, [], "{name}");
+    }
+}
+
+fn retryable_error() -> ProviderError {
+    ProviderError::Retryable {
+        message: String::new(),
+    }
+}
+
+fn fatal_error() -> ProviderError {
+    ProviderError::Fatal {
+        message: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn a_stream_that_ends_before_any_output_is_retried_then_reported() {
+    // Arrange
+    let mock = start(vec![sse(""), sse(""), sse("")]);
+
+    // Act
+    let (collected, _sleeper) = run(&mock).await;
+
+    // Assert
+    assert!(matches!(
+        collected.error,
+        Some(ProviderError::Retryable { .. })
+    ));
+    assert_eq!(mock.attempts(), 3);
+}
+
+#[tokio::test]
+async fn an_empty_stream_followed_by_a_good_one_succeeds_on_the_retry() {
+    // Arrange
+    let mock = start(vec![sse(""), sse(&text_stream(&["ok"]))]);
+
+    // Act
+    let (collected, _sleeper) = run(&mock).await;
+
+    // Assert
+    assert_eq!(collected.error, None);
+    assert_eq!(collected.events[0], text("ok"));
+    assert_eq!(mock.attempts(), 2);
+}
+
+#[tokio::test]
+async fn a_rotated_key_is_picked_up_on_the_next_call() {
+    // Arrange
+    let mock = start(vec![sse(&text_stream(&["a"])), sse(&text_stream(&["b"]))]);
+    let current = Arc::new(Mutex::new("key-one".to_owned()));
+    let reader = Arc::clone(&current);
+    let (provider, _sleeper, _clock) = build(mock.url.clone(), Some(KEY_ENV), move |_| {
+        Some(reader.lock().expect("lock").clone())
+    })
+    .expect("provider");
+
+    // Act
+    collect(&provider, request(), WAIT).await;
+    *current.lock().expect("lock") = "key-two".to_owned();
+    collect(&provider, request(), WAIT).await;
+
+    // Assert
+    let requests = mock.requests.lock().expect("lock");
+    assert_eq!(requests[0].header("authorization"), Some("Bearer key-one"));
+    assert_eq!(requests[1].header("authorization"), Some("Bearer key-two"));
+}
+
+#[tokio::test]
+async fn assistant_tool_calls_and_tool_results_are_encoded_in_the_request() {
+    // Arrange
+    let mock = start(vec![sse(&text_stream(&["ok"]))]);
+    let (provider, _sleeper, _clock) = provider(&mock);
+    let conversation = ModelRequest {
+        messages: vec![
+            RequestMessage::User("go".to_owned()),
+            RequestMessage::Assistant {
+                text: "reading".to_owned(),
+                tool_calls: vec![RequestToolCall {
+                    id: "c1".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: "{\"path\":\"a.txt\"}".to_owned(),
+                }],
+            },
+            RequestMessage::ToolResult {
+                call_id: "c1".to_owned(),
+                text: "contents".to_owned(),
+                is_error: false,
+            },
+            RequestMessage::ToolResult {
+                call_id: "c2".to_owned(),
+                text: "denied".to_owned(),
+                is_error: true,
+            },
+            RequestMessage::Assistant {
+                text: "done".to_owned(),
+                tool_calls: Vec::new(),
+            },
+        ],
+        ..ModelRequest::default()
+    };
+
+    // Act
+    let collected = collect(&provider, conversation, WAIT).await;
+
+    // Assert
+    assert_eq!(collected.error, None);
+    let requests = mock.requests.lock().expect("lock");
+    let messages = &requests[0].body["messages"];
+    let call = &messages[2]["tool_calls"][0];
+    assert_eq!(messages[2]["role"], "assistant");
+    assert_eq!(messages[2]["content"], "reading");
+    assert_eq!(call["id"], "c1");
+    assert_eq!(call["type"], "function");
+    assert_eq!(call["function"]["name"], "read");
+    assert_eq!(call["function"]["arguments"], "{\"path\":\"a.txt\"}");
+    assert_eq!(messages[3]["role"], "tool");
+    assert_eq!(messages[3]["tool_call_id"], "c1");
+    assert_eq!(messages[3]["content"], "contents");
+    assert_eq!(messages[4]["tool_call_id"], "c2");
+    assert_eq!(messages[4]["content"], "[tool error] denied");
+    assert!(messages[5].get("tool_calls").is_none());
+}
+
+#[tokio::test]
+async fn an_unsupported_finish_reason_is_fatal() {
+    // Arrange
+    let mock = start(vec![
+        sse(&(chunk(&json!({}), Some("brand_new")) + DONE)),
+        sse(&text_stream(&["x"])),
+    ]);
+
+    // Act
+    let (collected, _sleeper) = run(&mock).await;
+
+    // Assert
+    assert!(matches!(collected.error, Some(ProviderError::Fatal { .. })));
+    assert!(error_text(&collected).contains("unsupported reason brand_new"));
+    assert_eq!(mock.attempts(), 1);
+}
+
+#[tokio::test]
+async fn a_400_with_only_an_overflow_marker_is_a_context_window_overflow() {
+    for marker in [
+        "context length",
+        "context window",
+        "context size",
+        "maximum context",
+    ] {
+        // Arrange
+        let mock = start(vec![Reply::Http {
+            status: 400,
+            headers: Vec::new(),
+            body: json!({"error": {"message": format!("The {marker} is too small")}}).to_string(),
+        }]);
+
+        // Act
+        let (collected, _sleeper) = run(&mock).await;
+
+        // Assert
+        assert_eq!(
+            collected.error,
+            Some(ProviderError::ContextWindowExceeded),
+            "{marker}"
+        );
+        assert_eq!(mock.attempts(), 1, "{marker}");
+    }
+}
+
+#[tokio::test]
+async fn malformed_tool_arguments_are_passed_through_untouched() {
+    // Arrange
+    let body = call_delta(Some(0), Some("a"), Some("read"), "{\"path\": ")
+        + &call_delta(Some(0), None, None, "oops")
+        + &chunk(&json!({}), Some("tool_calls"))
+        + DONE;
+    let mock = start(vec![sse(&body)]);
+
+    // Act
+    let (collected, _sleeper) = run(&mock).await;
+
+    // Assert
+    assert_eq!(collected.error, None);
+    assert_eq!(
+        collected.events,
+        [
+            start_of("a", "read"),
+            fragment("a", "{\"path\": "),
+            fragment("a", "oops"),
+            usage(0, 0),
+            stop(StopReason::ToolUse),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn missing_usage_and_empty_choices_are_tolerated() {
+    // Arrange
+    let body = frame(&json!({"choices": []}))
+        + &frame(&json!({"id": "x"}))
+        + &chunk(&json!({"content": "hi"}), None)
+        + &chunk(&json!({}), Some("stop"))
+        + DONE;
+    let mock = start(vec![sse(&body)]);
+
+    // Act
+    let (collected, _sleeper) = run(&mock).await;
+
+    // Assert
+    assert_eq!(collected.error, None);
+    assert_eq!(
+        collected.events,
+        [text("hi"), usage(0, 0), stop(StopReason::EndTurn)]
+    );
+}
+
+#[tokio::test]
+async fn a_fragment_with_neither_id_nor_index_continues_the_latest_call() {
+    // Arrange
+    let body = call_delta(Some(0), Some("a"), Some("read"), "{\"p\":")
+        + &call_delta(Some(1), Some("b"), Some("write"), "{\"q\":")
+        + &call_delta(None, None, None, "1}")
+        + &chunk(&json!({}), Some("tool_calls"))
+        + DONE;
+    let mock = start(vec![sse(&body)]);
+
+    // Act
+    let (collected, _sleeper) = run(&mock).await;
+
+    // Assert
+    assert_eq!(collected.error, None);
+    assert_eq!(
+        collected.events,
+        [
+            start_of("a", "read"),
+            fragment("a", "{\"p\":"),
+            start_of("b", "write"),
+            fragment("b", "{\"q\":"),
+            fragment("b", "1}"),
+            usage(0, 0),
+            stop(StopReason::ToolUse),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_hand_written_stream_in_the_servers_usual_shape_replays_to_the_expected_events() {
+    // Arrange
+    let body = frame(
+        &json!({"id": "chatcmpl-1", "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
+        "finish_reason": null}]}),
+    ) + &chunk(&json!({"content": "Let me look."}), None)
+        + &call_delta(Some(0), Some("call_9"), Some("read"), "")
+        + &call_delta(Some(0), None, None, "{\"path\":")
+        + &call_delta(Some(0), None, None, "\"a.txt\"}")
+        + &chunk(&json!({}), Some("tool_calls"))
+        + &frame(&json!({"choices": [], "usage": {"prompt_tokens": 21,
+            "completion_tokens": 9, "total_tokens": 30}}))
+        + DONE;
+    let mock = start(vec![sse(&body)]);
+
+    // Act
+    let (collected, _sleeper) = run(&mock).await;
+
+    // Assert
+    assert_eq!(collected.error, None);
+    assert_eq!(
+        collected.events,
+        [
+            text("Let me look."),
+            start_of("call_9", "read"),
+            fragment("call_9", "{\"path\":"),
+            fragment("call_9", "\"a.txt\"}"),
+            usage(21, 9),
+            stop(StopReason::ToolUse),
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a stream recorded from a real server under CODA_LIVE_TESTS; no recording exists yet"]
+async fn a_recorded_real_stream_replays_to_the_expected_events() {
+    unimplemented!("parked until a real stream is recorded");
 }

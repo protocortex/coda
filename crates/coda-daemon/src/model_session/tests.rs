@@ -730,3 +730,118 @@ async fn the_tool_output_canary_is_content_in_originals_and_nowhere_else() {
     assert!(!span_text(&spans).contains(canary));
     assert_eq!(rig.bodies("tool_finished").await[0]["is_error"], false);
 }
+
+fn indexed_symbols(rig: &Rig, name: &str) -> i64 {
+    rig.db()
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn write_source(cwd: &std::path::Path, name: &str) {
+    std::fs::create_dir_all(cwd.join("src")).unwrap();
+    std::fs::write(cwd.join("src/lib.rs"), format!("pub fn {name}() {{}}\n")).unwrap();
+}
+
+#[tokio::test]
+async fn starting_a_session_indexes_the_workspace_without_any_edit() {
+    // Arrange
+    let mut rig = Rig::new(Mode::Default, &[text_turn("hi")]);
+    write_source(&rig.cwd, "indexed_at_start");
+    let before = indexed_symbols(&rig, "indexed_at_start");
+
+    // Act
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert_eq!(before, 0);
+    assert_eq!(indexed_symbols(&rig, "indexed_at_start"), 1);
+    assert_eq!(rig.bodies("result").await[0]["is_error"], false);
+}
+
+#[tokio::test]
+async fn a_failed_index_refresh_does_not_fail_the_session_start() {
+    // Arrange
+    let mut rig = Rig::new(Mode::Default, &[text_turn("hi")]);
+    write_source(&rig.cwd, "never_indexed");
+    // Without its tables the refresh cannot write, so it fails after the walk.
+    rig.db()
+        .execute_batch("DROP TABLE symbols_fts; DROP TABLE symbols; DROP TABLE index_files;")
+        .unwrap();
+
+    // Act
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert_eq!(rig.bodies("result").await[0]["is_error"], false);
+    assert_eq!(rig.bodies("stream_delta").await[0]["text"], "hi");
+}
+
+/// Files that are costly to parse yet hold few symbols, so the walk dominates
+/// the time and the writes that follow stay short.
+fn write_large_workspace(cwd: &std::path::Path) {
+    let body = "    let value = (1 + 2) * 3;\n".repeat(4000);
+    for file in 0..6 {
+        let source = format!("pub fn f{file}() {{\n{body}}}\n");
+        std::fs::write(cwd.join(format!("m{file}.rs")), source).unwrap();
+    }
+}
+
+/// The time a full walk of `cwd` takes on this machine.
+fn time_a_walk(cwd: &std::path::Path) -> Duration {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = std::sync::Mutex::new(Store::open(&scratch.path().join("store")).unwrap());
+    let started = std::time::Instant::now();
+    coda_core::tools::refresh_index(&store, cwd);
+    started.elapsed()
+}
+
+#[tokio::test]
+async fn a_store_user_is_not_blocked_while_the_index_walk_runs() {
+    // Arrange
+    let mut rig = Rig::new(Mode::Default, &[text_turn("hi")]);
+    write_large_workspace(&rig.cwd);
+    let walk = time_a_walk(&rig.cwd);
+    assert!(
+        walk > Duration::from_millis(100),
+        "{walk:?} is too short to measure"
+    );
+    let session = rig.session.clone();
+    let hub = Arc::clone(&rig.hub);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::clone(&done);
+    let user = tokio::spawn(async move {
+        let mut longest = Duration::ZERO;
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let started = std::time::Instant::now();
+            let session = session.clone();
+            hub.with_store(move |store| store.load_events(&session, 0, 10))
+                .await
+                .unwrap();
+            longest = longest.max(started.elapsed());
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        longest
+    });
+
+    // Act
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let longest = user.await.unwrap();
+
+    // Assert
+    assert!(
+        longest < walk / 2,
+        "a store call waited {longest:?} of a {walk:?} walk"
+    );
+    assert_eq!(indexed_symbols(&rig, "f5"), 1);
+}
