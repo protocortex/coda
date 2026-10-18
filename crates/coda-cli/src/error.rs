@@ -52,6 +52,10 @@ pub enum CliError {
     Environment(io::Error),
     #[error("could not wait for a shutdown signal: {0}")]
     Signal(io::Error),
+    #[error("could not repair: {0}")]
+    Repair(#[from] coda_daemon::repair::RepairError),
+    #[error("could not encode the report: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("could not write output: {0}")]
     Output(#[from] io::Error),
 }

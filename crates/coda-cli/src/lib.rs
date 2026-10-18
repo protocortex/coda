@@ -6,6 +6,7 @@ pub mod autostart;
 pub mod cli;
 mod context;
 mod daemon_cmd;
+mod doctor;
 mod error;
 pub mod exit;
 mod grant;
@@ -59,6 +60,7 @@ async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<ExitCode, C
     let force = cli.force;
     let done = match cli.command {
         Some(Command::Run(args)) => return run::run(ctx, io, force, args).await,
+        Some(Command::Doctor(args)) => return doctor::run(ctx, io, args).await,
         None => status::start(ctx, io, force).await,
         Some(Command::Daemon(DaemonArgs { action: None })) => daemon_cmd::serve(ctx).await,
         Some(Command::Daemon(DaemonArgs {

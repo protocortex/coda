@@ -275,6 +275,7 @@ dependencies = [
  "coda-core",
  "coda-daemon",
  "coda-protocol",
+ "coda-providers",
  "coda-store",
  "coda-telemetry",
  "coda-testkit",

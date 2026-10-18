@@ -12,6 +12,7 @@ pub mod pidfile;
 pub mod reaper;
 pub mod recover;
 pub mod registry;
+pub mod repair;
 pub mod server;
 pub mod session_rpc;
 pub mod state;

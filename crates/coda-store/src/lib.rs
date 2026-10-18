@@ -6,6 +6,7 @@ mod decisions;
 mod event_log;
 mod events;
 mod grants;
+pub mod health;
 mod index;
 pub mod migrate;
 mod originals;
