@@ -1023,3 +1023,42 @@ fn a_saving_for_an_unknown_session_is_rejected() {
     // Assert
     assert!(matches!(err, StoreError::SessionNotFound { .. }));
 }
+
+#[test]
+fn a_turn_stays_unfinished_until_it_ends_and_ending_twice_changes_nothing() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = store.create_session(&new_session("/a")).unwrap();
+    let first = store.begin_turn(&session).unwrap();
+    let second = store.begin_turn(&session).unwrap();
+
+    // Act
+    store.end_turn(&session, &first).unwrap();
+    store.end_turn(&session, &first).unwrap();
+    let unfinished = store.unfinished_turns().unwrap();
+
+    // Assert
+    assert_eq!(unfinished, vec![(session, second)]);
+}
+
+#[test]
+fn a_turn_reports_only_the_event_kinds_it_holds() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = store.create_session(&new_session("/a")).unwrap();
+    let held = store.begin_turn(&session).unwrap();
+    let other = store.begin_turn(&session).unwrap();
+    let record = EventRecord {
+        kind: "turn_interrupted".to_owned(),
+        body: "{}".to_owned(),
+    };
+    store.append_event(&session, &held, &record).unwrap();
+
+    // Act
+    let found = |turn, kind| store.turn_has_event(&session, turn, kind).unwrap();
+
+    // Assert
+    assert!(found(&held, "turn_interrupted"));
+    assert!(!found(&held, "result"));
+    assert!(!found(&other, "turn_interrupted"));
+}

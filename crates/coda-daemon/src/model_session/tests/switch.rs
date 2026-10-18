@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use coda_config::config::{Config, ModelAlias};
 use coda_protocol::types::{BackendKind, Mode, SessionId};
-use coda_store::NewSession;
+use coda_store::{NewSession, Store};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -247,6 +247,19 @@ async fn the_key_value_never_reaches_events_or_the_switched_session() {
     assert_eq!(record.model.as_deref(), Some("claude-fast"));
     assert!(!everything.contains(SECRET), "{everything}");
     assert!(!everything.contains("MY_ANTHROPIC_KEY"), "{everything}");
+}
+
+#[tokio::test]
+async fn a_model_switch_leaves_no_turn_open() {
+    // Arrange
+    let rig = api_rig(Arc::new(|_| Some(SECRET.to_owned())));
+
+    // Act
+    rig.sessions.set_model(&rig.session, "fast").await.unwrap();
+
+    // Assert
+    let open = rig.hub.with_store(Store::unfinished_turns).await.unwrap();
+    assert_eq!(open, vec![]);
 }
 
 #[test]

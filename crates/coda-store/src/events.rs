@@ -67,6 +67,59 @@ impl Store {
         Ok(turn_id(self.conn.last_insert_rowid()))
     }
 
+    /// Marks `turn` as ended now. A turn that already ended keeps its first end time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SessionNotFound`] or [`StoreError::TurnNotFound`].
+    pub fn end_turn(&mut self, session: &SessionId, turn: &TurnId) -> Result<(), StoreError> {
+        let session_row = self.existing_session_row(session)?;
+        let turn_row = owned_turn_row(&self.conn, session, session_row, turn)?;
+        self.conn.execute(
+            "UPDATE turns SET ended_at = ?1 WHERE id = ?2 AND ended_at IS NULL",
+            params![self.clock.now_ms(), turn_row],
+        )?;
+        Ok(())
+    }
+
+    /// Lists the turns that began and never ended, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the query fails.
+    pub fn unfinished_turns(&self) -> Result<Vec<(SessionId, TurnId)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, id FROM turns WHERE ended_at IS NULL ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                SessionId::new(row.get::<_, i64>(0)?.to_string()),
+                turn_id(row.get(1)?),
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Whether `turn` already has an event of `kind`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SessionNotFound`] or [`StoreError::TurnNotFound`].
+    pub fn turn_has_event(
+        &self,
+        session: &SessionId,
+        turn: &TurnId,
+        kind: &str,
+    ) -> Result<bool, StoreError> {
+        let session_row = self.existing_session_row(session)?;
+        let turn_row = owned_turn_row(&self.conn, session, session_row, turn)?;
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM events WHERE turn_id = ?1 AND kind = ?2)",
+            params![turn_row, kind],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Appends an event to `session` under the next sequence number, which is
     /// returned. Sequence numbers run 1, 2, 3 across all turns of the session.
     ///

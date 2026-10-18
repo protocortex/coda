@@ -171,19 +171,29 @@ async fn expire_session(
     pending: &[PendingPermission],
 ) -> Result<u32, HubError> {
     // An event belongs to a turn, and the turn that raised the request is not
-    // recorded. The turn starts only when there is an event to put in it.
-    let mut started_turn: Option<TurnId> = None;
+    // recorded, so the requests get a turn of their own.
+    let id = session.clone();
+    let turn = hub
+        .with_store_mut(move |store| store.begin_turn(&id))
+        .await?;
+    let expired = expire_requests(hub, session, &turn, pending).await?;
+    let id = session.clone();
+    let ended = turn.clone();
+    hub.with_store_mut(move |store| store.end_turn(&id, &ended))
+        .await?;
+    Ok(expired)
+}
+
+/// Records a timeout event in `turn` for each of `pending`, then denies it.
+/// Returns how many it denied; one a client answered meanwhile is skipped.
+pub(crate) async fn expire_requests(
+    hub: &Arc<Hub>,
+    session: &SessionId,
+    turn: &TurnId,
+    pending: &[PendingPermission],
+) -> Result<u32, HubError> {
     let mut expired = 0;
     for request in pending {
-        let turn = if let Some(turn) = &started_turn {
-            turn.clone()
-        } else {
-            let id = session.clone();
-            let started = hub
-                .with_store_mut(move |store| store.begin_turn(&id))
-                .await?;
-            started_turn.insert(started).clone()
-        };
         let event = Event::Timeout {
             session_id: session.clone(),
             request_id: request.id.clone(),
@@ -196,7 +206,7 @@ async fn expire_session(
         };
         // Publish before resolving: a failure here leaves the request open for
         // the next start instead of resolved with no timeout event.
-        hub.publish(session, &turn, record).await?;
+        hub.publish(session, turn, record).await?;
         match hub
             .resolve_pending(&request.id, PermissionDecision::Deny)
             .await

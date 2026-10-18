@@ -81,7 +81,7 @@ fn open_records_the_schema_version() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn newer_schema_version_is_refused() {
         err,
         StoreError::SchemaTooNew {
             found: 99,
-            supported: 6
+            supported: 7
         }
     ));
 }
@@ -544,4 +544,59 @@ fn v5_database_migrates_forward_keeping_symbols_and_seeding_file_state() {
         .unwrap();
     assert_eq!(row, ("kept".to_owned(), 0, None));
     assert_eq!(state, ("src/a.rs".to_owned(), String::new()));
+}
+
+const V6_SNAPSHOT: &str = include_str!("snapshots/v6.sql");
+const V6_OPEN_TURNS: &str = "INSERT INTO sessions (id, created_at) VALUES (1, 0);
+     INSERT INTO turns (id, session_id, started_at) VALUES (1, 1, 100);
+     INSERT INTO turns (id, session_id, started_at) VALUES (2, 1, 200);
+     INSERT INTO turns (id, session_id, started_at, ended_at) VALUES (3, 1, 300, 310);
+     INSERT INTO events (turn_id, seq, kind, body, at) VALUES (2, 1, 'k', 'b', 250);
+     INSERT INTO events (turn_id, seq, kind, body, at) VALUES (2, 2, 'k', 'b', 275);";
+
+#[test]
+fn v6_snapshot_migrates_forward_ending_every_open_turn() {
+    // Arrange
+    let mut old = Connection::open_in_memory().unwrap();
+    old.execute_batch(V6_SNAPSHOT).unwrap();
+    old.pragma_update(None, "user_version", 6).unwrap();
+    old.execute_batch(V6_OPEN_TURNS).unwrap();
+    let mut fresh = Connection::open_in_memory().unwrap();
+    migrate::migrate(&mut fresh).unwrap();
+
+    // Act
+    migrate::migrate(&mut old).unwrap();
+
+    // Assert
+    let ends: Vec<(i64, Option<i64>)> = old
+        .prepare("SELECT id, ended_at FROM turns ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(ends, [(1, Some(100)), (2, Some(275)), (3, Some(310))]);
+    assert_eq!(master_listing(&old), master_listing(&fresh));
+}
+
+#[test]
+fn opening_a_migrated_v6_database_leaves_recovery_no_unfinished_turn() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    fs::create_dir(&data_dir).unwrap();
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let db = data_dir.join("coda.db");
+    let old = Connection::open(&db).unwrap();
+    old.execute_batch(V6_SNAPSHOT).unwrap();
+    old.pragma_update(None, "user_version", 6).unwrap();
+    old.execute_batch(V6_OPEN_TURNS).unwrap();
+    drop(old);
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Act
+    let store = Store::open(&data_dir).unwrap();
+
+    // Assert
+    assert_eq!(store.unfinished_turns().unwrap(), vec![]);
 }

@@ -14,6 +14,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (4, include_str!("schema_v4.sql")),
     (5, include_str!("schema_v5.sql")),
     (6, include_str!("schema_v6.sql")),
+    (7, include_str!("schema_v7.sql")),
 ];
 
 /// Brings `conn` up to [`SCHEMA_VERSION`], applying each pending migration in

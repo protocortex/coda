@@ -408,7 +408,11 @@ impl Turns {
             kind: USER_MESSAGE_KIND.to_owned(),
             body,
         };
-        hub.publish(session, &turn, record).await?;
+        if let Err(e) = hub.publish(session, &turn, record).await {
+            // No task will run this turn, so nothing else would end it.
+            Self::finish(hub, session, &turn, true).await;
+            return Err(e);
+        }
         Ok(turn)
     }
 
@@ -505,11 +509,19 @@ impl Turns {
                     Ok(open) => deny_unanswered(store, &open),
                     Err(e) => warn!(session = %id, error = %e, "could not list open prompts"),
                 }
-                store.record_log_event(&log_event(LogEventKind::TurnEnded, &id, &turn_id))?;
-                if failed {
-                    store.record_log_event(&log_event(LogEventKind::Error, &id, &turn_id))?;
-                }
-                Ok(())
+                // End the turn first: the log is best effort, and a turn left
+                // open would be reported as interrupted at the next start.
+                let ended = store.end_turn(&id, &turn_id);
+                let logged = store
+                    .record_log_event(&log_event(LogEventKind::TurnEnded, &id, &turn_id))
+                    .and_then(|()| {
+                        if failed {
+                            store.record_log_event(&log_event(LogEventKind::Error, &id, &turn_id))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                ended.and(logged)
             })
             .await;
         if let Err(e) = recorded {

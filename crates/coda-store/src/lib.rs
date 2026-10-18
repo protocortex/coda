@@ -40,7 +40,7 @@ use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// File name of the database inside the data directory.
 pub const DB_FILE_NAME: &str = "coda.db";
