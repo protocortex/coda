@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use coda_config::config::{Config, PermissionMode};
@@ -39,10 +40,14 @@ use crate::backends::{
     AgentSession, CodexStart, SessionStart, StartError, pidfile_path, resolve_codex_off_worker,
     start_claude_session, start_codex_session,
 };
+mod drive;
+
+use self::drive::Drive;
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
 use crate::gate::{BrokerGate, Brokers};
 use crate::model_session::{Limits, ModelError, ModelSessions};
 use crate::subscribe::{Hub, HubError};
+use crate::supervisor::{RestartPolicy, Supervisor, TokioSleeper, Verdict};
 use crate::trace::backend_span;
 use crate::watchdog::{Phase, Timing, Watchdog};
 
@@ -148,9 +153,13 @@ pub struct Turns {
     backend_ids: Mutex<HashMap<SessionId, String>>,
     /// Sessions that have run an app-server turn, whose next thread starts empty.
     codex_threads: Mutex<HashSet<SessionId>>,
+    supervisor: Supervisor,
+    /// Set once the daemon shuts down, so no crashed backend is restarted.
+    stopping: AtomicBool,
 }
 
 struct Job {
+    record: SessionRecord,
     session: SessionId,
     turn: TurnId,
     text: String,
@@ -159,8 +168,16 @@ struct Job {
 }
 
 impl Turns {
+    /// Turns that restart a crashed backend with the default policy.
     #[must_use]
     pub fn new(hub: Arc<Hub>, config: TurnConfig) -> Arc<Self> {
+        let policy = RestartPolicy::new(coda_config::timing::Timing::default().restart_backoff);
+        Self::with_supervisor(hub, config, Supervisor::new(policy, Arc::new(TokioSleeper)))
+    }
+
+    /// Turns that restart a crashed backend as `supervisor` decides.
+    #[must_use]
+    pub fn with_supervisor(hub: Arc<Hub>, config: TurnConfig, supervisor: Supervisor) -> Arc<Self> {
         let brokers = Brokers::new(Arc::clone(&hub), config.models.permissions.grants.clone());
         let models = ModelSessions::new(
             Arc::clone(&hub),
@@ -177,6 +194,8 @@ impl Turns {
             running: Mutex::default(),
             backend_ids: Mutex::default(),
             codex_threads: Mutex::default(),
+            supervisor,
+            stopping: AtomicBool::new(false),
         })
     }
 
@@ -254,6 +273,7 @@ impl Turns {
         );
         slot.arm(cancel);
         let job = Job {
+            record,
             session: session_id,
             turn: turn.clone(),
             text,
@@ -321,6 +341,7 @@ impl Turns {
     }
 
     pub async fn shutdown(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
         self.models.shutdown().await;
     }
 
@@ -391,14 +412,15 @@ impl Turns {
         Ok(turn)
     }
 
-    /// The named steps of a running turn: drive the backend, drain its events,
-    /// clean up, record the end.
+    /// The named steps of a running turn: drive the backend (restarting it
+    /// when it crashes), drain its events, clean up, record the end.
     async fn run(self: Arc<Self>, job: Job) {
         let Job {
+            record,
             session,
             turn,
             text,
-            mut child,
+            child,
             gate,
         } = job;
         let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
@@ -412,26 +434,41 @@ impl Turns {
         let watched = WatchedGate {
             inner: gate,
             watchdog: Arc::clone(&watchdog),
+            tool_requested: AtomicBool::new(false),
         };
         let observer = Arc::clone(&watchdog);
         let emit_session = session.clone();
-        let mut emit = move |event: Event| {
+        let emit = move |event: Event| {
             observer.observe(&event);
             if tx.try_send(event).is_err() {
                 warn!(session = %emit_session, "event queue full or closed; dropping an event");
             }
         };
         info!(session = %session, turn = %turn, step = "drive", "driving the backend");
-        let mut timed_out = false;
-        let outcome = tokio::select! {
-            outcome = child.run_turn(&turn, &text, &watched, &mut emit) => outcome,
-            phase = watchdog.expired() => {
-                warn!(session = %session, turn = %turn, ?phase, "backend silent for too long; aborting");
-                timed_out = true;
-                emit(Event::TurnInterrupted { session_id: session.clone(), turn_id: turn.clone() });
-                Ok(TurnOutcome::Cancelled)
-            }
-        };
+        let mut drive = Drive::new(
+            &self,
+            &record,
+            &turn,
+            &text,
+            (&watched, &watchdog),
+            (child, emit),
+        );
+        let verdict = self.supervisor.run(&mut drive).await;
+        if let Verdict::Exhausted { restarts } = verdict {
+            warn!(session = %session, turn = %turn, restarts, "restart cap reached; failing the turn");
+            (drive.emit)(Event::Result {
+                session_id: session.clone(),
+                turn_id: turn.clone(),
+                is_error: true,
+            });
+        }
+        let Drive {
+            emit,
+            mut child,
+            outcome,
+            timed_out,
+            ..
+        } = drive;
         info!(session = %session, turn = %turn, step = "cleanup", "stopping the backend");
         stop(&mut child, &session).await;
         if let Some(backend_id) = child.session_id_from_backend() {
@@ -444,14 +481,14 @@ impl Turns {
             warn!(session = %session, "the event publisher stopped early");
         }
         remove_pidfile(&self.config.pidfile_dir, &session);
-        if let Err(e) = &outcome {
+        if let Some(Err(e)) = &outcome {
             warn!(session = %session, error = %e, "the turn failed");
         }
         // A cancelled turn is the user's choice, not a failure; a watchdog abort is one.
         let failed = timed_out
             || match &outcome {
-                Ok(TurnOutcome::Completed { is_error }) => *is_error,
-                Ok(TurnOutcome::Cancelled) => false,
+                Some(Ok(TurnOutcome::Completed { is_error })) => *is_error,
+                Some(Ok(TurnOutcome::Cancelled)) => false,
                 _ => true,
             };
         Self::finish(&self.hub, &session, &turn, failed).await;
@@ -522,10 +559,19 @@ async fn stop(child: &mut AgentSession, session: &SessionId) {
 struct WatchedGate {
     inner: BrokerGate,
     watchdog: Arc<Watchdog>,
+    /// Set once the backend asks to run any tool, which may have side effects.
+    tool_requested: AtomicBool,
+}
+
+impl WatchedGate {
+    fn tool_requested(&self) -> bool {
+        self.tool_requested.load(Ordering::SeqCst)
+    }
 }
 
 impl PermissionGate for WatchedGate {
     async fn request(&self, request: &ToolRequest) -> PermissionDecision {
+        self.tool_requested.store(true, Ordering::SeqCst);
         self.watchdog.set(Phase::PermissionPending);
         self.inner.request(request).await
     }

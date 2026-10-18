@@ -197,6 +197,7 @@ async fn a_process_exit_mid_turn_emits_backend_crashed() {
     assert!(events.contains(&Event::BackendCrashed {
         session_id: SessionId::new("s-1"),
         exit_code: Some(3),
+        will_restart: false,
     }));
 }
 

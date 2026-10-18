@@ -693,6 +693,7 @@ impl CodexAppServerSession {
         emit(Event::BackendCrashed {
             session_id: self.session_id.clone(),
             exit_code,
+            will_restart: false,
         });
         Ok(TurnOutcome::Crashed { exit_code })
     }

@@ -19,6 +19,8 @@ use super::{BACKEND_UNSUPPORTED, SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig, Tu
 use crate::dispatch::Dispatcher;
 use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
+use crate::supervisor::testing::RecordingSleeper;
+use crate::supervisor::{RestartPolicy, Supervisor};
 use crate::trace::BACKEND_SPAN;
 use crate::trace::capture::{Spans, install};
 use crate::watchdog::Timing;
@@ -34,6 +36,7 @@ const PAUSE_TEST_SKIP: Duration = Duration::from_millis(3 * PAUSE_TEST_IDLE_MS);
 const PAUSE_TEST_PERMISSION_MS: u64 = 60_000;
 const YIELDS_AFTER_SKIP: usize = 50;
 const QUEUE: usize = 256;
+const RESTART_BASE: Duration = Duration::from_millis(10);
 const STORE_DIR: &str = "store";
 const PROMPT_CANARY: &str = "CANARY-PROMPT-7f3a91";
 const HOME_CANARY: &str = "CANARY-HOME-c05e44";
@@ -52,7 +55,10 @@ fn relaxed() -> Timing {
     timing(20_000, 20_000)
 }
 
+mod restarts;
+
 struct Rig {
+    sleeper: Arc<RecordingSleeper>,
     data: TempDir,
     cwd: TempDir,
     hub: Arc<Hub>,
@@ -92,7 +98,12 @@ impl Rig {
             })
             .unwrap();
         let hub = Hub::new(store, QUEUE);
-        let turns = Turns::new(
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let supervisor = Supervisor::new(
+            RestartPolicy::new(RESTART_BASE),
+            Arc::clone(&sleeper) as Arc<_>,
+        );
+        let turns = Turns::with_supervisor(
             Arc::clone(&hub),
             TurnConfig {
                 binary: Some(coda_testkit::paths::fake_claude_path().unwrap()),
@@ -101,6 +112,7 @@ impl Rig {
                 timing,
                 models,
             },
+            supervisor,
         );
         let dispatcher = Dispatcher::new()
             .with_hub(Arc::clone(&hub))
@@ -108,6 +120,7 @@ impl Rig {
             .with_turns(Arc::clone(&turns));
         let (connection, outbox) = dispatcher.connect();
         Self {
+            sleeper,
             data,
             cwd,
             hub,

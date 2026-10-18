@@ -13,11 +13,16 @@
 //! end of file while the process lives on, and `open-credentials` opens
 //! `$HOME/.claude/.credentials.json` for writing and writes one byte, and
 //! `echo-text` sends the control file's `echo_text` back as a text delta.
+//! `tooldie` exits right after the tool call is answered, and `vanish` deletes
+//! its own binary before crashing like `crash`, so it cannot be started again.
+//! `flaky` crashes like `crash` the first time and works afterwards, using
+//! the control file's `crash_marker` path to remember it already crashed.
 //!
 //! Test controls come from `fake-claude-control.json` in the working
 //! directory, because the adapter passes the child only an allowlisted
 //! environment. `report_path` makes the binary write its arguments and
-//! environment facts there, `pid_path` receives the `sleep` pid, and
+//! environment facts there, `pid_path` receives the `sleep` pid, `pid_log` collects the pid of every
+//! `sleep` it started, one per line, and
 //! `flood` makes it fill stdout before it reads any input.
 
 use std::io::{self, BufRead, Write};
@@ -42,6 +47,9 @@ const CREDENTIALS_TRIGGER: &str = "open-credentials";
 const ECHO_TRIGGER: &str = "echo-text";
 const PARK_INTERVAL: Duration = Duration::from_secs(3600);
 const CRASH_TRIGGER: &str = "crash";
+const FLAKY_TRIGGER: &str = "flaky";
+const TOOL_DIE_TRIGGER: &str = "tooldie";
+const VANISH_TRIGGER: &str = "vanish";
 const NOISE_TRIGGER: &str = "noise";
 const CRASH_EXIT_CODE: i32 = 3;
 
@@ -86,10 +94,29 @@ fn start_grandchild(control: &Control) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
+    if let Some(log) = control.path("pid_log") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)?;
+        writeln!(file, "{}", child.id())?;
+    }
     match control.path("pid_path") {
         Some(path) => std::fs::write(path, child.id().to_string()),
         None => Ok(()),
     }
+}
+
+/// Whether this is the first `flaky` run, which is recorded by creating the marker.
+fn crashes_once(user_line: &str, control: &Control) -> io::Result<bool> {
+    let Some(marker) = control.path("crash_marker") else {
+        return Ok(false);
+    };
+    if !user_line.contains(FLAKY_TRIGGER) || marker.exists() {
+        return Ok(false);
+    }
+    std::fs::write(marker, b"crashed")?;
+    Ok(true)
 }
 
 fn open_credentials() -> io::Result<()> {
@@ -143,7 +170,11 @@ fn run_turn(
                 "delta":{"type":"text_delta","text":text}}}),
         )?;
     }
-    if user_line.contains(CRASH_TRIGGER) {
+    if user_line.contains(VANISH_TRIGGER) {
+        std::fs::remove_file(std::env::current_exe()?)?;
+        std::process::exit(CRASH_EXIT_CODE);
+    }
+    if user_line.contains(CRASH_TRIGGER) || crashes_once(user_line, control)? {
         std::process::exit(CRASH_EXIT_CODE);
     }
     if user_line.contains(ORPHAN_TRIGGER) {
@@ -163,6 +194,9 @@ fn run_turn(
     let Some(response) = lines.next().transpose()? else {
         return Ok(());
     };
+    if user_line.contains(TOOL_DIE_TRIGGER) {
+        std::process::exit(CRASH_EXIT_CODE);
+    }
     let text = if denied(&response) { "denied" } else { "ran" };
     emit(
         out,

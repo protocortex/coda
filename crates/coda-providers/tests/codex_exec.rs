@@ -304,7 +304,8 @@ async fn a_crash_mid_turn_is_reported_and_the_next_turn_starts_a_new_process() {
         events,
         vec![Event::BackendCrashed {
             session_id: SessionId::new("s-1"),
-            exit_code: Some(3)
+            exit_code: Some(3),
+            will_restart: false
         }]
     );
     assert_eq!(next, TurnOutcome::Completed { is_error: false });

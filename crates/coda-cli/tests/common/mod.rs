@@ -5,16 +5,19 @@
 use std::io::Cursor;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
 use coda_cli::{Context, Io, Wait, run};
+use coda_client::{Client, Subscription};
 use coda_config::config::Dirs;
+use coda_config::timing::Timing;
 use coda_daemon::server::{Server, ServerConfig};
 use coda_daemon::state::DaemonState;
 use coda_daemon::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
 use coda_store::Store;
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -116,4 +119,98 @@ impl TestDaemon {
             .expect("the daemon did not stop")
             .unwrap();
     }
+}
+
+pub const POLL: Duration = Duration::from_millis(50);
+
+/// Kills the daemon a test started and the backend groups it left in `run/`,
+/// even when an assertion fails first.
+pub struct Daemon {
+    pub child: Child,
+    pub run_dir: PathBuf,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let Ok(entries) = std::fs::read_dir(&self.run_dir) else {
+            return;
+        };
+        for path in entries.filter_map(|entry| Some(entry.ok()?.path())) {
+            if path.extension().is_none_or(|ext| ext != "pid") {
+                continue;
+            }
+            let pid = std::fs::read(&path)
+                .ok()
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                .and_then(|record| record["pid"].as_u64());
+            if let Some(pid) = pid {
+                let _ = Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{pid}")])
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
+pub fn start_daemon(home: &Path) -> Daemon {
+    let fake = coda_testkit::paths::fake_claude_path().unwrap();
+    let config = format!(
+        "[providers.claude_code]\nenabled = true\nbinary = {:?}\n",
+        fake.display().to_string()
+    );
+    std::fs::write(home.join("config.toml"), config).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_coda"))
+        .arg("daemon")
+        .env("CODA_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("coda binary should start");
+    Daemon {
+        child,
+        run_dir: Dirs::from_base(home).run_dir(),
+    }
+}
+
+pub fn timing() -> Timing {
+    Timing {
+        idle_timeout: WAIT,
+        ..Timing::for_tests()
+    }
+}
+
+pub async fn connect(home: &Path) -> Client {
+    let socket = Dirs::from_base(home).socket_path();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(client) = Client::connect(&socket, timing()).await {
+                return client;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("the daemon did not accept connections in time")
+}
+
+/// Reads notifications until `matches` accepts one and returns its params.
+pub async fn next_matching(
+    subscription: &mut Subscription,
+    matches: impl Fn(&str, &Value) -> bool,
+) -> Value {
+    tokio::time::timeout(WAIT, async {
+        while let Some(notification) = subscription.next().await {
+            let params = notification.params.unwrap_or(Value::Null);
+            if matches(&notification.method, &params) {
+                return params;
+            }
+        }
+        panic!("the subscription ended first");
+    })
+    .await
+    .expect("the expected notification did not arrive in time")
 }
