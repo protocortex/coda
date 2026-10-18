@@ -18,3 +18,6 @@ pub mod registry;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod tool_request;
+// The codec is used by the Codex app-server adapter, which lands separately.
+#[allow(dead_code)]
+mod websocket;
