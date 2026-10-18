@@ -37,7 +37,7 @@ use tracing::{Instrument, info, warn};
 use crate::backends::{SessionStart, StartError, pidfile_path, start_claude_session};
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
 use crate::gate::{BrokerGate, Brokers};
-use crate::model_session::{ModelError, ModelSessions};
+use crate::model_session::{Limits, ModelError, ModelSessions};
 use crate::subscribe::{Hub, HubError};
 use crate::trace::backend_span;
 use crate::watchdog::{Phase, Timing, Watchdog};
@@ -176,7 +176,12 @@ impl Turns {
     /// [`TurnError::Busy`], [`TurnError::Start`] when the backend cannot
     /// start, and [`TurnError::Hub`] when the store refuses.
     pub async fn send(self: &Arc<Self>, params: SessionSendParams) -> Result<TurnId, TurnError> {
-        let SessionSendParams { session_id, text } = params;
+        let SessionSendParams {
+            session_id,
+            text,
+            max_turns,
+            token_cap,
+        } = params;
         let id = session_id.clone();
         let record = self
             .hub
@@ -185,7 +190,13 @@ impl Turns {
             .map_err(|e| not_found_or(e, &session_id))?;
         match record.backend {
             BackendKind::ClaudeCode => self.send_claude(record, text).await,
-            BackendKind::Anthropic | BackendKind::Faux => self.models.send(record, text).await,
+            BackendKind::Anthropic | BackendKind::Faux => {
+                let limits = Limits {
+                    max_turns,
+                    token_cap,
+                };
+                self.models.send(record, text, limits).await
+            }
             _ => Err(TurnError::Unsupported(session_id)),
         }
     }

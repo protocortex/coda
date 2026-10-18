@@ -87,6 +87,7 @@ golden_tests! {
     session_create_params_minimal: "session.create.params.minimal" => SessionCreateParams,
     session_create_result: "session.create.result" => SessionCreateResult,
     session_send_params: "session.send.params" => SessionSendParams,
+    session_send_params_limits: "session.send.params.limits" => SessionSendParams,
     session_send_result: "session.send.result" => SessionSendResult,
     session_cancel_params: "session.cancel.params" => SessionCancelParams,
     session_cancel_result: "session.cancel.result" => SessionCancelResult,

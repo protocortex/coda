@@ -30,6 +30,10 @@ pub enum Command {
     /// Check that a daemon answers.
     Ping,
     /// Run one prompt to completion.
+    ///
+    /// Exit codes: 0 turn ended, 1 turn limit, 2 budget used up, 3 context
+    /// window full, 4 cancelled, 5 any other stop or a failed turn, 64 bad
+    /// usage, 70 the run itself failed.
     Run(RunArgs),
     /// Manage standing permission grants.
     #[command(subcommand)]

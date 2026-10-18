@@ -7,7 +7,9 @@ pub mod cli;
 mod context;
 mod daemon_cmd;
 mod error;
+pub mod exit;
 mod grant;
+mod run;
 mod status;
 mod usage;
 
@@ -19,8 +21,6 @@ use clap::Parser;
 use crate::cli::{Cli, Command, DaemonAction, DaemonArgs, GrantCommand};
 pub use crate::context::{Context, Io, Wait};
 pub use crate::error::CliError;
-
-const USAGE_EXIT_CODE: u8 = 2;
 
 /// Runs one `coda` invocation and returns its exit code. `args` starts with the
 /// program name.
@@ -34,11 +34,11 @@ where
         Err(usage) => return report_usage(&usage, io),
     };
     match execute(cli, ctx, io).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(failure) => {
             // Nowhere left to report a failed write to the error stream.
             let _ = writeln!(io.err, "coda: {failure}");
-            ExitCode::FAILURE
+            ExitCode::from(exit::FAILURE)
         }
     }
 }
@@ -48,16 +48,17 @@ fn report_usage(usage: &clap::Error, io: &mut Io<'_>) -> ExitCode {
     // Nowhere left to report a failed write.
     if usage.use_stderr() {
         let _ = write!(io.err, "{text}");
-        ExitCode::from(USAGE_EXIT_CODE)
+        ExitCode::from(exit::USAGE)
     } else {
         let _ = write!(io.out, "{text}");
         ExitCode::SUCCESS
     }
 }
 
-async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<(), CliError> {
+async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<ExitCode, CliError> {
     let force = cli.force;
-    match cli.command {
+    let done = match cli.command {
+        Some(Command::Run(args)) => return run::run(ctx, io, force, args).await,
         None => status::start(ctx, io, force).await,
         Some(Command::Daemon(DaemonArgs { action: None })) => daemon_cmd::serve(ctx).await,
         Some(Command::Daemon(DaemonArgs {
@@ -65,8 +66,8 @@ async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<(), CliErro
         })) => daemon_cmd::restart(ctx, io, force).await,
         Some(Command::Status) => status::show(ctx, io).await,
         Some(Command::Ping) => status::ping(ctx, io).await,
-        Some(Command::Run(_)) => Err(CliError::RunUnavailable),
         Some(Command::Grant(GrantCommand::Add(args))) => grant::add(ctx, io, force, args).await,
         Some(Command::Usage(args)) => usage::show(ctx, io, args).await,
-    }
+    };
+    done.map(|()| ExitCode::SUCCESS)
 }

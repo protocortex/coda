@@ -104,7 +104,7 @@ fn build_turns(config: &Config, dirs: &Dirs, hub: &Arc<Hub>) -> Arc<Turns> {
     )
 }
 
-fn load_config(dirs: &Dirs) -> Result<Config, CliError> {
+pub(crate) fn load_config(dirs: &Dirs) -> Result<Config, CliError> {
     match Config::load(&dirs.config_file()) {
         Ok(parsed) => {
             for key in &parsed.unknown_keys {

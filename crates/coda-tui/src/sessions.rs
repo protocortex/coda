@@ -330,7 +330,12 @@ impl Link {
             self.notice("there is no session to send to".to_owned());
             return Ok(());
         };
-        let params = SessionSendParams { session_id, text };
+        let params = SessionSendParams {
+            session_id,
+            text,
+            max_turns: None,
+            token_cap: None,
+        };
         self.client
             .request::<_, SessionSendResult>(SESSION_SEND, &params)
             .await
