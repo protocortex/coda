@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 coda-protocol = { path = "../coda-protocol" }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -279,6 +279,7 @@ dependencies = [
  "coda-store",
  "coda-telemetry",
  "coda-testkit",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -410,6 +411,7 @@ version = "0.0.0"
 dependencies = [
  "coda-protocol",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

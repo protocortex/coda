@@ -227,6 +227,41 @@ async fn a_schema_newer_than_the_binary_fails_and_an_older_one_warns() {
 }
 
 #[tokio::test]
+async fn a_database_release_newer_than_the_binary_fails_and_an_older_one_warns() {
+    for (release, expected, exit) in [
+        (Some("999.0.0"), "fail", EXIT_FAILURES),
+        (None, "warn", EXIT_WARNINGS),
+        (Some("not a version"), "fail", EXIT_FAILURES),
+    ] {
+        // Arrange
+        let dir = seeded_home();
+        let db = Dirs::from_base(dir.path())
+            .data_dir()
+            .join(coda_store::DB_FILE_NAME);
+        let conn = rusqlite::Connection::open(db).unwrap();
+        // The workspace is at 0.0.0, so no release is older: no record at all
+        // stands for a database that predates release tracking.
+        match release {
+            Some(release) => conn
+                .execute(
+                    "UPDATE meta SET value = ?1 WHERE key = 'last_release'",
+                    [release],
+                )
+                .unwrap(),
+            None => conn.execute("DELETE FROM meta", []).unwrap(),
+        };
+        drop(conn);
+
+        // Act
+        let (code, report) = doctor(dir.path(), &[]).await;
+
+        // Assert
+        assert_eq!(status(&report, "database release"), expected, "{report}");
+        assert_eq!(code, ExitCode::from(exit));
+    }
+}
+
+#[tokio::test]
 async fn an_unparsable_config_fails_and_an_unknown_key_warns() {
     for (text, expected) in [("max_turns = [", "fail"), ("surprise = 1\n", "warn")] {
         // Arrange
