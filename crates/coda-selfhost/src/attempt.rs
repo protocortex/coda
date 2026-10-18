@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::error::SelfhostError;
-use crate::process::run_bounded;
+use crate::process::{run_bounded, run_cleanup};
 use crate::task::{GRANTS, MAX_TURNS, PROMPT, TOKEN_CAP};
 
 const CONFIG_FILE: &str = "config.toml";
@@ -22,9 +22,31 @@ pub struct AttemptSpec<'a> {
     pub coda: &'a Path,
     pub home: &'a Path,
     pub workdir: &'a Path,
-    /// The faux provider script `coda run` replays.
-    pub script: PathBuf,
+    pub provider: Provider,
     pub limit: Duration,
+}
+
+/// The only Anthropic model a live run asks for.
+pub const MODEL: &str = "claude-sonnet-5-5";
+
+/// What serves the model calls of `coda run`.
+#[derive(Debug, Clone)]
+pub enum Provider {
+    /// Replays a faux provider script file.
+    Faux { script: PathBuf },
+    /// The Anthropic API; the key is read from the named environment variable.
+    Anthropic { api_key_env: String },
+}
+
+impl Provider {
+    /// The environment variable that holds the provider's API key, if any.
+    #[must_use]
+    pub fn key_env(&self) -> Option<&str> {
+        match self {
+            Self::Faux { .. } => None,
+            Self::Anthropic { api_key_env } => Some(api_key_env),
+        }
+    }
 }
 
 /// What `coda run` printed and how it exited.
@@ -35,21 +57,28 @@ pub struct Transcript {
     pub stderr: String,
 }
 
-/// The `config.toml` that replays `script` and pre-grants the pinned task's commands.
+/// The `config.toml` that selects `provider` and pre-grants the pinned task's
+/// commands. It names the key variable and never holds a key.
 #[must_use]
-pub fn config_toml(script: &Path) -> String {
+pub fn config_toml(provider: &Provider) -> String {
     let grants = GRANTS.map(|grant| format!("{grant:?}")).join(", ");
-    format!(
-        "[permissions]\ngrants = [{grants}]\n\n[providers.faux]\nenabled = true\nscript = {:?}\n",
-        script.display().to_string()
-    )
+    let section = match provider {
+        Provider::Faux { script } => format!(
+            "[providers.faux]\nenabled = true\nscript = {:?}\n",
+            script.display().to_string()
+        ),
+        Provider::Anthropic { api_key_env } => format!(
+            "[providers.anthropic]\nenabled = true\napi_key_env = {api_key_env:?}\nmodel = {MODEL:?}\n"
+        ),
+    };
+    format!("[permissions]\ngrants = [{grants}]\n\n{section}")
 }
 
 /// Runs the pinned task with `coda run` in `spec.workdir`; the daemon it
 /// starts is stopped before this returns.
 pub fn run_attempt(spec: &AttemptSpec<'_>) -> Result<Transcript, SelfhostError> {
     let config = spec.home.join(CONFIG_FILE);
-    fs::write(&config, config_toml(&spec.script)).map_err(|source| SelfhostError::Io {
+    fs::write(&config, config_toml(&spec.provider)).map_err(|source| SelfhostError::Io {
         path: config,
         source,
     })?;
@@ -77,26 +106,26 @@ struct DaemonGuard<'a, 'b>(&'a AttemptSpec<'b>);
 
 impl Drop for DaemonGuard<'_, '_> {
     fn drop(&mut self) {
-        let status = run_bounded(
-            Command::new(self.0.coda)
-                .arg("status")
-                .env("CODA_HOME", self.0.home),
-            STATUS_LIMIT,
-        );
+        let mut status_command = Command::new(self.0.coda);
+        status_command.arg("status").env("CODA_HOME", self.0.home);
+        if let Some(name) = self.0.provider.key_env() {
+            status_command.env_remove(name);
+        }
+        let status = run_cleanup(&mut status_command, STATUS_LIMIT);
         let Ok(status) = status else { return };
         let pid = status
             .stdout
             .lines()
             .find_map(|line| line.strip_prefix(PID_PREFIX));
         if let Some(pid) = pid {
-            let _ = run_bounded(Command::new("kill").arg(pid), STATUS_LIMIT);
+            let _ = run_cleanup(Command::new("kill").arg(pid), STATUS_LIMIT);
             wait_gone(pid);
         }
     }
 }
 
 fn is_alive(pid: &str) -> bool {
-    run_bounded(Command::new("kill").args(["-0", pid]), STATUS_LIMIT)
+    run_cleanup(Command::new("kill").args(["-0", pid]), STATUS_LIMIT)
         .is_ok_and(|done| done.status.success())
 }
 
@@ -130,7 +159,9 @@ mod tests {
     #[test]
     fn the_config_replays_the_script_and_grants_the_pinned_commands() {
         // Act
-        let config = config_toml(Path::new("/h/script.json"));
+        let config = config_toml(&Provider::Faux {
+            script: PathBuf::from("/h/script.json"),
+        });
 
         // Assert
         assert_eq!(
@@ -138,6 +169,23 @@ mod tests {
             "[permissions]\n\
              grants = [\"bash:cargo test\", \"bash:cargo build\", \"edit:crates/coda-cli/src/main.rs\"]\n\n\
              [providers.faux]\nenabled = true\nscript = \"/h/script.json\"\n"
+        );
+    }
+
+    #[test]
+    fn the_anthropic_config_names_the_key_variable_and_the_pinned_model() {
+        // Act
+        let config = config_toml(&Provider::Anthropic {
+            api_key_env: "ANTHROPIC_API_KEY".to_owned(),
+        });
+
+        // Assert
+        assert_eq!(
+            config,
+            "[permissions]\n\
+             grants = [\"bash:cargo test\", \"bash:cargo build\", \"edit:crates/coda-cli/src/main.rs\"]\n\n\
+             [providers.anthropic]\nenabled = true\napi_key_env = \"ANTHROPIC_API_KEY\"\n\
+             model = \"claude-sonnet-5-5\"\n"
         );
     }
 }

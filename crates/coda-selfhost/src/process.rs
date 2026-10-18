@@ -5,6 +5,8 @@
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,12 +29,51 @@ pub enum ProcessError {
     },
     #[error("{program} did not finish within {limit:?} and was killed")]
     Timeout { program: String, limit: Duration },
+    #[error("interrupted by a signal; {program} was killed")]
+    Interrupted { program: String },
+}
+
+fn interrupt_flag() -> &'static Arc<AtomicBool> {
+    static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    FLAG.get_or_init(|| Arc::new(AtomicBool::new(false)))
+}
+
+/// Makes SIGINT and SIGTERM stop the run instead of the process. Children are
+/// in their own process groups, so the terminal's Ctrl-C never reaches them:
+/// the run has to kill them itself and clean up before it exits.
+pub fn handle_interrupts() -> std::io::Result<()> {
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register(signal, Arc::clone(interrupt_flag()))?;
+    }
+    Ok(())
+}
+
+fn interrupted() -> bool {
+    interrupt_flag().load(Ordering::Relaxed)
 }
 
 /// Runs `command` with no stdin, in its own process group, and kills the
-/// whole group if it outlives `limit`.
+/// whole group if it outlives `limit` or a signal handled by
+/// [`handle_interrupts`] arrives.
 pub fn run_bounded(command: &mut Command, limit: Duration) -> Result<Captured, ProcessError> {
+    run(command, limit, true)
+}
+
+/// Like [`run_bounded`] but ignores interrupts, for the cleanup that must
+/// still happen after one.
+pub fn run_cleanup(command: &mut Command, limit: Duration) -> Result<Captured, ProcessError> {
+    run(command, limit, false)
+}
+
+fn run(
+    command: &mut Command,
+    limit: Duration,
+    stop_on_interrupt: bool,
+) -> Result<Captured, ProcessError> {
     let program = command.get_program().to_string_lossy().into_owned();
+    if stop_on_interrupt && interrupted() {
+        return Err(ProcessError::Interrupted { program });
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -49,12 +90,19 @@ pub fn run_bounded(command: &mut Command, limit: Duration) -> Result<Captured, P
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(POLL),
+            Ok(None) if Instant::now() < deadline && !(stop_on_interrupt && interrupted()) => {
+                thread::sleep(POLL);
+            }
             _ => {
+                let was_interrupted = stop_on_interrupt && interrupted();
                 kill_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(ProcessError::Timeout { program, limit });
+                return Err(if was_interrupted {
+                    ProcessError::Interrupted { program }
+                } else {
+                    ProcessError::Timeout { program, limit }
+                });
             }
         }
     };

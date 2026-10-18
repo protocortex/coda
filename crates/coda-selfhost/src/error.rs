@@ -12,6 +12,16 @@ pub enum SelfhostError {
     Rejected(#[from] VerifyError),
     #[error(transparent)]
     Process(#[from] ProcessError),
+    #[error("the API key variable {0} is not set; export it before running the live attempt")]
+    MissingKey(String),
+    #[error(
+        "transcript files already exist in {}; remove docs/selfhost/attempt-* first so \
+         none survive from an earlier run",
+        .0.display()
+    )]
+    StaleTranscripts(PathBuf),
+    #[error("{} is a symbolic link; refusing to write transcripts through it", .0.display())]
+    TranscriptDirIsLink(PathBuf),
     #[error("{what} failed ({status}): {stderr}")]
     CommandFailed {
         what: String,
