@@ -40,6 +40,23 @@ pub enum Command {
     Grant(GrantCommand),
     /// Show token usage and savings.
     Usage(UsageArgs),
+    /// Check the socket, database, backends and config, and repair leftovers.
+    ///
+    /// Exit codes: 0 healthy, 20 at least one check failed, 21 only warnings,
+    /// 64 bad usage, 70 the check itself failed. They stay clear of the codes
+    /// 0 to 5 that `run` uses.
+    Doctor(DoctorArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Remove a stale socket and kill orphaned backends; a running
+    /// daemon is never touched.
+    #[arg(long)]
+    pub repair: bool,
+    /// Print the report as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

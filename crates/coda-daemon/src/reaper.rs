@@ -3,7 +3,7 @@
 //! Startup cleanup after a daemon that died with turns running.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use coda_protocol::events::{Event, TIMEOUT_KIND};
@@ -70,19 +70,59 @@ enum Outcome {
     Kept,
 }
 
-async fn reap_backends(dir: &Path, procs: &impl Processes) -> ReapReport {
-    let mut report = ReapReport::default();
+/// The pidfiles in `dir`; empty when the directory cannot be listed.
+fn pidfiles(dir: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
             warn!(dir = %dir.display(), error = %e, "could not list the pidfile directory");
-            return report;
+            return Vec::new();
         }
     };
-    for path in entries.filter_map(|entry| Some(entry.ok()?.path())) {
-        if path.extension().is_none_or(|ext| ext != PIDFILE_EXTENSION) {
-            continue;
+    entries
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == PIDFILE_EXTENSION))
+        .collect()
+}
+
+/// Kills the orphaned backend groups `dir` still has pidfiles for and removes
+/// their pidfiles, with the same identity checks as a daemon start. Call it
+/// only while holding the instance lock.
+pub async fn reap_orphans(dir: &Path) -> ReapReport {
+    reap_backends(dir, &Live).await
+}
+
+/// What the pidfiles in a directory say about the backends they record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrphanSurvey {
+    /// Pidfiles whose process still runs as recorded.
+    pub live: u32,
+    /// Pidfiles whose process is gone or was replaced by an unrelated one.
+    pub stale: u32,
+    /// Pidfiles whose process could not be checked.
+    pub unchecked: u32,
+}
+
+/// Counts the recorded backends without signalling any of them.
+pub async fn survey_orphans(dir: &Path) -> OrphanSurvey {
+    let mut survey = OrphanSurvey::default();
+    for path in pidfiles(dir) {
+        let state = match pidfile::read(&path) {
+            Ok(record) => Live.check(&record).await.ok(),
+            Err(_) => Some(ProcessState::Gone),
+        };
+        match state {
+            Some(ProcessState::Same) => survey.live += 1,
+            Some(ProcessState::Gone | ProcessState::Other) => survey.stale += 1,
+            None => survey.unchecked += 1,
         }
+    }
+    survey
+}
+
+async fn reap_backends(dir: &Path, procs: &impl Processes) -> ReapReport {
+    let mut report = ReapReport::default();
+    for path in pidfiles(dir) {
         let outcome = match pidfile::read(&path) {
             Ok(record) => reconcile(procs, &record).await,
             Err(e) => {

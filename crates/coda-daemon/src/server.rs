@@ -108,8 +108,14 @@ impl ServerConfig {
     }
 
     fn lock_path(&self) -> PathBuf {
-        self.socket_path.with_extension(LOCK_FILE_EXTENSION)
+        lock_path_for(&self.socket_path)
     }
+}
+
+/// The instance lock file that belongs to the socket at `socket_path`.
+#[must_use]
+pub fn lock_path_for(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension(LOCK_FILE_EXTENSION)
 }
 
 /// Entry point for starting the daemon's socket server.
@@ -163,7 +169,7 @@ impl Server {
     }
 }
 
-fn ensure_private_dir(dir: &Path, expected_uid: u32) -> Result<(), ServerError> {
+pub(crate) fn ensure_private_dir(dir: &Path, expected_uid: u32) -> Result<(), ServerError> {
     let io_error = |source| ServerError::Io {
         path: dir.to_path_buf(),
         source,
@@ -194,7 +200,7 @@ fn ensure_private_dir(dir: &Path, expected_uid: u32) -> Result<(), ServerError> 
 /// Removes a leftover socket file nobody listens on. Called only while holding
 /// the instance lock, so a refused connection means the previous daemon is gone.
 /// Anything that is not a socket of the expected user is left untouched.
-fn remove_stale_socket(path: &Path, expected_uid: u32) -> Result<(), ServerError> {
+pub(crate) fn remove_stale_socket(path: &Path, expected_uid: u32) -> Result<(), ServerError> {
     let io_error = |source| ServerError::Io {
         path: path.to_path_buf(),
         source,

@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,18 @@ use tokio::process::Command;
 
 /// Owner read and write only: the file names a process the daemon may signal.
 pub const PIDFILE_MODE: u32 = 0o600;
+
+/// Pause between two samples of a process's executable while it settles.
+const SETTLE_INTERVAL: Duration = Duration::from_millis(25);
+/// Most samples taken while waiting for two in a row to agree.
+const SETTLE_MAX_SAMPLES: usize = 20;
+
+/// What a live process runs: the name and, where the platform shows it, the path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Image {
+    name: String,
+    path: Option<PathBuf>,
+}
 
 /// What a pidfile holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +42,12 @@ pub struct PidRecord {
     /// written, where the platform exposes it. Absent in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_path: Option<PathBuf>,
+    /// The process showed a name other than `exe`'s when recorded, as a shell
+    /// does when it runs a script. Such a launcher may exec another binary
+    /// later (macOS `sh` does, under load), so only its pid and start time
+    /// identify it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub launcher: bool,
 }
 
 /// What a recorded pid refers to now.
@@ -99,7 +118,7 @@ pub async fn process_start_time(pid: u32) -> Option<String> {
 pub async fn write(path: &Path, pid: u32, exe: &Path) -> Result<PidRecord, PidfileError> {
     let unavailable = || PidfileError::StartTimeUnavailable { pid };
     let started_at = process_start_time(pid).await.ok_or_else(unavailable)?;
-    let process_name = process_name(pid)
+    let image = settled_image(pid)
         .await
         .ok()
         .flatten()
@@ -108,8 +127,9 @@ pub async fn write(path: &Path, pid: u32, exe: &Path) -> Result<PidRecord, Pidfi
         pid,
         started_at,
         exe: exe.to_path_buf(),
-        process_name,
-        process_path: process_path(pid).await,
+        launcher: exe.file_name().and_then(|n| n.to_str()) != Some(image.name.as_str()),
+        process_name: image.name,
+        process_path: image.path,
     };
     let io = |source| PidfileError::Io {
         path: path.to_path_buf(),
@@ -187,6 +207,30 @@ async fn process_path(pid: u32) -> Option<PathBuf> {
     Path::new(path).is_absolute().then(|| PathBuf::from(path))
 }
 
+async fn sample_image(pid: u32) -> io::Result<Option<Image>> {
+    let Some(name) = process_name(pid).await? else {
+        return Ok(None);
+    };
+    Ok(Some(Image {
+        name,
+        path: process_path(pid).await,
+    }))
+}
+
+/// Samples until two in a row agree, up to [`SETTLE_MAX_SAMPLES`].
+async fn settled_image(pid: u32) -> io::Result<Option<Image>> {
+    let mut previous = sample_image(pid).await?;
+    for _ in 1..SETTLE_MAX_SAMPLES {
+        tokio::time::sleep(SETTLE_INTERVAL).await;
+        let current = sample_image(pid).await?;
+        if current == previous {
+            return Ok(current);
+        }
+        previous = current;
+    }
+    Ok(previous)
+}
+
 /// Compares the recorded pid with the live process.
 ///
 /// # Errors
@@ -207,7 +251,7 @@ pub async fn check_process(record: &PidRecord) -> io::Result<ProcessState> {
         (Some(recorded), Some(live)) => *recorded == live,
         _ => true,
     };
-    Ok(if name_matches && path_matches {
+    Ok(if record.launcher || (name_matches && path_matches) {
         ProcessState::Same
     } else {
         ProcessState::Other
@@ -226,9 +270,12 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
+    use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
-    use super::{PIDFILE_MODE, PidfileError, is_same_process, process_start_time, read, write};
+    use super::{
+        PIDFILE_MODE, PidfileError, is_same_process, process_start_time, read, sample_image, write,
+    };
 
     const EXE: &str = "/usr/bin/claude-test";
     const SLEEP: &str = "/bin/sleep";
@@ -476,5 +523,48 @@ mod tests {
 
         // Assert
         assert!(matches!(result, Err(PidfileError::Parse { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_shebang_launcher_is_still_the_same_process_after_it_execs_another_binary() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("claude");
+        fs::write(&script, "#!/bin/sh\nread line\nexec /bin/sleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = Command::new(&script)
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let record = write(&dir.path().join("a.pid"), pid, &script)
+            .await
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"go\n")
+            .await
+            .unwrap();
+        let execed = async {
+            while sample_image(pid)
+                .await
+                .unwrap()
+                .is_none_or(|i| i.name != "sleep")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), execed)
+            .await
+            .expect("the launcher never exec'd");
+
+        // Act
+        let same = is_same_process(&record).await;
+
+        // Assert
+        assert!(same, "{record:?}");
     }
 }
