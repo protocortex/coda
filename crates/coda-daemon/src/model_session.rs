@@ -227,17 +227,18 @@ impl ModelSessions {
                 return Err(e.into());
             }
         };
+        *lock(&model_loop.turn) = turn.clone();
+        // Reset before arming: a cancel from here on must stop this send. Armed
+        // before any further await, so a panic from here on still ends the turn.
+        let cancel = model_loop.turn_loop.cancel_token();
+        cancel.reset();
+        slot.arm((cancel, turn.clone()));
         if rebuilt {
             let body = json!({});
             let reset = publish_kind(&self.hub, &session, &turn, CONVERSATION_RESET_KIND, &body);
             log_failure(reset.await);
         }
         self.keep_prompt(&session, &text).await;
-        *lock(&model_loop.turn) = turn.clone();
-        // Reset before arming: a cancel from here on must stop this send.
-        let cancel = model_loop.turn_loop.cancel_token();
-        cancel.reset();
-        slot.arm((cancel, turn.clone()));
         let span = backend_span(&session, &turn, backend_name(record.backend));
         let sessions = Arc::clone(self);
         let task_turn = turn.clone();
@@ -295,7 +296,11 @@ impl ModelSessions {
             .hub
             .with_store_mut(move |store| {
                 store.set_session_model(&id, &model)?;
-                store.begin_turn(&id)
+                // The switch is an event with no work behind it, so its turn
+                // is over at once instead of looking cut short after a restart.
+                let turn = store.begin_turn(&id)?;
+                store.end_turn(&id, &turn)?;
+                Ok(turn)
             })
             .await?;
         if let Some(dropped) = self.take_loop(session) {

@@ -586,6 +586,56 @@ async fn a_cancelled_turn_is_logged_as_ended_and_not_as_an_error() {
 }
 
 #[tokio::test]
+async fn a_turn_is_ended_even_when_the_event_log_refuses_its_end_record() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.send("hello").await;
+    rig.wait_for_pending().await;
+    rig.db()
+        .execute_batch(
+            "CREATE TRIGGER refuse_log BEFORE INSERT ON event_log \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+
+    // Act
+    rig.call("session.cancel", json!({"session_id": rig.session}))
+        .await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let open: i64 = rig
+        .db()
+        .query_row(
+            "SELECT COUNT(*) FROM turns WHERE ended_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(open, 0);
+}
+
+#[tokio::test]
+async fn a_turn_whose_first_event_cannot_be_stored_is_not_left_open() {
+    // Arrange
+    let rig = Rig::new(relaxed(), Vec::new());
+    rig.db()
+        .execute_batch(
+            "CREATE TRIGGER refuse_events BEFORE INSERT ON events \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+
+    // Act
+    let begun = Turns::begin(&rig.hub, &rig.session, "hello").await;
+
+    // Assert
+    let open = rig.hub.with_store(Store::unfinished_turns).await.unwrap();
+    assert!(begun.is_err());
+    assert_eq!(open, vec![]);
+}
+
+#[tokio::test]
 async fn methods_are_unavailable_without_turns() {
     // Arrange
     let dispatcher = Dispatcher::new();

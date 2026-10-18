@@ -11,7 +11,7 @@ use std::time::Duration;
 use coda_config::config::{Config, ConfigError, Dirs};
 use coda_daemon::backends::locate_claude_code;
 use coda_daemon::lock::LockError;
-use coda_daemon::reaper::reap;
+use coda_daemon::recover::recover;
 use coda_daemon::server::{BoundServer, Server, ServerConfig, ServerError};
 use coda_daemon::state::DaemonState;
 use coda_daemon::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
@@ -53,7 +53,7 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
     let hub = Hub::new(store, DEFAULT_QUEUE_CAPACITY);
     // The instance lock is held now, so whatever the pidfiles name is an orphan.
     info!("step 4: cleaning up after a previous daemon");
-    let report = reap(&ctx.dirs.run_dir(), &hub).await;
+    let report = recover(&ctx.dirs.run_dir(), &hub).await;
     info!(?report, "startup cleanup finished");
     let turns = build_turns(&config, &ctx.dirs, &hub);
     let bound = bound
