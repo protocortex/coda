@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Builds the `fake-claude` binary once per test process and returns where it is.
+//! Builds the fake `claude` and `codex` binaries once per test process and returns where they are.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,23 +12,24 @@ const SMOKE_ATTEMPTS: u32 = 5;
 /// How long one smoke run may take before it is killed and retried.
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-const BIN_NAME: &str = "fake-claude";
+const CLAUDE_BIN: &str = "fake-claude";
+const CODEX_BIN: &str = "fake-codex";
 const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
-/// A private target dir, so a nested build never rewrites a binary that a
-/// concurrent test process is executing from the shared one.
-const TARGET_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/fake-claude");
+/// Parent of the private target dirs, one per binary, so a nested build never
+/// rewrites a binary that a concurrent test process is executing from the shared one.
+const TARGET_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target");
 
 /// Why the fake binary could not be provided.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum BuildError {
     /// `cargo build` could not be started.
-    #[error("could not run cargo to build {BIN_NAME}: {0}")]
+    #[error("could not run cargo to build a fake binary: {0}")]
     Spawn(String),
     /// `cargo build` ran and failed.
-    #[error("cargo failed to build {BIN_NAME}: {0}")]
+    #[error("cargo failed to build a fake binary: {0}")]
     Failed(String),
     /// The build succeeded but reported no executable.
-    #[error("cargo built {BIN_NAME} but reported no executable path")]
+    #[error("cargo built a fake binary but reported no executable path")]
     NoArtifact,
 }
 
@@ -41,10 +42,19 @@ pub enum BuildError {
 /// Returns [`BuildError`] when cargo cannot build the binary.
 pub fn fake_claude_path() -> Result<PathBuf, BuildError> {
     static PATH: OnceLock<Result<PathBuf, BuildError>> = OnceLock::new();
-    PATH.get_or_init(build).clone()
+    PATH.get_or_init(|| build(CLAUDE_BIN)).clone()
 }
 
-fn build() -> Result<PathBuf, BuildError> {
+/// Builds `fake-codex` on first use and returns the path to the executable.
+///
+/// # Errors
+/// Returns [`BuildError`] when cargo cannot build the binary.
+pub fn fake_codex_path() -> Result<PathBuf, BuildError> {
+    static PATH: OnceLock<Result<PathBuf, BuildError>> = OnceLock::new();
+    PATH.get_or_init(|| build(CODEX_BIN)).clone()
+}
+
+fn build(bin_name: &str) -> Result<PathBuf, BuildError> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
         .args([
@@ -52,9 +62,10 @@ fn build() -> Result<PathBuf, BuildError> {
             "--quiet",
             "--message-format=json",
             "--bin",
-            BIN_NAME,
+            bin_name,
         ])
-        .args(["--manifest-path", MANIFEST, "--target-dir", TARGET_DIR])
+        .args(["--manifest-path", MANIFEST, "--target-dir"])
+        .arg(Path::new(TARGET_ROOT).join(bin_name))
         .output()
         .map_err(|source| BuildError::Spawn(source.to_string()))?;
     if !output.status.success() {
@@ -66,7 +77,7 @@ fn build() -> Result<PathBuf, BuildError> {
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|message| message["reason"] == "compiler-artifact")
-        .filter(|message| message["target"]["name"] == BIN_NAME)
+        .filter(|message| message["target"]["name"] == bin_name)
         .find_map(|message| {
             // Cargo re-links the uplifted `executable` on every build, so a
             // concurrent test process could see it missing; the hashed copy
@@ -75,7 +86,7 @@ fn build() -> Result<PathBuf, BuildError> {
             Some(PathBuf::from(built))
         })
         .ok_or(BuildError::NoArtifact)?;
-    ensure_runnable(&path)?;
+    ensure_runnable(bin_name, &path)?;
     Ok(path)
 }
 
@@ -83,7 +94,7 @@ fn build() -> Result<PathBuf, BuildError> {
 ///
 /// macOS can kill a binary with SIGKILL when several test processes execute
 /// it right after it was linked, so the first runs are retried.
-fn ensure_runnable(path: &Path) -> Result<(), BuildError> {
+fn ensure_runnable(bin_name: &str, path: &Path) -> Result<(), BuildError> {
     let mut last = String::new();
     for _ in 0..SMOKE_ATTEMPTS {
         match smoke_attempt(path, SMOKE_TIMEOUT) {
@@ -92,7 +103,7 @@ fn ensure_runnable(path: &Path) -> Result<(), BuildError> {
         }
     }
     Err(BuildError::Failed(format!(
-        "{BIN_NAME} does not start: {last}"
+        "{bin_name} does not start: {last}"
     )))
 }
 

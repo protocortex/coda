@@ -7,17 +7,11 @@ use std::path::{Path, PathBuf};
 use coda_protocol::types::PermissionDecision;
 use serde_json::{Value, json};
 
+use crate::jsonl::{DiagnosticLog, Framed, LineFramer, bounded};
 use crate::tool_request::{Tool, ToolRequest};
 
-const NEWLINE: u8 = b'\n';
 const CAN_USE_TOOL: &str = "can_use_tool";
 const DENY_MESSAGE: &str = "denied by coda";
-/// Longest line the parser buffers; a longer one is discarded.
-const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
-/// Diagnostics kept; further ones are only counted.
-const MAX_DIAGNOSTICS: usize = 256;
-/// Longest stream-supplied string kept in a diagnostic, in characters.
-const MAX_KIND_CHARS: usize = 64;
 
 /// One message from the Claude Code output stream that coda acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +82,11 @@ pub enum Diagnostic {
         /// What was missing.
         reason: &'static str,
     },
+    /// A Codex thread id that is missing or not a plain identifier.
+    InvalidThreadId {
+        /// 1-based line number in the stream.
+        line: u64,
+    },
     /// The line exceeded the size limit and was discarded.
     LineTooLong {
         /// 1-based line number in the stream.
@@ -98,13 +97,8 @@ pub enum Diagnostic {
 /// Turns raw output bytes into [`Message`]s, tolerating bad input.
 #[derive(Debug, Default)]
 pub struct StreamParser {
-    /// Start of the current incomplete line; empty between lines.
-    pending: Vec<u8>,
-    /// Skipping the rest of a line that exceeded [`MAX_LINE_BYTES`].
-    discarding: bool,
-    lines_seen: u64,
-    diagnostics: Vec<Diagnostic>,
-    dropped_diagnostics: u64,
+    framer: LineFramer,
+    log: DiagnosticLog,
 }
 
 impl StreamParser {
@@ -117,45 +111,10 @@ impl StreamParser {
     /// Adds bytes as read; a line split across calls is held until complete.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Message> {
         let mut messages = Vec::new();
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            let newline = rest.iter().position(|byte| *byte == NEWLINE);
-            let (segment, tail) = match newline {
-                Some(end) => (&rest[..end], &rest[end + 1..]),
-                None => (rest, &rest[rest.len()..]),
-            };
-            rest = tail;
-            if self.discarding {
-                if newline.is_some() {
-                    self.discarding = false;
-                    self.lines_seen += 1;
-                }
-                continue;
-            }
-            if self.pending.len() + segment.len() > MAX_LINE_BYTES {
-                self.record(Diagnostic::LineTooLong {
-                    line: self.lines_seen + 1,
-                });
-                self.pending.clear();
-                self.discarding = newline.is_none();
-                if newline.is_some() {
-                    self.lines_seen += 1;
-                }
-                continue;
-            }
-            if newline.is_none() {
-                self.pending.extend_from_slice(segment);
-                continue;
-            }
-            self.lines_seen += 1;
-            if self.pending.is_empty() {
-                messages.extend(self.parse_bytes(segment));
-            } else {
-                self.pending.extend_from_slice(segment);
-                let line = std::mem::take(&mut self.pending);
-                messages.extend(self.parse_bytes(&line));
-                self.pending = line;
-                self.pending.clear();
+        for framed in self.framer.feed(bytes) {
+            match framed {
+                Framed::Line { number, bytes } => messages.extend(self.parse_bytes(&bytes, number)),
+                Framed::TooLong { number } => self.record(Diagnostic::LineTooLong { line: number }),
             }
         }
         messages
@@ -164,33 +123,28 @@ impl StreamParser {
     /// The first diagnostics recorded, in stream order.
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
-        &self.diagnostics
+        self.log.items()
     }
 
     /// How many diagnostics were dropped after the retention cap was reached.
     #[must_use]
     pub fn dropped_diagnostics(&self) -> u64 {
-        self.dropped_diagnostics
+        self.log.dropped()
     }
 
     fn record(&mut self, diagnostic: Diagnostic) {
-        if self.diagnostics.len() < MAX_DIAGNOSTICS {
-            self.diagnostics.push(diagnostic);
-        } else {
-            self.dropped_diagnostics += 1;
-        }
+        self.log.record(diagnostic);
     }
 
-    fn parse_bytes(&mut self, bytes: &[u8]) -> Option<Message> {
+    fn parse_bytes(&mut self, bytes: &[u8], line: u64) -> Option<Message> {
         let text = String::from_utf8_lossy(bytes);
         if text.trim().is_empty() {
             return None;
         }
-        self.parse_line(&text)
+        self.parse_line(&text, line)
     }
 
-    fn parse_line(&mut self, text: &str) -> Option<Message> {
-        let line = self.lines_seen;
+    fn parse_line(&mut self, text: &str, line: u64) -> Option<Message> {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             self.record(Diagnostic::MalformedLine { line });
             return None;
@@ -262,10 +216,6 @@ impl StreamParser {
     }
 }
 
-fn bounded(text: &str) -> String {
-    text.chars().take(MAX_KIND_CHARS).collect()
-}
-
 fn text_delta(value: &Value) -> Option<String> {
     let event = &value["event"];
     if event["type"] != "content_block_delta" {
@@ -332,6 +282,7 @@ pub fn control_response(request_id: &str, decision: PermissionDecision, input: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jsonl::{MAX_DIAGNOSTICS, MAX_KIND_CHARS, MAX_LINE_BYTES};
     use crate::tool_request::Tool;
     use coda_protocol::types::PermissionDecision;
     use serde_json::{Value, json};
