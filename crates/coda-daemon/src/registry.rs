@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, METHOD_NOT_FOUND};
-use coda_protocol::methods::{SessionSetModelParams, SessionSetModelResult};
+use coda_protocol::methods::{DaemonBackendsResult, SessionSetModelParams, SessionSetModelResult};
 use coda_protocol::types::SessionInfo;
 use coda_providers::registry::RegistryError;
 use coda_store::StoreError;
@@ -42,6 +42,14 @@ pub(crate) async fn set_model(turns: Option<&Arc<Turns>>, params: Option<Value>)
             cwd: record.cwd,
             mode: record.mode,
         },
+    })
+}
+
+/// Answers `daemon.backends` with the backends the configuration enables.
+pub(crate) fn backends(turns: Option<&Arc<Turns>>) -> HandlerResult {
+    let turns = turns.ok_or_else(|| error(METHOD_NOT_FOUND, "Method not found"))?;
+    to_value(&DaemonBackendsResult {
+        backends: turns.models.available_backends(),
     })
 }
 

@@ -103,14 +103,16 @@ fn provider_key(backend: BackendKind) -> Option<&'static str> {
     }
 }
 
+const MODEL_BACKENDS: [BackendKind; 3] = [
+    BackendKind::Anthropic,
+    BackendKind::OpenaiCompat,
+    BackendKind::Faux,
+];
+
 fn backend_of(provider: &str) -> Option<BackendKind> {
-    [
-        BackendKind::Anthropic,
-        BackendKind::OpenaiCompat,
-        BackendKind::Faux,
-    ]
-    .into_iter()
-    .find(|backend| provider_key(*backend) == Some(provider))
+    MODEL_BACKENDS
+        .into_iter()
+        .find(|backend| provider_key(*backend) == Some(provider))
 }
 
 impl ModelRegistry {
@@ -122,6 +124,19 @@ impl ModelRegistry {
             aliases: config.models.clone(),
             timing: Timing::from_config(&config.timing),
         }
+    }
+
+    /// The model-API backends whose provider section is enabled.
+    #[must_use]
+    pub fn enabled_backends(&self) -> Vec<BackendKind> {
+        MODEL_BACKENDS
+            .into_iter()
+            .filter(|backend| {
+                provider_key(*backend)
+                    .and_then(|key| self.providers.get(key))
+                    .is_some_and(|section| section.enabled)
+            })
+            .collect()
     }
 
     /// The target of the alias `name` on a session that runs on `backend`.
@@ -277,6 +292,29 @@ model = "script-1"
 provider = "nowhere"
 model = "m"
 "#;
+
+    #[test]
+    fn only_enabled_providers_are_listed_as_backends() {
+        // Arrange
+        let all = registry(CONFIG);
+        let one_off = registry(
+            "[providers.openai_compat]\nenabled = false\n[providers.faux]\nenabled = true\n",
+        );
+
+        // Act
+        let (listed, partial) = (all.enabled_backends(), one_off.enabled_backends());
+
+        // Assert
+        assert_eq!(
+            listed,
+            [
+                BackendKind::Anthropic,
+                BackendKind::OpenaiCompat,
+                BackendKind::Faux
+            ]
+        );
+        assert_eq!(partial, [BackendKind::Faux]);
+    }
 
     fn registry(text: &str) -> ModelRegistry {
         ModelRegistry::from_config(&Config::from_toml_str(text).unwrap().config)

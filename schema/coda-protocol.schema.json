@@ -1,6 +1,8 @@
 {
   "$defs": {
     "BackendKind": {"description":"The agent backend that drives a session.\n\nAdding a variant requires a `PROTOCOL_VERSION` bump: older peers reject\nunknown variants rather than ignoring them.","oneOf":[{"const":"claude_code","description":"Claude Code CLI.","type":"string"},{"const":"codex_app_server","description":"Codex through its app server.","type":"string"},{"const":"codex_exec","description":"Codex through one-shot exec runs.","type":"string"},{"const":"anthropic","description":"Anthropic API.","type":"string"},{"const":"openai_compat","description":"Any API compatible with the `OpenAI` chat format.","type":"string"},{"const":"faux","description":"Scripted backend used in tests.","type":"string"}]},
+    "DaemonBackendsParams": {"description":"Parameters of [`DAEMON_BACKENDS`].","type":"object"},
+    "DaemonBackendsResult": {"description":"Result of [`DAEMON_BACKENDS`].","properties":{"backends":{"description":"The enabled backends, in the order the daemon registers them.","items":{"$ref":"#/$defs/BackendKind"},"type":"array"}},"required":["backends"],"type":"object"},
     "DaemonShutdownParams": {"description":"Parameters of [`DAEMON_SHUTDOWN`].","type":"object"},
     "DaemonShutdownResult": {"description":"Result of [`DAEMON_SHUTDOWN`].","type":"object"},
     "DaemonStatusParams": {"description":"Parameters of [`DAEMON_STATUS`].","type":"object"},
@@ -49,6 +51,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "event": {"$ref":"#/$defs/Event"},
   "methods": {
+    "daemon.backends": {"params":{"$ref":"#/$defs/DaemonBackendsParams"},"result":{"$ref":"#/$defs/DaemonBackendsResult"}},
     "daemon.ping": {"params":{"$ref":"#/$defs/PingParams"},"result":{"$ref":"#/$defs/PingResult"}},
     "daemon.shutdown": {"params":{"$ref":"#/$defs/DaemonShutdownParams"},"result":{"$ref":"#/$defs/DaemonShutdownResult"}},
     "daemon.status": {"params":{"$ref":"#/$defs/DaemonStatusParams"},"result":{"$ref":"#/$defs/DaemonStatusResult"}},

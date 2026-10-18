@@ -11,11 +11,13 @@ use coda_config::timing::Timing;
 use coda_protocol::events::{EVENT_NOTIFICATION, Event};
 use coda_protocol::jsonrpc::Notification;
 use coda_protocol::methods::{
-    DAEMON_PING, PERMISSION_RESPOND, PermissionRespondParams, PermissionRespondResult, PingParams,
-    PingResult, SESSION_CANCEL, SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_SEND,
+    DAEMON_BACKENDS, DAEMON_PING, DaemonBackendsParams, DaemonBackendsResult, PERMISSION_RESPOND,
+    PermissionRespondParams, PermissionRespondResult, PingParams, PingResult, SESSION_CANCEL,
+    SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_SEND, SESSION_SET_MODEL,
     SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
     SessionListParams, SessionListResult, SessionResumeParams, SessionResumeResult,
-    SessionSendParams, SessionSendResult, SessionSummary,
+    SessionSendParams, SessionSendResult, SessionSetModelParams, SessionSetModelResult,
+    SessionSummary,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId, SessionInfo};
 use serde_json::Value;
@@ -24,6 +26,7 @@ use tracing::warn;
 
 use crate::app::LinkEvent;
 use crate::permission::{PermissionAnswer, PermissionPrompt};
+use crate::status::backend_name;
 
 /// Notification that announces a request waiting for an answer.
 const PERMISSION_REQUEST_NOTIFICATION: &str = "permission.request";
@@ -41,6 +44,9 @@ const RESUME_LOOKUP_LIMIT: u32 = 10;
 /// Replaying from the first event rebuilds the transcript of a reopened session.
 const REPLAY_FROM_START: u64 = 0;
 
+/// Said after a backend switch: the new backend starts with an empty history.
+pub const TRANSCRIPT_NOT_CARRIED: &str = "the transcript is not carried over to the new session";
+
 /// A request from the UI to the task that holds the daemon connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkCommand {
@@ -56,6 +62,12 @@ pub enum LinkCommand {
     Resume(SessionId),
     /// Ask the daemon for its sessions.
     ListSessions,
+    /// Switch the current session to a model alias.
+    SetModel(String),
+    /// Show the backends the daemon offers.
+    ListBackends,
+    /// Start a new session on the named backend.
+    SwitchBackend(String),
 }
 
 /// Reads an event notification's params; kinds the UI has no use for give `None`.
@@ -73,6 +85,14 @@ pub fn user_message_from_params(params: &Value) -> Option<String> {
     }
     let body: Value = serde_json::from_str(params.get("body")?.as_str()?).ok()?;
     body.get("text")?.as_str().map(str::to_owned)
+}
+
+fn backend_names(backends: &[BackendKind]) -> String {
+    backends
+        .iter()
+        .map(|backend| backend_name(*backend))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The newest session of `sessions` that a start with `backend` may reopen:
@@ -195,6 +215,49 @@ async fn next_notification(subscription: &mut Option<Subscription>) -> Option<No
     }
 }
 
+/// Opens streams of session events.
+trait Subscribe {
+    async fn subscribe(
+        &self,
+        session: &SessionId,
+        since_seq: Option<u64>,
+    ) -> Result<Subscription, ClientError>;
+}
+
+impl Subscribe for Client {
+    async fn subscribe(
+        &self,
+        session: &SessionId,
+        since_seq: Option<u64>,
+    ) -> Result<Subscription, ClientError> {
+        Client::subscribe(self, session, since_seq).await
+    }
+}
+
+/// Moves `current` to the stream of `info`, then tells the UI so it clears the
+/// screen before the replay. A failed subscribe leaves the UI and the stream it
+/// follows untouched, except when the session is the one already followed: the
+/// daemon allows one stream per session, so that one is closed first.
+async fn follow_session(
+    client: &impl Subscribe,
+    current: &mut Option<Subscription>,
+    events: &UnboundedSender<LinkEvent>,
+    info: SessionInfo,
+    since_seq: Option<u64>,
+) -> Result<(), ClientError> {
+    if current
+        .as_ref()
+        .is_some_and(|stream| stream.session() == &info.id)
+    {
+        *current = None;
+    }
+    let subscription = client.subscribe(&info.id, since_seq).await?;
+    *current = Some(subscription);
+    // The receiver is gone only while the UI shuts down.
+    let _ = events.send(LinkEvent::SessionStarted(info));
+    Ok(())
+}
+
 impl Opener for Link {
     async fn resume(&mut self, id: &SessionId) -> Result<(), ClientError> {
         self.reopen(id).await
@@ -288,16 +351,19 @@ impl Link {
         self.follow(resumed.session, Some(REPLAY_FROM_START)).await
     }
 
-    /// Switches to `info`. The UI is told first so it clears the screen before the replay.
     async fn follow(
         &mut self,
         info: SessionInfo,
         since_seq: Option<u64>,
     ) -> Result<(), ClientError> {
-        self.subscription = None;
-        self.tell(LinkEvent::SessionStarted(info.clone()));
-        self.subscription = Some(self.client.subscribe(&info.id, since_seq).await?);
-        Ok(())
+        follow_session(
+            &self.client,
+            &mut self.subscription,
+            &self.events,
+            info,
+            since_seq,
+        )
+        .await
     }
 
     async fn handle(&mut self, command: LinkCommand) {
@@ -310,6 +376,9 @@ impl Link {
                 .await
                 .map(|sessions| self.tell(LinkEvent::Sessions(sessions)))
                 .map_err(|e| ("list the sessions", e)),
+            LinkCommand::SetModel(alias) => self.set_model(alias).await,
+            LinkCommand::ListBackends => self.list_backends().await,
+            LinkCommand::SwitchBackend(name) => self.switch_backend(&name).await,
             LinkCommand::New => self.start_new().await.map_err(|e| ("start a session", e)),
             LinkCommand::Resume(id) => self
                 .reopen(&id)
@@ -319,6 +388,64 @@ impl Link {
         if let Err((action, error)) = outcome {
             self.notice(format!("could not {action}: {error}"));
         }
+    }
+
+    async fn backends(&self) -> Result<Vec<BackendKind>, ClientError> {
+        let listed: DaemonBackendsResult = self
+            .client
+            .request(DAEMON_BACKENDS, &DaemonBackendsParams {})
+            .await?;
+        Ok(listed.backends)
+    }
+
+    async fn list_backends(&self) -> Result<(), (&'static str, ClientError)> {
+        let backends = self
+            .backends()
+            .await
+            .map_err(|e| ("list the backends", e))?;
+        self.notice(format!("backends: {}", backend_names(&backends)));
+        Ok(())
+    }
+
+    /// Starts a new session on `name` when the daemon offers that backend. The
+    /// old session keeps its history; the new one starts empty.
+    async fn switch_backend(&mut self, name: &str) -> Result<(), (&'static str, ClientError)> {
+        let backends = self
+            .backends()
+            .await
+            .map_err(|e| ("list the backends", e))?;
+        let Some(chosen) = backends.iter().copied().find(|b| backend_name(*b) == name) else {
+            self.notice(format!(
+                "backend `{name}` is not available; choose one of: {}",
+                backend_names(&backends)
+            ));
+            return Ok(());
+        };
+        let previous = std::mem::replace(&mut self.config.backend, chosen);
+        if let Err(error) = self.start_new().await {
+            self.config.backend = previous;
+            return Err(("start a session on that backend", error));
+        }
+        self.notice(TRANSCRIPT_NOT_CARRIED.to_owned());
+        Ok(())
+    }
+
+    async fn set_model(&self, alias: String) -> Result<(), (&'static str, ClientError)> {
+        let Some(session_id) = self.current() else {
+            self.notice("there is no session to switch".to_owned());
+            return Ok(());
+        };
+        let params = SessionSetModelParams {
+            session_id,
+            model: alias,
+        };
+        let switched: SessionSetModelResult = self
+            .client
+            .request(SESSION_SET_MODEL, &params)
+            .await
+            .map_err(|e| ("switch the model", e))?;
+        self.tell(LinkEvent::ModelSwitched(switched.session));
+        Ok(())
     }
 
     fn current(&self) -> Option<SessionId> {
@@ -523,6 +650,41 @@ mod tests {
         // Assert
         assert_eq!(outcome.unwrap(), None);
         assert_eq!(opener.calls, ["resume", "create"]);
+    }
+
+    struct FailingSubscribe;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl Subscribe for FailingSubscribe {
+        async fn subscribe(
+            &self,
+            _session: &SessionId,
+            _since_seq: Option<u64>,
+        ) -> Result<Subscription, ClientError> {
+            Err(ClientError::Disconnected)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_subscribe_does_not_tell_the_ui_the_session_changed() {
+        // Arrange
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut current = None;
+        let info = SessionInfo {
+            id: SessionId::new("s-new"),
+            backend: BackendKind::Faux,
+            model: None,
+            cwd: "/work".to_owned(),
+            mode: Mode::default(),
+        };
+
+        // Act
+        let outcome = follow_session(&FailingSubscribe, &mut current, &events, info, None).await;
+
+        // Assert
+        assert!(outcome.is_err());
+        assert!(current.is_none());
+        assert!(received.try_recv().is_err());
     }
 
     #[test]

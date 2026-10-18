@@ -24,6 +24,7 @@ const TITLE: &str = " coda (Esc quits) ";
 /// Rows a page key moves the transcript.
 const PAGE_ROWS: usize = 5;
 const NO_SESSIONS: &str = "the daemon has no sessions";
+const BACKEND_SWITCH_BUSY: &str = "wait for the running turn to finish before switching backend";
 
 /// Where the link to the daemon stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +48,8 @@ pub enum LinkEvent {
     Permission(PermissionPrompt),
     /// The session the UI follows changed; its history is about to replay.
     SessionStarted(SessionInfo),
+    /// The daemon switched the model of the session the UI follows.
+    ModelSwitched(SessionInfo),
     /// The user's own message, live or replayed from the stored history.
     UserMessage(String),
     /// The daemon's sessions, answering `/sessions`.
@@ -127,6 +130,13 @@ impl App {
                 self.status.set_session(info.backend, info.model);
                 self.overlay = Overlay::default();
                 self.turn_running = false;
+            }
+            LinkEvent::ModelSwitched(info) => {
+                self.chat.push_notice(format!(
+                    "model is now {}",
+                    info.model.as_deref().unwrap_or("the default")
+                ));
+                self.status.switch_model(info.model);
             }
             LinkEvent::UserMessage(text) => self.chat.push_user(text),
             LinkEvent::Sessions(sessions) => self.show_sessions(&sessions),
@@ -232,6 +242,13 @@ impl App {
             Command::Sessions => LinkCommand::ListSessions,
             Command::New => LinkCommand::New,
             Command::Resume(id) => LinkCommand::Resume(id),
+            Command::Model(alias) => LinkCommand::SetModel(alias),
+            Command::Backend(None) => LinkCommand::ListBackends,
+            Command::Backend(Some(_)) if self.turn_running => {
+                self.chat.push_notice(BACKEND_SWITCH_BUSY.to_owned());
+                return;
+            }
+            Command::Backend(Some(name)) => LinkCommand::SwitchBackend(name),
             Command::Quit => {
                 self.quit = true;
                 return;
@@ -788,5 +805,117 @@ mod tests {
         assert!(shown.contains("hello again"), "{shown}");
         assert!(shown.contains("s-7"), "{shown}");
         assert!(shown.contains("running"), "{shown}");
+    }
+
+    fn wide_screen(app: &App) -> String {
+        crate::test_support::screen(80, 8, |frame| app.render(frame))
+    }
+
+    #[test]
+    fn switch_commands_go_to_the_link_and_never_into_the_prompt() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+
+        // Act
+        type_line(&mut app, "/model fast");
+        type_line(&mut app, "/backend");
+        type_line(&mut app, "/backend faux");
+
+        // Assert
+        assert_eq!(
+            sent(&mut commands),
+            vec![
+                LinkCommand::SetModel("fast".to_owned()),
+                LinkCommand::ListBackends,
+                LinkCommand::SwitchBackend("faux".to_owned()),
+            ]
+        );
+        assert!(!app.turn_running);
+    }
+
+    #[test]
+    fn a_backend_switch_is_refused_while_a_turn_is_running() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        type_line(&mut app, "q hi");
+        sent(&mut commands);
+
+        // Act
+        type_line(&mut app, "/backend faux");
+
+        // Assert
+        assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+        let shown = wide_screen(&app);
+        assert!(shown.contains("wait for the running turn"), "{shown}");
+    }
+
+    #[test]
+    fn a_prompt_starting_with_a_path_is_sent_to_the_model() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+
+        // Act
+        type_line(&mut app, "/usr/bin holds the tools");
+
+        // Assert
+        assert_eq!(
+            sent(&mut commands),
+            vec![LinkCommand::Send("/usr/bin holds the tools".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_model_command_without_an_alias_shows_usage_and_sends_nothing() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+
+        // Act
+        type_line(&mut app, "/model");
+
+        // Assert
+        assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+        let shown = wide_screen(&app);
+        assert!(shown.contains("/model needs a model alias"), "{shown}");
+    }
+
+    #[test]
+    fn a_switched_model_shows_in_the_status_line_and_the_transcript() {
+        // Arrange
+        let mut app = App::new();
+        app.handle_event(LinkEvent::SessionStarted(session("s-1")));
+        let mut switched = session("s-1");
+        switched.model = Some("claude-fast".to_owned());
+
+        // Act
+        app.handle_event(LinkEvent::ModelSwitched(switched));
+
+        // Assert
+        let shown = wide_screen(&app);
+        assert!(shown.contains("faux | claude-fast"), "{shown}");
+        assert!(shown.contains("model is now claude-fast"), "{shown}");
+    }
+
+    #[test]
+    fn the_notice_after_a_backend_switch_says_the_transcript_is_not_carried_over() {
+        // Arrange
+        let mut app = App::new();
+        app.handle_event(LinkEvent::UserMessage("old chat".to_owned()));
+        let mut started = session("s-2");
+        started.backend = BackendKind::Anthropic;
+
+        // Act
+        app.handle_event(LinkEvent::SessionStarted(started));
+        app.handle_event(LinkEvent::Notice(
+            crate::sessions::TRANSCRIPT_NOT_CARRIED.to_owned(),
+        ));
+
+        // Assert
+        let shown = wide_screen(&app);
+        assert!(!shown.contains("old chat"), "{shown}");
+        assert!(
+            shown.contains("the transcript is not carried over to the new session"),
+            "{shown}"
+        );
+        assert!(shown.contains("anthropic | m-1"), "{shown}");
     }
 }

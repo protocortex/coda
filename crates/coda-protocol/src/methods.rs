@@ -37,6 +37,8 @@ pub const GRANT_ADD: &str = "grant.add";
 pub const USAGE_SUMMARY: &str = "usage.summary";
 /// Switches the model of a session.
 pub const SESSION_SET_MODEL: &str = "session.set_model";
+/// Lists the backends a session can start on.
+pub const DAEMON_BACKENDS: &str = "daemon.backends";
 /// Reports daemon state.
 pub const DAEMON_STATUS: &str = "daemon.status";
 /// Asks the daemon to stop serving and exit.
@@ -57,6 +59,7 @@ pub const METHODS: &[&str] = &[
     GRANT_ADD,
     USAGE_SUMMARY,
     SESSION_SET_MODEL,
+    DAEMON_BACKENDS,
     DAEMON_STATUS,
     DAEMON_SHUTDOWN,
     DAEMON_PING,
@@ -304,6 +307,17 @@ pub struct SessionSetModelResult {
     pub session: SessionInfo,
 }
 
+/// Parameters of [`DAEMON_BACKENDS`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DaemonBackendsParams {}
+
+/// Result of [`DAEMON_BACKENDS`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DaemonBackendsResult {
+    /// The enabled backends, in the order the daemon registers them.
+    pub backends: Vec<BackendKind>,
+}
+
 /// Parameters of [`DAEMON_STATUS`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonStatusParams {}
@@ -362,6 +376,7 @@ mod tests {
             (GRANT_ADD, "grant.add"),
             (USAGE_SUMMARY, "usage.summary"),
             (SESSION_SET_MODEL, "session.set_model"),
+            (DAEMON_BACKENDS, "daemon.backends"),
             (DAEMON_STATUS, "daemon.status"),
             (DAEMON_SHUTDOWN, "daemon.shutdown"),
             (DAEMON_PING, "daemon.ping"),
