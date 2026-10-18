@@ -32,6 +32,11 @@ impl Status {
         self.usage = TokenUsage::default();
     }
 
+    /// Shows `model` while keeping the backend and the tokens used so far.
+    pub fn switch_model(&mut self, model: Option<String>) {
+        self.model = model;
+    }
+
     /// Adds the tokens of a usage report to the running total.
     pub fn apply(&mut self, event: &Event) {
         if let Event::Usage { usage, .. } = event {
@@ -56,7 +61,7 @@ impl Status {
     }
 }
 
-fn backend_name(kind: BackendKind) -> &'static str {
+pub(crate) fn backend_name(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::ClaudeCode => "claude_code",
         BackendKind::CodexAppServer => "codex_app_server",

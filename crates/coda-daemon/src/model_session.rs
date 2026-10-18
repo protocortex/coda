@@ -188,6 +188,14 @@ impl ModelSessions {
         })
     }
 
+    /// The enabled backends a session can start on: agent backends first,
+    /// then the model APIs.
+    pub(crate) fn available_backends(&self) -> Vec<BackendKind> {
+        let mut backends = crate::backends::enabled_agent_backends(&self.config);
+        backends.extend(self.registry.enabled_backends());
+        backends
+    }
+
     /// Starts a send with `text` and returns without waiting for it to end.
     /// `limits` apply only when this send has to build the session's loop; a
     /// loop kept from an earlier send keeps its own, and a model switch hands

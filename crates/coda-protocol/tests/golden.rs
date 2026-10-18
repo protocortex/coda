@@ -8,13 +8,14 @@ use std::path::PathBuf;
 
 use coda_protocol::events::Event;
 use coda_protocol::methods::{
-    DaemonShutdownParams, DaemonShutdownResult, DaemonStatusParams, DaemonStatusResult,
-    GrantAddParams, GrantAddResult, InitializeParams, InitializeResult, PermissionRequestParams,
-    PermissionRespondParams, PermissionRespondResult, PingParams, PingResult, SessionCancelParams,
-    SessionCancelResult, SessionCreateParams, SessionCreateResult, SessionListParams,
-    SessionListResult, SessionResumeParams, SessionResumeResult, SessionSendParams,
-    SessionSendResult, SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams,
-    SessionSubscribeResult, UsageSummaryParams, UsageSummaryResult,
+    DaemonBackendsParams, DaemonBackendsResult, DaemonShutdownParams, DaemonShutdownResult,
+    DaemonStatusParams, DaemonStatusResult, GrantAddParams, GrantAddResult, InitializeParams,
+    InitializeResult, PermissionRequestParams, PermissionRespondParams, PermissionRespondResult,
+    PingParams, PingResult, SessionCancelParams, SessionCancelResult, SessionCreateParams,
+    SessionCreateResult, SessionListParams, SessionListResult, SessionResumeParams,
+    SessionResumeResult, SessionSendParams, SessionSendResult, SessionSetModelParams,
+    SessionSetModelResult, SessionSubscribeParams, SessionSubscribeResult, UsageSummaryParams,
+    UsageSummaryResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -108,6 +109,8 @@ golden_tests! {
     usage_summary_result: "usage.summary.result" => UsageSummaryResult,
     session_set_model_params: "session.set_model.params" => SessionSetModelParams,
     session_set_model_result: "session.set_model.result" => SessionSetModelResult,
+    daemon_backends_params: "daemon.backends.params" => DaemonBackendsParams,
+    daemon_backends_result: "daemon.backends.result" => DaemonBackendsResult,
     daemon_status_params: "daemon.status.params" => DaemonStatusParams,
     daemon_status_result: "daemon.status.result" => DaemonStatusResult,
     daemon_shutdown_params: "daemon.shutdown.params" => DaemonShutdownParams,

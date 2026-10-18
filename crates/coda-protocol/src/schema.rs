@@ -84,6 +84,11 @@ pub fn protocol_schema() -> Value {
         &mut methods,
         m::SESSION_SET_MODEL,
     );
+    add_method::<m::DaemonBackendsParams, m::DaemonBackendsResult>(
+        &mut generator,
+        &mut methods,
+        m::DAEMON_BACKENDS,
+    );
     add_method::<m::DaemonStatusParams, m::DaemonStatusResult>(
         &mut generator,
         &mut methods,

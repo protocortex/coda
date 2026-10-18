@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use coda_config::config::Config;
 use coda_protocol::types::{BackendKind, SessionId};
-use coda_providers::backend::{AgentBackend, BackendError, VERIFIED_CLAUDE_CODE_VERSIONS, locate};
+use coda_providers::backend::{
+    AgentBackend, BackendError, VERIFIED_CLAUDE_CODE_VERSIONS, locate, require_enabled,
+};
 use coda_providers::claude_session::{AdapterError, ClaudeSession, SessionSpec};
 use coda_providers::detect::DetectedBinary;
 
@@ -36,6 +38,19 @@ impl AgentBackend for ClaudeCodeBackend {
     fn verified_versions(&self) -> &'static [&'static str] {
         VERIFIED_CLAUDE_CODE_VERSIONS
     }
+}
+
+/// The delegated agent backends the daemon registers; a Codex backend joins here.
+const AGENT_BACKENDS: &[&dyn AgentBackend] = &[&ClaudeCodeBackend];
+
+/// The registered agent backends that `config` enables.
+#[must_use]
+pub fn enabled_agent_backends(config: &Config) -> Vec<BackendKind> {
+    AGENT_BACKENDS
+        .iter()
+        .filter(|backend| require_enabled(**backend, config).is_ok())
+        .map(|backend| backend.kind())
+        .collect()
 }
 
 /// Finds the Claude Code binary once the backend is enabled in `config`.
@@ -125,7 +140,12 @@ mod tests {
     use coda_protocol::types::{BackendKind, SessionId};
     use coda_providers::backend::AgentBackend;
 
-    use super::{ClaudeCodeBackend, SessionStart, StartError, pidfile_path, start_claude_session};
+    use coda_config::config::Config;
+
+    use super::{
+        ClaudeCodeBackend, SessionStart, StartError, enabled_agent_backends, pidfile_path,
+        start_claude_session,
+    };
     use crate::pidfile::{is_same_process, read};
 
     fn start(dir: &tempfile::TempDir, binary: std::path::PathBuf) -> SessionStart {
@@ -137,6 +157,27 @@ mod tests {
             parent_env: Vec::new(),
             pidfile_dir: dir.path().to_path_buf(),
         }
+    }
+
+    #[test]
+    fn claude_code_is_listed_only_when_its_section_is_enabled() {
+        // Arrange
+        let enabled = Config::from_toml_str("[providers.claude_code]\nenabled = true\n")
+            .unwrap()
+            .config;
+        let disabled = Config::from_toml_str("[providers.claude_code]\nenabled = false\n")
+            .unwrap()
+            .config;
+
+        // Act
+        let (on, off) = (
+            enabled_agent_backends(&enabled),
+            enabled_agent_backends(&disabled),
+        );
+
+        // Assert
+        assert_eq!(on, [BackendKind::ClaudeCode]);
+        assert_eq!(off, Vec::<BackendKind>::new());
     }
 
     #[test]
