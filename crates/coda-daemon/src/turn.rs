@@ -24,6 +24,7 @@ use coda_protocol::methods::{
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::{ClaudeSession, TurnOutcome};
 use coda_providers::gate::PermissionGate;
+use coda_providers::registry::RegistryError;
 use coda_providers::tool_request::ToolRequest;
 use coda_store::{
     EventRecord, LogEvent, LogEventKind, LogScope, PendingPermission, SessionRecord, Store,
@@ -89,13 +90,15 @@ pub enum TurnError {
 }
 
 impl TurnError {
-    fn into_rpc(self) -> ErrorObject {
+    pub(crate) fn into_rpc(self) -> ErrorObject {
         match self {
             Self::SessionNotFound(_) => error(SESSION_NOT_FOUND, "Session not found"),
             Self::Busy(_) => error(TURN_RUNNING, "A turn is already running"),
-            Self::Unsupported(_) | Self::Model(ModelError::Disabled(_)) => {
-                error(BACKEND_UNSUPPORTED, "Backend not supported")
-            }
+            Self::Unsupported(_)
+            | Self::Model(
+                ModelError::Disabled(_) | ModelError::Registry(RegistryError::Disabled(_)),
+            ) => error(BACKEND_UNSUPPORTED, "Backend not supported"),
+            Self::Model(ModelError::Registry(e)) => crate::registry::registry_error(&e),
             other => {
                 tracing::error!(error = %other, "request failed");
                 error(INTERNAL_ERROR, "Internal error")
@@ -190,7 +193,7 @@ impl Turns {
             .map_err(|e| not_found_or(e, &session_id))?;
         match record.backend {
             BackendKind::ClaudeCode => self.send_claude(record, text).await,
-            BackendKind::Anthropic | BackendKind::Faux => {
+            BackendKind::Anthropic | BackendKind::OpenaiCompat | BackendKind::Faux => {
                 let limits = Limits {
                     max_turns,
                     token_cap,

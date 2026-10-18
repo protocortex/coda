@@ -19,8 +19,8 @@ use coda_protocol::jsonrpc::{
 use coda_protocol::methods::{
     DAEMON_PING, DAEMON_SHUTDOWN, DAEMON_STATUS, DaemonShutdownResult, GRANT_ADD, INITIALIZE,
     InitializeParams, InitializeResult, PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult,
-    SESSION_CANCEL, SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_SEND, SESSION_SUBSCRIBE,
-    SessionSubscribeParams, SessionSubscribeResult, USAGE_SUMMARY,
+    SESSION_CANCEL, SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_SEND, SESSION_SET_MODEL,
+    SESSION_SUBSCRIBE, SessionSubscribeParams, SessionSubscribeResult, USAGE_SUMMARY,
 };
 use coda_protocol::types::SessionId;
 use serde::de::DeserializeOwned;
@@ -28,6 +28,7 @@ use serde_json::Value;
 use tracing::{Instrument, error};
 
 use crate::grants_rpc;
+use crate::registry;
 use crate::session_rpc;
 use crate::state::{ClientGuard, DaemonState};
 use crate::subscribe::{Connection, Hub, HubError, Outbox};
@@ -152,6 +153,7 @@ impl Dispatcher {
             }
             SESSION_SEND => turn::send(self.turns.as_ref(), params).await,
             SESSION_CANCEL => turn::cancel(self.turns.as_ref(), params),
+            SESSION_SET_MODEL => registry::set_model(self.turns.as_ref(), params).await,
             PERMISSION_RESPOND => turn::respond(self.turns.as_ref(), params).await,
             DAEMON_STATUS => self.status(),
             DAEMON_SHUTDOWN => self.shutdown(),

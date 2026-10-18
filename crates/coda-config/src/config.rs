@@ -109,6 +109,19 @@ pub struct ProviderConfig {
     pub verified_versions: Vec<String>,
     /// Script file replayed by the `faux` backend.
     pub script: Option<PathBuf>,
+    /// API root of a model provider; the provider's own default when unset.
+    pub base_url: Option<String>,
+    /// Model a session uses when it names none.
+    pub model: Option<String>,
+}
+
+/// One `[models.<alias>]` section: a name that selects a provider and model.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ModelAlias {
+    /// Key of the `[providers.<name>]` section that serves the model.
+    pub provider: String,
+    /// Model id sent to the provider.
+    pub model: String,
 }
 
 /// The `[telemetry]` section.
@@ -133,6 +146,8 @@ pub struct Config {
     pub token_cap: u64,
     /// Backends by name.
     pub providers: BTreeMap<String, ProviderConfig>,
+    /// Model aliases by name.
+    pub models: BTreeMap<String, ModelAlias>,
     /// Telemetry settings.
     pub telemetry: TelemetryConfig,
     /// Timeout overrides.
@@ -146,6 +161,7 @@ impl Default for Config {
             max_turns: DEFAULT_MAX_TURNS,
             token_cap: DEFAULT_TOKEN_CAP,
             providers: BTreeMap::new(),
+            models: BTreeMap::new(),
             telemetry: TelemetryConfig::default(),
             timing: Timing::default(),
         }
@@ -448,6 +464,23 @@ idle_timeout_ms = 1500
             matches!(&err, ConfigError::PlaintextSecret { path } if path == "providers.claude.api_key"),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn model_aliases_and_provider_defaults_are_parsed() {
+        // Arrange
+        let input = "[providers.openai_compat]\nbase_url = \"http://localhost:1/v1\"\nmodel = \"m\"\n\
+                     [models.local]\nprovider = \"openai_compat\"\nmodel = \"qwen\"\n";
+
+        // Act
+        let parsed = parse(input);
+
+        // Assert
+        let provider = &parsed.config.providers["openai_compat"];
+        assert_eq!(provider.base_url.as_deref(), Some("http://localhost:1/v1"));
+        assert_eq!(provider.model.as_deref(), Some("m"));
+        assert_eq!(parsed.config.models["local"].model, "qwen");
+        assert_eq!(parsed.unknown_keys, Vec::<String>::new());
     }
 
     #[test]

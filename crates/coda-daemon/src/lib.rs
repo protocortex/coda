@@ -10,6 +10,7 @@ pub mod lock;
 pub mod model_session;
 pub mod pidfile;
 pub mod reaper;
+pub mod registry;
 pub mod server;
 pub mod session_rpc;
 pub mod state;
