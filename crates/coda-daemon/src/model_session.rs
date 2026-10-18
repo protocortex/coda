@@ -20,11 +20,10 @@ use coda_core::tools::{BaseToolsConfig, StoreOriginals, ToolsError, base_tools, 
 use coda_core::turn::{CancelToken, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{Event, TIMEOUT_KIND};
 use coda_protocol::types::{BackendKind, PermissionDecision, SessionId, TokenUsage, TurnId};
-use coda_providers::anthropic::provider::{AnthropicOptions, AnthropicProvider};
-use coda_providers::anthropic::request::RequestSettings;
 use coda_providers::faux::{FauxError, FauxProvider};
-use coda_providers::model::{
-    ModelProvider, ModelRequest, ModelStream, ProviderError, SystemClock, TokioSleeper,
+use coda_providers::model::{ModelProvider, ModelRequest, ModelStream, ProviderError};
+use coda_providers::registry::{
+    ANTHROPIC_KEY, ModelClient, ModelRegistry, OPENAI_COMPAT_KEY, RegistryError,
 };
 use coda_store::{EventRecord, SessionRecord, StoreError};
 use coda_tools::bash::{DEFAULT_ENV_ALLOWLIST, allowlisted_env};
@@ -38,10 +37,6 @@ use crate::trace::backend_span;
 use crate::turn::{TurnError, Turns, store_event};
 
 const FAUX_KEY: &str = "faux";
-const ANTHROPIC_KEY: &str = "anthropic";
-const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
-const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-5-5";
-const MAX_OUTPUT_TOKENS: u32 = 8192;
 /// Tool output above this many bytes is shortened for the model and kept whole.
 const COMPACT_THRESHOLD_BYTES: usize = 16 * 1024;
 const SYSTEM_PROMPT: &str = "You are Coda, a coding assistant working in the user's repository. \
@@ -59,6 +54,9 @@ pub const CONTEXT_OVERFLOW_KIND: &str = "context_overflow";
 pub const TURN_STOPPED_KIND: &str = "turn_stopped";
 /// A session whose earlier conversation was lost starts over from here.
 pub const CONVERSATION_RESET_KIND: &str = "conversation_reset";
+/// A session was switched to another model alias; its next send starts a new
+/// cache prefix. The body names the alias, provider and model, never a key.
+pub const MODEL_SWITCHED_KIND: &str = "model_switched";
 
 /// Why a model-API session could not be started.
 #[derive(Debug, thiserror::Error)]
@@ -69,8 +67,8 @@ pub enum ModelError {
     NotAModelBackend(BackendKind),
     #[error(transparent)]
     Faux(#[from] FauxError),
-    #[error("the provider cannot be used: {0}")]
-    Provider(#[from] ProviderError),
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
     #[error(transparent)]
     Tools(#[from] ToolsError),
     #[error(transparent)]
@@ -79,10 +77,23 @@ pub enum ModelError {
     Broker(#[from] BrokerError),
 }
 
+/// Why a session could not be switched to another model.
+#[derive(Debug, thiserror::Error)]
+pub enum SwitchError {
+    #[error("session {0} has a turn running; switch models when it is idle")]
+    Busy(SessionId),
+    #[error("session {0} does not use a model-API backend")]
+    NotAModelBackend(SessionId),
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+    #[error(transparent)]
+    Hub(#[from] HubError),
+}
+
 /// The provider a session was configured with.
 enum Provider {
     Faux(FauxProvider),
-    Anthropic(AnthropicProvider<TokioSleeper, SystemClock>),
+    Api(ModelClient),
     /// Fails the task that drives it, to exercise panic handling.
     #[cfg(test)]
     Panicking,
@@ -92,7 +103,7 @@ impl ModelProvider for Provider {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ProviderError> {
         match self {
             Self::Faux(provider) => provider.stream(request).await,
-            Self::Anthropic(provider) => provider.stream(request).await,
+            Self::Api(provider) => provider.stream(request).await,
             #[cfg(test)]
             Self::Panicking => panic!("the test provider panics on purpose"),
         }
@@ -111,6 +122,7 @@ struct ModelLoop {
     turn_loop: TurnLoop<Provider, BrokerGate>,
     events: UnboundedReceiver<TurnEvent>,
     turn: Arc<Mutex<TurnId>>,
+    limits: Limits,
 }
 
 /// Removes a session from the running table when dropped, so a task that
@@ -139,6 +151,7 @@ pub struct ModelSessions {
     hub: Arc<Hub>,
     brokers: Arc<Brokers>,
     config: Config,
+    registry: ModelRegistry,
     env: Vec<(OsString, OsString)>,
     key_reader: EnvReader,
     /// Present from the moment a send reserves the session, with its cancel
@@ -146,6 +159,9 @@ pub struct ModelSessions {
     running: Mutex<HashMap<SessionId, Option<(CancelToken, TurnId)>>>,
     /// Idle conversations, least recently used first.
     loops: Mutex<Vec<(SessionId, ModelLoop)>>,
+    /// Limits of conversations a model switch dropped, until the next send
+    /// builds the replacement.
+    carried_limits: Mutex<HashMap<SessionId, Limits>>,
 }
 
 impl ModelSessions {
@@ -162,17 +178,20 @@ impl ModelSessions {
         Arc::new(Self {
             hub,
             brokers,
+            registry: ModelRegistry::from_config(&config),
             config,
             env: allowlisted_env(DEFAULT_ENV_ALLOWLIST, env),
             key_reader,
             running: Mutex::default(),
             loops: Mutex::default(),
+            carried_limits: Mutex::default(),
         })
     }
 
     /// Starts a send with `text` and returns without waiting for it to end.
     /// `limits` apply only when this send has to build the session's loop; a
-    /// loop kept from an earlier send keeps its own.
+    /// loop kept from an earlier send keeps its own, and a model switch hands
+    /// the dropped loop's limits to the loop that replaces it.
     ///
     /// # Errors
     /// Returns [`TurnError::Busy`] when the session is running,
@@ -186,14 +205,12 @@ impl ModelSessions {
     ) -> Result<TurnId, TurnError> {
         let session = record.id.clone();
         let slot = self.reserve(&session)?;
+        // The caller's record may predate a model switch that finished while
+        // this send was starting; under the reservation the stored one is final.
+        let id = session.clone();
+        let record = self.hub.with_store(move |s| s.load_session(&id)).await?;
         info!(session = %session, step = "build_loop", "preparing the model session");
-        let (model_loop, rebuilt) = match self.take_loop(&session) {
-            Some(model_loop) => (model_loop, false),
-            None => (
-                self.build(&record, limits).await?,
-                self.has_history(&session).await,
-            ),
-        };
+        let (model_loop, rebuilt) = self.loop_for_send(&record, limits).await?;
         info!(session = %session, step = "begin_turn", "recording the user message");
         let turn = match Turns::begin(&self.hub, &session, &text).await {
             Ok(turn) => turn,
@@ -224,6 +241,67 @@ impl ModelSessions {
             .instrument(span),
         );
         Ok(turn)
+    }
+
+    /// Switches an idle model-API session to the alias `alias`.
+    ///
+    /// The steps: reserve the session so no send can start, resolve the alias
+    /// and build its client to prove it is usable, store the resolved model id,
+    /// drop the idle conversation and record the switch. The conversation does
+    /// not carry over: the next send starts a new one with a fresh prefix, which
+    /// the `conversation_reset` event marks, while the send limits of the
+    /// dropped loop are kept for it. The alias name lives only in the switch
+    /// event, so a later change to the aliases cannot reinterpret the stored
+    /// model. Only `session` is touched.
+    ///
+    /// # Errors
+    /// Returns [`SwitchError::Busy`] while a send runs,
+    /// [`SwitchError::NotAModelBackend`] for other backends,
+    /// [`SwitchError::Registry`] when the alias is unknown or its client cannot
+    /// be built, and [`SwitchError::Hub`] when the store refuses.
+    pub(crate) async fn set_model(
+        self: &Arc<Self>,
+        session: &SessionId,
+        alias: &str,
+    ) -> Result<SessionRecord, SwitchError> {
+        let id = session.clone();
+        let record = self.hub.with_store(move |s| s.load_session(&id)).await?;
+        if !matches!(
+            record.backend,
+            BackendKind::Anthropic | BackendKind::OpenaiCompat | BackendKind::Faux
+        ) {
+            return Err(SwitchError::NotAModelBackend(session.clone()));
+        }
+        let _slot = self
+            .reserve(session)
+            .map_err(|_| SwitchError::Busy(session.clone()))?;
+        info!(session = %session, step = "resolve_alias", "checking the model alias");
+        let target = self.registry.alias(alias, record.backend)?;
+        if record.backend != BackendKind::Faux {
+            let reader = Arc::clone(&self.key_reader);
+            self.registry.build(&target, move |name| reader(name))?;
+        }
+        info!(session = %session, step = "store_switch", "storing the new model");
+        let (id, model) = (session.clone(), target.model.clone());
+        let turn = self
+            .hub
+            .with_store_mut(move |store| {
+                store.set_session_model(&id, &model)?;
+                store.begin_turn(&id)
+            })
+            .await?;
+        if let Some(dropped) = self.take_loop(session) {
+            lock(&self.carried_limits).insert(session.clone(), dropped.limits);
+        }
+        let body = json!({
+            "alias": alias,
+            "provider": backend_name(record.backend),
+            "model": target.model,
+            "conversation": "reset",
+        });
+        log_failure(publish_kind(&self.hub, session, &turn, MODEL_SWITCHED_KIND, &body).await);
+        let id = session.clone();
+        Ok(self.hub.with_store(move |s| s.load_session(&id)).await?)
     }
 
     /// Cancels the running send of `session`; `false` when none is running.
@@ -342,29 +420,35 @@ impl ModelSessions {
                 }
                 Ok(Provider::Faux(FauxProvider::from_config(&self.config)?))
             }
-            BackendKind::Anthropic => {
-                let section = self.section(ANTHROPIC_KEY)?;
-                let options = AnthropicOptions {
-                    base_url: ANTHROPIC_BASE_URL.to_owned(),
-                    settings: RequestSettings {
-                        model: record
-                            .model
-                            .clone()
-                            .unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_owned()),
-                        max_tokens: MAX_OUTPUT_TOKENS,
-                        system: String::new(),
-                        tools: Vec::new(),
-                    },
-                    timing: coda_providers::anthropic::Timing::from_config(&self.config.timing),
-                };
+            BackendKind::Anthropic | BackendKind::OpenaiCompat => {
+                let target = self
+                    .registry
+                    .select(record.backend, record.model.as_deref())?;
                 let reader = Arc::clone(&self.key_reader);
                 let lookup = move |name: &str| reader(name);
-                Ok(Provider::Anthropic(AnthropicProvider::from_config(
-                    section, options, lookup,
-                )?))
+                Ok(Provider::Api(self.registry.build(&target, lookup)?))
             }
             other => Err(ModelError::NotAModelBackend(other)),
         }
+    }
+
+    /// The idle loop of the session, or a new one and whether it replaces a
+    /// conversation that had history.
+    async fn loop_for_send(
+        &self,
+        record: &SessionRecord,
+        limits: Limits,
+    ) -> Result<(ModelLoop, bool), ModelError> {
+        if let Some(model_loop) = self.take_loop(&record.id) {
+            return Ok((model_loop, false));
+        }
+        let limits = lock(&self.carried_limits)
+            .get(&record.id)
+            .copied()
+            .unwrap_or(limits);
+        let built = self.build(record, limits).await?;
+        lock(&self.carried_limits).remove(&record.id);
+        Ok((built, self.has_history(&record.id).await))
     }
 
     async fn build(&self, record: &SessionRecord, limits: Limits) -> Result<ModelLoop, ModelError> {
@@ -411,6 +495,7 @@ impl ModelSessions {
             turn_loop,
             events,
             turn,
+            limits,
         })
     }
 
@@ -427,6 +512,7 @@ impl ModelSessions {
             mut turn_loop,
             mut events,
             turn: shared_turn,
+            limits,
         } = model_loop;
         info!(session = %session, turn = %turn, step = "drive", "driving the turn loop");
         let outcome = {
@@ -459,6 +545,7 @@ impl ModelSessions {
             turn_loop,
             events,
             turn: shared_turn,
+            limits,
         };
         self.keep_loop(session, model_loop);
     }
@@ -505,6 +592,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn backend_name(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Anthropic => ANTHROPIC_KEY,
+        BackendKind::OpenaiCompat => OPENAI_COMPAT_KEY,
         _ => FAUX_KEY,
     }
 }

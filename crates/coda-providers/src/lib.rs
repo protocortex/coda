@@ -12,6 +12,7 @@ pub mod gate;
 pub mod model;
 pub mod openai_compat;
 pub mod policy;
+pub mod registry;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod tool_request;
