@@ -6,6 +6,7 @@ pub mod anthropic;
 pub mod backend;
 pub mod claude_code;
 pub mod claude_session;
+pub mod codex_app_server;
 pub mod codex_exec;
 pub mod detect;
 pub mod faux;
@@ -18,6 +19,4 @@ pub mod registry;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod tool_request;
-// The codec is used by the Codex app-server adapter, which lands separately.
-#[allow(dead_code)]
 mod websocket;
