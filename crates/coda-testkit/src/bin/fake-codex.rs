@@ -24,7 +24,8 @@
 //! environment. `report_path` receives the arguments, the prompt and
 //! environment facts, and `pid_path` receives the `sleep` pid. `upgrade_status` makes the app-server answer the
 //! upgrade with that HTTP status and `version` sets the version it reports. `no_thread_id` makes `thread/start`
-//! answer without a thread id and `exit_early` exits before the socket exists.
+//! answer without a thread id, `exit_early` exits before the socket exists and `hang_start` parks
+//! before it creates one.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -301,6 +302,9 @@ mod app_server {
         write_report(args, "")?;
         if control_value("exit_early").is_some() {
             std::process::exit(EARLY_EXIT_CODE);
+        }
+        if control_value("hang_start").is_some() {
+            park();
         }
         let listen = arg_after(args, LISTEN_FLAG).unwrap_or_default();
         let mut stream = accept(listen.strip_prefix(SCHEME).unwrap_or(&listen))?;

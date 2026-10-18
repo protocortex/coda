@@ -33,6 +33,8 @@ const SECRET_KEY_SUFFIXES: [&str; 7] = [
     "credential",
 ];
 const ENV_NAME_SUFFIX: &str = "_env";
+/// The values `sandbox` accepts, the names Codex gives its sandbox modes.
+pub const SANDBOX_MODES: [&str; 3] = ["read-only", "workspace-write", "danger-full-access"];
 
 /// Why reading or parsing the configuration failed.
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +66,14 @@ pub enum ConfigError {
     PlaintextSecret {
         /// Dotted path of the offending key.
         path: String,
+    },
+    /// A key holds a value outside the ones it accepts.
+    #[error("invalid value at `{path}`: use one of {allowed}")]
+    InvalidValue {
+        /// Dotted path of the offending key.
+        path: String,
+        /// The accepted values.
+        allowed: String,
     },
     /// Neither `CODA_HOME` nor `HOME` is set.
     #[error("cannot locate the config directory: neither CODA_HOME nor HOME is set")]
@@ -113,6 +123,10 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     /// Model a session uses when it names none.
     pub model: Option<String>,
+    /// Sandbox a Codex session runs under; read-only when unset.
+    pub sandbox: Option<String>,
+    /// Allows a `sandbox` wider than read-only.
+    pub allow_wider_sandbox: bool,
 }
 
 /// One `[models.<alias>]` section: a name that selects a provider and model.
@@ -182,18 +196,35 @@ impl Config {
     ///
     /// # Errors
     /// Returns [`ConfigError::Syntax`] if the text is not valid for the schema, or
-    /// [`ConfigError::PlaintextSecret`] if a provider section holds a literal secret.
+    /// [`ConfigError::PlaintextSecret`] if a provider section holds a literal secret, or
+    /// [`ConfigError::InvalidValue`] if a provider `sandbox` is not a Codex sandbox.
     pub fn from_toml_str(text: &str) -> Result<Parsed, ConfigError> {
         let value: toml::Value = toml::from_str(text)?;
         if let Some(providers) = value.get(PROVIDERS_KEY) {
             find_plaintext_secret(providers, PROVIDERS_KEY)?;
         }
         let mut unknown_keys = Vec::new();
-        let config = serde_ignored::deserialize(value, |path| unknown_keys.push(path.to_string()))?;
+        let config: Self =
+            serde_ignored::deserialize(value, |path| unknown_keys.push(path.to_string()))?;
+        config.check_sandboxes()?;
         Ok(Parsed {
             config,
             unknown_keys,
         })
+    }
+
+    fn check_sandboxes(&self) -> Result<(), ConfigError> {
+        for (name, section) in &self.providers {
+            if let Some(sandbox) = &section.sandbox
+                && !SANDBOX_MODES.contains(&sandbox.as_str())
+            {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{PROVIDERS_KEY}.{name}.sandbox"),
+                    allowed: SANDBOX_MODES.join(", "),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Reads and parses the file at `path`.
@@ -342,6 +373,45 @@ mod tests {
         assert!(!parsed.config.telemetry.capture_content);
         assert_eq!(parsed.config.timing, crate::timing::Timing::default());
         assert_eq!(parsed.unknown_keys, Vec::<String>::new());
+    }
+
+    #[test]
+    fn sandbox_settings_default_to_read_only_without_an_opt_in() {
+        // Arrange
+        let wide = "[providers.codex]\nsandbox = \"workspace-write\"\nallow_wider_sandbox = true\n";
+
+        // Act
+        let (plain, opted_in) = (parse("[providers.codex]\nenabled = true\n"), parse(wide));
+
+        // Assert
+        let (plain, opted_in) = (
+            &plain.config.providers["codex"],
+            &opted_in.config.providers["codex"],
+        );
+        assert_eq!(
+            (plain.sandbox.as_deref(), plain.allow_wider_sandbox),
+            (None, false)
+        );
+        assert_eq!(
+            (opted_in.sandbox.as_deref(), opted_in.allow_wider_sandbox),
+            (Some("workspace-write"), true)
+        );
+    }
+
+    #[test]
+    fn an_unknown_sandbox_is_rejected_at_load_naming_the_key() {
+        // Arrange
+        let text = "[providers.codex]\nsandbox = \"workspace-writ\"\n";
+
+        // Act
+        let err = Config::from_toml_str(text).unwrap_err();
+
+        // Assert
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { path, .. } if path == "providers.codex.sandbox"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("danger-full-access"));
     }
 
     #[test]

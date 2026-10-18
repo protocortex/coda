@@ -128,7 +128,7 @@ impl Fixture {
         verified: &[&str],
         parent_env: &[(&str, &str)],
     ) -> Result<CodexAppServerSession, AppServerError> {
-        let start = CodexAppServerSession::start(self.spec(verified, parent_env));
+        let start = CodexAppServerSession::start(self.spec(verified, parent_env), None);
         tokio::time::timeout(TURN_TIMEOUT, start)
             .await
             .expect("start did not finish in time")

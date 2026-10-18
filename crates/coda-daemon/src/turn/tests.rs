@@ -66,12 +66,26 @@ struct Rig {
 
 impl Rig {
     fn new(timing: Timing, parent_env: Vec<(OsString, OsString)>) -> Self {
+        Self::build(
+            timing,
+            parent_env,
+            BackendKind::ClaudeCode,
+            coda_config::config::Config::default(),
+        )
+    }
+
+    fn build(
+        timing: Timing,
+        parent_env: Vec<(OsString, OsString)>,
+        backend: BackendKind,
+        models: coda_config::config::Config,
+    ) -> Self {
         let data = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let mut store = Store::open(&data.path().join(STORE_DIR)).unwrap();
         let session = store
             .create_session(&NewSession {
-                backend: BackendKind::ClaudeCode,
+                backend,
                 model: None,
                 cwd: cwd.path().to_string_lossy().into_owned(),
                 mode: Mode::Default,
@@ -85,7 +99,7 @@ impl Rig {
                 pidfile_dir: data.path().to_path_buf(),
                 parent_env,
                 timing,
-                models: coda_config::config::Config::default(),
+                models,
             },
         );
         let dispatcher = Dispatcher::new()
@@ -725,4 +739,89 @@ async fn text_the_backend_emits_is_stored_as_content() {
 
     // Assert
     assert!(dump(&rig.db(), "events").contains(ECHO_CANARY));
+}
+
+fn codex_config() -> coda_config::config::Config {
+    let binary = coda_testkit::paths::fake_codex_path().unwrap();
+    let toml = format!(
+        "[providers.codex]\nenabled = true\nbinary = \"{}\"\nverified_versions = [\"0.0.0-fake\"]\n",
+        binary.display()
+    );
+    coda_config::config::Config::from_toml_str(&toml)
+        .unwrap()
+        .config
+}
+
+fn codex_rig(control: &Value) -> Rig {
+    let rig = Rig::build(
+        relaxed(),
+        Vec::new(),
+        BackendKind::CodexAppServer,
+        codex_config(),
+    );
+    let file = rig.cwd.path().join("fake-codex-control.json");
+    std::fs::write(file, control.to_string()).unwrap();
+    rig
+}
+
+#[tokio::test]
+async fn a_codex_turn_runs_on_the_app_server_and_a_later_one_says_the_thread_is_new() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+
+    // Act
+    let sent = rig.send("hello").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert!(sent["result"]["turn_id"].is_string());
+    let kinds = rig.kinds().await;
+    assert!(kinds.contains(&"stream_delta".to_owned()));
+    assert!(!kinds.contains(&"approvals_unavailable".to_owned()));
+    assert!(!rig.pidfile().exists());
+    assert!(!dump(&rig.db(), "events").contains("do not carry over"));
+
+    // Act
+    rig.send("second").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert!(dump(&rig.db(), "events").contains("do not carry over"));
+}
+
+#[tokio::test]
+async fn a_codex_turn_on_the_exec_fallback_stores_the_approvals_unavailable_event() {
+    // Arrange
+    let mut rig = codex_rig(&json!({"version": "9.9.9"}));
+
+    // Act
+    rig.send("hello").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let kinds = rig.kinds().await;
+    assert!(kinds.contains(&"approvals_unavailable".to_owned()));
+    assert!(!rig.pidfile().exists());
+}
+
+#[tokio::test]
+async fn a_codex_app_server_crash_is_stored_as_a_crash_event_without_a_fallback() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+
+    // Act
+    rig.send("please crash").await;
+    rig.wait_for("backend_crashed").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert!(
+        !rig.kinds()
+            .await
+            .contains(&"approvals_unavailable".to_owned())
+    );
+    let log = dump(&rig.db(), "event_log");
+    assert!(log.contains("turn_ended") && log.contains("error"), "{log}");
 }
