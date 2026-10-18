@@ -74,6 +74,28 @@ fn replace_file_records_hash_and_time_per_file() {
 }
 
 #[test]
+fn restamp_moves_the_index_time_and_keeps_hash_and_symbols() {
+    // Arrange
+    let (_dir, mut store, clock) = open();
+    clock.0.store(100, Ordering::SeqCst);
+    store
+        .replace_file(REPO, "a.rs", "h", vec![symbol("alpha", 1)])
+        .unwrap();
+    clock.0.store(900, Ordering::SeqCst);
+
+    // Act
+    store.restamp_files(REPO, &["a.rs".to_owned()]).unwrap();
+
+    // Assert
+    let files = store.indexed_files(REPO).unwrap();
+    assert_eq!(
+        (files[0].content_hash.as_str(), files[0].indexed_at),
+        ("h", 900)
+    );
+    assert_eq!(hits(&store, REPO, "alpha", 10).len(), 1);
+}
+
+#[test]
 fn replace_file_swaps_old_rows_for_new_ones() {
     // Arrange
     let (_dir, mut store, _clock) = open();

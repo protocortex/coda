@@ -8,6 +8,7 @@
 //! [`sandbox::Sandbox`].
 
 pub mod bash;
+pub mod code;
 pub mod edit;
 pub mod grep;
 pub mod read;
@@ -91,6 +92,19 @@ pub enum ToolError {
     /// The original could not be retrieved.
     #[error(transparent)]
     Original(#[from] coda_protocol::readers::ReaderError),
+    /// The code index could not answer.
+    #[error("code index failed: {0}")]
+    Index(coda_protocol::readers::ReaderError),
+    /// The requested first line is after the last line of the file.
+    #[error("{path} has {lines} lines, so line {start} is past the end")]
+    PastEndOfFile {
+        /// The workspace-relative path.
+        path: String,
+        /// The one-based line the caller asked to start at.
+        start: u64,
+        /// How many lines the file has.
+        lines: u64,
+    },
     /// The file is not valid UTF-8 text.
     #[error("{path} is not valid UTF-8 text")]
     NotUtf8 {

@@ -16,7 +16,7 @@ use std::time::Duration;
 use coda_config::config::{Config, ProviderConfig};
 use coda_core::broker::BrokerError;
 use coda_core::prompt::{Conversation, Prefix, PromptError};
-use coda_core::tools::{BaseToolsConfig, StoreOriginals, ToolsError, base_tools};
+use coda_core::tools::{BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index};
 use coda_core::turn::{CancelToken, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{Event, TIMEOUT_KIND};
 use coda_protocol::types::{BackendKind, PermissionDecision, SessionId, TokenUsage, TurnId};
@@ -369,12 +369,19 @@ impl ModelSessions {
 
     async fn build(&self, record: &SessionRecord, limits: Limits) -> Result<ModelLoop, ModelError> {
         let provider = self.provider(record)?;
+        let (store, workdir) = (self.hub.store_handle(), PathBuf::from(&record.cwd));
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || refresh_index(&store, &workdir)).await
+        {
+            warn!(%error, "the code index refresh crashed");
+        }
         let tools = base_tools(
             &BaseToolsConfig {
                 workdir: PathBuf::from(&record.cwd),
                 bash_timeout: self.config.timing.tool_execution,
                 env: self.env.clone(),
             },
+            self.hub.store_handle(),
             StoreOriginals::new(self.hub.store_handle(), record.id.clone()),
         )?;
         let prefix = Prefix::new(SYSTEM_PROMPT, tools.schemas, "")?;

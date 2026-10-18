@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 coda-config = { path = "../coda-config" }
+coda-index = { path = "../coda-index" }
 coda-protocol = { path = "../coda-protocol" }
 coda-providers = { path = "../coda-providers" }
 coda-store = { path = "../coda-store" }

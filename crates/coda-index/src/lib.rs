@@ -9,7 +9,8 @@ pub mod walk;
 
 pub use lang::Language;
 pub use symbols::{Symbol, SymbolError, SymbolKind, extract};
-pub use update::{FailedFile, UpdateError, UpdateReport, update_index};
+pub use update::{FailedFile, UpdateError, UpdateReport, apply_walk, update_index};
 pub use walk::{
     IndexedFile, SkipReason, Skipped, WalkError, WalkLimits, WalkReport, index_workspace,
+    list_sources,
 };
