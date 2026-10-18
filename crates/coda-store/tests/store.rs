@@ -81,7 +81,7 @@ fn open_records_the_schema_version() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn newer_schema_version_is_refused() {
         err,
         StoreError::SchemaTooNew {
             found: 99,
-            supported: 5
+            supported: 6
         }
     ));
 }
@@ -275,8 +275,10 @@ fn v3_snapshot_migrates_forward_keeping_unresolved_pending_requests() {
         [
             "events_by_turn_and_time",
             "savings_by_session",
+            "index_files",
             "pending_permissions",
-            "savings"
+            "savings",
+            "symbols"
         ]
     );
 }
@@ -502,4 +504,44 @@ fn symlinked_data_dir_is_refused() {
     // Assert
     assert!(matches!(err, StoreError::SymlinkedDataDir { .. }));
     assert!(!real.join("coda.db").exists());
+}
+
+#[test]
+fn v5_database_migrates_forward_keeping_symbols_and_seeding_file_state() {
+    // Arrange
+    let mut old = Connection::open_in_memory().unwrap();
+    for sql in [
+        include_str!("../src/schema.sql"),
+        include_str!("../src/schema_v2.sql"),
+        include_str!("../src/schema_v3.sql"),
+        include_str!("../src/schema_v4.sql"),
+        include_str!("../src/schema_v5.sql"),
+    ] {
+        old.execute_batch(sql).unwrap();
+    }
+    old.pragma_update(None, "user_version", 5).unwrap();
+    old.execute_batch(
+        "INSERT INTO symbols (repo_path, file_path, name, kind, line) \
+         VALUES ('/repo', 'src/a.rs', 'kept', 'fn', 3);",
+    )
+    .unwrap();
+
+    // Act
+    migrate::migrate(&mut old).unwrap();
+
+    // Assert
+    let row: (String, i64, Option<String>) = old
+        .query_row("SELECT name, end_line, parent FROM symbols", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    let state: (String, String) = old
+        .query_row(
+            "SELECT file_path, content_hash FROM index_files WHERE repo_path = '/repo'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("kept".to_owned(), 0, None));
+    assert_eq!(state, ("src/a.rs".to_owned(), String::new()));
 }

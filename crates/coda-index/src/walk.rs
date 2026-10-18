@@ -2,11 +2,13 @@
 
 //! Gitignore-aware workspace walk that indexes supported source files.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
+use sha2::{Digest, Sha256};
 
 use crate::lang::Language;
 use crate::symbols::{Symbol, SymbolError, extract};
@@ -16,6 +18,9 @@ pub const DEFAULT_MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// A NUL byte within this many leading bytes marks a file as binary.
 const BINARY_SNIFF_BYTES: usize = 8192;
+
+/// Length of a SHA-256 digest in lowercase hex.
+const SHA256_HEX_LEN: usize = 64;
 
 /// Limits applied while walking.
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +42,8 @@ pub struct IndexedFile {
     /// Path relative to the walk root.
     pub path: PathBuf,
     pub language: Language,
+    /// SHA-256 of the file bytes the symbols were extracted from, in lowercase hex.
+    pub content_hash: String,
     pub symbols: Vec<Symbol>,
 }
 
@@ -113,9 +120,10 @@ fn walk(root: &Path, limits: WalkLimits, extractor: Extractor) -> Result<WalkRep
         }
         let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
         match index_file(path, language, limits, extractor) {
-            Ok(symbols) => report.files.push(IndexedFile {
+            Ok((content_hash, symbols)) => report.files.push(IndexedFile {
                 path: rel,
                 language,
+                content_hash,
                 symbols,
             }),
             Err(FileFailure::Skip(reason)) => report.skipped.push(Skipped { path: rel, reason }),
@@ -136,15 +144,25 @@ fn index_file(
     language: Language,
     limits: WalkLimits,
     extractor: Extractor,
-) -> Result<Vec<Symbol>, FileFailure> {
+) -> Result<(String, Vec<Symbol>), FileFailure> {
     let bytes = read_capped(path, limits.max_file_bytes).map_err(FileFailure::Skip)?;
     if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
         return Err(FileFailure::Skip(SkipReason::Binary));
     }
-    extractor(language, &bytes).map_err(|err| match err {
+    let symbols = extractor(language, &bytes).map_err(|err| match err {
         SymbolError::Grammar(language) => FileFailure::Grammar(language),
         SymbolError::Parse => FileFailure::Skip(SkipReason::ParseFailed),
-    })
+    })?;
+    Ok((hex_digest(&bytes), symbols))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(SHA256_HEX_LEN), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 /// Reads at most `max + 1` bytes, so a file that grew past the cap after

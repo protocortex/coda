@@ -19,7 +19,7 @@ pub use decisions::{NewDecision, StoredDecision};
 pub use event_log::{LogEvent, LogEventKind, LogScope, MAX_LOG_ID};
 pub use events::{EventRecord, StoredEvent};
 pub use grants::{Grant, GrantKey};
-pub use index::Symbol;
+pub use index::{IndexStatus, IndexedFileState, Symbol};
 pub use originals::{MAX_ORIGINAL_BYTES, MAX_SESSION_ORIGINAL_BYTES};
 pub use pending::{NewPending, PendingPermission};
 pub use readers::{RepoIndex, SessionOriginals};
@@ -40,7 +40,7 @@ use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// File name of the database inside the data directory.
 pub const DB_FILE_NAME: &str = "coda.db";

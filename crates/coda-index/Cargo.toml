@@ -8,13 +8,17 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+coda-store = { path = "../coda-store" }
 ignore.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
 
 [dev-dependencies]
+coda-protocol = { path = "../coda-protocol" }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 tempfile.workspace = true
 
 [lints]
