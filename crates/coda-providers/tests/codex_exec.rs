@@ -211,11 +211,7 @@ async fn the_child_gets_only_allowlisted_environment() {
     // Assert
     let report = fixture.report();
     let names = report["env_names"].as_array().unwrap();
-    assert!(
-        names
-            .iter()
-            .all(|name| ENV_ALLOWLIST.contains(&name.as_str().unwrap()))
-    );
+    assert!(names.iter().all(|name| ENV_ALLOWLIST.contains(&name.as_str().unwrap())), "OFFENDING {names:?}");
     assert!(!names.contains(&Value::from("OPENAI_API_KEY")));
     assert_eq!(report["home"], "/tmp/codex-home");
 }
