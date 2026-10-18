@@ -90,6 +90,8 @@ fn symbol(name: &str, kind: &str, line: u32) -> Symbol {
         name: name.to_owned(),
         kind: kind.to_owned(),
         line,
+        end_line: line,
+        parent: None,
     }
 }
 
@@ -399,10 +401,20 @@ fn index_readers_only_see_their_own_repo() {
     // Arrange
     let (_dir, mut store) = open_store();
     store
-        .upsert_symbols("/repo-a", "src/lib.rs", vec![symbol("alpha_fn", "fn", 1)])
+        .replace_file(
+            "/repo-a",
+            "src/lib.rs",
+            "hash",
+            vec![symbol("alpha_fn", "fn", 1)],
+        )
         .unwrap();
     store
-        .upsert_symbols("/repo-b", "src/lib.rs", vec![symbol("beta_fn", "fn", 2)])
+        .replace_file(
+            "/repo-b",
+            "src/lib.rs",
+            "hash",
+            vec![symbol("beta_fn", "fn", 2)],
+        )
         .unwrap();
     let a = store.index_reader("/repo-a");
     let b = store.index_reader("/repo-b");
@@ -430,9 +442,10 @@ fn index_reader_finds_a_written_symbol_by_search_and_symbols() {
     // Arrange
     let (_dir, mut store) = open_store();
     store
-        .upsert_symbols(
+        .replace_file(
             "/repo",
             "src/lib.rs",
+            "hash",
             vec![symbol("parse_config", "fn", 12)],
         )
         .unwrap();
@@ -464,14 +477,15 @@ fn index_reader_outline_lists_a_file_in_source_order() {
     // Arrange
     let (_dir, mut store) = open_store();
     store
-        .upsert_symbols(
+        .replace_file(
             "/repo",
             "src/a.rs",
+            "hash",
             vec![symbol("second", "fn", 20), symbol("first", "struct", 3)],
         )
         .unwrap();
     store
-        .upsert_symbols("/repo", "src/b.rs", vec![symbol("other", "fn", 1)])
+        .replace_file("/repo", "src/b.rs", "hash", vec![symbol("other", "fn", 1)])
         .unwrap();
     let bound = store.index_reader("/repo");
     let reader: &dyn IndexReader = &bound;
@@ -491,7 +505,9 @@ fn search_respects_the_limit_and_tolerates_query_syntax() {
     let symbols = (1..=5)
         .map(|n| symbol(&format!("item{n}"), "fn", n))
         .collect();
-    store.upsert_symbols("/repo", "src/a.rs", symbols).unwrap();
+    store
+        .replace_file("/repo", "src/a.rs", "hash", symbols)
+        .unwrap();
     let bound = store.index_reader("/repo");
     let reader: &dyn IndexReader = &bound;
 
@@ -509,12 +525,22 @@ fn upserting_a_file_again_replaces_its_symbols() {
     // Arrange
     let (_dir, mut store) = open_store();
     store
-        .upsert_symbols("/repo", "src/a.rs", vec![symbol("old_name", "fn", 1)])
+        .replace_file(
+            "/repo",
+            "src/a.rs",
+            "hash",
+            vec![symbol("old_name", "fn", 1)],
+        )
         .unwrap();
 
     // Act
     store
-        .upsert_symbols("/repo", "src/a.rs", vec![symbol("new_name", "fn", 1)])
+        .replace_file(
+            "/repo",
+            "src/a.rs",
+            "hash",
+            vec![symbol("new_name", "fn", 1)],
+        )
         .unwrap();
 
     // Assert
@@ -529,10 +555,15 @@ fn clearing_a_file_removes_it_from_search_and_outline() {
     // Arrange
     let (_dir, mut store) = open_store();
     store
-        .upsert_symbols("/repo", "src/a.rs", vec![symbol("gone_soon", "fn", 1)])
+        .replace_file(
+            "/repo",
+            "src/a.rs",
+            "hash",
+            vec![symbol("gone_soon", "fn", 1)],
+        )
         .unwrap();
     store
-        .upsert_symbols("/repo", "src/b.rs", vec![symbol("stays", "fn", 1)])
+        .replace_file("/repo", "src/b.rs", "hash", vec![symbol("stays", "fn", 1)])
         .unwrap();
 
     // Act

@@ -74,10 +74,14 @@ impl RepoIndex<'_> {
             "SELECT s.name, s.kind, s.file_path, s.line FROM symbols_fts \
              JOIN symbols s ON s.id = symbols_fts.rowid \
              WHERE symbols_fts MATCH ?1 AND s.repo_path = ?2 \
-             ORDER BY rank, s.id LIMIT ?3",
+             ORDER BY rank, s.file_path, s.line, s.id LIMIT ?3",
         )?;
         let rows = stmt.query_map(
-            params![fts_phrase(query), self.repo_path, limit_to_sql(limit)],
+            params![
+                fts_phrase(query),
+                self.repo_path,
+                limit_to_sql(limit.min(MAX_SYMBOL_RESULTS))
+            ],
             symbol_location,
         )?;
         Ok(rows.collect::<Result<_, _>>()?)

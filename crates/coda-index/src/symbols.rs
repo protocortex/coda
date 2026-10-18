@@ -25,6 +25,29 @@ pub enum SymbolKind {
     Impl,
 }
 
+impl SymbolKind {
+    /// Short lowercase label stored in the index and shown to the model.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "fn",
+            Self::Method => "method",
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+            Self::Trait => "trait",
+            Self::Module => "mod",
+            Self::TypeAlias => "type",
+            Self::Const => "const",
+            Self::Class => "class",
+            Self::Interface => "interface",
+            Self::Static => "static",
+            Self::Macro => "macro",
+            Self::Union => "union",
+            Self::Impl => "impl",
+        }
+    }
+}
+
 /// A named definition with its 1-based line span and enclosing definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
