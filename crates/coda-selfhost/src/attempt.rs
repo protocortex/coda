@@ -47,9 +47,6 @@ pub fn config_toml(script: &Path) -> String {
 
 /// Runs the pinned task with `coda run` in `spec.workdir`; the daemon it
 /// starts is stopped before this returns.
-///
-/// # Errors
-/// Returns [`SelfhostError`] when the config cannot be written or `coda` cannot run.
 pub fn run_attempt(spec: &AttemptSpec<'_>) -> Result<Transcript, SelfhostError> {
     let config = spec.home.join(CONFIG_FILE);
     fs::write(&config, config_toml(&spec.script)).map_err(|source| SelfhostError::Io {

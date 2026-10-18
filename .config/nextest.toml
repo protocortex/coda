@@ -1,3 +1,5 @@
+nextest-version = "0.9.70"
+
 # Two self-hosting tests build the workspace in a temporary copy; running them
 # alone keeps that load from tripping the timing-sensitive tests beside them.
 [[profile.default.overrides]]

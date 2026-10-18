@@ -18,6 +18,21 @@ use crate::workspace::git;
 /// Attributes that mark a test function.
 const TEST_ATTRIBUTES: [&str; 2] = ["#[test]", "#[tokio::test"];
 
+/// Coverage and flag variables of an outer `cargo llvm-cov` run. Left in place
+/// they would instrument the nested build and write profile data into it.
+const OUTER_BUILD_ENV: [&str; 7] = [
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "LLVM_PROFILE_FILE",
+    "CARGO_LLVM_COV",
+    "CARGO_LLVM_COV_TARGET_DIR",
+];
+
+/// Parallel jobs per nested cargo, so it does not take the whole machine.
+const NESTED_BUILD_JOBS: &str = "2";
+
 /// How much of a failed command's error output is kept.
 const FAILURE_TAIL_CHARS: usize = 4000;
 
@@ -71,10 +86,6 @@ pub struct VerifyPlan<'a> {
 }
 
 /// Runs every acceptance check on `plan.workdir`.
-///
-/// # Errors
-/// Returns [`SelfhostError::Rejected`] for the first failed check, or the
-/// error of a command that could not run.
 pub fn verify_workdir(plan: &VerifyPlan<'_>) -> Result<(), SelfhostError> {
     // Intent-to-add makes files the attempt created show up in the diff.
     git(plan.workdir, &["add", "-A", "--intent-to-add"])?;
@@ -139,15 +150,7 @@ fn cargo(
     args: &[&str],
     more: &[String],
 ) -> Result<String, SelfhostError> {
-    let mut command = Command::new("cargo");
-    command
-        .args(args)
-        .args(more)
-        .current_dir(plan.workdir)
-        .env(NESTED_ENV, "1");
-    if let Some(target) = plan.target_dir {
-        command.env("CARGO_TARGET_DIR", target);
-    }
+    let mut command = nested_cargo(plan, args, more);
     let done = run_bounded(&mut command, plan.limit)?;
     if !done.status.success() {
         return Err(SelfhostError::CommandFailed {
@@ -159,6 +162,23 @@ fn cargo(
     Ok(done.stdout)
 }
 
+fn nested_cargo(plan: &VerifyPlan<'_>, args: &[&str], more: &[String]) -> Command {
+    let mut command = Command::new("cargo");
+    command
+        .args(args)
+        .args(more)
+        .current_dir(plan.workdir)
+        .env(NESTED_ENV, "1")
+        .env("CARGO_BUILD_JOBS", NESTED_BUILD_JOBS);
+    for name in OUTER_BUILD_ENV {
+        command.env_remove(name);
+    }
+    if let Some(target) = plan.target_dir {
+        command.env("CARGO_TARGET_DIR", target);
+    }
+    command
+}
+
 /// The end of `text`, where a build or test failure says why.
 fn tail(text: &str) -> String {
     let skip = text.chars().count().saturating_sub(FAILURE_TAIL_CHARS);
@@ -166,10 +186,6 @@ fn tail(text: &str) -> String {
 }
 
 /// Checks the changed paths and the diff text of an attempt.
-///
-/// # Errors
-/// Returns the first of [`VerifyError::NoDiff`], [`VerifyError::MainNotTouched`]
-/// and [`VerifyError::NoTestAdded`] that applies.
 pub fn check_diff(changed: &[&str], diff: &str) -> Result<(), VerifyError> {
     if changed.is_empty() {
         return Err(VerifyError::NoDiff);
@@ -197,9 +213,6 @@ fn adds_test(diff: &str) -> bool {
 }
 
 /// Reads the identity of `package` from `cargo metadata --format-version 1` output.
-///
-/// # Errors
-/// Returns [`VerifyError::BadMetadata`] or [`VerifyError::UnknownPackage`].
 pub fn identity_from_metadata(metadata: &str, package: &str) -> Result<Identity, VerifyError> {
     let parsed: Value =
         serde_json::from_str(metadata).map_err(|e| VerifyError::BadMetadata(e.to_string()))?;
@@ -219,9 +232,6 @@ pub fn identity_from_metadata(metadata: &str, package: &str) -> Result<Identity,
 }
 
 /// Checks that `stdout` is JSON whose `name` and `version` equal `expected`.
-///
-/// # Errors
-/// Returns [`VerifyError::NotJson`] or [`VerifyError::Mismatch`].
 pub fn check_version_output(stdout: &str, expected: &Identity) -> Result<(), VerifyError> {
     let not_json = |why: &str| VerifyError::NotJson(why.to_owned());
     let parsed: Value = serde_json::from_str(stdout).map_err(|e| not_json(&e.to_string()))?;
@@ -260,6 +270,28 @@ diff --git a/crates/coda-cli/tests/version.rs b/crates/coda-cli/tests/version.rs
         Identity {
             name: "coda-cli".to_owned(),
             version: "0.0.0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn nested_cargo_drops_the_outer_coverage_env_and_caps_jobs() {
+        // Arrange
+        let plan = VerifyPlan {
+            workdir: Path::new("."),
+            cargo_test_args: vec![],
+            target_dir: None,
+            limit: Duration::from_secs(1),
+        };
+
+        // Act
+        let command = nested_cargo(&plan, &["test"], &[]);
+
+        // Assert
+        let envs: Vec<_> = command.get_envs().collect();
+        let jobs = Some(NESTED_BUILD_JOBS.as_ref());
+        assert!(envs.contains(&("CARGO_BUILD_JOBS".as_ref(), jobs)));
+        for name in OUTER_BUILD_ENV {
+            assert!(envs.contains(&(name.as_ref(), None)), "{name} is kept");
         }
     }
 

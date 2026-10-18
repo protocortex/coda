@@ -31,9 +31,6 @@ pub enum ProcessError {
 
 /// Runs `command` with no stdin, in its own process group, and kills the
 /// whole group if it outlives `limit`.
-///
-/// # Errors
-/// Returns [`ProcessError`] when the command cannot start or times out.
 pub fn run_bounded(command: &mut Command, limit: Duration) -> Result<Captured, ProcessError> {
     let program = command.get_program().to_string_lossy().into_owned();
     let mut child = command

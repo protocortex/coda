@@ -24,9 +24,6 @@ const IDENTITY: [&str; 6] = [
 /// Copies the tracked regular files of the git repository at `source` into
 /// `dest` and commits them there as the baseline the attempt is diffed against.
 /// Untracked files and symlinks are never copied.
-///
-/// # Errors
-/// Returns [`SelfhostError`] when a file cannot be copied or git fails.
 pub fn prepare_copy(source: &Path, dest: &Path) -> Result<(), SelfhostError> {
     let listing = git(source, &["ls-files", "-z", "--cached"])?;
     for relative in listing.split('\0').filter(|name| !name.is_empty()) {
@@ -50,9 +47,6 @@ pub fn prepare_copy(source: &Path, dest: &Path) -> Result<(), SelfhostError> {
 }
 
 /// Runs `git args` in `dir` and returns its standard output.
-///
-/// # Errors
-/// Returns [`SelfhostError::CommandFailed`] on a non-zero exit.
 pub fn git(dir: &Path, args: &[&str]) -> Result<String, SelfhostError> {
     let done = run_bounded(Command::new("git").args(args).current_dir(dir), GIT_LIMIT)?;
     if !done.status.success() {
