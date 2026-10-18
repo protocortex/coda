@@ -81,7 +81,7 @@ fn open_records_the_schema_version() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn newer_schema_version_is_refused() {
         err,
         StoreError::SchemaTooNew {
             found: 99,
-            supported: 7
+            supported: 8
         }
     ));
 }
@@ -276,6 +276,7 @@ fn v3_snapshot_migrates_forward_keeping_unresolved_pending_requests() {
             "events_by_turn_and_time",
             "savings_by_session",
             "index_files",
+            "meta",
             "pending_permissions",
             "savings",
             "symbols"
@@ -599,4 +600,29 @@ fn opening_a_migrated_v6_database_leaves_recovery_no_unfinished_turn() {
 
     // Assert
     assert_eq!(store.unfinished_turns().unwrap(), vec![]);
+}
+
+#[test]
+fn a_database_from_a_newer_release_is_refused_without_being_modified() {
+    // Arrange
+    let (dir, store) = open_store();
+    drop(store);
+    raw(&dir)
+        .execute(
+            "UPDATE meta SET value = '999.0.0' WHERE key = 'last_release'",
+            [],
+        )
+        .unwrap();
+    let db = dir.path().join("data").join(coda_store::DB_FILE_NAME);
+    let before = std::fs::read(&db).unwrap();
+
+    // Act
+    let err = Store::open(&dir.path().join("data")).unwrap_err();
+
+    // Assert
+    assert!(
+        matches!(&err, StoreError::ReleaseTooNew { found, .. } if found == "999.0.0"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&db).unwrap(), before);
 }

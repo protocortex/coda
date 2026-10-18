@@ -48,6 +48,36 @@ pub fn schema_version(data_dir: &Path) -> Result<Option<u32>, StoreError> {
         .transpose()
 }
 
+/// How the release that last opened the database compares to this binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatabaseRelease {
+    /// The database predates release tracking.
+    Unrecorded,
+    Older(String),
+    Current,
+    Newer(String),
+}
+
+/// The database's recorded release against this binary's, or `None` when
+/// there is no file.
+///
+/// # Errors
+/// Returns [`StoreError::Sqlite`] when the file is not a readable database and
+/// [`StoreError::InvalidRelease`] when the recorded release is not a version.
+pub fn release_status(data_dir: &Path) -> Result<Option<DatabaseRelease>, StoreError> {
+    let Some(conn) = open_read_only(data_dir)? else {
+        return Ok(None);
+    };
+    let binary = migrate::binary_release()?;
+    let status = match migrate::read_last_release(&conn)? {
+        None => DatabaseRelease::Unrecorded,
+        Some(found) if found < binary => DatabaseRelease::Older(found.to_string()),
+        Some(found) if found > binary => DatabaseRelease::Newer(found.to_string()),
+        Some(_) => DatabaseRelease::Current,
+    };
+    Ok(Some(status))
+}
+
 /// The problems SQLite's `integrity_check` finds (empty when the database is
 /// sound), or `None` when there is no file.
 ///
@@ -88,6 +118,36 @@ mod tests {
         // Assert
         assert_eq!(version, Some(SCHEMA_VERSION));
         assert_eq!(problems, Some(Vec::new()));
+    }
+
+    #[test]
+    fn release_status_compares_the_recorded_release_with_the_binary() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        drop(Store::open(&data).unwrap());
+        let set = |value: Option<&str>| {
+            let conn = Connection::open(data.join(DB_FILE_NAME)).unwrap();
+            conn.execute("DELETE FROM meta", []).unwrap();
+            if let Some(v) = value {
+                conn.execute("INSERT INTO meta VALUES ('last_release', ?1)", [v])
+                    .unwrap();
+            }
+        };
+        let cases = [
+            (None, DatabaseRelease::Unrecorded),
+            (Some("999.0.0"), DatabaseRelease::Newer("999.0.0".into())),
+            (Some(crate::BINARY_RELEASE), DatabaseRelease::Current),
+        ];
+        for (recorded, expected) in cases {
+            set(recorded);
+
+            // Act
+            let status = release_status(&data).unwrap();
+
+            // Assert
+            assert_eq!(status, Some(expected));
+        }
     }
 
     #[test]

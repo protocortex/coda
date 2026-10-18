@@ -41,7 +41,10 @@ use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
+
+/// Release of this binary, recorded in the database each time it opens it.
+pub const BINARY_RELEASE: &str = env!("CARGO_PKG_VERSION");
 
 /// File name of the database inside the data directory.
 pub const DB_FILE_NAME: &str = "coda.db";
@@ -58,6 +61,25 @@ const GROUP_AND_OTHER_BITS: u32 = 0o077;
 pub enum StoreError {
     #[error("database schema version {found} is newer than the supported version {supported}")]
     SchemaTooNew { found: u32, supported: u32 },
+    #[error(
+        "database was last opened by release {found}, newer than this binary's {supported}; \
+         upgrade coda, the database was left unchanged"
+    )]
+    ReleaseTooNew { found: String, supported: String },
+    #[error(
+        "migration step {seq} claims release {introduced_in}, newer than the binary's {binary}"
+    )]
+    StepFromFuture {
+        seq: u32,
+        introduced_in: String,
+        binary: String,
+    },
+    #[error("migration step {seq} is out of order: steps must ascend by release and sequence")]
+    StepsOutOfOrder { seq: u32 },
+    #[error("migrations ended at schema version {found}, expected {expected}")]
+    MigrationIncomplete { found: u32, expected: u32 },
+    #[error("{value:?} is not a valid release version")]
+    InvalidRelease { value: String },
     #[error("data directory {} is accessible by other users, expected mode 0700", path.display())]
     InsecureDataDir { path: PathBuf },
     #[error("data directory {} is a symbolic link, refusing to follow it", path.display())]
@@ -143,8 +165,8 @@ impl Store {
     /// open to group or others, [`StoreError::SymlinkedDataDir`] when it is a
     /// symlink, [`StoreError::InsecureDbFile`] when an existing database file is
     /// open to group or others, [`StoreError::WalNotEnabled`] when WAL cannot be
-    /// enabled, [`StoreError::SchemaTooNew`] when the database
-    /// is newer than this binary, and I/O or SQLite errors otherwise.
+    /// enabled, [`StoreError::SchemaTooNew`] or
+    /// [`StoreError::ReleaseTooNew`] when the database is newer than this binary, and I/O or SQLite errors otherwise.
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
         Self::open_with_clock(data_dir, Arc::new(SystemClock))
     }
@@ -169,7 +191,11 @@ impl Store {
         let mut conn = Connection::open(&db_path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // Checked before switching to WAL so a refused database is left untouched.
-        migrate::ensure_supported(migrate::read_version(&conn)?)?;
+        migrate::ensure_supported(migrate::read_version(&conn)?, SCHEMA_VERSION)?;
+        migrate::ensure_release_supported(
+            migrate::read_last_release(&conn)?.as_ref(),
+            &migrate::binary_release()?,
+        )?;
         let mode = switch_to_wal(&conn)?;
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(StoreError::WalNotEnabled { mode });

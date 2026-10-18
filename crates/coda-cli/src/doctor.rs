@@ -15,7 +15,8 @@ use coda_daemon::reaper::survey_orphans;
 use coda_daemon::repair::{RepairError, RepairReport, repair};
 use coda_protocol::methods::DaemonStatusResult;
 use coda_providers::backend::{AgentBackend, locate, require_enabled};
-use coda_store::{SCHEMA_VERSION, health};
+use coda_store::health::DatabaseRelease;
+use coda_store::{BINARY_RELEASE, SCHEMA_VERSION, health};
 use serde::Serialize;
 use tracing::{info, warn};
 
@@ -203,6 +204,7 @@ async fn run_checks(ctx: &Context, daemon: Option<&DaemonStatusResult>) -> Vec<C
         check_orphans(ctx, daemon).await,
         check_database(ctx, daemon),
         check_schema(ctx, daemon),
+        check_release(ctx, daemon),
         config_check,
         check_backends(config).await,
     ]
@@ -358,6 +360,36 @@ fn check_schema(ctx: &Context, daemon: Option<&DaemonStatusResult>) -> Check {
             ),
         ),
         Err(_) => Check::warn(NAME, "version unreadable, see the database check"),
+    }
+}
+
+fn check_release(ctx: &Context, daemon: Option<&DaemonStatusResult>) -> Check {
+    const NAME: &str = "database release";
+    if daemon.is_some() {
+        return Check::ok(NAME, "owned by the running daemon, not read");
+    }
+    match health::release_status(&ctx.dirs.data_dir()) {
+        Ok(None) => Check::ok(NAME, "no database yet"),
+        Ok(Some(DatabaseRelease::Current)) => Check::ok(NAME, format!("release {BINARY_RELEASE}")),
+        Ok(Some(DatabaseRelease::Unrecorded)) => Check::warn(
+            NAME,
+            format!(
+                "database predates release tracking, will migrate on next start to {BINARY_RELEASE}"
+            ),
+        ),
+        Ok(Some(DatabaseRelease::Older(found))) => Check::warn(
+            NAME,
+            format!(
+                "database was last opened by release {found}, will migrate on next start to {BINARY_RELEASE}"
+            ),
+        ),
+        Ok(Some(DatabaseRelease::Newer(found))) => Check::fail(
+            NAME,
+            format!(
+                "database was last opened by release {found}, newer than this binary's {BINARY_RELEASE}; upgrade coda"
+            ),
+        ),
+        Err(e) => Check::fail(NAME, e.to_string()),
     }
 }
 
