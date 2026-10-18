@@ -22,6 +22,9 @@ const CONTROL_FILE: &str = "fake-codex-control.json";
 const REPORT_FILE: &str = "report.json";
 const PID_FILE: &str = "grandchild.pid";
 const FAKE_THREAD: &str = "fake-thread-1";
+/// Set by the LLVM profiling runtime inside a coverage-instrumented child on Linux, not by the
+/// adapter.
+const COVERAGE_RUNTIME_ENV: &[&str] = &["__LLVM_PROFILE_RT_INIT_ONCE"];
 const HOSTILE_ID: &str = "--dangerously-bypass-approvals-and-sandbox";
 
 struct Fixture {
@@ -211,10 +214,14 @@ async fn the_child_gets_only_allowlisted_environment() {
     // Assert
     let report = fixture.report();
     let names = report["env_names"].as_array().unwrap();
+    let unexpected: Vec<&str> = names
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .filter(|name| !ENV_ALLOWLIST.contains(name) && !COVERAGE_RUNTIME_ENV.contains(name))
+        .collect();
     assert!(
-        names
-            .iter()
-            .all(|name| ENV_ALLOWLIST.contains(&name.as_str().unwrap()))
+        unexpected.is_empty(),
+        "unexpected child env: {unexpected:?}"
     );
     assert!(!names.contains(&Value::from("OPENAI_API_KEY")));
     assert_eq!(report["home"], "/tmp/codex-home");
