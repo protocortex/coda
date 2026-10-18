@@ -276,6 +276,7 @@ dependencies = [
  "coda-daemon",
  "coda-protocol",
  "coda-providers",
+ "coda-selfhost",
  "coda-store",
  "coda-telemetry",
  "coda-testkit",
@@ -403,6 +404,16 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "coda-selfhost"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
