@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::NESTED_ENV;
 use crate::error::SelfhostError;
-use crate::process::run_bounded;
+use crate::process::{ProcessError, run_bounded};
 use crate::workspace::git;
 
 /// Attributes that mark a test function.
@@ -57,6 +57,8 @@ pub enum VerifyError {
     MainNotTouched,
     #[error("the attempt added no test")]
     NoTestAdded,
+    #[error("{what} did not finish within {limit:?}")]
+    TimedOut { what: String, limit: Duration },
     #[error("{what} failed: {stderr}")]
     StepFailed { what: String, stderr: String },
     #[error("the metadata has no package {0:?}")]
@@ -83,6 +85,9 @@ pub struct VerifyPlan<'a> {
     pub target_dir: Option<&'a Path>,
     /// Bound for each cargo invocation.
     pub limit: Duration,
+    /// Environment variables the nested cargo, which runs code the model
+    /// wrote, must not inherit, such as the API key.
+    pub withheld_env: Vec<String>,
 }
 
 /// Runs every acceptance check on `plan.workdir`.
@@ -151,7 +156,14 @@ fn cargo(
     more: &[String],
 ) -> Result<String, SelfhostError> {
     let mut command = nested_cargo(plan, args, more);
-    let done = run_bounded(&mut command, plan.limit)?;
+    let done = run_bounded(&mut command, plan.limit).map_err(|error| match error {
+        ProcessError::Timeout { limit, .. } => VerifyError::TimedOut {
+            what: what.to_owned(),
+            limit,
+        }
+        .into(),
+        other => SelfhostError::from(other),
+    })?;
     if !done.status.success() {
         return Err(SelfhostError::CommandFailed {
             what: what.to_owned(),
@@ -171,6 +183,9 @@ fn nested_cargo(plan: &VerifyPlan<'_>, args: &[&str], more: &[String]) -> Comman
         .env(NESTED_ENV, "1")
         .env("CARGO_BUILD_JOBS", NESTED_BUILD_JOBS);
     for name in OUTER_BUILD_ENV {
+        command.env_remove(name);
+    }
+    for name in &plan.withheld_env {
         command.env_remove(name);
     }
     if let Some(target) = plan.target_dir {
@@ -281,6 +296,7 @@ diff --git a/crates/coda-cli/tests/version.rs b/crates/coda-cli/tests/version.rs
             cargo_test_args: vec![],
             target_dir: None,
             limit: Duration::from_secs(1),
+            withheld_env: vec!["API_KEY_VAR".to_owned()],
         };
 
         // Act
@@ -290,9 +306,30 @@ diff --git a/crates/coda-cli/tests/version.rs b/crates/coda-cli/tests/version.rs
         let envs: Vec<_> = command.get_envs().collect();
         let jobs = Some(NESTED_BUILD_JOBS.as_ref());
         assert!(envs.contains(&("CARGO_BUILD_JOBS".as_ref(), jobs)));
-        for name in OUTER_BUILD_ENV {
+        for name in OUTER_BUILD_ENV.into_iter().chain(["API_KEY_VAR"]) {
             assert!(envs.contains(&(name.as_ref(), None)), "{name} is kept");
         }
+    }
+
+    #[test]
+    fn a_cargo_step_that_outlives_its_limit_rejects_the_attempt() {
+        // Arrange
+        let plan = VerifyPlan {
+            workdir: Path::new("."),
+            cargo_test_args: vec![],
+            target_dir: None,
+            limit: Duration::ZERO,
+            withheld_env: vec![],
+        };
+
+        // Act
+        let result = cargo(&plan, "cargo version", &["--version"], &[]);
+
+        // Assert
+        assert!(
+            matches!(result, Err(SelfhostError::Rejected(_))),
+            "{result:?}"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 pub mod attempt;
 pub mod error;
+pub mod live;
 pub mod process;
 pub mod scrub;
 pub mod task;

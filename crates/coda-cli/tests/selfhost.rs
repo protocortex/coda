@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use coda_selfhost::NESTED_ENV;
-use coda_selfhost::attempt::{AttemptSpec, run_attempt};
+use coda_selfhost::attempt::{AttemptSpec, Provider, run_attempt};
 use coda_selfhost::error::SelfhostError;
+use coda_selfhost::live::{LiveOptions, run_live};
+use coda_selfhost::process::ProcessError;
 use coda_selfhost::task::{
     MAIN_NEW, MAIN_OLD, TEST_NEW, TEST_OLD, faux_script, manifest_edit_script,
 };
@@ -64,7 +66,9 @@ impl Sandbox {
             coda: Path::new(env!("CARGO_BIN_EXE_coda")),
             home: &self.home,
             workdir: &self.repo,
-            script: script_path,
+            provider: Provider::Faux {
+                script: script_path,
+            },
             limit: ATTEMPT_LIMIT,
         })
         .unwrap();
@@ -73,10 +77,7 @@ impl Sandbox {
 
     fn verify(&self) -> Result<(), SelfhostError> {
         let target = target_dir();
-        // The scenarios build different sources into one output directory.
-        fs::create_dir_all(&target).unwrap();
-        let lock = fs::File::create(target.join(LOCK_FILE)).unwrap();
-        lock.lock().unwrap();
+        let _lock = lock_target(&target);
         verify_workdir(&VerifyPlan {
             workdir: &self.repo,
             cargo_test_args: ["-p", "coda-cli", "--test", "version"]
@@ -84,6 +85,7 @@ impl Sandbox {
                 .to_vec(),
             target_dir: Some(&target),
             limit: CARGO_LIMIT,
+            withheld_env: Vec::new(),
         })
     }
 }
@@ -116,6 +118,15 @@ fn target_dir() -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
         .map_or_else(|| source_root().join("target"), PathBuf::from)
         .join(TARGET_SUBDIR)
+}
+
+/// The scenarios build different sources into one output directory, so they
+/// take turns; the lock is released when the file is dropped.
+fn lock_target(target: &Path) -> fs::File {
+    fs::create_dir_all(target).unwrap();
+    let lock = fs::File::create(target.join(LOCK_FILE)).unwrap();
+    lock.lock().unwrap();
+    lock
 }
 
 /// The verifier's own `cargo test` runs this file again; it must not recurse.
@@ -197,4 +208,123 @@ fn the_verifier_rejects_no_diff_no_test_and_the_wrong_json() {
         // Act and Assert
         assert_eq!(rejected(sandbox.verify()), expected);
     }
+}
+
+const CANARY_VAR: &str = "SELFHOST_CANARY_KEY";
+const CANARY: &str = "canary-7f3a9c41";
+
+/// A faux script whose only reply is `text`: it changes nothing.
+fn chatter_script(text: &str) -> String {
+    serde_json::json!([{"events": [
+        {"type": "text_delta", "text": text},
+        {"type": "stop", "reason": "end_turn"},
+    ]}])
+    .to_string()
+}
+
+struct LiveRun {
+    outcome: Result<Option<u32>, SelfhostError>,
+    log: Vec<String>,
+    out: PathBuf,
+    _dir: TempDir,
+}
+
+/// Runs the live loop with the faux provider; `scripts(n)` is attempt `n`'s script.
+fn live(coda: &Path, scripts: impl Fn(u32) -> String) -> LiveRun {
+    let dir = short_dir();
+    let out = dir.path().join("transcripts");
+    let target = target_dir();
+    let _lock = lock_target(&target);
+    let mut log = Vec::new();
+    let provider = |attempt: u32, home: &Path| {
+        let script = home.join("script.json");
+        fs::write(&script, scripts(attempt)).unwrap();
+        Provider::Faux { script }
+    };
+    let outcome = run_live(
+        &LiveOptions {
+            coda,
+            source: &source_root(),
+            attempts: 3,
+            provider: &provider,
+            env: vec![(CANARY_VAR.to_owned(), CANARY.to_owned())],
+            cargo_test_args: ["-p", "coda-cli", "--test", "version"]
+                .map(str::to_owned)
+                .to_vec(),
+            target_dir: Some(&target),
+            attempt_limit: ATTEMPT_LIMIT,
+            cargo_limit: CARGO_LIMIT,
+            transcripts: Some(&out),
+        },
+        &mut |line| log.push(line.to_owned()),
+    );
+    LiveRun {
+        outcome,
+        log,
+        out,
+        _dir: dir,
+    }
+}
+
+#[test]
+fn the_scripted_attempt_loop_stops_at_the_first_attempt_that_passes() {
+    if nested() {
+        return;
+    }
+    // Act
+    let run = live(Path::new(env!("CARGO_BIN_EXE_coda")), |attempt| {
+        if attempt == 1 {
+            chatter_script("no change")
+        } else {
+            faux_script()
+        }
+    });
+
+    // Assert
+    assert_eq!(run.outcome.unwrap(), Some(2));
+    assert!(run.out.join("attempt-1.txt").is_file());
+    assert!(run.out.join("attempt-2.txt").is_file());
+    assert!(!run.out.join("attempt-3.txt").exists());
+    assert!(run.log.iter().all(|line| !line.contains("attempt 3")));
+}
+
+#[test]
+fn when_every_attempt_is_rejected_the_loop_reports_none_and_the_transcripts_hide_the_key() {
+    if nested() {
+        return;
+    }
+    // Act
+    let run = live(Path::new(env!("CARGO_BIN_EXE_coda")), |_| {
+        chatter_script(&format!("my key is {CANARY}"))
+    });
+
+    // Assert
+    assert_eq!(run.outcome.unwrap(), None);
+    for attempt in 1..=3 {
+        let transcript =
+            fs::read_to_string(run.out.join(format!("attempt-{attempt}.txt"))).unwrap();
+        assert!(
+            transcript.contains(&format!("<env:{CANARY_VAR}>")),
+            "{transcript}"
+        );
+        assert!(!transcript.contains(CANARY));
+    }
+    assert!(run.log.iter().all(|line| !line.contains(CANARY)));
+}
+
+#[test]
+fn a_run_that_cannot_start_is_an_error_not_a_rejected_attempt() {
+    if nested() {
+        return;
+    }
+    // Act
+    let run = live(Path::new("/no/such/coda"), |_| faux_script());
+
+    // Assert
+    assert!(matches!(
+        run.outcome,
+        Err(SelfhostError::Process(ProcessError::Spawn { .. }))
+    ));
+    assert!(!run.out.exists(), "a transcript was written");
+    assert!(run.log.iter().all(|line| !line.contains("attempt 2")));
 }
