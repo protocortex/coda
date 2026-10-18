@@ -10,6 +10,7 @@ pub mod detect;
 pub mod faux;
 pub mod gate;
 pub mod model;
+pub mod openai_compat;
 pub mod policy;
 #[cfg(feature = "testing")]
 pub mod testing;
