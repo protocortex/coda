@@ -129,11 +129,19 @@ impl Chat {
                     text: text.clone(),
                 }),
             },
-            Event::BackendCrashed { exit_code, .. } => {
-                self.push(Entry::Notice(match exit_code {
+            Event::BackendCrashed {
+                exit_code,
+                will_restart,
+                ..
+            } => {
+                let mut notice = match exit_code {
                     Some(code) => format!("backend crashed (exit {code})"),
                     None => "backend crashed".to_owned(),
-                }));
+                };
+                if *will_restart {
+                    notice.push_str(", restarting");
+                }
+                self.push(Entry::Notice(notice));
             }
             Event::TurnInterrupted { .. } => {
                 self.push(Entry::Notice("turn interrupted".to_owned()));
@@ -329,6 +337,7 @@ mod tests {
                 Event::BackendCrashed {
                     session_id: SessionId::new("s-1"),
                     exit_code: Some(2),
+                    will_restart: false,
                 },
                 "backend crashed (exit 2)",
             ),

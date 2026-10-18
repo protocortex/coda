@@ -141,6 +141,7 @@ fn absent_optional_fields_stay_absent_when_serialized() {
     let crashed = Event::BackendCrashed {
         session_id: SessionId::new("s-1"),
         exit_code: None,
+        will_restart: false,
     };
 
     // Act

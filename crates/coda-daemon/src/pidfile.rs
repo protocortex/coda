@@ -25,6 +25,10 @@ pub struct PidRecord {
     /// The executable name the live process showed when the file was written.
     /// It can differ from `exe` for a symlink or an interpreter launcher.
     pub process_name: String,
+    /// The full path of the executable the live process ran when the file was
+    /// written, where the platform exposes it. Absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_path: Option<PathBuf>,
 }
 
 /// What a recorded pid refers to now.
@@ -105,6 +109,7 @@ pub async fn write(path: &Path, pid: u32, exe: &Path) -> Result<PidRecord, Pidfi
         started_at,
         exe: exe.to_path_buf(),
         process_name,
+        process_path: process_path(pid).await,
     };
     let io = |source| PidfileError::Io {
         path: path.to_path_buf(),
@@ -161,6 +166,27 @@ async fn process_name(pid: u32) -> io::Result<Option<String>> {
     }))
 }
 
+/// The full path of the executable `pid` runs: `/proc/<pid>/exe` where it
+/// exists, else the first text mapping `lsof` lists (the executable itself;
+/// macOS has no `/proc`). `None` when neither answers, so callers fall back to
+/// the name and start time.
+async fn process_path(pid: u32) -> Option<PathBuf> {
+    if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) {
+        return Some(exe);
+    }
+    let output = Command::new("lsof")
+        .args(["-a", "-d", "txt", "-Fn", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let path = text.lines().find_map(|line| line.strip_prefix('n'))?;
+    Path::new(path).is_absolute().then(|| PathBuf::from(path))
+}
+
 /// Compares the recorded pid with the live process.
 ///
 /// # Errors
@@ -172,10 +198,19 @@ pub async fn check_process(record: &PidRecord) -> io::Result<ProcessState> {
         Some(started) if started != record.started_at => return Ok(ProcessState::Other),
         Some(_) => {}
     }
-    Ok(match process_name(record.pid).await? {
-        None => ProcessState::Gone,
-        Some(name) if name == record.process_name => ProcessState::Same,
-        Some(_) => ProcessState::Other,
+    let name_matches = match process_name(record.pid).await? {
+        None => return Ok(ProcessState::Gone),
+        Some(name) => name == record.process_name,
+    };
+    // A path is compared only when both sides have one; the name and start time then stand alone.
+    let path_matches = match (&record.process_path, process_path(record.pid).await) {
+        (Some(recorded), Some(live)) => *recorded == live,
+        _ => true,
+    };
+    Ok(if name_matches && path_matches {
+        ProcessState::Same
+    } else {
+        ProcessState::Other
     })
 }
 
@@ -335,6 +370,27 @@ mod tests {
         .await
         .unwrap();
         record.process_name = "claude".to_owned();
+
+        // Act
+        let same = is_same_process(&record).await;
+
+        // Assert
+        assert!(!same);
+    }
+
+    #[tokio::test]
+    async fn a_live_pid_with_the_same_name_at_another_path_is_not_the_same_process() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let child = sleeper();
+        let mut record = write(
+            &dir.path().join("a.pid"),
+            child.id().unwrap(),
+            Path::new(SLEEP),
+        )
+        .await
+        .unwrap();
+        record.process_path = Some(Path::new("/tmp/elsewhere/sleep").to_path_buf());
 
         // Act
         let same = is_same_process(&record).await;

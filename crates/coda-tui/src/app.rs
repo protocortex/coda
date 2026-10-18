@@ -150,8 +150,10 @@ impl App {
             Event::Approve { request_id, .. }
             | Event::Deny { request_id, .. }
             | Event::Timeout { request_id, .. } => self.overlay.resolve(request_id),
-            Event::Result { .. } | Event::TurnInterrupted { .. } | Event::BackendCrashed { .. } => {
-                self.turn_running = false;
+            Event::Result { .. } | Event::TurnInterrupted { .. } => self.turn_running = false,
+            // A restart keeps the same turn going, so only a final crash ends it.
+            Event::BackendCrashed { will_restart, .. } => {
+                self.turn_running &= *will_restart;
             }
             _ => {}
         }
@@ -809,6 +811,40 @@ mod tests {
 
     fn wide_screen(app: &App) -> String {
         crate::test_support::screen(80, 8, |frame| app.render(frame))
+    }
+
+    fn crashed(will_restart: bool) -> LinkEvent {
+        LinkEvent::Session(Event::BackendCrashed {
+            session_id: SessionId::new("s-1"),
+            exit_code: Some(3),
+            will_restart,
+        })
+    }
+
+    #[test]
+    fn a_crash_that_is_followed_by_a_restart_keeps_the_turn_running() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        type_line(&mut app, "go");
+
+        // Act
+        app.handle_event(crashed(true));
+
+        // Assert
+        assert!(app.turn_running);
+    }
+
+    #[test]
+    fn a_crash_with_no_restart_ends_the_turn() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        type_line(&mut app, "go");
+
+        // Act
+        app.handle_event(crashed(false));
+
+        // Assert
+        assert!(!app.turn_running);
     }
 
     #[test]

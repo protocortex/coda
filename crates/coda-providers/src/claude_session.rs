@@ -121,6 +121,12 @@ impl CancelHandle {
     pub fn cancel(&self) {
         self.0.send_replace(true);
     }
+
+    /// Whether cancellation was requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
 }
 
 /// One Claude Code process and the turns run on it.
@@ -412,6 +418,7 @@ impl ClaudeSession {
         emit(Event::BackendCrashed {
             session_id: self.session_id.clone(),
             exit_code,
+            will_restart: false,
         });
         Ok(TurnOutcome::Crashed { exit_code })
     }

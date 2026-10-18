@@ -15,6 +15,7 @@ pub mod server;
 pub mod session_rpc;
 pub mod state;
 pub mod subscribe;
+pub mod supervisor;
 pub mod trace;
 pub mod turn;
 pub mod usage_rpc;

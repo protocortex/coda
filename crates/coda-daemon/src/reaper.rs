@@ -344,6 +344,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_record_with_the_same_name_at_another_path_is_not_killed() {
+        // Arrange
+        let rig = Rig::new();
+        let (mut child, path) = rig
+            .orphan("1.pid", |r| {
+                r.process_path = Some(PathBuf::from("/tmp/elsewhere/sleep"));
+            })
+            .await;
+
+        // Act
+        let report = rig.reap().await;
+
+        // Assert
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(report.killed, 0);
+        assert_eq!(report.stale, 1);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_record_with_the_same_path_and_start_time_is_killed() {
+        // Arrange
+        let rig = Rig::new();
+        let (mut child, path) = rig.orphan("1.pid", |_| {}).await;
+        let recorded = pidfile::read(&path).unwrap();
+
+        // Act
+        let report = rig.reap().await;
+
+        // Assert
+        assert!(recorded.process_path.is_some());
+        tokio::time::timeout(WAIT, child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.killed, 1);
+    }
+
+    #[tokio::test]
     async fn an_unreadable_pidfile_is_removed_and_other_files_are_left_alone() {
         // Arrange
         let rig = Rig::new();

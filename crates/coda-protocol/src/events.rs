@@ -91,6 +91,10 @@ pub enum Event {
         /// Exit code, when the process exited normally enough to have one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
+        /// Whether the daemon starts the backend again for the same turn, so the
+        /// turn is still running. Absent means no restart follows.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        will_restart: bool,
     },
     /// A running turn was cut short.
     TurnInterrupted {
@@ -159,6 +163,7 @@ mod tests {
             Event::BackendCrashed {
                 session_id: SessionId::new("s-1"),
                 exit_code: None,
+                will_restart: false,
             }
         );
     }

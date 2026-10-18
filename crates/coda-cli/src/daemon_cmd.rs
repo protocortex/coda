@@ -15,6 +15,7 @@ use coda_daemon::reaper::reap;
 use coda_daemon::server::{BoundServer, Server, ServerConfig, ServerError};
 use coda_daemon::state::DaemonState;
 use coda_daemon::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
+use coda_daemon::supervisor::{RestartPolicy, Supervisor, TokioSleeper};
 use coda_daemon::turn::{TurnConfig, Turns};
 use coda_store::Store;
 use coda_telemetry::init::{TelemetryConfig, init};
@@ -92,7 +93,11 @@ fn build_turns(config: &Config, dirs: &Dirs, hub: &Arc<Hub>) -> Arc<Turns> {
             None
         }
     };
-    Turns::new(
+    let restarts = Supervisor::new(
+        RestartPolicy::new(config.timing.restart_backoff),
+        Arc::new(TokioSleeper),
+    );
+    Turns::with_supervisor(
         Arc::clone(hub),
         TurnConfig {
             binary,
@@ -101,6 +106,7 @@ fn build_turns(config: &Config, dirs: &Dirs, hub: &Arc<Hub>) -> Arc<Turns> {
             timing: (&config.timing).into(),
             models: config.clone(),
         },
+        restarts,
     )
 }
 
