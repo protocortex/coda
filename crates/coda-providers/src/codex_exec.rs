@@ -56,7 +56,7 @@ pub enum SandboxMode {
 }
 
 impl SandboxMode {
-    fn as_arg(self) -> &'static str {
+    pub(crate) fn as_arg(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
             Self::WorkspaceWrite => "workspace-write",
