@@ -24,6 +24,7 @@ use coda_protocol::methods::{
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::TurnOutcome;
+use coda_providers::detect::DEFAULT_PROBE_TIMEOUT;
 use coda_providers::gate::PermissionGate;
 use coda_providers::registry::RegistryError;
 use coda_providers::tool_request::ToolRequest;
@@ -306,7 +307,12 @@ impl Turns {
             return Ok(AgentSession::Claude(Box::new(session)));
         }
         let search_dirs = path_dirs(&parent_env);
-        let settings = resolve_codex_off_worker(self.config.models.clone(), search_dirs).await?;
+        let settings = resolve_codex_off_worker(
+            self.config.models.clone(),
+            search_dirs,
+            DEFAULT_PROBE_TIMEOUT,
+        )
+        .await?;
         let continued = self.codex_threads().contains(&session_id);
         let session = start_codex_session(CodexStart {
             settings,

@@ -15,7 +15,7 @@ use coda_config::config::Dirs;
 use coda_config::timing::Timing;
 use coda_protocol::codec::{FrameDecoder, encode_frame};
 use coda_store::{GrantKey, Store};
-use common::{TestDaemon, cli, context, short_dir};
+use common::{StopDaemon, TestDaemon, cli, context, short_dir};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -290,6 +290,7 @@ async fn daemon_restart_treats_a_failed_status_as_busy() {
 async fn forced_daemon_restart_replaces_a_daemon_whose_status_fails() {
     // Arrange
     let dir = short_dir();
+    let _stop = StopDaemon::new(dir.path());
     serve_failing_status(dir.path());
     let ctx = context(dir.path());
 

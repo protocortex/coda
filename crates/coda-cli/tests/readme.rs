@@ -5,15 +5,17 @@
 //! is present, every `--flag` the docs name exists in its command's `--help`, and the
 //! defaults tables match `Config::default()`.
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use coda_config::config::{Config, ProviderConfig};
+use common::StopDaemon;
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_coda");
@@ -30,8 +32,6 @@ const NOTICE_SENTENCES: [&str; 4] = [
     "You must check the terms for your account yourself.",
     "The claude_code and codex backends stay disabled until you enable them.",
 ];
-const PID_PREFIX: &str = "pid: ";
-const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const CANARY_KEY: &str = "sk-canary-must-not-reach-a-block";
 const HELP_COMMANDS: [&[&str]; 9] = [
     &[],
@@ -92,63 +92,6 @@ fn short_dir() -> TempDir {
         .unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     dir
-}
-
-/// Runs `command` and returns its standard output, or `None` if it outlasts `limit`.
-fn output_within(command: &mut Command, limit: Duration) -> Option<String> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + limit;
-    while child.try_wait().ok()?.is_none() {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(POLL);
-    }
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    Some(out)
-}
-
-fn signal(name: &str, pid: &str) -> bool {
-    Command::new("kill")
-        .args([name, pid])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// Stops any daemon the blocks left running, even when an assertion fails first,
-/// and waits for it to exit so the directory it uses can be removed.
-struct StopDaemon(PathBuf);
-
-impl Drop for StopDaemon {
-    fn drop(&mut self) {
-        let mut status = Command::new(BIN);
-        status.arg("status").env("CODA_HOME", &self.0);
-        let Some(out) = output_within(&mut status, STOP_TIMEOUT) else {
-            return;
-        };
-        let Some(pid) = out.lines().find_map(|line| line.strip_prefix(PID_PREFIX)) else {
-            return;
-        };
-        signal("-TERM", pid);
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        while signal("-0", pid) {
-            if Instant::now() >= deadline {
-                signal("-KILL", pid);
-                return;
-            }
-            std::thread::sleep(POLL);
-        }
-    }
 }
 
 struct Ran {
@@ -215,7 +158,7 @@ fn the_readme_quickstart_blocks_run_and_print_what_they_claim() {
     let home = short_dir();
     let work = short_dir();
     let scratch = short_dir();
-    let _stop = StopDaemon(home.path().to_path_buf());
+    let _stop = StopDaemon::new(home.path());
     let tested: Vec<usize> = (0..blocks.len())
         .filter(|&i| has_tag(&blocks[i], TEST_TAG))
         .collect();

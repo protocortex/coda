@@ -20,7 +20,10 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-const WAIT: Duration = Duration::from_secs(5);
+/// Upper bounds, not durations: they only matter when the machine is badly loaded.
+const WAIT: Duration = Duration::from_secs(60);
+/// `Timing::for_tests` lets a daemon request take 50 ms, which a busy machine misses.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const QUEUE: usize = 64;
 
 /// Synthetic script: a tool call that waits for a permission answer.
@@ -90,7 +93,10 @@ impl Rig {
         let (event_tx, events) = mpsc::unbounded_channel();
         tokio::spawn(run_link(
             self.dir.path().join("s.sock"),
-            Timing::for_tests(),
+            Timing {
+                idle_timeout: REQUEST_TIMEOUT,
+                ..Timing::for_tests()
+            },
             LinkConfig {
                 backend: BackendKind::Faux,
                 cwd: self.cwd.clone(),

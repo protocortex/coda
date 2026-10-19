@@ -603,11 +603,11 @@ async fn a_server_that_exits_before_listening_fails_the_start_quickly() {
     let fixture = Fixture::new(&json!({"exit_early": true}));
 
     // Act
-    let result = tokio::time::timeout(GONE_TIMEOUT, fixture.start(&[], &[]))
-        .await
-        .expect("start kept waiting for a dead server");
+    let result = fixture.start(&[], &[]).await;
 
     // Assert
+    // A start that kept waiting for the dead server would end as `StartTimeout`
+    // instead, so the error tells the two apart without a tight wall-clock bound.
     assert!(matches!(
         result,
         Err(AppServerError::ExitedEarly { exit_code: Some(5) })

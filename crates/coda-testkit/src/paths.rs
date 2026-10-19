@@ -2,6 +2,7 @@
 
 //! Builds the fake `claude` and `codex` binaries once per test process and returns where they are.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -78,16 +79,57 @@ fn build(bin_name: &str) -> Result<PathBuf, BuildError> {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|message| message["reason"] == "compiler-artifact")
         .filter(|message| message["target"]["name"] == bin_name)
-        .find_map(|message| {
-            // Cargo re-links the uplifted `executable` on every build, so a
-            // concurrent test process could see it missing; the hashed copy
-            // in `deps` is left alone when the build is fresh.
-            let built = message["filenames"].get(0)?.as_str()?;
-            Some(PathBuf::from(built))
-        })
+        .find_map(|message| Some(PathBuf::from(message["executable"].as_str()?)))
         .ok_or(BuildError::NoArtifact)?;
+    let path = stable_artifact(&path, bin_name)?;
     ensure_runnable(bin_name, &path)?;
     Ok(path)
+}
+
+/// The hashed copy of `executable` in `deps`.
+///
+/// Every cargo run re-creates `executable`, so a test process that starts it
+/// meanwhile finds it missing and the system scans it again. The hashed copy is
+/// left alone when the build is fresh. The uplifted name is a hard link to the
+/// current build's hashed file, so that file is chosen; several hashed files may
+/// exist after builds with other flags, so the newest is only the fallback.
+fn stable_artifact(executable: &Path, bin_name: &str) -> Result<PathBuf, BuildError> {
+    let deps = executable
+        .parent()
+        .ok_or(BuildError::NoArtifact)?
+        .join("deps");
+    let prefix = format!("{}-", bin_name.replace('-', "_"));
+    let entries = std::fs::read_dir(&deps).map_err(|source| {
+        BuildError::Failed(format!("cannot list {}: {source}", deps.display()))
+    })?;
+    let candidates: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let path = entry.path();
+            path.extension().is_none()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .filter_map(|entry| Some((entry.metadata().ok()?, entry.path())))
+        .collect();
+    let built = std::fs::metadata(executable).ok();
+    let same_file = |meta: &std::fs::Metadata| {
+        built
+            .as_ref()
+            .is_some_and(|b| b.dev() == meta.dev() && b.ino() == meta.ino())
+    };
+    candidates
+        .iter()
+        .find(|(meta, _)| same_file(meta))
+        .or_else(|| {
+            candidates
+                .iter()
+                .max_by_key(|(meta, _)| meta.modified().ok())
+        })
+        .map(|(_, path)| path.clone())
+        .ok_or(BuildError::NoArtifact)
 }
 
 /// Runs the fresh binary until it starts cleanly.
@@ -174,6 +216,52 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "2.1.292 (Claude Code)"
         );
+    }
+
+    #[test]
+    fn the_newest_hashed_artifact_is_chosen_over_the_uplifted_name_and_build_leftovers() {
+        // Arrange
+        let dir = std::env::temp_dir().join(format!("stable-{}", std::process::id()));
+        let deps = dir.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let now = std::time::SystemTime::now();
+        for (name, age) in [
+            ("fake_claude-aaa", 20),
+            ("fake_claude-bbb", 10),
+            ("fake_claude-bbb.d", 0),
+            ("other-ccc", 0),
+        ] {
+            let file = std::fs::File::create(deps.join(name)).unwrap();
+            file.set_modified(now - Duration::from_secs(age)).unwrap();
+        }
+
+        // Act
+        let chosen = stable_artifact(&dir.join("fake-claude"), "fake-claude");
+
+        // Assert
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(chosen.unwrap(), deps.join("fake_claude-bbb"));
+    }
+
+    #[test]
+    fn the_hashed_file_linked_to_the_uplifted_executable_wins_over_a_newer_one() {
+        // Arrange
+        let dir = std::env::temp_dir().join(format!("linked-{}", std::process::id()));
+        let deps = dir.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let now = std::time::SystemTime::now();
+        for (name, age) in [("fake_claude-old", 20), ("fake_claude-new", 0)] {
+            let file = std::fs::File::create(deps.join(name)).unwrap();
+            file.set_modified(now - Duration::from_secs(age)).unwrap();
+        }
+        std::fs::hard_link(deps.join("fake_claude-old"), dir.join("fake-claude")).unwrap();
+
+        // Act
+        let chosen = stable_artifact(&dir.join("fake-claude"), "fake-claude");
+
+        // Assert
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(chosen.unwrap(), deps.join("fake_claude-old"));
     }
 
     #[test]

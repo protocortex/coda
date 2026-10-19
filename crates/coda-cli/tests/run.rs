@@ -4,23 +4,22 @@
 
 mod common;
 
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use coda_cli::Context;
 use coda_client::Client;
 use coda_config::config::Dirs;
-use coda_config::timing::Timing;
 use coda_protocol::methods::{
     SESSION_CANCEL, SESSION_LIST, SessionCancelParams, SessionCancelResult, SessionListParams,
     SessionListResult, SessionStatus, SessionSummary,
 };
+use coda_protocol::types::SessionId;
 use coda_store::Store;
-use common::{Outcome, WAIT, cli, context, short_dir};
+use common::{Outcome, StopDaemon, WAIT, cli, context, short_dir, timing};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-const BIN: &str = env!("CARGO_BIN_EXE_coda");
 const POLL: Duration = Duration::from_millis(20);
 
 fn text_turn(text: &str) -> Value {
@@ -44,28 +43,12 @@ fn overflow_turn() -> Value {
     json!({"events": [], "error": {"class": "context_window_exceeded"}})
 }
 
-/// Stops the daemon a test started, even when an assertion fails first.
-struct StopDaemon(String);
-
-impl Drop for StopDaemon {
-    fn drop(&mut self) {
-        let status = Command::new(BIN)
-            .arg("status")
-            .env("CODA_HOME", &self.0)
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-            .unwrap_or_default();
-        if let Some(pid) = status.lines().find_map(|line| line.strip_prefix("pid: ")) {
-            let _ = Command::new("kill").arg(pid).stderr(Stdio::null()).status();
-        }
-    }
-}
-
 struct Rig {
+    // First, so the daemon is stopped while its home directory still exists.
+    _stop: StopDaemon,
     home: TempDir,
     work: TempDir,
     ctx: Context,
-    _stop: StopDaemon,
 }
 
 /// A home whose config enables the faux provider with `script`, plus `extra` config text.
@@ -81,7 +64,7 @@ fn rig(script: &[Value], extra: &str) -> Rig {
     std::fs::write(home.path().join("config.toml"), config).unwrap();
     let ctx = context(home.path());
     Rig {
-        _stop: StopDaemon(home.path().display().to_string()),
+        _stop: StopDaemon::new(home.path()),
         home,
         work,
         ctx,
@@ -158,44 +141,51 @@ async fn a_cancelled_run_exits_four() {
             .success()
     );
     let socket = Dirs::from_base(rig.home.path()).socket_path();
-    let stopper = async {
-        let session = loop {
-            if let Ok(client) = Client::connect(&socket, Timing::for_tests()).await {
-                let listed: SessionListResult = client
-                    .request(
-                        SESSION_LIST,
-                        &SessionListParams {
-                            cwd: None,
-                            limit: None,
-                        },
-                    )
-                    .await
-                    .unwrap();
-                if let Some(running) = listed
-                    .sessions
-                    .iter()
-                    .find(|s| s.status == SessionStatus::Running)
-                {
-                    break (client, running.id.clone());
-                }
+    // A turn whose backend is still starting lists as running but answers a
+    // cancel with `cancelled: false`, so the cancel is repeated until accepted.
+    let cancel_loop = async {
+        loop {
+            if let Ok(client) = Client::connect(&socket, timing()).await
+                && let Some(id) = running_session(&client).await
+                && cancel(&client, id).await.cancelled
+            {
+                return;
             }
             tokio::time::sleep(POLL).await;
-        };
-        let (client, id) = session;
-        let cancelled: SessionCancelResult = client
-            .request(SESSION_CANCEL, &SessionCancelParams { session_id: id })
-            .await
-            .unwrap();
-        cancelled
+        }
     };
 
     // Act
-    let (outcome, cancelled) = tokio::join!(run(&rig, &[]), tokio::time::timeout(WAIT, stopper));
-    let cancelled = cancelled.expect("the run never showed as running");
+    let (outcome, in_time) = tokio::join!(run(&rig, &[]), tokio::time::timeout(WAIT, cancel_loop));
 
     // Assert
-    assert!(cancelled.cancelled);
+    in_time.expect("the run was never cancelled");
     assert_eq!(outcome.code, ExitCode::from(4), "{}", outcome.err);
+}
+
+async fn running_session(client: &Client) -> Option<SessionId> {
+    let listed: SessionListResult = client
+        .request(
+            SESSION_LIST,
+            &SessionListParams {
+                cwd: None,
+                limit: None,
+            },
+        )
+        .await
+        .ok()?;
+    listed
+        .sessions
+        .into_iter()
+        .find(|s| s.status == SessionStatus::Running)
+        .map(|s| s.id)
+}
+
+async fn cancel(client: &Client, session_id: SessionId) -> SessionCancelResult {
+    client
+        .request(SESSION_CANCEL, &SessionCancelParams { session_id })
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -220,7 +210,7 @@ async fn a_headless_run_denies_a_permission_prompt_and_carries_on() {
 
 async fn only_session(rig: &Rig) -> SessionSummary {
     let socket = Dirs::from_base(rig.home.path()).socket_path();
-    let client = Client::connect(&socket, Timing::for_tests()).await.unwrap();
+    let client = Client::connect(&socket, timing()).await.unwrap();
     let listed: SessionListResult = client
         .request(
             SESSION_LIST,

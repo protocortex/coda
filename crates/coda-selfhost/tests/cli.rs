@@ -325,8 +325,12 @@ fn a_failure_to_run_prints_without_environment_values() {
     assert!(!stderr.contains(CANARY), "{stderr}");
 }
 
+/// An upper bound, not a duration: copying the workspace and starting a
+/// process can stall for a long time on a loaded machine.
+const PROCESS_BOUND: Duration = Duration::from_secs(120);
+
 fn wait_for(path: &Path) -> String {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + PROCESS_BOUND;
     loop {
         if let Ok(text) = fs::read_to_string(path) {
             return text.trim().to_owned();
@@ -386,7 +390,7 @@ fn an_interrupt_kills_the_running_coda_and_removes_the_temporary_root() {
             .arg(child.id().to_string())
             .status()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + PROCESS_BOUND;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;

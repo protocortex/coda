@@ -26,9 +26,10 @@ use crate::trace::capture::{Spans, install};
 use crate::watchdog::Timing;
 use coda_core::broker::DECISION_SPAN;
 
-const WAIT: Duration = Duration::from_secs(20);
+/// An upper bound, not a duration: starting a process can stall for many
+/// seconds on a loaded machine, and a wait returns as soon as its event does.
+const WAIT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(20);
-const QUIET_PERIOD: Duration = Duration::from_millis(400);
 /// Far above the backend start-up latency, so the idle limit cannot trip before the pause.
 const PAUSE_TEST_IDLE_MS: u64 = 5_000;
 /// Virtual time to skip: many idle limits, but short of the permission timeout.
@@ -486,15 +487,19 @@ async fn an_answer_from_another_session_is_refused_and_changes_nothing() {
 
     // Act
     let refused = rig.respond_as(&intruder, &request, "allow_once").await;
-    tokio::time::sleep(QUIET_PERIOD).await;
 
     // Assert
     assert_eq!(refused["result"]["accepted"], false);
     assert_eq!(rig.pending().await.len(), 1);
     assert!(!rig.kinds().await.contains(&"approve".to_owned()));
+    // The owner's answer still works, and the turn's end proves the refused
+    // answer left nothing behind: exactly one approval was stored.
     let accepted = rig.respond(&request, "allow_once").await;
     assert_eq!(accepted["result"]["accepted"], true);
     rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+    let approvals = rig.kinds().await.iter().filter(|k| *k == "approve").count();
+    assert_eq!(approvals, 1);
 }
 
 #[test]
@@ -577,7 +582,6 @@ async fn a_cancelled_turn_is_logged_as_ended_and_not_as_an_error() {
         .await;
     rig.wait_for("turn_interrupted").await;
     rig.wait_until_idle().await;
-    tokio::time::sleep(QUIET_PERIOD).await;
 
     // Assert
     let log = dump(&rig.db(), "event_log");

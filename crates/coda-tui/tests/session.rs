@@ -20,7 +20,10 @@ use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
 use tracing::instrument::WithSubscriber;
 
-const WAIT: Duration = Duration::from_secs(5);
+/// Upper bounds, not durations: they only matter when the machine is badly loaded.
+const WAIT: Duration = Duration::from_secs(60);
+/// `Timing::for_tests` lets a daemon request take 50 ms, which a busy machine misses.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Plays back scripted polls: `None` is a quiet tick, `Some` a key press.
 struct Script(VecDeque<Option<KeyEvent>>);
@@ -124,7 +127,10 @@ async fn it_connects_to_a_running_daemon_and_exits_on_quit() {
     let app = within(run_session(
         terminal(),
         &socket,
-        Timing::for_tests(),
+        Timing {
+            idle_timeout: REQUEST_TIMEOUT,
+            ..Timing::for_tests()
+        },
         QuitAfter::new(Duration::from_millis(500)),
         never(),
     ))
@@ -213,7 +219,10 @@ async fn it_shows_a_disconnect_when_the_daemon_dies_after_connecting() {
         run_session(
             terminal(),
             &session_socket,
-            Timing::for_tests(),
+            Timing {
+                idle_timeout: REQUEST_TIMEOUT,
+                ..Timing::for_tests()
+            },
             QuitAfter::new(Duration::from_secs(3)),
             never(),
         )
