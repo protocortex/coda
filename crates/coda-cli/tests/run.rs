@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::process::{Command, ExitCode};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::Duration;
 
 use coda_cli::Context;
@@ -16,7 +16,7 @@ use coda_protocol::methods::{
 };
 use coda_protocol::types::SessionId;
 use coda_store::Store;
-use common::{Outcome, StopDaemon, WAIT, cli, context, short_dir, timing};
+use common::{Outcome, StopDaemon, WAIT, cli, connect, context, short_dir, timing};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -161,6 +161,114 @@ async fn a_cancelled_run_exits_four() {
     // Assert
     in_time.expect("the run was never cancelled");
     assert_eq!(outcome.code, ExitCode::from(4), "{}", outcome.err);
+}
+
+/// Kills the child on drop, so a failed assertion never leaves `coda run` behind.
+struct Reaper(Child);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn an_interrupt_while_the_prompt_is_being_sent_cancels_the_turn_and_exits_four() {
+    // Arrange
+    let sleeper = tool_turn("bash", &json!({"command": "sleep 30"}));
+    let rig = rig(
+        std::slice::from_ref(&sleeper),
+        "[permissions]\ngrants = [\"bash:sleep 30\"]\n",
+    );
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(rig.work.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    // The daemon reads the script while it starts the send, and a named pipe
+    // holds that read until the test writes to it.
+    let script = rig.home.path().join("script.json");
+    std::fs::remove_file(&script).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(&script)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let stdout = std::fs::File::create(rig.home.path().join("run.out")).unwrap();
+    let stderr = std::fs::File::create(rig.home.path().join("run.err")).unwrap();
+    let mut child = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_coda"))
+            .args(["run", "--prompt", "hello", "--cwd"])
+            .arg(rig.work.path())
+            .env("CODA_HOME", rig.home.path())
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .unwrap(),
+    );
+    let client = connect(rig.home.path()).await;
+    let session = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(id) = running_session(&client).await {
+                return id;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("the send never reached the daemon");
+
+    // Act
+    let interrupted = Command::new("kill")
+        .args(["-INT", &child.0.id().to_string()])
+        .status()
+        .unwrap();
+    // Opening a named pipe for writing blocks until the daemon reads it, so the
+    // write runs on its own thread and a missing reader fails the test.
+    let (written, released) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = written.send(std::fs::write(
+            &script,
+            Value::Array(vec![sleeper]).to_string(),
+        ));
+    });
+    let status = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                return status;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("coda run did not exit after the interrupt");
+
+    // Assert
+    assert!(interrupted.success());
+    released
+        .recv_timeout(WAIT)
+        .expect("the daemon never read the script")
+        .unwrap();
+    assert_eq!(status.code(), Some(4), "{status:?}");
+    let store = Store::open(&Dirs::from_base(rig.home.path()).data_dir()).unwrap();
+    let events = store.load_events(&session, 0, 1000).unwrap();
+    // The cancel reached the daemon while the send was still held, so the model
+    // never ran: only an interrupt handled during the send can do that.
+    let kinds: Vec<_> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(kinds, ["user_message", "turn_stopped", "result"]);
+    let stopped = events
+        .into_iter()
+        .find(|e| e.kind == "turn_stopped")
+        .expect("the turn recorded no stop condition");
+    let body: Value = serde_json::from_str(&stopped.body).unwrap();
+    assert_eq!(body["condition"], "cancelled");
 }
 
 async fn running_session(client: &Client) -> Option<SessionId> {

@@ -8,8 +8,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
-use coda_client::{Client, Subscription};
+use coda_client::{Client, ClientError, Subscription};
 use coda_core::turn::StopCondition;
 use coda_daemon::model_session::TURN_STOPPED_KIND;
 use coda_daemon::subscribe::PERMISSION_REQUEST_NOTIFICATION;
@@ -22,9 +23,10 @@ use coda_protocol::methods::{
 use coda_protocol::types::{BackendKind, PermissionDecision, SessionId};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing::{debug, info, warn};
 
-use crate::autostart::ensure_daemon;
+use crate::autostart::{connect_unchecked, ensure_daemon};
 use crate::cli::RunArgs;
 use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
@@ -34,6 +36,10 @@ use crate::exit;
 const FAUX_KEY: &str = "faux";
 const STREAM_DELTA_KIND: &str = "stream_delta";
 const RESULT_KIND: &str = "result";
+
+/// How long an interrupted run waits for the daemon to answer the send, and
+/// then, separately, for it to end the turn. A second Ctrl-C ends either wait.
+const CANCEL_GRACE: Duration = Duration::from_secs(30);
 
 const END_TURN: &str = StopCondition::EndTurn.as_str();
 const MAX_TURNS: &str = StopCondition::MaxTurns.as_str();
@@ -61,6 +67,12 @@ struct Finish {
 /// Returns [`CliError::EmptyPrompt`] when there is nothing to send,
 /// [`CliError::RunInterrupted`] when the daemon connection is lost before the
 /// turn ends, or the errors of reaching the daemon and of its requests.
+///
+/// The first Ctrl-C cancels the turn and the run reports how it ended; a second
+/// one quits at once with [`CliError::RunInterrupted`]. Without a second one, an
+/// interrupted run waits at most [`CANCEL_GRACE`] for the daemon to answer the
+/// send, plus the timeouts of its cancel requests, and then [`CANCEL_GRACE`]
+/// again for the turn to end.
 pub async fn run(
     ctx: &Context,
     io: &mut Io<'_>,
@@ -85,21 +97,90 @@ pub async fn run(
         .await?;
     let session = created.session.id;
     let mut events = client.subscribe(&session, Some(0)).await?;
+    // Registered before the send so an interrupt during it is never lost, and
+    // not earlier so Ctrl-C still stops the run while the daemon starts.
+    let mut interrupts = signal(SignalKind::interrupt())?;
     info!(step = "send", session = %session, "sending the prompt");
-    let _: SessionSendResult = client
-        .request(
-            SESSION_SEND,
-            &SessionSendParams {
-                session_id: session.clone(),
-                text: prompt,
-                max_turns: args.max_turns,
-                token_cap: args.token_cap,
-            },
-        )
-        .await?;
+    let params = SessionSendParams {
+        session_id: session.clone(),
+        text: prompt,
+        max_turns: args.max_turns,
+        token_cap: args.token_cap,
+    };
+    let send = client.request::<_, SessionSendResult>(SESSION_SEND, &params);
+    tokio::pin!(send);
+    let mut interrupted = false;
+    tokio::select! {
+        answer = &mut send => {
+            answer?;
+        }
+        _ = interrupts.recv() => {
+            interrupted = true;
+            cancel_during_send(
+                &client,
+                &session,
+                connect_unchecked(ctx),
+                send,
+                &mut interrupts,
+            )
+            .await?;
+        }
+    }
     info!(step = "follow", session = %session, "following the turn");
-    let finish = follow(&client, &mut events, &session, io).await?;
+    let follow = follow(
+        &client,
+        &mut events,
+        &session,
+        &mut interrupts,
+        interrupted,
+        io,
+    );
+    let finish = if interrupted {
+        tokio::time::timeout(CANCEL_GRACE, follow)
+            .await
+            .map_err(|_| CliError::RunInterrupted)??
+    } else {
+        follow.await?
+    };
     Ok(report(&finish, io)?)
+}
+
+/// Cancels a turn whose send the daemon has not answered yet, then waits for
+/// that answer. The daemon serves one connection's requests in order, so the
+/// first cancel goes over a new connection. It can land before the daemon has
+/// reserved the session, or the new connection can fail, so unless it was
+/// accepted the cancel is repeated over `client` once the send is answered.
+///
+/// A second Ctrl-C ends the wait at once with [`CliError::RunInterrupted`];
+/// otherwise the send is waited for at most [`CANCEL_GRACE`].
+async fn cancel_during_send(
+    client: &Client,
+    session: &SessionId,
+    connect_side: impl Future<Output = Result<Client, CliError>>,
+    send: impl Future<Output = Result<SessionSendResult, ClientError>>,
+    interrupts: &mut Signal,
+) -> Result<(), CliError> {
+    info!(session = %session, "interrupted while sending, cancelling the turn");
+    let cancel = async {
+        let accepted = match connect_side.await {
+            Ok(side) => cancel_turn(&side, session).await,
+            Err(failure) => {
+                warn!(session = %session, error = %failure, "could not reach the daemon over a second connection to cancel");
+                false
+            }
+        };
+        tokio::time::timeout(CANCEL_GRACE, send)
+            .await
+            .map_err(|_| CliError::RunInterrupted)??;
+        if !accepted {
+            cancel_turn(client, session).await;
+        }
+        Ok(())
+    };
+    tokio::select! {
+        done = cancel => done,
+        _ = interrupts.recv() => Err(CliError::RunInterrupted),
+    }
 }
 
 /// The prompt flag, or else all of the input.
@@ -129,11 +210,15 @@ fn backend(ctx: &Context) -> Result<BackendKind, CliError> {
 }
 
 /// Prints streamed text, denies permission prompts and cancels on Ctrl-C,
-/// until the turn's result arrives.
+/// until the turn's result arrives. The first Ctrl-C cancels the turn; a
+/// second one, once `interrupted`, gives up waiting for the result and ends the
+/// run with [`CliError::RunInterrupted`].
 async fn follow(
     client: &Client,
     events: &mut Subscription,
     session: &SessionId,
+    interrupts: &mut Signal,
+    mut interrupted: bool,
     io: &mut Io<'_>,
 ) -> Result<Finish, CliError> {
     let mut condition = None;
@@ -141,7 +226,11 @@ async fn follow(
     loop {
         let notification = tokio::select! {
             next = events.next() => next.ok_or(CliError::RunInterrupted)?,
-            _ = tokio::signal::ctrl_c() => {
+            _ = interrupts.recv() => {
+                if interrupted {
+                    return Err(CliError::RunInterrupted);
+                }
+                interrupted = true;
                 info!(session = %session, "interrupted, cancelling the turn");
                 cancel_turn(client, session).await;
                 continue;
@@ -181,15 +270,19 @@ async fn follow(
     }
 }
 
-/// The cancel can lose a race with the turn ending; the result still follows,
-/// so a failed cancel is only logged.
-async fn cancel_turn(client: &Client, session: &SessionId) {
+/// Whether the daemon accepted the cancel. It can lose a race with the turn
+/// ending; the result still follows, so a failed cancel is only logged.
+async fn cancel_turn(client: &Client, session: &SessionId) -> bool {
     let params = SessionCancelParams {
         session_id: session.clone(),
     };
     let cancelled: Result<SessionCancelResult, _> = client.request(SESSION_CANCEL, &params).await;
-    if let Err(failure) = cancelled {
-        warn!(session = %session, error = %failure, "the cancel request failed; following the turn on");
+    match cancelled {
+        Ok(result) => result.cancelled,
+        Err(failure) => {
+            warn!(session = %session, error = %failure, "the cancel request failed; following the turn on");
+            false
+        }
     }
 }
 
@@ -323,5 +416,136 @@ mod tests {
         cancel_turn(&client, &SessionId::new("s-1")).await;
 
         // Assert: reaching this line means the failure did not propagate or panic.
+    }
+
+    /// A daemon that serves one connection and returns the methods it was
+    /// asked, ending after a `session.cancel` or when the connection closes.
+    /// It leaves `session.send` unanswered unless `answer_send` is set.
+    async fn serve(listener: tokio::net::UnixListener, answer_send: bool) -> Vec<String> {
+        use coda_protocol::codec::{FrameDecoder, encode_frame};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut decoder, mut methods, mut buffer) = (FrameDecoder::new(), Vec::new(), [0; 4096]);
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                return methods;
+            }
+            decoder.push(&buffer[..read]).unwrap();
+            while let Some(frame) = decoder.next_frame().unwrap() {
+                let request: Value = serde_json::from_slice(&frame).unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                let result = match method.as_str() {
+                    SESSION_SEND if answer_send => serde_json::json!({"turn_id": "t-1"}),
+                    SESSION_CANCEL => serde_json::json!({"cancelled": true}),
+                    _ => Value::Null,
+                };
+                methods.push(method.clone());
+                if !result.is_null() {
+                    let reply = serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+                    let frame = encode_frame(&serde_json::to_vec(&reply).unwrap()).unwrap();
+                    stream.write_all(&frame).await.unwrap();
+                }
+                if method == SESSION_CANCEL {
+                    return methods;
+                }
+            }
+        }
+    }
+
+    async fn rig(
+        answer_send: bool,
+    ) -> (
+        tempfile::TempDir,
+        Client,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        let dir = tempfile::Builder::new()
+            .prefix("cc")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("d.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let daemon = tokio::spawn(serve(listener, answer_send));
+        let client = Client::connect_unchecked(&socket, coda_config::timing::Timing::for_tests())
+            .await
+            .unwrap();
+        (dir, client, daemon)
+    }
+
+    fn no_second_connection() -> std::future::Ready<Result<Client, CliError>> {
+        std::future::ready(Err(CliError::NotRunning))
+    }
+
+    fn params(session: &SessionId) -> SessionSendParams {
+        SessionSendParams {
+            session_id: session.clone(),
+            text: "hello".to_owned(),
+            max_turns: None,
+            token_cap: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_second_connection_still_gets_the_cancel_over_the_main_one() {
+        // Arrange
+        let (_dir, client, daemon) = rig(true).await;
+        let session = SessionId::new("s-1");
+        let mut interrupts = signal(SignalKind::interrupt()).unwrap();
+        let params = params(&session);
+        let send = client.request::<_, SessionSendResult>(SESSION_SEND, &params);
+
+        // Act
+        let done = cancel_during_send(
+            &client,
+            &session,
+            no_second_connection(),
+            send,
+            &mut interrupts,
+        )
+        .await;
+
+        // Assert
+        done.unwrap();
+        let methods = tokio::time::timeout(Duration::from_secs(20), daemon)
+            .await
+            .expect("the daemon never saw the cancel")
+            .unwrap();
+        assert_eq!(methods, [SESSION_SEND, SESSION_CANCEL]);
+    }
+
+    #[tokio::test]
+    async fn a_second_interrupt_ends_the_wait_for_the_send_at_once() {
+        // Arrange
+        let (_dir, client, _daemon) = rig(false).await;
+        let session = SessionId::new("s-1");
+        let mut interrupts = signal(SignalKind::interrupt()).unwrap();
+        let params = params(&session);
+        let send = client.request::<_, SessionSendResult>(SESSION_SEND, &params);
+        let interrupt = std::process::Command::new("kill")
+            .args(["-INT", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+
+        // Act
+        let done = tokio::time::timeout(
+            Duration::from_secs(10),
+            cancel_during_send(
+                &client,
+                &session,
+                no_second_connection(),
+                send,
+                &mut interrupts,
+            ),
+        )
+        .await;
+
+        // Assert
+        assert!(interrupt.success());
+        assert!(matches!(
+            done.expect("the second interrupt was ignored"),
+            Err(CliError::RunInterrupted)
+        ));
     }
 }

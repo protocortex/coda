@@ -229,6 +229,34 @@ async fn a_missing_key_variable_is_a_clear_error_that_names_no_other_variable() 
 }
 
 #[tokio::test]
+async fn a_cancel_during_a_model_switch_reports_nothing_cancelled() {
+    // Arrange
+    let target = Arc::new(std::sync::OnceLock::<(Arc<ModelSessions>, SessionId)>::new());
+    let cancelled = Arc::new(std::sync::Mutex::new(None));
+    let reader: EnvReader = {
+        let (target, cancelled) = (Arc::clone(&target), Arc::clone(&cancelled));
+        // The key is read while the switch holds the session.
+        Arc::new(move |_| {
+            let (sessions, session) = target.get().unwrap();
+            *lock(&cancelled) = Some(sessions.cancel(session));
+            Some(SECRET.to_owned())
+        })
+    };
+    let rig = api_rig(reader);
+    assert!(
+        target
+            .set((Arc::clone(&rig.sessions), rig.session.clone()))
+            .is_ok()
+    );
+
+    // Act
+    rig.sessions.set_model(&rig.session, "fast").await.unwrap();
+
+    // Assert
+    assert_eq!(*lock(&cancelled), Some(false));
+}
+
+#[tokio::test]
 async fn the_key_value_never_reaches_events_or_the_switched_session() {
     // Arrange
     let rig = api_rig(Arc::new(|_| Some(SECRET.to_owned())));

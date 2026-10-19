@@ -23,12 +23,14 @@
 //! environment. `report_path` makes the binary write its arguments and
 //! environment facts there, `pid_path` receives the `sleep` pid, `pid_log` collects the pid of every
 //! `sleep` it started, one per line, and
-//! `flood` makes it fill stdout before it reads any input.
+//! `flood` makes it fill stdout before it reads any input, and `start_gate`
+//! holds the start-up, before any output, until a file exists at that path, and
+//! exits non-zero if none appears within two minutes.
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const VERSION: &str = "2.1.292 (Claude Code)";
 const SESSION_ID: &str = "fake-session-1";
@@ -37,6 +39,9 @@ const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 const CLAUDECODE_VAR: &str = "CLAUDECODE";
 const CONTROL_FILE: &str = "fake-claude-control.json";
 const CREDENTIALS_PATH: &str = ".claude/.credentials.json";
+const GATE_POLL: Duration = Duration::from_millis(10);
+/// Longest a `start_gate` holds the start-up, so an orphaned fake cannot poll forever.
+const GATE_LIMIT: Duration = Duration::from_secs(120);
 const FLOOD_LINES: usize = 20_000;
 const GRANDCHILD_PROGRAM: &str = "sleep";
 const GRANDCHILD_SECONDS: &str = "300";
@@ -223,6 +228,16 @@ fn main() -> io::Result<()> {
     let control = Control::load();
     if let Some(path) = control.path("report_path") {
         write_report(path)?;
+    }
+    if let Some(gate) = control.path("start_gate") {
+        let deadline = Instant::now() + GATE_LIMIT;
+        while !gate.exists() {
+            if Instant::now() >= deadline {
+                eprintln!("fake-claude: the start gate never opened");
+                std::process::exit(1);
+            }
+            std::thread::sleep(GATE_POLL);
+        }
     }
     let mut out = io::stdout().lock();
     if control.flood() {

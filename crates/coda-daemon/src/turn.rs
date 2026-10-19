@@ -120,6 +120,73 @@ impl TurnError {
 
 type CancelHandle = coda_providers::claude_session::CancelHandle;
 
+/// A session's place in a running table from the moment a send reserves it.
+/// It is armed once the backend can be cancelled; a cancel that arrives earlier
+/// is kept and applied by [`Reservation::arm`]. The reservation leaves the
+/// table with its turn, so no flag outlives it.
+pub(crate) struct Reservation<T> {
+    armed: Option<T>,
+    cancel_requested: bool,
+    cancellable: bool,
+}
+
+impl<T> Default for Reservation<T> {
+    fn default() -> Self {
+        Self {
+            armed: None,
+            cancel_requested: false,
+            cancellable: true,
+        }
+    }
+}
+
+impl<T> Reservation<T> {
+    /// A reservation of work that has nothing to cancel, which only keeps the
+    /// session busy.
+    pub(crate) fn uncancellable() -> Self {
+        Self {
+            cancellable: false,
+            ..Self::default()
+        }
+    }
+
+    /// Cancels now when armed, else remembers the request for [`Self::arm`].
+    /// Returns whether there was anything to cancel.
+    pub(crate) fn request_cancel(&mut self, cancel: impl FnOnce(&T)) -> bool {
+        if !self.cancellable {
+            return false;
+        }
+        match &self.armed {
+            Some(armed) => cancel(armed),
+            None => self.cancel_requested = true,
+        }
+        true
+    }
+
+    /// Stores `armed` and applies a cancel requested while it was missing.
+    pub(crate) fn arm(&mut self, armed: T, cancel: impl FnOnce(&T)) {
+        if std::mem::take(&mut self.cancel_requested) {
+            cancel(&armed);
+        }
+        self.armed = Some(armed);
+    }
+
+    /// Replaces the armed value of a turn whose backend started again. A cancel
+    /// asked for meanwhile already reached the old value, which the caller
+    /// hands on.
+    pub(crate) fn rearm(&mut self, armed: T) {
+        self.armed = Some(armed);
+    }
+
+    pub(crate) fn armed(&self) -> Option<&T> {
+        self.armed.as_ref()
+    }
+
+    pub(crate) fn into_armed(self) -> Option<T> {
+        self.armed
+    }
+}
+
 /// A session's entry in the running table. It is removed on drop, so a turn
 /// task that panics or fails during setup never leaves the session busy.
 struct TurnSlot {
@@ -129,9 +196,9 @@ struct TurnSlot {
 
 impl TurnSlot {
     fn arm(&self, cancel: CancelHandle) {
-        self.turns
-            .running()
-            .insert(self.session.clone(), Some(cancel));
+        if let Some(reservation) = self.turns.running().get_mut(&self.session) {
+            reservation.arm(cancel, CancelHandle::cancel);
+        }
     }
 }
 
@@ -149,7 +216,7 @@ pub struct Turns {
     pub(crate) models: Arc<ModelSessions>,
     /// A session is present from the moment a send reserves it; the cancel
     /// handle is set once the backend runs. Never held across an await.
-    running: Mutex<HashMap<SessionId, Option<CancelHandle>>>,
+    running: Mutex<HashMap<SessionId, Reservation<CancelHandle>>>,
     /// The backends' own session ids, so the next turn resumes the conversation.
     backend_ids: Mutex<HashMap<SessionId, String>>,
     /// Sessions that have run an app-server turn, whose next thread starts empty.
@@ -329,14 +396,11 @@ impl Turns {
     }
 
     /// Cancels the running turn of `session`; `false` when none is running.
-    /// A turn whose backend is still starting cannot be cancelled yet.
+    /// A turn whose backend is still starting is cancelled as soon as it can be.
     pub fn cancel(&self, session: &SessionId) -> bool {
-        match self.running().get(session) {
-            Some(Some(cancel)) => {
-                cancel.cancel();
-                true
-            }
-            _ => self.models.cancel(session),
+        match self.running().get_mut(session) {
+            Some(reservation) => reservation.request_cancel(CancelHandle::cancel),
+            None => self.models.cancel(session),
         }
     }
 
@@ -364,14 +428,14 @@ impl Turns {
         u32::try_from(running).unwrap_or(u32::MAX)
     }
 
-    fn running(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, Option<CancelHandle>>> {
+    fn running(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, Reservation<CancelHandle>>> {
         self.running.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn reserve(self: &Arc<Self>, session: &SessionId) -> Result<TurnSlot, TurnError> {
         match self.running().entry(session.clone()) {
             Entry::Occupied(_) => return Err(TurnError::Busy(session.clone())),
-            Entry::Vacant(vacant) => vacant.insert(None),
+            Entry::Vacant(vacant) => vacant.insert(Reservation::default()),
         };
         Ok(TurnSlot {
             turns: Arc::clone(self),

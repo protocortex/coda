@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use coda_config::config::{Config, ProviderConfig};
 use coda_protocol::jsonrpc::Response;
-use coda_protocol::types::{BackendKind, Mode, SessionId};
+use coda_protocol::types::{BackendKind, Mode, SessionId, TurnId};
 use coda_providers::model::{ModelProvider, ModelRequest};
 use coda_store::{NewSession, SessionRecord, Store, StoredEvent};
 use rusqlite::types::ValueRef;
@@ -23,7 +23,7 @@ use crate::subscribe::{Connection, Hub, Outbox};
 use crate::trace::capture::{Spans, install};
 use crate::turn::{BACKEND_UNSUPPORTED, TurnConfig, Turns};
 use crate::watchdog::Timing;
-use coda_core::turn::{PROVIDER_CALL_SPAN, TOOL_CALL_SPAN};
+use coda_core::turn::{CancelToken, PROVIDER_CALL_SPAN, TOOL_CALL_SPAN};
 
 const WAIT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(20);
@@ -378,6 +378,41 @@ async fn cancel_stops_the_loop_and_expires_the_open_permission_request() {
     let timeouts = rig.bodies("timeout").await;
     assert_eq!(timeouts[0]["request_id"], request);
     assert!(!rig.cwd.join("ran.txt").exists());
+}
+
+#[tokio::test]
+async fn a_cancel_while_the_send_is_starting_cancels_the_loop_once_it_is_armed() {
+    // Arrange
+    let rig = Rig::new(Mode::Default, &[]);
+    let models = &rig.turns.models;
+    let slot = models.reserve(&rig.session).unwrap();
+    let token = CancelToken::default();
+
+    // Act
+    let cancelled = models.cancel(&rig.session);
+    token.reset();
+    slot.arm((token.clone(), TurnId::new("t-1")));
+
+    // Assert
+    assert!(cancelled);
+    assert!(token.is_cancelled());
+}
+
+#[tokio::test]
+async fn a_cancel_with_no_turn_is_not_remembered_for_the_next_send() {
+    // Arrange
+    let rig = Rig::new(Mode::Default, &[]);
+    let models = &rig.turns.models;
+    let cancelled = models.cancel(&rig.session);
+    let token = CancelToken::default();
+
+    // Act
+    let slot = models.reserve(&rig.session).unwrap();
+    slot.arm((token.clone(), TurnId::new("t-1")));
+
+    // Assert
+    assert!(!cancelled);
+    assert!(!token.is_cancelled());
 }
 
 #[tokio::test]
