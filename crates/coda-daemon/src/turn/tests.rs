@@ -136,8 +136,12 @@ impl Rig {
 
     async fn call(&mut self, method: &str, params: Value) -> Value {
         self.next_id += 1;
-        let request =
-            json!({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params});
+        self.request(self.next_id, method, params).await
+    }
+
+    /// Like `call` with a caller-chosen id, so two requests can be in flight at once.
+    async fn request(&self, id: i64, method: &str, params: Value) -> Value {
+        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let payload = serde_json::to_vec(&request).unwrap();
         let response: Response = self
             .dispatcher
@@ -393,6 +397,63 @@ async fn cancelling_a_session_without_a_turn_reports_nothing_cancelled() {
 
     // Assert
     assert_eq!(cancelled["result"]["cancelled"], false);
+}
+
+#[tokio::test]
+async fn a_cancel_while_the_backend_is_starting_ends_the_turn_cancelled() {
+    // Arrange
+    let rig = Rig::new(relaxed(), Vec::new());
+    let gate = rig.cwd.path().join("start.gate");
+    rig.control(&json!({ "start_gate": gate }));
+    let params = json!({"session_id": rig.session, "text": "hello"});
+
+    // Act
+    let held_send = rig.request(1, "session.send", params);
+    let cancel_then_release = async {
+        tokio::time::timeout(WAIT, async {
+            while !rig.turns.is_running(&rig.session) {
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .expect("the send never reserved the session");
+        let cancelled = rig
+            .request(2, "session.cancel", json!({"session_id": rig.session}))
+            .await;
+        std::fs::write(&gate, "").unwrap();
+        cancelled
+    };
+    let (_, cancelled) = tokio::join!(held_send, cancel_then_release);
+
+    // Assert
+    assert_eq!(cancelled["result"]["cancelled"], true);
+    rig.wait_for("turn_interrupted").await;
+    rig.wait_until_idle().await;
+    assert_eq!(rig.pending().await.len(), 0);
+    let kinds = rig.kinds().await;
+    assert!(
+        !kinds.iter().any(|k| k == "permission_request"),
+        "{kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_with_no_turn_does_not_cancel_the_next_turn() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    let cancelled = rig
+        .call("session.cancel", json!({"session_id": rig.session}))
+        .await;
+
+    // Act
+    rig.send("hello").await;
+    let request = rig.wait_for_pending().await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_for("result").await;
+
+    // Assert
+    assert_eq!(cancelled["result"]["cancelled"], false);
+    assert!(!rig.kinds().await.iter().any(|k| k == "turn_interrupted"));
 }
 
 #[tokio::test]

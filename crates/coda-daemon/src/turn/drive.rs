@@ -96,9 +96,9 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
             }
         }
         let cancel = self.child.cancel_handle();
-        self.turns
-            .running()
-            .insert(self.record.id.clone(), Some(cancel.clone()));
+        if let Some(reservation) = self.turns.running().get_mut(&self.record.id) {
+            reservation.rearm(cancel.clone());
+        }
         // A cancel that landed after the check above hit the old handle, so hand it on.
         if stopped() {
             cancel.cancel();

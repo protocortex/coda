@@ -34,7 +34,7 @@ use tracing::{Instrument, info, warn};
 use crate::gate::{BrokerGate, Brokers};
 use crate::subscribe::{Hub, HubError};
 use crate::trace::backend_span;
-use crate::turn::{TurnError, Turns, store_event};
+use crate::turn::{Reservation, TurnError, Turns, store_event};
 
 const FAUX_KEY: &str = "faux";
 /// Tool output above this many bytes is shortened for the model and kept whole.
@@ -135,7 +135,11 @@ struct Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        let armed = self.sessions.running().remove(&self.session).flatten();
+        let armed = self
+            .sessions
+            .running()
+            .remove(&self.session)
+            .and_then(Reservation::into_armed);
         if let (true, Some((_, turn))) = (std::thread::panicking(), armed) {
             warn!(session = %self.session, turn = %turn, "the turn panicked");
             let (hub, session) = (Arc::clone(&self.sessions.hub), self.session.clone());
@@ -156,7 +160,7 @@ pub struct ModelSessions {
     key_reader: EnvReader,
     /// Present from the moment a send reserves the session, with its cancel
     /// token and turn once it runs; never held across an await.
-    running: Mutex<HashMap<SessionId, Option<(CancelToken, TurnId)>>>,
+    running: Mutex<HashMap<SessionId, Reservation<(CancelToken, TurnId)>>>,
     /// Idle conversations, least recently used first.
     loops: Mutex<Vec<(SessionId, ModelLoop)>>,
     /// Limits of conversations a model switch dropped, until the next send
@@ -281,8 +285,9 @@ impl ModelSessions {
         ) {
             return Err(SwitchError::NotAModelBackend(session.clone()));
         }
+        // A switch has no turn, so a cancel finds nothing to stop.
         let _slot = self
-            .reserve(session)
+            .reserve_as(session, Reservation::uncancellable())
             .map_err(|_| SwitchError::Busy(session.clone()))?;
         info!(session = %session, step = "resolve_alias", "checking the model alias");
         let target = self.registry.alias(alias, record.backend)?;
@@ -318,13 +323,11 @@ impl ModelSessions {
     }
 
     /// Cancels the running send of `session`; `false` when none is running.
+    /// A send that is still starting is cancelled as soon as it is armed.
     pub fn cancel(&self, session: &SessionId) -> bool {
-        match self.running().get(session) {
-            Some(Some((cancel, _))) => {
-                cancel.cancel();
-                true
-            }
-            _ => false,
+        match self.running().get_mut(session) {
+            Some(reservation) => reservation.request_cancel(|(cancel, _)| cancel.cancel()),
+            None => false,
         }
     }
 
@@ -340,8 +343,8 @@ impl ModelSessions {
     }
 
     async fn shutdown_within(&self, grace: Duration) {
-        for (cancel, _) in self.running().values().flatten() {
-            cancel.cancel();
+        for reservation in self.running().values_mut() {
+            reservation.request_cancel(|(cancel, _)| cancel.cancel());
         }
         let idle = async {
             while self.active() > 0 {
@@ -352,7 +355,7 @@ impl ModelSessions {
             let stuck: Vec<_> = self
                 .running()
                 .iter()
-                .filter_map(|(session, armed)| Some((session.clone(), armed.as_ref()?.1.clone())))
+                .filter_map(|(session, r)| Some((session.clone(), r.armed()?.1.clone())))
                 .collect();
             for (session, turn) in stuck {
                 warn!(session = %session, turn = %turn, "the turn did not stop in time");
@@ -367,7 +370,7 @@ impl ModelSessions {
         self.running().len()
     }
 
-    fn running(&self) -> MutexGuard<'_, HashMap<SessionId, Option<(CancelToken, TurnId)>>> {
+    fn running(&self) -> MutexGuard<'_, HashMap<SessionId, Reservation<(CancelToken, TurnId)>>> {
         lock(&self.running)
     }
 
@@ -391,11 +394,19 @@ impl ModelSessions {
     }
 
     fn reserve(self: &Arc<Self>, session: &SessionId) -> Result<Slot, TurnError> {
+        self.reserve_as(session, Reservation::default())
+    }
+
+    fn reserve_as(
+        self: &Arc<Self>,
+        session: &SessionId,
+        reservation: Reservation<(CancelToken, TurnId)>,
+    ) -> Result<Slot, TurnError> {
         match self.running().entry(session.clone()) {
             std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(TurnError::Busy(session.clone()));
             }
-            std::collections::hash_map::Entry::Vacant(vacant) => vacant.insert(None),
+            std::collections::hash_map::Entry::Vacant(vacant) => vacant.insert(reservation),
         };
         Ok(Slot {
             sessions: Arc::clone(self),
@@ -566,9 +577,9 @@ impl ModelSessions {
 
 impl Slot {
     fn arm(&self, armed: (CancelToken, TurnId)) {
-        self.sessions
-            .running()
-            .insert(self.session.clone(), Some(armed));
+        if let Some(reservation) = self.sessions.running().get_mut(&self.session) {
+            reservation.arm(armed, |(cancel, _)| cancel.cancel());
+        }
     }
 }
 

@@ -128,7 +128,11 @@ impl CancelToken {
         self.flag.store(false, Ordering::SeqCst);
     }
 
-    fn is_cancelled(&self) -> bool {
+    /// Whether a cancel was requested and not reset since. Public only so the
+    /// daemon's tests can observe a token; the turn loop checks it itself.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
     }
 
