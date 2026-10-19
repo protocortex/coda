@@ -2,12 +2,12 @@
 
 #![allow(dead_code)]
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coda_cli::{Context, Io, Wait, run};
 use coda_client::{Client, Subscription};
@@ -22,7 +22,9 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-pub const WAIT: Duration = Duration::from_secs(10);
+/// An upper bound for waits, not a duration: starting a process can stall for
+/// many seconds on a loaded machine, and a wait returns as soon as its event does.
+pub const WAIT: Duration = Duration::from_secs(60);
 
 /// macOS limits socket paths to 104 bytes, so keep them under /tmp.
 pub fn short_dir() -> TempDir {
@@ -122,6 +124,76 @@ impl TestDaemon {
 }
 
 pub const POLL: Duration = Duration::from_millis(50);
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const PID_PREFIX: &str = "pid: ";
+
+/// Stops the daemon that a test started through the real binary, and waits for
+/// it to exit, even when an assertion fails first.
+///
+/// The daemon is found through `coda status` in its home directory, so declare
+/// this guard after the temporary directory that holds the home: locals drop in
+/// reverse declaration order (struct fields in declaration order), and the guard
+/// must run while that directory still exists.
+pub struct StopDaemon(PathBuf);
+
+impl StopDaemon {
+    pub fn new(home: &Path) -> Self {
+        Self(home.to_path_buf())
+    }
+}
+
+impl Drop for StopDaemon {
+    fn drop(&mut self) {
+        let mut status = Command::new(env!("CARGO_BIN_EXE_coda"));
+        status.arg("status").env("CODA_HOME", &self.0);
+        let Some(out) = output_within(&mut status, STOP_TIMEOUT) else {
+            return;
+        };
+        let Some(pid) = out.lines().find_map(|line| line.strip_prefix(PID_PREFIX)) else {
+            return;
+        };
+        signal("-TERM", pid);
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while signal("-0", pid) {
+            if Instant::now() >= deadline {
+                signal("-KILL", pid);
+                return;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+/// Runs `command` and returns its standard output, or `None` if it outlasts `limit`.
+fn output_within(command: &mut Command, limit: Duration) -> Option<String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + limit;
+    while child.try_wait().ok()?.is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(POLL);
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    Some(out)
+}
+
+fn signal(name: &str, pid: &str) -> bool {
+    Command::new("kill")
+        .args([name, pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
 
 /// Kills the daemon a test started and the backend groups it left in `run/`,
 /// even when an assertion fails first.

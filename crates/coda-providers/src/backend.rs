@@ -3,6 +3,7 @@
 //! The delegated-agent backend trait and its enable switch.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use coda_config::config::{Config, ProviderConfig};
 use coda_protocol::types::BackendKind;
@@ -89,6 +90,19 @@ pub fn locate(
     config: &Config,
     search_dirs: &[PathBuf],
 ) -> Result<DetectedBinary, BackendError> {
+    locate_within(backend, config, search_dirs, DEFAULT_PROBE_TIMEOUT)
+}
+
+/// [`locate`] with its own limit on how long `--version` may take.
+///
+/// # Errors
+/// The errors of [`locate`].
+pub fn locate_within(
+    backend: &dyn AgentBackend,
+    config: &Config,
+    search_dirs: &[PathBuf],
+    probe_timeout: Duration,
+) -> Result<DetectedBinary, BackendError> {
     let section = require_enabled(backend, config)?;
     let verified: Vec<String> = backend
         .verified_versions()
@@ -101,7 +115,7 @@ pub fn locate(
         explicit: section.binary.as_deref(),
         search_dirs,
         verified: &verified,
-        probe_timeout: DEFAULT_PROBE_TIMEOUT,
+        probe_timeout,
     };
     match detect(&request) {
         Detection::Found(binary) => Ok(binary),
@@ -138,6 +152,18 @@ mod tests {
         fn verified_versions(&self) -> &'static [&'static str] {
             VERIFIED_CLAUDE_CODE_VERSIONS
         }
+    }
+
+    /// An upper bound, not a duration: starting a freshly written script can
+    /// stall for many seconds on a loaded machine.
+    const PATIENT_PROBE: Duration = Duration::from_secs(60);
+
+    fn locate_patiently(
+        backend: &dyn AgentBackend,
+        config: &Config,
+        search_dirs: &[PathBuf],
+    ) -> Result<DetectedBinary, BackendError> {
+        locate_within(backend, config, search_dirs, PATIENT_PROBE)
     }
 
     fn config(toml: &str) -> Config {
@@ -217,7 +243,7 @@ mod tests {
         let config = config("[providers.claude_code]\nenabled = true\n");
 
         // Act
-        let binary = locate(&Claude, &config, &[dir.path().to_path_buf()]).unwrap();
+        let binary = locate_patiently(&Claude, &config, &[dir.path().to_path_buf()]).unwrap();
 
         // Assert
         assert_eq!(binary.version, "2.1.292");
@@ -232,7 +258,7 @@ mod tests {
             config("[providers.claude_code]\nenabled = true\nverified_versions = [\"2.5.0\"]\n");
 
         // Act
-        let binary = locate(&Claude, &config, &[dir.path().to_path_buf()]).unwrap();
+        let binary = locate_patiently(&Claude, &config, &[dir.path().to_path_buf()]).unwrap();
 
         // Assert
         assert!(binary.verified);
@@ -245,7 +271,7 @@ mod tests {
         let config = config("[providers.claude_code]\nenabled = true\n");
 
         // Act
-        let binary = locate(&Claude, &config, &[dir.path().to_path_buf()]).unwrap();
+        let binary = locate_patiently(&Claude, &config, &[dir.path().to_path_buf()]).unwrap();
 
         // Assert
         assert!(!binary.verified);
@@ -262,7 +288,7 @@ mod tests {
         let config = config(&toml);
 
         // Act
-        let binary = locate(&Claude, &config, &[]).unwrap();
+        let binary = locate_patiently(&Claude, &config, &[]).unwrap();
 
         // Assert
         assert_eq!(binary.path, dir.path().join("claude"));

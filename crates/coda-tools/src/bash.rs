@@ -463,12 +463,48 @@ mod tests {
 
         // Assert
         assert!(started.elapsed() < BOUND);
-        assert!(out.truncated);
-        assert!(out.text.starts_with("y\ny\n"));
         assert!(
             out.text
                 .ends_with("[timed out after 300 ms, process group killed]")
         );
+    }
+
+    #[test]
+    fn endless_output_is_cut_at_the_cap() {
+        // Arrange
+        let (_dir, tool) = tool(BOUND, &[]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (shared_tx, shared_rx) = mpsc::channel();
+        let share_capture = move |reader: OwnedFd, cap: usize| {
+            let capture = Capture::start(reader, cap)?;
+            let _ = shared_tx.send(Arc::clone(&capture.shared));
+            Ok(capture)
+        };
+        // Cancels once the reader holds more than the cap, so the test waits
+        // for the output itself instead of guessing how long the shell takes.
+        let watcher = {
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                let shared = shared_rx.recv_timeout(BOUND).unwrap();
+                let deadline = Instant::now() + BOUND;
+                while shared.lock().unwrap().bytes.len() <= CAP {
+                    assert!(Instant::now() < deadline, "the command printed too little");
+                    thread::sleep(POLL);
+                }
+                cancel.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // Act
+        let out = tool
+            .execute(&json!({"command": "yes"}), &cancel, share_capture)
+            .unwrap();
+        watcher.join().unwrap();
+
+        // Assert
+        assert!(out.truncated);
+        assert!(out.text.starts_with("y\ny\n"));
+        assert!(out.text.ends_with("[cancelled, process group killed]"));
     }
 
     #[test]

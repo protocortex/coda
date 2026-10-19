@@ -269,6 +269,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::time::Duration;
 
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
@@ -279,6 +280,9 @@ mod tests {
 
     const EXE: &str = "/usr/bin/claude-test";
     const SLEEP: &str = "/bin/sleep";
+    /// An upper bound, not a duration: starting a process can stall for many
+    /// seconds on a loaded machine.
+    const EXEC_BOUND: Duration = Duration::from_secs(60);
 
     fn sleeper() -> tokio::process::Child {
         Command::new("sleep")
@@ -554,10 +558,10 @@ mod tests {
                 .unwrap()
                 .is_none_or(|i| i.name != "sleep")
             {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        tokio::time::timeout(std::time::Duration::from_secs(10), execed)
+        tokio::time::timeout(EXEC_BOUND, execed)
             .await
             .expect("the launcher never exec'd");
 

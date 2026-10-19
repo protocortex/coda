@@ -6,7 +6,7 @@ mod common;
 
 use std::process::{Command, Output};
 
-use common::short_dir;
+use common::{StopDaemon, short_dir};
 
 const BIN: &str = env!("CARGO_BIN_EXE_coda");
 
@@ -27,18 +27,6 @@ fn pid_of(home: &std::path::Path) -> String {
         .to_owned()
 }
 
-/// Stops the daemon a test started, even when an assertion fails first.
-struct DaemonCleanup<'a>(&'a std::path::Path);
-
-impl Drop for DaemonCleanup<'_> {
-    fn drop(&mut self) {
-        let status = String::from_utf8(coda(self.0, &["status"]).stdout).unwrap_or_default();
-        if let Some(pid) = status.lines().find_map(|line| line.strip_prefix("pid: ")) {
-            let _ = Command::new("kill").arg(pid).status();
-        }
-    }
-}
-
 #[test]
 fn status_without_a_daemon_exits_non_zero_with_a_message() {
     // Arrange
@@ -56,7 +44,7 @@ fn status_without_a_daemon_exits_non_zero_with_a_message() {
 fn running_coda_starts_the_daemon_then_ping_and_status_answer() {
     // Arrange
     let home = short_dir();
-    let _cleanup = DaemonCleanup(home.path());
+    let _stop = StopDaemon::new(home.path());
 
     // Act
     let started = coda(home.path(), &[]);
@@ -77,7 +65,7 @@ fn running_coda_starts_the_daemon_then_ping_and_status_answer() {
 fn daemon_restart_replaces_the_running_daemon() {
     // Arrange
     let home = short_dir();
-    let _cleanup = DaemonCleanup(home.path());
+    let _stop = StopDaemon::new(home.path());
     assert!(coda(home.path(), &[]).status.success());
     let before = pid_of(home.path());
 

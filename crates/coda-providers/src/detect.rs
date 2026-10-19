@@ -193,6 +193,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
+    /// An upper bound, not a duration: starting a freshly written script can
+    /// stall for many seconds on a loaded machine.
+    const PATIENT_PROBE: Duration = Duration::from_secs(60);
+
     fn tool_dir(files: &[(&str, &str, u32)]) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         for (name, body, mode) in files {
@@ -217,7 +221,7 @@ mod tests {
             explicit,
             search_dirs: dirs,
             verified,
-            probe_timeout: Duration::from_secs(10),
+            probe_timeout: PATIENT_PROBE,
         }
     }
 
@@ -409,11 +413,9 @@ mod tests {
         let script = "#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' x\necho\necho 2.1.292\n";
         let dir = tool_dir(&[("claude", script, 0o755)]);
         let dirs = [dir.path().to_path_buf()];
-        let mut req = request(&dirs, None, &[]);
-        req.probe_timeout = Duration::from_secs(3);
 
         // Act
-        let found = detect(&req);
+        let found = detect(&request(&dirs, None, &[]));
 
         // Assert
         let Detection::Found(binary) = found else {

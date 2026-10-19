@@ -6,13 +6,14 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use coda_config::config::Config;
 use coda_protocol::events::Event;
 use coda_protocol::types::{BackendKind, SessionId, TurnId};
 use coda_providers::backend::{
     AgentBackend, BackendError, VERIFIED_CLAUDE_CODE_VERSIONS, VERIFIED_CODEX_VERSIONS, locate,
-    require_enabled,
+    locate_within, require_enabled,
 };
 use coda_providers::claude_session::{
     AdapterError, CancelHandle, ClaudeSession, SessionSpec, TurnOutcome,
@@ -177,7 +178,8 @@ pub struct CodexSettings {
     pub binary_verified: bool,
 }
 
-/// Finds the Codex binary and the sandbox its sessions run under.
+/// Finds the Codex binary and the sandbox its sessions run under; `--version`
+/// may take up to `probe_timeout`.
 ///
 /// # Errors
 /// Returns [`StartError::Backend`] when Codex is disabled or not installed and
@@ -186,8 +188,9 @@ pub struct CodexSettings {
 pub fn resolve_codex(
     config: &Config,
     search_dirs: &[PathBuf],
+    probe_timeout: Duration,
 ) -> Result<CodexSettings, StartError> {
-    let binary = locate(&CodexBackend, config, search_dirs)?;
+    let binary = locate_within(&CodexBackend, config, search_dirs, probe_timeout)?;
     let section = require_enabled(&CodexBackend, config)?;
     let sandbox = resolve_sandbox(section.sandbox.as_deref(), section.allow_wider_sandbox)?;
     let verified_versions = CodexBackend
@@ -213,8 +216,9 @@ pub fn resolve_codex(
 pub async fn resolve_codex_off_worker(
     config: Config,
     search_dirs: Vec<PathBuf>,
+    probe_timeout: Duration,
 ) -> Result<CodexSettings, StartError> {
-    tokio::task::spawn_blocking(move || resolve_codex(&config, &search_dirs)).await?
+    tokio::task::spawn_blocking(move || resolve_codex(&config, &search_dirs, probe_timeout)).await?
 }
 
 /// What it takes to start one Codex session.
@@ -338,7 +342,6 @@ pub fn pidfile_path(dir: &Path, session: &SessionId) -> PathBuf {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-
     use std::time::Duration;
 
     use coda_protocol::types::{BackendKind, SessionId};
@@ -359,6 +362,12 @@ mod tests {
     use crate::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
 
     const WAIT: Duration = Duration::from_secs(30);
+    /// An upper bound, not a duration: starting a freshly written script can
+    /// stall for many seconds on a loaded machine.
+    const PATIENT_PROBE: Duration = Duration::from_secs(60);
+    const TICK: Duration = Duration::from_millis(10);
+    const TICKS_DURING_PROBE: u32 = 5;
+    const MAX_HOLD_POLLS: u32 = 3_000;
 
     fn start(dir: &tempfile::TempDir, binary: std::path::PathBuf) -> SessionStart {
         SessionStart {
@@ -467,7 +476,7 @@ mod tests {
 
     fn codex_start(dir: &tempfile::TempDir, config: &Config) -> CodexStart {
         CodexStart {
-            settings: resolve_codex(config, &[]).unwrap(),
+            settings: resolve_codex(config, &[], PATIENT_PROBE).unwrap(),
             cwd: dir.path().to_path_buf(),
             session_id: SessionId::new("s-1"),
             resume: None,
@@ -517,9 +526,9 @@ mod tests {
 
         // Act
         let (refused, accepted, default) = (
-            resolve_codex(&refused, &[]),
-            resolve_codex(&accepted, &[]),
-            resolve_codex(&default, &[]),
+            resolve_codex(&refused, &[], PATIENT_PROBE),
+            resolve_codex(&accepted, &[], PATIENT_PROBE),
+            resolve_codex(&default, &[], PATIENT_PROBE),
         );
 
         // Assert
@@ -598,32 +607,39 @@ mod tests {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("codex");
-        fs::write(&binary, "#!/bin/sh\nsleep 0.5\necho 'codex-cli 1.0.0'\n").unwrap();
+        let release = dir.path().join("release");
+        // The probe stays open until the ticker has run, so the test never
+        // depends on how long the probe happens to take. The loop is bounded so
+        // a probe that blocks the runtime still ends, and then fails the test.
+        let script = format!(
+            "#!/bin/sh\nn=0\nwhile [ ! -e '{}' ] && [ $n -lt {MAX_HOLD_POLLS} ]; do\n  sleep 0.01\n  n=$((n+1))\ndone\necho 'codex-cli 1.0.0'\n",
+            release.display()
+        );
+        fs::write(&binary, script).unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         let toml = format!(
             "[providers.codex]\nenabled = true\nbinary = \"{}\"\n",
             binary.display()
         );
         let config = Config::from_toml_str(&toml).unwrap().config;
-        let mut ticks = 0_u32;
 
         // Act
         let settings = tokio::time::timeout(WAIT, async {
-            tokio::select! {
-                settings = resolve_codex_off_worker(config, Vec::new()) => settings,
-                () = async {
-                    loop {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        ticks += 1;
-                    }
-                } => unreachable!("the ticker never ends"),
+            let probe = resolve_codex_off_worker(config, Vec::new(), PATIENT_PROBE);
+            tokio::pin!(probe);
+            for _ in 0..TICKS_DURING_PROBE {
+                tokio::select! {
+                    settings = &mut probe => panic!("the probe ended before it was released: {settings:?}"),
+                    () = tokio::time::sleep(TICK) => {}
+                }
             }
+            fs::write(&release, "").unwrap();
+            probe.await
         })
         .await
-        .expect("the probe did not finish in time");
+        .expect("the probe, or the runtime beside it, stalled");
 
         // Assert
         assert_eq!(settings.unwrap().binary, binary);
-        assert!(ticks >= 5, "only {ticks} ticks ran during the probe");
     }
 }
