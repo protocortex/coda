@@ -139,6 +139,7 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
         if let Some(Event::BackendCrashed {
             session_id,
             exit_code,
+            detail,
             ..
         }) = crash
         {
@@ -146,6 +147,7 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
                 session_id,
                 exit_code,
                 will_restart,
+                detail,
             });
         }
         self.outcome = Some(result);

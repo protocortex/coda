@@ -12,7 +12,9 @@ use coda_protocol::events::Event;
 use coda_protocol::types::{SessionId, TokenUsage, TurnId};
 use coda_providers::claude_code::Diagnostic;
 use coda_providers::claude_session::{ENV_ALLOWLIST, TurnOutcome};
-use coda_providers::codex_exec::{CodexError, CodexExecSession, CodexSpec, SandboxMode};
+use coda_providers::codex_exec::{
+    CodexError, CodexExecSession, CodexMessage, CodexParser, CodexSpec, SandboxMode,
+};
 use serde_json::Value;
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -138,7 +140,7 @@ async fn a_turn_maps_codex_events_to_coda_events() {
                     input_tokens: 120,
                     output_tokens: 30,
                     cache_read_tokens: 100,
-                    cache_write_tokens: 0,
+                    cache_write_tokens: 7,
                 },
             },
             Event::Result {
@@ -305,10 +307,36 @@ async fn a_crash_mid_turn_is_reported_and_the_next_turn_starts_a_new_process() {
         vec![Event::BackendCrashed {
             session_id: SessionId::new("s-1"),
             exit_code: Some(3),
-            will_restart: false
+            will_restart: false,
+            detail: None,
         }]
     );
     assert_eq!(next, TurnOutcome::Completed { is_error: false });
+}
+
+#[tokio::test]
+async fn a_crash_carries_what_the_process_wrote_to_stderr() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = fixture.session();
+
+    // Act
+    let (outcome, events) = turn(&mut session, "refuse").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Crashed { exit_code: Some(3) });
+    assert_eq!(
+        events,
+        vec![Event::BackendCrashed {
+            session_id: SessionId::new("s-1"),
+            exit_code: Some(3),
+            will_restart: false,
+            detail: Some(
+                "Not inside a trusted directory and --skip-git-repo-check was not specified."
+                    .to_owned()
+            ),
+        }]
+    );
 }
 
 #[tokio::test]
@@ -405,4 +433,42 @@ async fn a_session_that_cannot_run_a_turn_fails_with_a_specific_error() {
     assert!(matches!(errors[2], CodexError::Spawn { .. }));
     assert!(errors[2].to_string().contains("no-such-codex"));
     assert!(!fixture.cwd.path().join(REPORT_FILE).exists());
+}
+
+/// Two real `codex exec --json` turns; the second one resumed the first one's thread.
+const LIVE_EXEC: &str = include_str!("../../coda-testkit/fixtures/codex/live-exec.jsonl");
+
+#[test]
+fn the_live_exec_transcript_replays_two_turns_of_one_thread() {
+    // Arrange
+    let mut parser = CodexParser::new();
+    let stream = LIVE_EXEC.lines().skip(1).collect::<Vec<_>>().join("\n") + "\n";
+
+    // Act
+    let messages = parser.feed(stream.as_bytes());
+
+    // Assert
+    let thread = || CodexMessage::ThreadStarted {
+        thread_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+    };
+    let completed = |input, output, cached| {
+        CodexMessage::TurnCompleted(TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cached,
+            cache_write_tokens: 0,
+        })
+    };
+    assert_eq!(
+        messages,
+        vec![
+            thread(),
+            CodexMessage::AgentMessage("ok".to_owned()),
+            completed(14340, 5, 11008),
+            thread(),
+            CodexMessage::AgentMessage("done".to_owned()),
+            completed(30243, 10, 25216),
+        ]
+    );
+    assert_eq!(parser.diagnostics(), []);
 }

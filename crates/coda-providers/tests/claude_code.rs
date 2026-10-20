@@ -124,3 +124,54 @@ fn the_adapter_responses_match_the_recorded_live_shapes() {
         assert!(recorded.contains(&shape), "{name}");
     }
 }
+
+const LIVE_TRANSCRIPTS: [&str; 4] = [
+    "live-allow.jsonl",
+    "live-deny.jsonl",
+    "live-readonly.jsonl",
+    "live-text.jsonl",
+];
+
+#[test]
+fn live_transcripts_replay_without_diagnostics_and_end_in_a_result() {
+    for name in LIVE_TRANSCRIPTS {
+        // Arrange
+        let transcript = fixtures::load(name).unwrap();
+
+        // Act
+        let (messages, diagnostics) = parse(&transcript);
+
+        // Assert
+        assert_eq!(transcript.label(), Label::Live, "{name}");
+        assert_eq!(diagnostics, vec![], "{name}");
+        assert_eq!(kinds(&messages)[0], "init", "{name}");
+        assert_eq!(
+            messages.last(),
+            Some(&Message::Result { is_error: false }),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn live_permission_transcripts_replay_the_bash_request() {
+    for name in ["live-allow.jsonl", "live-deny.jsonl"] {
+        // Arrange
+        let transcript = fixtures::load(name).unwrap();
+
+        // Act
+        let (messages, _) = parse(&transcript);
+
+        // Assert
+        let asks: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::PermissionRequest(ask) => Some(ask),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asks.len(), 1, "{name}");
+        assert_eq!(asks[0].tool_name, "Bash", "{name}");
+        assert_eq!(asks[0].input["command"], "touch hello.txt", "{name}");
+    }
+}

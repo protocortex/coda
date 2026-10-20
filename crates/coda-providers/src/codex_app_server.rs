@@ -3,11 +3,12 @@
 //! The Codex `app-server` backend: one long-lived process speaking JSON over WebSocket.
 //!
 //! The server listens on a Unix socket in a directory only coda can enter. The
-//! method names and message shapes handled here follow the documented protocol
-//! and have only been exercised against the synthetic `fake-codex`; checking
-//! them, and the value of an accepted decision, against a live `codex` is open.
+//! handshake, command approvals (`accept` and `decline`), item, token usage and
+//! turn messages were checked against codex-cli 0.163.0; see
+//! `docs/live-recording.md`. File change approvals and `turn/interrupt` were not
+//! seen live, and the `fake-codex` the other tests use is still synthetic.
 //!
-//! Known limit, pending live verification: cancelling a turn kills the server's
+//! Known limit: cancelling a turn kills the server's
 //! process group and closes the session. `turn/interrupt` is not used, so a
 //! cancelled turn cannot be followed by another on the same session.
 
@@ -294,11 +295,7 @@ impl CodexAppServerSession {
         let mut next_id = 0;
         let init =
             json!({"clientInfo": {"name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")}});
-        let result = request(&mut stream, &mut reader, &mut next_id, "initialize", init).await?;
-        let version = result["serverInfo"]["version"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
+        request(&mut stream, &mut reader, &mut next_id, "initialize", init).await?;
         let initialized = json!({"method": "initialized"}).to_string();
         stream.write_all(&text_frame(&initialized)).await?;
         let thread = json!({
@@ -321,6 +318,7 @@ impl CodexAppServerSession {
                 method: "thread/start",
             })?
             .to_owned();
+        let version = server_version(&result);
         Ok((stream, reader, version, thread_id))
     }
 
@@ -474,7 +472,7 @@ impl CodexAppServerSession {
                     self.items.remove(id);
                 }
             }
-            "thread/tokenUsage/updated" => *usage = Some(usage_of(&params["tokenUsage"]["last"])),
+            "thread/tokenUsage/updated" => add_usage(usage, &params["tokenUsage"]["last"]),
             "turn/completed" => {
                 let is_error = params["turn"]["status"] != "completed";
                 if let Some(usage) = usage.take() {
@@ -694,6 +692,7 @@ impl CodexAppServerSession {
             session_id: self.session_id.clone(),
             exit_code,
             will_restart: false,
+            detail: None,
         });
         Ok(TurnOutcome::Crashed { exit_code })
     }
@@ -861,12 +860,127 @@ fn shows_nothing(request: &ToolRequest) -> bool {
     }
 }
 
+/// The server reports its version only as `cliVersion` on the thread it starts.
+fn server_version(thread_start_result: &Value) -> String {
+    thread_start_result["thread"]["cliVersion"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Adds one model call's usage to the turn's total: the server sends one update per call.
+fn add_usage(total: &mut Option<TokenUsage>, last: &Value) {
+    let call = usage_of(last);
+    let sum = total.unwrap_or_default();
+    *total = Some(TokenUsage {
+        input_tokens: sum.input_tokens + call.input_tokens,
+        output_tokens: sum.output_tokens + call.output_tokens,
+        cache_read_tokens: sum.cache_read_tokens + call.cache_read_tokens,
+        cache_write_tokens: sum.cache_write_tokens + call.cache_write_tokens,
+    });
+}
+
 fn usage_of(usage: &Value) -> TokenUsage {
     let count = |key: &str| usage[key].as_u64().unwrap_or(0);
     TokenUsage {
         input_tokens: count("inputTokens"),
         output_tokens: count("outputTokens"),
         cache_read_tokens: count("cachedInputTokens"),
-        cache_write_tokens: 0,
+        cache_write_tokens: count("cacheWriteInputTokens"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LIVE_ACCEPT: &str =
+        include_str!("../../coda-testkit/fixtures/codex/live-app-server-accept.jsonl");
+    const LIVE_DECLINE: &str =
+        include_str!("../../coda-testkit/fixtures/codex/live-app-server-decline.jsonl");
+
+    /// The JSON-RPC messages sent in direction `dir` (`recv` or `send`), in order.
+    /// Fails on any line that is not JSON, so a damaged fixture cannot pass quietly.
+    fn live_messages(fixture: &str, dir: &str) -> Vec<Value> {
+        fixture
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                serde_json::from_str::<Value>(line)
+                    .unwrap_or_else(|error| panic!("fixture line {}: {error}", index + 1))
+            })
+            .filter(|line| line["dir"] == dir && line.get("message").is_some())
+            .map(|line| line["message"].clone())
+            .collect()
+    }
+
+    /// Server messages of the live approval run, in order.
+    fn live_received() -> Vec<Value> {
+        live_messages(LIVE_ACCEPT, "recv")
+    }
+
+    #[test]
+    fn the_version_comes_from_the_thread_the_live_server_started() {
+        // Arrange
+        let thread_start = live_received()
+            .into_iter()
+            .find(|message| message["result"]["thread"]["id"].is_string())
+            .expect("the transcript holds a thread/start result");
+
+        // Act
+        let version = server_version(&thread_start["result"]);
+
+        // Assert
+        assert_eq!(version, "0.163.0");
+    }
+
+    #[test]
+    fn the_usage_of_every_model_call_in_a_live_turn_adds_up() {
+        // Arrange
+        let mut total = None;
+
+        // Act
+        for message in live_received() {
+            if message["method"] == "thread/tokenUsage/updated" {
+                add_usage(&mut total, &message["params"]["tokenUsage"]["last"]);
+            }
+        }
+
+        // Assert
+        assert_eq!(
+            total,
+            Some(TokenUsage {
+                input_tokens: 29513,
+                output_tokens: 280,
+                cache_read_tokens: 25600,
+                cache_write_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn the_live_declined_approval_is_answered_decline_and_the_turn_still_completes() {
+        // Arrange
+        let (received, sent) = (
+            live_messages(LIVE_DECLINE, "recv"),
+            live_messages(LIVE_DECLINE, "send"),
+        );
+
+        // Act
+        let request = received
+            .iter()
+            .find(|m| m["method"] == "item/commandExecution/requestApproval")
+            .expect("the transcript holds a command approval request");
+        let answer = sent
+            .iter()
+            .find(|m| m["id"] == request["id"] && m.get("result").is_some())
+            .expect("coda answered the request");
+        let last = received.last().expect("the server sent messages");
+
+        // Assert
+        assert!(request["params"]["command"].is_string());
+        assert_eq!(answer["result"]["decision"], DECLINE);
+        assert_eq!(last["method"], "turn/completed");
+        assert_eq!(last["params"]["turn"]["status"], "completed");
     }
 }

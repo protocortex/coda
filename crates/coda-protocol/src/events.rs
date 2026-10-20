@@ -95,6 +95,9 @@ pub enum Event {
         /// turn is still running. Absent means no restart follows.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         will_restart: bool,
+        /// The last lines the process wrote to its error stream, when it wrote any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     /// A running turn was cut short.
     TurnInterrupted {
@@ -164,6 +167,7 @@ mod tests {
                 session_id: SessionId::new("s-1"),
                 exit_code: None,
                 will_restart: false,
+                detail: None,
             }
         );
     }

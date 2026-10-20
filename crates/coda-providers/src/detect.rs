@@ -158,7 +158,7 @@ fn collect(receiver: Option<mpsc::Receiver<String>>, deadline: Instant) -> Strin
 
 /// Extracts the first dotted version number from `--version` output, keeping a
 /// prerelease or build suffix such as `-alpha.3`. The allowlist matches the whole
-/// string exactly, and the Codex app-server's `serverInfo.version` is checked
+/// string exactly, and the Codex app-server's `thread.cliVersion` is checked
 /// against the same list, so list the text both print.
 #[must_use]
 pub fn parse_version(output: &str) -> Option<String> {

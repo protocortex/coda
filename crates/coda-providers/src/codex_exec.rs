@@ -2,16 +2,16 @@
 
 //! The Codex `exec --json` backend: one supervised process per turn.
 //!
-//! The event shapes parsed here follow the documented JSONL event names and
-//! have only been exercised against the synthetic `fake-codex`. Verifying
-//! them against a live `codex` is still open.
+//! The event shapes and the argv order (`--sandbox` before `resume`) were checked
+//! against codex-cli 0.163.0; see `docs/live-recording.md`. The `fake-codex`
+//! binary the other tests use is still synthetic.
 
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use coda_protocol::events::Event;
@@ -20,6 +20,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::claude_code::Diagnostic;
@@ -34,6 +35,9 @@ const RESUME_ARG: &str = "resume";
 /// Tells `codex exec` to read the prompt from stdin, which keeps it out of the process list.
 const STDIN_PROMPT_ARG: &str = "-";
 const MAX_THREAD_ID_BYTES: usize = 128;
+/// How much of the child's error output is kept to explain a crash.
+const STDERR_TAIL_BYTES: usize = 2048;
+const STDERR_READ_BYTES: usize = 1024;
 
 /// The future a [`SpawnHook`] returns; `Err` carries the reason it failed.
 pub type SpawnHookFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
@@ -50,6 +54,40 @@ impl std::fmt::Debug for HookSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SpawnHook")
     }
+}
+
+/// The last [`STDERR_TAIL_BYTES`] of a child's error output, collected while it runs.
+#[derive(Debug)]
+struct StderrTail {
+    kept: Arc<Mutex<Vec<u8>>>,
+    drain: JoinHandle<()>,
+}
+
+impl StderrTail {
+    /// Waits for the stream to end (the child is gone) and returns what it held.
+    async fn finish(self) -> Option<String> {
+        let _ = timeout(EXIT_GRACE, self.drain).await;
+        let kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let text = String::from_utf8_lossy(&kept);
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_owned())
+    }
+}
+
+/// Reads `stderr` to its end in the background, so a full pipe never stalls the child.
+fn drain_stderr(mut stderr: impl AsyncRead + Unpin + Send + 'static) -> StderrTail {
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&kept);
+    let drain = tokio::spawn(async move {
+        let mut chunk = [0_u8; STDERR_READ_BYTES];
+        while let Ok(read @ 1..) = stderr.read(&mut chunk).await {
+            let mut kept = sink.lock().unwrap_or_else(PoisonError::into_inner);
+            kept.extend_from_slice(&chunk[..read]);
+            let excess = kept.len().saturating_sub(STDERR_TAIL_BYTES);
+            kept.drain(..excess);
+        }
+    });
+    StderrTail { kept, drain }
 }
 
 /// A thread id is passed as a command-line argument, so it must never parse as a flag.
@@ -225,7 +263,7 @@ fn usage_of(usage: &Value) -> TokenUsage {
         input_tokens: count("input_tokens"),
         output_tokens: count("output_tokens"),
         cache_read_tokens: count("cached_input_tokens"),
-        cache_write_tokens: 0,
+        cache_write_tokens: count("cache_write_input_tokens"),
     }
 }
 
@@ -234,6 +272,7 @@ fn usage_of(usage: &Value) -> TokenUsage {
 pub struct CodexExecSession {
     spec: CodexSpec,
     child: Option<Child>,
+    stderr: Option<StderrTail>,
     parser: CodexParser,
     cancel: Arc<watch::Sender<bool>>,
     backend_session_id: Option<String>,
@@ -249,6 +288,7 @@ impl CodexExecSession {
             backend_session_id: spec.resume.clone(),
             spec,
             child: None,
+            stderr: None,
             parser: CodexParser::new(),
             cancel: Arc::new(watch::channel(false).0),
             spawn_hook: None,
@@ -398,7 +438,7 @@ impl CodexExecSession {
             .current_dir(&self.spec.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .process_group(0);
         let mut child = command.spawn().map_err(|source| CodexError::Spawn {
@@ -410,6 +450,7 @@ impl CodexExecSession {
             .stdout
             .take()
             .ok_or(CodexError::MissingPipe("stdout"))?;
+        self.stderr = child.stderr.take().map(drain_stderr);
         self.child = Some(child);
         Ok((stdin, stdout))
     }
@@ -491,10 +532,15 @@ impl CodexExecSession {
             .reap(EXIT_GRACE)
             .await?
             .and_then(|status| status.code());
+        let detail = match self.stderr.take() {
+            Some(tail) => tail.finish().await,
+            None => None,
+        };
         emit(Event::BackendCrashed {
             session_id: self.spec.session_id.clone(),
             exit_code,
             will_restart: false,
+            detail,
         });
         Ok(TurnOutcome::Crashed { exit_code })
     }
@@ -702,5 +748,21 @@ mod tests {
                 Diagnostic::InvalidThreadId { line: 3 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn the_stderr_tail_keeps_only_the_last_bytes() {
+        // Arrange
+        let output = format!("{}end", "x".repeat(STDERR_TAIL_BYTES * 3));
+
+        // Act
+        let tail = drain_stderr(std::io::Cursor::new(output.into_bytes()))
+            .finish()
+            .await;
+
+        // Assert
+        let tail = tail.expect("stderr had output");
+        assert_eq!(tail.len(), STDERR_TAIL_BYTES);
+        assert!(tail.ends_with("xxend"));
     }
 }

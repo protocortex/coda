@@ -818,6 +818,7 @@ mod tests {
             session_id: SessionId::new("s-1"),
             exit_code: Some(3),
             will_restart,
+            detail: None,
         })
     }
 
