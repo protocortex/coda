@@ -132,6 +132,47 @@ fn live_refuses_to_start_without_the_key_variable() {
 }
 
 #[test]
+fn a_subscription_backend_needs_no_key_and_runs_coda_without_api_keys() {
+    for (backend, section) in [
+        ("claude-code", "[providers.claude_code]"),
+        ("codex", "[providers.codex]"),
+    ] {
+        // Arrange
+        let repo = git_repo();
+        let tools = tempfile::tempdir().unwrap();
+        let coda = script(
+            tools.path(),
+            "fake-coda",
+            "echo \"api=${ANTHROPIC_API_KEY-unset} openai=${OPENAI_API_KEY-unset} home=${HOME:+set}\"\n\
+             cat \"$CODA_HOME/config.toml\"",
+        );
+
+        // Act
+        let output = Command::new(BIN)
+            .args(["live", "--attempts", "1", "--backend", backend])
+            .arg("--coda")
+            .arg(&coda)
+            .arg("--source")
+            .arg(repo.path())
+            .arg("--write-transcript")
+            .env("ANTHROPIC_API_KEY", CANARY)
+            .env("OPENAI_API_KEY", CANARY)
+            .output()
+            .unwrap();
+
+        // Assert
+        assert_eq!(output.status.code(), Some(1), "{backend}: {output:?}");
+        let written = fs::read_to_string(repo.path().join("docs/selfhost/attempt-1.txt")).unwrap();
+        assert!(
+            written.contains("api=unset openai=unset home=set"),
+            "{written}"
+        );
+        assert!(written.contains(section), "{written}");
+        assert!(!written.contains("api_key_env") && !written.contains(CANARY));
+    }
+}
+
+#[test]
 fn transcripts_are_written_only_with_the_flag_and_hide_the_key() {
     // Arrange
     let repo = git_repo();

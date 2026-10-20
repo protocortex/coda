@@ -26,6 +26,11 @@ pub struct AttemptSpec<'a> {
     pub limit: Duration,
 }
 
+/// The variable the Anthropic API key is conventionally read from.
+pub const ANTHROPIC_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+/// The variable the `OpenAI` API key is conventionally read from.
+pub const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+
 /// The only Anthropic model a live run asks for.
 pub const MODEL: &str = "claude-sonnet-5-5";
 
@@ -36,6 +41,10 @@ pub enum Provider {
     Faux { script: PathBuf },
     /// The Anthropic API; the key is read from the named environment variable.
     Anthropic { api_key_env: String },
+    /// The locally installed Claude Code, run under the user's own login.
+    ClaudeCode,
+    /// The locally installed Codex CLI, run under the user's own login.
+    Codex,
 }
 
 impl Provider {
@@ -43,8 +52,29 @@ impl Provider {
     #[must_use]
     pub fn key_env(&self) -> Option<&str> {
         match self {
-            Self::Faux { .. } => None,
+            Self::Faux { .. } | Self::ClaudeCode | Self::Codex => None,
             Self::Anthropic { api_key_env } => Some(api_key_env),
+        }
+    }
+
+    /// Variables that must not reach the code the attempt wrote: the provider's
+    /// key, and for a subscription backend every API key, so a run cannot
+    /// silently bill an API account.
+    #[must_use]
+    pub fn withheld_env(&self) -> Vec<&str> {
+        match self {
+            Self::ClaudeCode | Self::Codex => vec![ANTHROPIC_KEY_ENV, OPENAI_KEY_ENV],
+            other => other.key_env().into_iter().collect(),
+        }
+    }
+
+    /// Variables `coda run` itself must not inherit: those of a subscription
+    /// backend, which then has only its login to use. The Anthropic key must
+    /// reach `coda run`, so it is not withheld here.
+    fn run_withheld_env(&self) -> Vec<&str> {
+        match self {
+            Self::ClaudeCode | Self::Codex => self.withheld_env(),
+            _ => Vec::new(),
         }
     }
 }
@@ -67,6 +97,12 @@ pub fn config_toml(provider: &Provider) -> String {
             "[providers.faux]\nenabled = true\nscript = {:?}\n",
             script.display().to_string()
         ),
+        // Codex starts read-only; the pinned task needs writes inside the copy,
+        // and each command still goes through coda's permission broker.
+        Provider::Codex => "[providers.codex]\nenabled = true\n\
+                            sandbox = \"workspace-write\"\nallow_wider_sandbox = true\n"
+            .to_owned(),
+        Provider::ClaudeCode => "[providers.claude_code]\nenabled = true\n".to_owned(),
         Provider::Anthropic { api_key_env } => format!(
             "[providers.anthropic]\nenabled = true\napi_key_env = {api_key_env:?}\nmodel = {MODEL:?}\n"
         ),
@@ -83,9 +119,12 @@ pub fn run_attempt(spec: &AttemptSpec<'_>) -> Result<Transcript, SelfhostError> 
         source,
     })?;
     let _daemon = DaemonGuard(spec);
+    let mut run = Command::new(spec.coda);
+    for name in spec.provider.run_withheld_env() {
+        run.env_remove(name);
+    }
     let done = run_bounded(
-        Command::new(spec.coda)
-            .args(["run", "--prompt", PROMPT, "--mode", "accept-edits"])
+        run.args(["run", "--prompt", PROMPT, "--mode", "accept-edits"])
             .args(["--max-turns", &MAX_TURNS.to_string()])
             .args(["--token-cap", &TOKEN_CAP.to_string()])
             .arg("--cwd")
@@ -108,7 +147,7 @@ impl Drop for DaemonGuard<'_, '_> {
     fn drop(&mut self) {
         let mut status_command = Command::new(self.0.coda);
         status_command.arg("status").env("CODA_HOME", self.0.home);
-        if let Some(name) = self.0.provider.key_env() {
+        for name in self.0.provider.withheld_env() {
             status_command.env_remove(name);
         }
         let status = run_cleanup(&mut status_command, STATUS_LIMIT);
@@ -186,6 +225,54 @@ mod tests {
              grants = [\"bash:cargo test\", \"bash:cargo build\", \"edit:crates/coda-cli/src/main.rs\"]\n\n\
              [providers.anthropic]\nenabled = true\napi_key_env = \"ANTHROPIC_API_KEY\"\n\
              model = \"claude-sonnet-5-5\"\n"
+        );
+    }
+
+    #[test]
+    fn the_claude_code_config_enables_the_delegated_backend_without_a_key() {
+        // Act
+        let config = config_toml(&Provider::ClaudeCode);
+
+        // Assert
+        assert_eq!(
+            config,
+            "[permissions]\n\
+             grants = [\"bash:cargo test\", \"bash:cargo build\", \"edit:crates/coda-cli/src/main.rs\"]\n\n\
+             [providers.claude_code]\nenabled = true\n"
+        );
+    }
+
+    #[test]
+    fn claude_code_has_no_key_variable_and_withholds_the_api_key() {
+        // Act
+        let claude = Provider::ClaudeCode;
+        let anthropic = Provider::Anthropic {
+            api_key_env: "K".to_owned(),
+        };
+
+        // Assert
+        assert_eq!(claude.key_env(), None);
+        assert_eq!(
+            claude.withheld_env(),
+            ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+        );
+        assert_eq!(anthropic.withheld_env(), ["K"]);
+    }
+
+    #[test]
+    fn the_codex_config_enables_the_workspace_write_sandbox_without_a_key() {
+        // Act
+        let config = config_toml(&Provider::Codex);
+
+        // Assert
+        assert!(config.ends_with(
+            "[providers.codex]\nenabled = true\nsandbox = \"workspace-write\"\n\
+             allow_wider_sandbox = true\n"
+        ));
+        assert_eq!(Provider::Codex.key_env(), None);
+        assert_eq!(
+            Provider::Codex.withheld_env(),
+            ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
         );
     }
 }

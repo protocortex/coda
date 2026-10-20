@@ -88,7 +88,11 @@ pub fn run_live(
         prepare_copy(options.source, &repo)?;
         say(&format!("attempt {number}: running coda"));
         let provider = (options.provider)(number, &home);
-        let withheld_env = provider.key_env().map(str::to_owned).into_iter().collect();
+        let withheld_env = provider
+            .withheld_env()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         let ran = run_attempt(&AttemptSpec {
             coda: options.coda,
             home: &home,

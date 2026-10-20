@@ -19,7 +19,8 @@ cargo step that outlives its time limit (a retry may help); 2 usage error; 3 the
 verifier itself failed (git or file errors, cargo missing), which a retry loop
 should not count as a failed attempt. The verifier's cargo runs the code the
 attempt wrote, so it does not inherit `ANTHROPIC_API_KEY` (for `live`, the
-variable named by `--api-key-env`).
+variable named by `--api-key-env`, or `ANTHROPIC_API_KEY` with the
+`claude-code` or `codex` backend).
 
 ## Regression run in CI
 
@@ -49,7 +50,37 @@ transcripts under `crates/coda-testkit/fixtures/`; see
 export ANTHROPIC_API_KEY=...        # or name another variable with --api-key-env
 scripts/selfhost.sh                 # attempts only, nothing is written
 scripts/selfhost.sh --write-transcript
+scripts/selfhost.sh --backend claude-code   # no key, uses your Claude Code login
+scripts/selfhost.sh --backend codex         # no key, uses your Codex login
 ```
+
+### Running with your installed Claude Code or Codex
+
+`--backend codex` is the same idea with the `codex` binary: `[providers.codex]`
+with `enabled = true`, `sandbox = "workspace-write"` and
+`allow_wider_sandbox = true` (the default sandbox is read-only, which cannot
+make the edit), under your Codex login in `~/.codex`. `OPENAI_API_KEY` is
+withheld along with `ANTHROPIC_API_KEY`. `CODEX_HOME` is not forwarded, so the
+default `~/.codex` is used. The adapter keeps approvals on request and routes
+them to coda's broker; the copy is a git repository, which `codex exec`
+requires. Codex also runs its own tool loop.
+
+`--backend claude-code` writes `[providers.claude_code]` with `enabled = true`
+and so runs the delegated backend: the `claude` binary found on `PATH`, signed
+in as you, under your subscription. No API key is needed and the key check is
+skipped. The run is headless use of Claude Code, which the user confirmed
+(OI-1); the account risk notice in
+[README](../README.md#account-risk-notice) applies to it.
+
+- `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are removed from the environment of `coda run` and of the
+  verifier's cargo, so the run cannot silently bill the API. The daemon also
+  starts `claude` with an allowlisted environment (`ENV_ALLOWLIST` in
+  `crates/coda-providers/src/claude_session.rs`) that includes `HOME`, which
+  the CLI needs to find its login, and excludes every key.
+- The scrubber still runs over every transcript and printed line.
+- Claude Code runs its own tool loop. This run therefore exercises coda's
+  daemon, permission broker, supervisor and grants, not coda's own tool
+  implementations (those are covered by the Anthropic backend run).
 
 `scripts/selfhost.sh` only builds and calls `coda-selfhost live`. The command:
 
@@ -58,7 +89,7 @@ scripts/selfhost.sh --write-transcript
   variable's name (`api_key_env`), and `coda` reads the value.
 - runs up to 3 attempts (`--attempts`, 1 to 3), each in a fresh temporary copy
   with a fresh `CODA_HOME`, and stops at the first one the verifier accepts.
-- uses the Anthropic provider with model `claude-sonnet-5-5` (`MODEL` in
+- uses, by default, the Anthropic provider with model `claude-sonnet-5-5` (`MODEL` in
   `crates/coda-selfhost/src/attempt.rs`), mode `accept-edits`, 30 turns and a
   400000 token cap. In `accept-edits` mode edits to any path inside the copy
   are allowed without a grant, except execution-affecting paths (`Cargo.toml`,

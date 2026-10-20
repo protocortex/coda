@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
-use coda_selfhost::attempt::Provider;
+use clap::{Parser, Subcommand, ValueEnum};
+use coda_selfhost::attempt::{ANTHROPIC_KEY_ENV, Provider};
 use coda_selfhost::error::SelfhostError;
 use coda_selfhost::live::{LiveOptions, require_key, run_live};
 use coda_selfhost::process::{ProcessError, handle_interrupts};
@@ -17,13 +17,23 @@ use coda_selfhost::verify::{VerifyPlan, verify_workdir};
 const ATTEMPT_LIMIT: Duration = Duration::from_mins(30);
 /// Where `--write-transcript` puts the scrubbed transcripts, under the source.
 const TRANSCRIPT_DIR: &str = "docs/selfhost";
-const DEFAULT_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const CARGO_LIMIT: Duration = Duration::from_mins(30);
 /// Exit codes: 0 accepted, 1 rejected, 2 usage (clap), 3 harness failure,
 /// 130 interrupted by SIGINT or SIGTERM.
 const REJECTED: u8 = 1;
 const INFRASTRUCTURE: u8 = 3;
 const INTERRUPTED: u8 = 130;
+
+/// What serves the live run's model calls.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Backend {
+    /// The Anthropic API, with a key from an environment variable.
+    Anthropic,
+    /// The locally installed Claude Code, under the user's own login.
+    ClaudeCode,
+    /// The locally installed Codex CLI, under the user's own login.
+    Codex,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "coda-selfhost")]
@@ -46,7 +56,8 @@ enum Command {
         #[arg(last = true)]
         cargo_test_args: Vec<String>,
     },
-    /// Run up to 3 live attempts against the Anthropic API (spends tokens).
+    /// Run up to 3 live attempts through `coda run` (spends tokens or subscription
+    /// usage).
     /// Exit 0 when one passes the verifier, 1 when all are rejected (a timeout
     /// rejects an attempt), 3 when the run itself failed, including a missing
     /// API key variable, 130 when interrupted.
@@ -59,8 +70,11 @@ enum Command {
         source: PathBuf,
         #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=3))]
         attempts: u32,
-        /// Name of the environment variable holding the API key.
-        #[arg(long, default_value = DEFAULT_KEY_ENV)]
+        /// What serves the model calls; `claude-code` and `codex` need no API key.
+        #[arg(long, value_enum, default_value_t = Backend::Anthropic)]
+        backend: Backend,
+        /// Name of the environment variable holding the API key (anthropic only).
+        #[arg(long, default_value = ANTHROPIC_KEY_ENV)]
         api_key_env: String,
         /// Write the scrubbed transcripts to docs/selfhost under the source;
         /// without it nothing is written.
@@ -108,7 +122,7 @@ fn execute(command: Command, env: &[(String, String)]) -> Result<bool, SelfhostE
                 cargo_test_args,
                 target_dir: target_dir.as_deref(),
                 limit: CARGO_LIMIT,
-                withheld_env: vec![DEFAULT_KEY_ENV.to_owned()],
+                withheld_env: vec![ANTHROPIC_KEY_ENV.to_owned()],
             });
             match verdict {
                 Ok(()) => Ok(true),
@@ -123,13 +137,20 @@ fn execute(command: Command, env: &[(String, String)]) -> Result<bool, SelfhostE
             coda,
             source,
             attempts,
+            backend,
             api_key_env,
             write_transcript,
         } => {
-            require_key(&api_key_env)?;
+            if matches!(backend, Backend::Anthropic) {
+                require_key(&api_key_env)?;
+            }
             let out = source.join(TRANSCRIPT_DIR);
-            let provider = |_: u32, _: &Path| Provider::Anthropic {
-                api_key_env: api_key_env.clone(),
+            let provider = |_: u32, _: &Path| match backend {
+                Backend::Anthropic => Provider::Anthropic {
+                    api_key_env: api_key_env.clone(),
+                },
+                Backend::ClaudeCode => Provider::ClaudeCode,
+                Backend::Codex => Provider::Codex,
             };
             let passed = run_live(
                 &LiveOptions {
