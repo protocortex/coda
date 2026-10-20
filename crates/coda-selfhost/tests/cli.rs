@@ -106,6 +106,58 @@ fn live(repo: &Path, coda: &Path, extra: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn relative_coda_and_source_paths_still_resolve_in_the_attempt_workspace() {
+    // Arrange
+    let repo = git_repo();
+    script(repo.path(), "fake-coda", "echo ran-from-relative-path");
+
+    // Act
+    let output = Command::new(BIN)
+        .args(["live", "--attempts", "1", "--api-key-env", KEY_VAR])
+        .args([
+            "--coda",
+            "./fake-coda",
+            "--source",
+            ".",
+            "--write-transcript",
+        ])
+        .current_dir(repo.path())
+        .env(KEY_VAR, CANARY)
+        .output()
+        .unwrap();
+
+    // Assert
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let written = fs::read_to_string(repo.path().join("docs/selfhost/attempt-1.txt")).unwrap();
+    assert!(written.contains("ran-from-relative-path"), "{written}");
+}
+
+#[test]
+fn a_missing_coda_binary_is_reported_before_any_attempt_starts() {
+    // Arrange
+    let repo = git_repo();
+
+    // Act
+    let output = Command::new(BIN)
+        .args(["live", "--api-key-env", KEY_VAR])
+        .args(["--coda", "no-such-coda", "--source", "."])
+        .current_dir(repo.path())
+        .env(KEY_VAR, CANARY)
+        .output()
+        .unwrap();
+
+    // Assert
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(
+        stderr.contains("--coda") && stderr.contains("does not exist"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("copying"), "{stderr}");
+}
+
+#[test]
 fn live_refuses_to_start_without_the_key_variable() {
     // Arrange
     let repo = git_repo();
@@ -382,7 +434,7 @@ fn a_failure_to_run_prints_without_environment_values() {
     // Assert
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(3), "{stderr}");
-    assert!(stderr.contains("could not run"), "{stderr}");
+    assert!(stderr.contains("does not exist"), "{stderr}");
     assert!(!stderr.contains(CANARY), "{stderr}");
 }
 
