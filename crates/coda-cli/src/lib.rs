@@ -10,8 +10,10 @@ mod doctor;
 mod error;
 pub mod exit;
 mod grant;
+mod init;
 mod run;
 mod status;
+mod tui_cmd;
 mod usage;
 
 use std::ffi::OsString;
@@ -22,6 +24,7 @@ use clap::Parser;
 use crate::cli::{Cli, Command, DaemonAction, DaemonArgs, GrantCommand};
 pub use crate::context::{Context, Io, Wait};
 pub use crate::error::CliError;
+pub use crate::tui_cmd::{TuiFuture, TuiLauncher};
 
 /// Runs one `coda` invocation and returns its exit code. `args` starts with the
 /// program name.
@@ -61,7 +64,10 @@ async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<ExitCode, C
     let done = match cli.command {
         Some(Command::Run(args)) => return run::run(ctx, io, force, args).await,
         Some(Command::Doctor(args)) => return doctor::run(ctx, io, args).await,
+        None if ctx.is_tty => tui_cmd::open(ctx, io, force).await,
         None => status::start(ctx, io, force).await,
+        Some(Command::Tui) => tui_cmd::tui(ctx, io, force).await,
+        Some(Command::Init) => init::run(ctx, io),
         Some(Command::Daemon(DaemonArgs { action: None })) => daemon_cmd::serve(ctx).await,
         Some(Command::Daemon(DaemonArgs {
             action: Some(DaemonAction::Restart),

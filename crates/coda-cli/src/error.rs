@@ -10,6 +10,7 @@ use coda_config::config::ConfigError;
 use coda_daemon::server::ServerError;
 use coda_store::StoreError;
 use coda_telemetry::init::TelemetryError;
+use coda_tui::TuiError;
 
 /// Why a `coda` command failed. The messages are shown to the user as they are.
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +25,12 @@ pub enum CliError {
     Server(#[from] ServerError),
     #[error(transparent)]
     Client(#[from] ClientError),
+    #[error("the terminal UI failed: {0}")]
+    Tui(#[from] TuiError),
+    #[error("`coda tui` needs an interactive terminal; use `coda status` to see the daemon")]
+    NoTerminal,
+    #[error("{} already exists; edit it, or remove it to start over", path.display())]
+    ConfigExists { path: PathBuf },
     #[error("no daemon is running; run `coda` to start one")]
     NotRunning,
     #[error("the running daemon is older than this coda; restart it with `coda daemon restart`")]

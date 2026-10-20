@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use coda_config::timing::Timing;
 use coda_daemon::server::{Server, ServerConfig};
-use coda_tui::app::ConnectionState;
+use coda_tui::app::{ConnectionState, SETUP_GUIDANCE};
 use coda_tui::logs::LogBuffer;
 use coda_tui::{KeySource, UserInput, drive, run_session};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -131,6 +131,7 @@ async fn it_connects_to_a_running_daemon_and_exits_on_quit() {
             idle_timeout: REQUEST_TIMEOUT,
             ..Timing::for_tests()
         },
+        false,
         QuitAfter::new(Duration::from_millis(500)),
         never(),
     ))
@@ -157,6 +158,7 @@ async fn it_shows_a_failed_connection_and_still_exits_on_quit() {
             terminal(),
             Path::new(&missing),
             Timing::for_tests(),
+            false,
             QuitAfter::new(Duration::from_millis(300)),
             never(),
         )
@@ -193,6 +195,7 @@ async fn quitting_works_while_a_daemon_that_never_answers_is_still_connecting() 
         terminal(),
         &socket,
         timing,
+        false,
         QuitAfter::new(Duration::from_millis(100)),
         never(),
     ))
@@ -223,6 +226,7 @@ async fn it_shows_a_disconnect_when_the_daemon_dies_after_connecting() {
                 idle_timeout: REQUEST_TIMEOUT,
                 ..Timing::for_tests()
             },
+            false,
             QuitAfter::new(Duration::from_secs(3)),
             never(),
         )
@@ -254,6 +258,7 @@ async fn a_shutdown_signal_ends_the_session_without_a_key() {
         terminal(),
         &missing,
         Timing::for_tests(),
+        false,
         QuitAfter::new(Duration::from_secs(60)),
         signal,
     ))
@@ -262,4 +267,38 @@ async fn a_shutdown_signal_ends_the_session_without_a_key() {
 
     // Assert
     assert!(app.should_quit());
+}
+
+const SCREEN_WIDTH: u16 = 120;
+const SCREEN_HEIGHT: u16 = 10;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_setup_guidance_is_on_screen_when_setup_is_needed() {
+    // Arrange
+    let dir = short_dir();
+    let missing = dir.path().join("none.sock");
+
+    // Act
+    let app = within(run_session(
+        terminal(),
+        &missing,
+        Timing::for_tests(),
+        true,
+        QuitAfter::new(Duration::from_millis(200)),
+        never(),
+    ))
+    .await
+    .unwrap();
+
+    // Assert
+    let mut screen = Terminal::new(TestBackend::new(SCREEN_WIDTH, SCREEN_HEIGHT)).unwrap();
+    screen.draw(|frame| app.render(frame)).unwrap();
+    let text: String = screen
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert!(text.contains(SETUP_GUIDANCE), "{text}");
 }

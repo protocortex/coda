@@ -32,8 +32,8 @@ pub struct Step {
     pub sql: &'static str,
 }
 
-/// Every step, sorted by `(introduced_in, seq)`. The workspace is still at
-/// 0.0.0, so all of them are introduced in it.
+/// Every step, sorted by `(introduced_in, seq)`. The steps that predate the
+/// first release are tagged 0.0.0; later ones carry the release that ships them.
 pub const STEPS: &[Step] = &[
     Step {
         seq: 1,

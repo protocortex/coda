@@ -23,6 +23,10 @@ use crate::status::Status;
 const TITLE: &str = " coda (Esc quits) ";
 /// Rows a page key moves the transcript.
 const PAGE_ROWS: usize = 5;
+/// Shown in the transcript when no provider is enabled in the config.
+pub const SETUP_GUIDANCE: &str = "No provider is enabled. Run `coda init`, enable one in config.toml, then run `coda daemon restart`.";
+/// Closes the connection line after the daemon went away.
+pub const LOST_DAEMON_HINT: &str = "Press Esc, then run `coda` to start it again.";
 const NO_SESSIONS: &str = "the daemon has no sessions";
 const BACKEND_SWITCH_BUSY: &str = "wait for the running turn to finish before switching backend";
 
@@ -94,6 +98,10 @@ impl App {
             link: Some(link),
             ..Self::new()
         }
+    }
+
+    pub fn show_setup_guidance(&mut self) {
+        self.chat.push_notice(SETUP_GUIDANCE);
     }
 
     pub fn set_connection(&mut self, connection: ConnectionState) {
@@ -296,7 +304,7 @@ impl App {
             ConnectionState::Connected => "Connected to the daemon".to_owned(),
             ConnectionState::Failed(reason) => format!("Not connected: {reason}"),
             ConnectionState::Disconnected(reason) => {
-                format!("Disconnected from the daemon: {reason}")
+                format!("Disconnected from the daemon: {reason}. {LOST_DAEMON_HINT}")
             }
         }
     }
@@ -440,6 +448,42 @@ mod tests {
         let screen = screen(&app);
         assert!(screen.contains("Disconnected"), "{screen}");
         assert!(screen.contains("EOF"), "{screen}");
+    }
+
+    #[test]
+    fn a_lost_daemon_says_how_to_recover() {
+        // Arrange
+        let mut app = App::new();
+
+        // Act
+        app.handle_event(LinkEvent::Disconnected("EOF".to_owned()));
+
+        // Assert
+        let screen = wide_screen(&app);
+        assert!(screen.contains(LOST_DAEMON_HINT), "{screen}");
+    }
+
+    #[test]
+    fn setup_guidance_says_to_restart_the_daemon() {
+        // Arrange / Act / Assert
+        assert!(SETUP_GUIDANCE.contains("coda daemon restart"));
+    }
+
+    #[test]
+    fn setup_guidance_is_shown_only_when_asked_for() {
+        for (needs_setup, shown) in [(true, true), (false, false)] {
+            // Arrange
+            let mut app = App::new();
+
+            // Act
+            if needs_setup {
+                app.show_setup_guidance();
+            }
+
+            // Assert
+            let screen = wide_screen(&app);
+            assert_eq!(screen.contains(SETUP_GUIDANCE), shown, "{screen}");
+        }
     }
 
     #[test]
@@ -810,7 +854,7 @@ mod tests {
     }
 
     fn wide_screen(app: &App) -> String {
-        crate::test_support::screen(80, 8, |frame| app.render(frame))
+        crate::test_support::screen(120, 8, |frame| app.render(frame))
     }
 
     fn crashed(will_restart: bool) -> LinkEvent {

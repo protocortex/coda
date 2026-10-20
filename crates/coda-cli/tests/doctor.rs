@@ -239,8 +239,7 @@ async fn a_database_release_newer_than_the_binary_fails_and_an_older_one_warns()
             .data_dir()
             .join(coda_store::DB_FILE_NAME);
         let conn = rusqlite::Connection::open(db).unwrap();
-        // The workspace is at 0.0.0, so no release is older: no record at all
-        // stands for a database that predates release tracking.
+        // No record at all stands for a database that predates release tracking.
         match release {
             Some(release) => conn
                 .execute(

@@ -2,6 +2,10 @@
 
 Coda reads one file, `config.toml`, from its home directory.
 
+## Creating the file
+
+`coda init` writes a starter `config.toml` to this directory, with every provider section commented out. It refuses to overwrite a file that exists. Until a provider is enabled, `coda` and `coda tui` open the terminal UI with a note that tells you to enable one. A running daemon reads the file once, so run `coda daemon restart` after you edit it.
+
 ## Where files live
 
 | Path | Holds |

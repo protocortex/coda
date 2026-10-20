@@ -120,8 +120,9 @@ where
 }
 
 /// Shows the connection state and runs until the user quits or `shutdown`
-/// completes. The connection is made in the background, so the keys work while
-/// it is pending; a failed or lost connection is shown, not returned.
+/// completes. `needs_setup` adds the setup guidance to the transcript. The
+/// connection is made in the background, so the keys work while it is pending;
+/// a failed or lost connection is shown, not returned.
 ///
 /// # Errors
 /// Returns [`TuiError`] if the terminal fails or the UI task panics.
@@ -129,6 +130,7 @@ pub async fn run_session<B, K>(
     mut terminal: Terminal<B>,
     socket_path: &Path,
     timing: Timing,
+    needs_setup: bool,
     mut keys: K,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<App, TuiError>
@@ -139,6 +141,9 @@ where
 {
     let (commands, command_rx) = mpsc::unbounded_channel();
     let mut app = App::with_link(commands);
+    if needs_setup {
+        app.show_setup_guidance();
+    }
     draw(&mut terminal, &app)?;
     let (sender, mut events) = mpsc::unbounded_channel();
     let dispatch = tracing::dispatcher::get_default(Dispatch::clone);
@@ -196,19 +201,26 @@ fn finish(session: Result<(), TuiError>, restored: io::Result<()>) -> Result<(),
 /// exit, an error, a panic or SIGTERM/SIGHUP.
 ///
 /// Log output is held back while the terminal is in raw mode and printed to
-/// stderr after it is restored.
+/// stderr after it is restored. `needs_setup` is passed on to [`run_session`].
 ///
 /// # Errors
 /// Returns [`TuiError`] if the terminal cannot be set up or fails while running.
-pub async fn run(socket_path: &Path, timing: Timing) -> Result<(), TuiError> {
+pub async fn run(socket_path: &Path, timing: Timing, needs_setup: bool) -> Result<(), TuiError> {
     let shutdown = termination()?;
     let logs = LogBuffer::default();
     let guard = TerminalGuard::new(AnsiMode::new(io::stdout(), SystemRawMode))?;
     install_panic_hook(restore_stdout);
     let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let session = run_session(terminal, socket_path, timing, TerminalKeys, shutdown)
-        .with_subscriber(logs.dispatch())
-        .await;
+    let session = run_session(
+        terminal,
+        socket_path,
+        timing,
+        needs_setup,
+        TerminalKeys,
+        shutdown,
+    )
+    .with_subscriber(logs.dispatch())
+    .await;
     let restored = guard.restore();
     // Best effort: the terminal is already back, and there is no better place to report.
     let _ = io::stderr().write_all(&logs.take());

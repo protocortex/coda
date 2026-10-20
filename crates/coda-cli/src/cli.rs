@@ -16,7 +16,8 @@ pub struct Cli {
     /// Restart a daemon that is busy without asking.
     #[arg(long, global = true)]
     pub force: bool,
-    /// What to do; without one, make sure the daemon is running.
+    /// What to do; without one, open the TUI on a terminal, else make sure
+    /// the daemon is running.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -25,6 +26,10 @@ pub struct Cli {
 pub enum Command {
     /// Run the daemon in the foreground, or manage the running one.
     Daemon(DaemonArgs),
+    /// Open the terminal UI, starting the daemon if needed.
+    Tui,
+    /// Write a starter config.toml; an existing one is never overwritten.
+    Init,
     /// Show the running daemon's state.
     Status,
     /// Check that a daemon answers.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,6 +8,7 @@ use coda_config::config::Dirs;
 use coda_config::timing::Timing;
 
 use crate::error::CliError;
+use crate::tui_cmd::{TuiLauncher, real_tui};
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_WAIT_POLL: Duration = Duration::from_millis(50);
@@ -41,10 +42,14 @@ pub struct Context {
     pub timing: Timing,
     /// Limits for waiting on daemon start and stop.
     pub wait: Wait,
+    /// Whether standard input and output are both a terminal.
+    pub is_tty: bool,
+    /// Runs the terminal UI.
+    pub launch_tui: TuiLauncher,
 }
 
 impl Context {
-    /// A context with default timing and waits.
+    /// A context with default timing and waits, no terminal and the real UI.
     #[must_use]
     pub fn new(dirs: Dirs, exe: PathBuf, cwd: PathBuf) -> Self {
         Self {
@@ -53,6 +58,8 @@ impl Context {
             cwd,
             timing: Timing::default(),
             wait: Wait::default(),
+            is_tty: false,
+            launch_tui: real_tui,
         }
     }
 
@@ -63,11 +70,13 @@ impl Context {
     /// Returns [`CliError::Config`] if neither `CODA_HOME` nor `HOME` is set, or
     /// [`CliError::Environment`] if the executable or directory cannot be found.
     pub fn from_env() -> Result<Self, CliError> {
-        Ok(Self::new(
+        let mut ctx = Self::new(
             Dirs::from_env()?,
             std::env::current_exe().map_err(CliError::Environment)?,
             std::env::current_dir().map_err(CliError::Environment)?,
-        ))
+        );
+        ctx.is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        Ok(ctx)
     }
 }
 
