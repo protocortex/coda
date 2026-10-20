@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use coda_client::{Client, ClientError, Subscription};
+use coda_config::config::Config;
 use coda_core::turn::StopCondition;
 use coda_daemon::model_session::TURN_STOPPED_KIND;
 use coda_daemon::subscribe::PERMISSION_REQUEST_NOTIFICATION;
@@ -34,6 +35,8 @@ use crate::error::CliError;
 use crate::exit;
 
 const FAUX_KEY: &str = "faux";
+const CLAUDE_CODE_KEY: &str = "claude_code";
+const CODEX_KEY: &str = "codex";
 const STREAM_DELTA_KIND: &str = "stream_delta";
 const RESULT_KIND: &str = "result";
 
@@ -198,15 +201,23 @@ fn read_prompt(io: &mut Io<'_>, flag: Option<String>) -> Result<String, CliError
     Ok(prompt)
 }
 
-/// The scripted provider when the config enables it, else the Anthropic API.
+/// The scripted provider when the config enables it, else the delegated
+/// Claude Code agent, else the delegated Codex agent, else the Anthropic API.
 fn backend(ctx: &Context) -> Result<BackendKind, CliError> {
-    let config = load_config(&ctx.dirs)?;
-    let scripted = config.providers.get(FAUX_KEY).is_some_and(|p| p.enabled);
-    Ok(if scripted {
+    Ok(pick_backend(&load_config(&ctx.dirs)?))
+}
+
+fn pick_backend(config: &Config) -> BackendKind {
+    let enabled = |key| config.providers.get(key).is_some_and(|p| p.enabled);
+    if enabled(FAUX_KEY) {
         BackendKind::Faux
+    } else if enabled(CLAUDE_CODE_KEY) {
+        BackendKind::ClaudeCode
+    } else if enabled(CODEX_KEY) {
+        BackendKind::CodexAppServer
     } else {
         BackendKind::Anthropic
-    })
+    }
 }
 
 /// Prints streamed text, denies permission prompts and cancels on Ctrl-C,
@@ -345,6 +356,29 @@ fn exit_code(condition: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pick(toml: &str) -> BackendKind {
+        pick_backend(&Config::from_toml_str(toml).unwrap().config)
+    }
+
+    #[test]
+    fn the_backend_is_faux_then_claude_code_then_codex_then_anthropic() {
+        // Arrange
+        let faux = "[providers.faux]\nenabled = true\n";
+        let claude = "[providers.claude_code]\nenabled = true\n";
+        let codex = "[providers.codex]\nenabled = true\n";
+
+        // Act and Assert
+        assert_eq!(pick(&format!("{codex}{claude}{faux}")), BackendKind::Faux);
+        assert_eq!(pick(&format!("{codex}{claude}")), BackendKind::ClaudeCode);
+        assert_eq!(pick(claude), BackendKind::ClaudeCode);
+        assert_eq!(pick(codex), BackendKind::CodexAppServer);
+        assert_eq!(
+            pick("[providers.claude_code]\nenabled = false\n"),
+            BackendKind::Anthropic
+        );
+        assert_eq!(pick(""), BackendKind::Anthropic);
+    }
 
     #[test]
     fn every_stop_condition_maps_to_its_exit_code() {
