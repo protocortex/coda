@@ -11,7 +11,7 @@ use coda_selfhost::attempt::{ANTHROPIC_KEY_ENV, Provider};
 use coda_selfhost::error::SelfhostError;
 use coda_selfhost::live::{LiveOptions, require_key, run_live};
 use coda_selfhost::process::{ProcessError, handle_interrupts};
-use coda_selfhost::scrub::scrub;
+use coda_selfhost::scrub::{first_invalid_json_line, scrub};
 use coda_selfhost::verify::{VerifyPlan, verify_workdir};
 
 const ATTEMPT_LIMIT: Duration = Duration::from_mins(30);
@@ -82,7 +82,12 @@ enum Command {
         write_transcript: bool,
     },
     /// Print a transcript file without environment values, keys and absolute paths.
-    Scrub { file: PathBuf },
+    Scrub {
+        file: PathBuf,
+        /// Print nothing and exit 1 if a scrubbed line is not valid JSON.
+        #[arg(long)]
+        jsonl: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -169,10 +174,15 @@ fn execute(command: Command, env: &[(String, String)]) -> Result<bool, SelfhostE
             )?;
             Ok(passed.is_some())
         }
-        Command::Scrub { file } => {
+        Command::Scrub { file, jsonl } => {
             let text = std::fs::read_to_string(&file)
                 .map_err(|source| SelfhostError::Io { path: file, source })?;
-            print!("{}", scrub(&text, env));
+            let scrubbed = scrub(&text, env);
+            if jsonl && let Some(line) = first_invalid_json_line(&scrubbed) {
+                eprintln!("coda-selfhost: line {line} is not valid JSON after scrubbing");
+                return Ok(false);
+            }
+            print!("{scrubbed}");
             Ok(true)
         }
     }
