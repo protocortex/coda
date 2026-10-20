@@ -58,6 +58,16 @@ pub fn scrub(text: &str, env: &[(String, String)]) -> String {
     scrub_opaque(&scrub_uuids(&scrub_emails(&out)))
 }
 
+/// The 1-based number of the first line of `text` that is not a JSON value.
+///
+/// Scrubbing works on text, so a bad replacement could break a line.
+#[must_use]
+pub fn first_invalid_json_line(text: &str) -> Option<usize> {
+    text.lines()
+        .position(|line| serde_json::from_str::<serde_json::Value>(line).is_err())
+        .map(|index| index + 1)
+}
+
 /// The end of the JSON scalar at the start of `value`, if it is a string or number.
 fn scalar_len(value: &str) -> Option<usize> {
     if let Some(body) = value.strip_prefix('"') {
@@ -302,6 +312,27 @@ fn scrub_opaque(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_that_is_not_json_is_reported_by_its_number() {
+        // Arrange
+        let text = "{\"a\":1}\n{\"b\":\n[2]\n";
+
+        // Act
+        let invalid = first_invalid_json_line(text);
+
+        // Assert
+        assert_eq!(invalid, Some(2));
+    }
+
+    #[test]
+    fn text_with_only_json_lines_has_no_invalid_line() {
+        // Act
+        let invalid = first_invalid_json_line("{\"a\":1}\n\"x\"\n");
+
+        // Assert
+        assert_eq!(invalid, None);
+    }
 
     #[test]
     fn environment_values_are_replaced_longest_first_and_short_ones_kept() {

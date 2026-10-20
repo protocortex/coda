@@ -59,8 +59,8 @@ addresses, UUIDs (numbered stand-ins, so equal ids stay equal), `prefix_body` id
 such as `msg_...` and `toolu_...`, and long mixed-case blobs such as thinking
 signatures. It also zeroes quota numbers (`usedPercent`, `utilization`,
 `resetsAt`, `windowDurationMins`, `balance`), redacts `authMode`, `planType` and
-the overage fields, and cuts the OS and terminal out of `userAgent`. The script then fails and removes the fixtures if a line is not valid JSON or
-any still contain
+the overage fields, and cuts the OS and terminal out of `userAgent`. The scrubber (`scrub --jsonl`) fails if a scrubbed line is not valid
+JSON. The script removes the fixtures in that case, or if they still contain
 the user name, home path, host name, `/Users/`, `/home/`, an email address or a
 key. Read the fixtures before committing them: the scrubber works on text, not on
 meaning, so a new field can carry something it does not know.

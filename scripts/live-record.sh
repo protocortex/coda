@@ -6,7 +6,7 @@
 # CODA_LIVE_TESTS=1 and never runs in CI. Set KEEP_RAW=1 to keep the unscrubbed
 # recordings (they hold paths and ids; delete them yourself).
 # Usage: CODA_LIVE_TESTS=1 scripts/live-record.sh
-set -euo pipefail
+set -Eeuo pipefail
 
 [ "${CODA_LIVE_TESTS:-}" = 1 ] || {
   echo "live-record: set CODA_LIVE_TESTS=1 to spend quota on real CLI calls" >&2
@@ -28,12 +28,15 @@ host="$(hostname -s)"
 # Only the names the scrubber must know about reach it: no other environment values.
 scrub() {
   env -i HOME="$HOME" USER="$user" LOGNAME="$user" HOSTNAME="$host" \
-    "$scrubber" scrub "$raw/$1.raw.jsonl" >"$2"
+    "$scrubber" scrub --jsonl "$raw/$1.raw.jsonl" >"$2"
 }
 
 claude=crates/coda-testkit/fixtures/claude
 codex=crates/coda-testkit/fixtures/codex
 mkdir -p "$claude" "$codex"
+# Scrubbing works on text, so the scrubber also rejects a line that no longer
+# parses as JSON. Remove whatever was written if any scrub fails.
+trap 'rm -f -- "$claude"/live-*.jsonl "$codex"/live-*.jsonl' ERR
 scrub claude-live-allow "$claude/live-allow.jsonl"
 scrub claude-live-deny "$claude/live-deny.jsonl"
 scrub claude-live-text "$claude/live-text.jsonl"
@@ -42,18 +45,8 @@ scrub codex-exec-live "$codex/live-exec.jsonl"
 scrub codex-app-live-accept "$codex/live-app-server-accept.jsonl"
 scrub codex-app-live-decline "$codex/live-app-server-decline.jsonl"
 
+trap - ERR
 written=("$claude"/live-*.jsonl "$codex"/live-*.jsonl)
-
-# Scrubbing works on text, so a bad replacement could break a line: every line
-# must still parse as JSON.
-command -v jq >/dev/null || { echo "live-record: jq is required" >&2; exit 2; }
-for file in "${written[@]}"; do
-  jq empty "$file" >/dev/null 2>&1 || {
-    echo "live-record: $file has a line that is not valid JSON after scrubbing" >&2
-    rm -f -- "${written[@]}"
-    exit 1
-  }
-done
 
 # A leftover name, home path, host, address or key means the scrubber missed
 # something: remove the new fixtures rather than leave them to be committed.

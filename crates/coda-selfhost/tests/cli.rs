@@ -197,6 +197,26 @@ fn scrub_prints_a_file_without_environment_values_or_paths() {
     );
 }
 
+#[test]
+fn scrub_jsonl_rejects_a_line_that_is_not_json_and_prints_nothing() {
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("raw.jsonl");
+    fs::write(&file, "{\"a\":1}\n{\"b\":\n").unwrap();
+
+    // Act
+    let output = Command::new(BIN)
+        .args(["scrub", "--jsonl"])
+        .arg(&file)
+        .output()
+        .unwrap();
+
+    // Assert
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("line 2"));
+}
+
 const OTHER_VAR: &str = "SELFHOST_TEST_OTHER";
 const OTHER: &str = "other-canary-5521";
 
