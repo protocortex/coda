@@ -1,0 +1,9 @@
+{"codex_version":"0.163.0","label":"live","note":"recorded through CodexExecSession with argv `exec --json --sandbox read-only [resume <thread>] -`; lines are the stdout of each process in order","prompts":["Reply with the single word: ok","Reply with the single word: done"],"recorded_at":"2026-10-20T13:53:01Z","recorder":"coda-providers/tests/live_record.rs","scenario":"exec turn, then a second turn that resumes the thread","type":"coda_recording"}
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ok"}}
+{"type":"turn.completed","usage":{"input_tokens":14340,"cached_input_tokens":11008,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":30243,"cached_input_tokens":25216,"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0}}

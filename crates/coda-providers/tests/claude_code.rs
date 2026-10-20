@@ -101,11 +101,9 @@ fn synthetic_transcripts_cannot_whitelist_control_response_shapes() {
     }
 }
 
-/// Outstanding until live transcripts are recorded from a real session:
-/// `fixtures/claude/live-allow.jsonl` and `live-deny.jsonl` must carry a live
-/// header, and the adapter's responses must match their recorded shapes.
+/// The live transcripts carry the `control_response` shapes coda sent and the
+/// real `claude` accepted; the adapter must keep writing exactly those shapes.
 #[test]
-#[ignore = "waiting for recorded live transcripts live-allow.jsonl and live-deny.jsonl"]
 fn the_adapter_responses_match_the_recorded_live_shapes() {
     for (name, decision) in [
         ("live-allow.jsonl", PermissionDecision::AllowOnce),
