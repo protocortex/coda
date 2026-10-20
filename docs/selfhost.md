@@ -37,11 +37,12 @@ overwritten. It uses two build jobs and drops the outer `RUSTFLAGS` and
 coverage variables, so a `cargo llvm-cov` run does not instrument it. The two
 building tests run alone (`.config/nextest.toml`).
 
-## Live run (parked)
+## Live run
 
-Status: not run, and not to be run until OI-1 is verified (whether the
-account's terms allow this headless use of the Anthropic API). OI-2
-(allow-path provider fixtures) is also open. No transcript exists under
+Status: not run yet. OI-1 (whether headless use is allowed) was confirmed by the
+user on 2026-10-21, and OI-2 (allow-path provider fixtures) is closed by the live
+transcripts under `crates/coda-testkit/fixtures/`; see
+[live-recording.md](live-recording.md). No transcript exists under
 `docs/selfhost/`, and none may be written by hand.
 
 ```sh
@@ -72,9 +73,10 @@ scripts/selfhost.sh --write-transcript
 - writes `docs/selfhost/attempt-N.txt` only with `--write-transcript`, and
   refuses to start if `docs/selfhost` is a symlink or already holds an
   `attempt-*` file, so a stale transcript never survives a run. Each file is
-  written to a temporary name and renamed into place. Each transcript has environment values (including the key), `sk-` style keys and
-  absolute paths replaced by `<env:NAME>`, `<key>` and `<path>`. Read it before
-  committing it.
+  written to a temporary name and renamed into place. Each transcript has environment values (including the key), `sk-` style keys,
+  absolute paths, email addresses, UUIDs and long opaque ids replaced by
+  `<env:NAME>`, `<key>`, `<path>`, `<email>`, numbered stand-in UUIDs and
+  `<opaque>`. Read it before committing it.
 
 Everything printed to the terminal has the same scrubbing applied, including
 rejection reasons and errors.
