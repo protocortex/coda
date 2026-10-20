@@ -24,6 +24,19 @@ cargo build --workspace
 
 The binary is `target/debug/coda`. Put it on your `PATH` for the commands below.
 
+## First run
+
+Write a starter config, enable one provider in it, then restart the daemon and open the terminal UI.
+
+```sh
+coda init
+$EDITOR "${CODA_HOME:-$HOME/.config/coda}/config.toml"
+coda daemon restart
+coda
+```
+
+`coda init` writes `config.toml` with every provider section commented out. It stops with an error if the file already exists, so it does not overwrite your settings. Plain `coda` and `coda tui` start the daemon if none is running and open the terminal UI. With no provider enabled, the UI tells you to run `coda init` and edit the config.
+
 ## Quickstart with the faux provider
 
 The faux provider replays a script you write. It needs no network and no account, so it is the safest way to try Coda.
@@ -102,6 +115,9 @@ kill "$(coda status | sed -n 's/^pid: //p')"
 
 | Command | What it does |
 | --- | --- |
+| `coda` | On a terminal, start the daemon if needed and open the terminal UI. Without a terminal it starts the daemon and prints its pid. |
+| `coda tui` | Open the terminal UI, starting the daemon if needed. It fails with a message when there is no terminal. |
+| `coda init` | Write a starter `config.toml` with every provider commented out. It does not overwrite an existing file. |
 | `coda daemon` | Run the daemon in the foreground. `coda daemon restart` replaces a running one. |
 | `coda status` | Show the daemon pid, version and uptime. It fails if no daemon runs. |
 | `coda ping` | Print `pong` if a daemon answers. It fails if no daemon runs. |
@@ -110,11 +126,11 @@ kill "$(coda status | sed -n 's/^pid: //p')"
 | `coda usage` | Show token usage and savings. `--session` limits it to one session. It asks a running daemon, or reads the database when none runs. |
 | `coda doctor` | Check the socket, lock, orphaned backends, database, schema, database release, config and backends. `--repair` removes a stale socket and kills orphaned backends. `--json` prints JSON. |
 
-`coda run`, `coda grant add` and bare `coda` start a daemon if none is running. `coda daemon restart` starts one too. `coda status`, `coda ping`, `coda usage` and `coda doctor` do not start one.
+`coda run`, `coda grant add`, `coda tui` and bare `coda` start a daemon if none is running. `coda daemon restart` starts one too. `coda status`, `coda ping`, `coda usage` and `coda doctor` do not start one.
 
 `coda run` picks its backend from the config. It uses the faux provider if `[providers.faux]` is enabled, and the anthropic provider otherwise. It does not pick `openai_compat`, `claude_code` or `codex`.
 
-Every command accepts `--force`, but it only matters in two cases. A command that starts a daemon (`coda run`, `coda grant add`, bare `coda`) asks before it replaces a busy daemon that speaks another protocol version, and `--force` skips that question. `coda daemon restart` refuses to replace a busy daemon unless you pass `--force`.
+Every command accepts `--force`, but it only matters in two cases. A command that starts a daemon (`coda run`, `coda grant add`, `coda tui`, bare `coda`) asks before it replaces a busy daemon that speaks another protocol version, and `--force` skips that question. `coda daemon restart` refuses to replace a busy daemon unless you pass `--force`.
 
 ## Exit codes
 

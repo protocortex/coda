@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "coda-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "coda-client",
@@ -280,6 +280,7 @@ dependencies = [
  "coda-store",
  "coda-telemetry",
  "coda-testkit",
+ "coda-tui",
  "rusqlite",
  "serde",
  "serde_json",
@@ -291,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "coda-client"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "coda-config",
  "coda-daemon",
@@ -307,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "coda-config"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_ignored",
@@ -318,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "coda-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "coda-config",
  "coda-index",
@@ -338,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "coda-daemon"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "coda-config",
  "coda-core",
@@ -361,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "coda-index"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "coda-protocol",
  "coda-store",
@@ -377,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "coda-protocol"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "jsonschema",
  "schemars",
@@ -389,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "coda-providers"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "coda-config",
  "coda-protocol",
@@ -408,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "coda-selfhost"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "serde_json",
@@ -419,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "coda-store"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "coda-protocol",
  "rusqlite",
@@ -432,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "coda-telemetry"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -445,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "coda-testkit"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rustix",
  "serde_json",
@@ -454,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "coda-tools"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "coda-protocol",
  "regex",
@@ -467,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "coda-tui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "coda-client",
  "coda-config",
