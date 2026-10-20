@@ -346,7 +346,8 @@ async fn a_close_frame_or_exit_mid_turn_is_a_crash() {
             vec![Event::BackendCrashed {
                 session_id: SessionId::new("s-1"),
                 exit_code: Some(exit_code),
-                will_restart: false
+                will_restart: false,
+                detail: None,
             }]
         );
     }

@@ -132,12 +132,18 @@ impl Chat {
             Event::BackendCrashed {
                 exit_code,
                 will_restart,
+                detail,
                 ..
             } => {
                 let mut notice = match exit_code {
                     Some(code) => format!("backend crashed (exit {code})"),
                     None => "backend crashed".to_owned(),
                 };
+                // The last line is the reason; earlier ones are usually a banner.
+                if let Some(reason) = detail.as_deref().and_then(|text| text.lines().last()) {
+                    notice.push_str(": ");
+                    notice.push_str(reason);
+                }
                 if *will_restart {
                     notice.push_str(", restarting");
                 }
@@ -338,8 +344,18 @@ mod tests {
                     session_id: SessionId::new("s-1"),
                     exit_code: Some(2),
                     will_restart: false,
+                    detail: None,
                 },
                 "backend crashed (exit 2)",
+            ),
+            (
+                Event::BackendCrashed {
+                    session_id: SessionId::new("s-1"),
+                    exit_code: Some(1),
+                    will_restart: false,
+                    detail: Some("banner\nno repo".to_owned()),
+                },
+                "backend crashed (exit 1): no repo",
             ),
             (
                 Event::TurnInterrupted {

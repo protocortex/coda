@@ -142,6 +142,7 @@ fn absent_optional_fields_stay_absent_when_serialized() {
         session_id: SessionId::new("s-1"),
         exit_code: None,
         will_restart: false,
+        detail: None,
     };
 
     // Act

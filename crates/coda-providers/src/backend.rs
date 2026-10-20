@@ -11,11 +11,11 @@ use coda_protocol::types::BackendKind;
 use crate::detect::{DEFAULT_PROBE_TIMEOUT, DetectRequest, DetectedBinary, Detection, detect};
 
 /// Claude Code versions verified to work; extended by `verified_versions` in config.
-pub const VERIFIED_CLAUDE_CODE_VERSIONS: &[&str] = &["2.1.292"];
+pub const VERIFIED_CLAUDE_CODE_VERSIONS: &[&str] = &["2.1.292", "2.1.296"];
 
-/// Codex versions verified to work. None are verified against a live `codex` yet,
-/// so every version comes from `verified_versions` in config.
-pub const VERIFIED_CODEX_VERSIONS: &[&str] = &[];
+/// Codex versions verified to work: a live `exec` and a live `app-server` turn
+/// ran through the adapters. Extended by `verified_versions` in config.
+pub const VERIFIED_CODEX_VERSIONS: &[&str] = &["0.163.0"];
 
 /// Why a backend cannot be used.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -136,6 +136,38 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The version a live transcript's header names.
+    fn recorded_version(transcript: &str, field: &str) -> String {
+        let header: serde_json::Value =
+            serde_json::from_str(transcript.lines().next().unwrap()).unwrap();
+        header[field].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn every_version_with_a_live_transcript_is_verified() {
+        // Arrange
+        let claude = include_str!("../../coda-testkit/fixtures/claude/live-allow.jsonl");
+        let exec = include_str!("../../coda-testkit/fixtures/codex/live-exec.jsonl");
+        let app_server =
+            include_str!("../../coda-testkit/fixtures/codex/live-app-server-accept.jsonl");
+
+        // Act
+        let claude_version = recorded_version(claude, "claude_version");
+        let codex_versions = [
+            recorded_version(exec, "codex_version"),
+            recorded_version(app_server, "codex_version"),
+        ];
+
+        // Assert
+        assert!(VERIFIED_CLAUDE_CODE_VERSIONS.contains(&claude_version.as_str()));
+        for version in codex_versions {
+            assert!(
+                VERIFIED_CODEX_VERSIONS.contains(&version.as_str()),
+                "{version}"
+            );
+        }
+    }
 
     struct Claude;
 

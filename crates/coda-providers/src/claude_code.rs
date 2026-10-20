@@ -163,7 +163,8 @@ impl StreamParser {
                     session_id: session_id.to_owned(),
                 })
             }
-            "system" => None,
+            // Real streams also carry the model's own tool results and rate-limit updates.
+            "system" | "user" | "rate_limit_event" => None,
             "stream_event" => text_delta(&value).map(Message::TextDelta),
             "assistant" => Some(Message::Assistant {
                 text: assistant_text(&value),
@@ -369,7 +370,7 @@ mod tests {
         let mut parser = StreamParser::new();
 
         // Act
-        let messages = feed_lines(&mut parser, &[r#"{"type":"rate_limit_event"}"#, RESULT]);
+        let messages = feed_lines(&mut parser, &[r#"{"type":"future_event"}"#, RESULT]);
 
         // Assert
         assert_eq!(messages.len(), 1);
@@ -377,7 +378,7 @@ mod tests {
             parser.diagnostics(),
             [Diagnostic::UnknownType {
                 line: 1,
-                kind: "rate_limit_event".to_owned()
+                kind: "future_event".to_owned()
             }]
         );
     }

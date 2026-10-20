@@ -844,6 +844,15 @@ mod tests {
                 false,
             ),
             ("/a", Tool::Bash, "/a/x", None, false),
+            // Codex reports shell commands wrapped like this; the wrapped form
+            // is a different command, so a plain grant never covers it.
+            (
+                "/a",
+                Tool::Bash,
+                "/a/x",
+                Some("/bin/zsh -lc 'cargo test'"),
+                false,
+            ),
         ];
 
         for (repo, tool, cwd, command, expected) in cases {

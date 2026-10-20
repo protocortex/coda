@@ -46,7 +46,7 @@ One section per backend. The names Coda uses are `claude_code`, `codex`, `anthro
 | `binary` | string (path) | unset | Path of the backend program. When unset, Coda searches the `PATH`. Used by `claude_code` and `codex`. |
 | `api_key_env` | string | unset | Name of the environment variable that holds the API key. The anthropic provider requires it. Coda stores only the name. |
 | `env_passthrough` | array of strings | `[]` | Extra environment variable names for the backend process. Read from the file, not used yet. |
-| `verified_versions` | array of strings | `[]` | Backend versions you have checked. They are added to the versions built in for each backend: `claude_code` has `2.1.292` built in and `codex` has none. |
+| `verified_versions` | array of strings | `[]` | Backend versions you have checked. They are added to the versions built in for each backend: `claude_code` has `2.1.292` and `2.1.296` built in and `codex` has `0.163.0`. |
 | `script` | string (path) | unset | Script file the `faux` provider replays. It is required for `faux`, and a file over its size limit is refused. |
 | `base_url` | string | unset | API root. Required for `openai_compat`. The anthropic provider uses its own default when unset. |
 | `model` | string | unset | Model a session uses when it names none. |

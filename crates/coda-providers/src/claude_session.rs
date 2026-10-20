@@ -419,6 +419,7 @@ impl ClaudeSession {
             session_id: self.session_id.clone(),
             exit_code,
             will_restart: false,
+            detail: None,
         });
         Ok(TurnOutcome::Crashed { exit_code })
     }

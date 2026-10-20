@@ -7,7 +7,8 @@
 //! `turn.completed`. The event shapes are SYNTHETIC, written from the
 //! documented JSONL event names, not recorded from a real `codex` run.
 //!
-//! A prompt containing `crash` exits mid-turn and `fail` ends the turn with
+//! A prompt containing `crash` exits mid-turn, `refuse` exits mid-turn after
+//! writing a reason to stderr, and `fail` ends the turn with
 //! `turn.failed`. `noise` is preceded by a malformed line and an unknown
 //! event type, `bigline` by one line over the parser limit. `hostile` reports a thread id that looks like a flag. `stall` parks
 //! the process after `turn.started` and `grandchild` first starts a `sleep`
@@ -45,6 +46,8 @@ const GRANDCHILD_SECONDS: &str = "300";
 const BIG_LINE_BYTES: usize = 9 * 1024 * 1024;
 const PARK_INTERVAL: Duration = Duration::from_secs(3600);
 const CRASH_EXIT_CODE: i32 = 3;
+const REFUSAL_MESSAGE: &str =
+    "Not inside a trusted directory and --skip-git-repo-check was not specified.";
 
 fn emit(out: &mut impl Write, value: &Value) -> io::Result<()> {
     writeln!(out, "{value}")?;
@@ -122,6 +125,10 @@ fn run_turn(args: &[String], prompt: &str, out: &mut impl Write) -> io::Result<(
     if prompt.contains("crash") {
         std::process::exit(CRASH_EXIT_CODE);
     }
+    if prompt.contains("refuse") {
+        eprintln!("{REFUSAL_MESSAGE}");
+        std::process::exit(CRASH_EXIT_CODE);
+    }
     if prompt.contains("stall") || prompt.contains("grandchild") {
         park();
     }
@@ -144,7 +151,8 @@ fn run_turn(args: &[String], prompt: &str, out: &mut impl Write) -> io::Result<(
     emit(
         out,
         &json!({"type": "turn.completed", "usage": {"input_tokens": 120,
-            "cached_input_tokens": 100, "output_tokens": 30}}),
+            "cached_input_tokens": 100, "cache_write_input_tokens": 7,
+            "output_tokens": 30}}),
     )
 }
 
@@ -320,21 +328,19 @@ mod app_server {
             };
             let (id, params) = (message["id"].clone(), &message["params"]);
             match message["method"].as_str().unwrap_or_default() {
-                "initialize" => {
+                "initialize" => send(
+                    &mut stream,
+                    &json!({"id": id, "result": {"userAgent": "coda/fake", "platformOs": "fake"}}),
+                )?,
+                "thread/start" => {
+                    update_report("thread_start", params)?;
                     let version = control_value("version")
                         .and_then(|v| v.as_str().map(str::to_owned))
                         .unwrap_or_else(|| SERVER_VERSION.to_owned());
-                    send(
-                        &mut stream,
-                        &json!({"id": id, "result": {"serverInfo": {"name": "codex-app-server", "version": version}}}),
-                    )?;
-                }
-                "thread/start" => {
-                    update_report("thread_start", params)?;
                     let thread = if control_value("no_thread_id").is_some() {
-                        json!({})
+                        json!({"cliVersion": version})
                     } else {
-                        json!({"id": "fake-thread-1"})
+                        json!({"id": "fake-thread-1", "cliVersion": version})
                     };
                     send(
                         &mut stream,
