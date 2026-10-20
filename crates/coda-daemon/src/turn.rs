@@ -59,8 +59,7 @@ pub const TURN_RUNNING: i64 = -32003;
 /// The session uses a backend this daemon cannot run.
 pub const BACKEND_UNSUPPORTED: i64 = -32004;
 
-/// Stored event kind of the user's message.
-pub const USER_MESSAGE_KIND: &str = "user_message";
+pub use coda_core::history::USER_MESSAGE_KIND;
 const CLAUDE_BACKEND_NAME: &str = "claude_code";
 const CODEX_BACKEND_NAME: &str = "codex";
 /// Events buffered between the adapter and the store writer. The adapter's

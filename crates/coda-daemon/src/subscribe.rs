@@ -24,7 +24,7 @@ use tracing::{debug, error, warn};
 /// Notifications buffered per connection before it is disconnected as too slow.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 /// Stored event kind of a newly queued permission request.
-pub const PERMISSION_REQUEST_KIND: &str = "permission_request";
+pub use coda_core::history::PERMISSION_REQUEST_KIND;
 /// Notification re-sent on resume for a request nobody has answered yet.
 pub const PERMISSION_REQUEST_NOTIFICATION: &str = "permission.request";
 /// Stored events read per store call while replaying.

@@ -15,11 +15,19 @@ use std::time::Duration;
 
 use coda_config::config::{Config, ProviderConfig};
 use coda_core::broker::BrokerError;
+use coda_core::history::{
+    ASSISTANT_MESSAGE_KIND, TOOL_FINISHED_KIND, assistant_body, empty_text_id, tool_finished_body,
+};
+pub use coda_core::history::{
+    CONTEXT_OVERFLOW_KIND, CONVERSATION_RESET_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND,
+};
 use coda_core::prompt::{Conversation, Prefix, PromptError};
 use coda_core::tools::{BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index};
 use coda_core::turn::{CancelToken, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{Event, TIMEOUT_KIND};
-use coda_protocol::types::{BackendKind, PermissionDecision, SessionId, TokenUsage, TurnId};
+use coda_protocol::types::{
+    BackendKind, OriginalId, PermissionDecision, SessionId, TokenUsage, TurnId,
+};
 use coda_providers::faux::{FauxError, FauxProvider};
 use coda_providers::model::{ModelProvider, ModelRequest, ModelStream, ProviderError};
 use coda_providers::registry::{
@@ -48,15 +56,6 @@ const MAX_IDLE_LOOPS: usize = 64;
 /// How long a shutdown waits for cancelled sends to wind down.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
-
-pub const TOOL_FINISHED_KIND: &str = "tool_finished";
-pub const CONTEXT_OVERFLOW_KIND: &str = "context_overflow";
-pub const TURN_STOPPED_KIND: &str = "turn_stopped";
-/// A session whose earlier conversation was lost starts over from here.
-pub const CONVERSATION_RESET_KIND: &str = "conversation_reset";
-/// A session was switched to another model alias; its next send starts a new
-/// cache prefix. The body names the alias, provider and model, never a key.
-pub const MODEL_SWITCHED_KIND: &str = "model_switched";
 
 /// Why a model-API session could not be started.
 #[derive(Debug, thiserror::Error)]
@@ -663,8 +662,22 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
             };
             store_event(hub, session, turn, &usage).await
         }
-        TurnEvent::ToolFinished { tool, is_error } => {
-            let body = json!({ "tool": tool, "is_error": is_error });
+        TurnEvent::Assistant { text, tool_calls } => {
+            let mut kept = Vec::with_capacity(tool_calls.len());
+            for call in &tool_calls {
+                kept.push((call, keep_original(hub, session, &call.arguments).await));
+            }
+            let body = assistant_body(&text, &kept);
+            publish_kind(hub, session, turn, ASSISTANT_MESSAGE_KIND, &body).await
+        }
+        TurnEvent::ToolFinished {
+            tool,
+            call_id,
+            text,
+            is_error,
+        } => {
+            let original = keep_original(hub, session, &text).await;
+            let body = tool_finished_body(&tool, &call_id, original.as_ref(), is_error);
             publish_kind(hub, session, turn, TOOL_FINISHED_KIND, &body).await
         }
         TurnEvent::ContextOverflow => {
@@ -672,6 +685,25 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
         }
     };
     log_failure(stored);
+}
+
+/// Keeps a tool call's arguments or result in `originals`, apart from the event
+/// log; without it a rebuilt history shows a note or an empty value instead.
+async fn keep_original(hub: &Arc<Hub>, session: &SessionId, text: &str) -> Option<OriginalId> {
+    if text.is_empty() {
+        return Some(empty_text_id());
+    }
+    let (id, text) = (session.clone(), text.to_owned());
+    match hub
+        .with_store_mut(move |store| store.store_original(&id, &text))
+        .await
+    {
+        Ok(original) => Some(original),
+        Err(e) => {
+            warn!(session = %session, error = %e, "could not keep the text of a tool call");
+            None
+        }
+    }
 }
 
 /// Denies the prompts the turn left open, each with a timeout event, since
