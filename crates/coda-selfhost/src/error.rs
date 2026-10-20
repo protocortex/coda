@@ -22,6 +22,8 @@ pub enum SelfhostError {
     StaleTranscripts(PathBuf),
     #[error("{} is a symbolic link; refusing to write transcripts through it", .0.display())]
     TranscriptDirIsLink(PathBuf),
+    #[error("{option} {} does not exist", path.display())]
+    MissingPath { option: &'static str, path: PathBuf },
     #[error("{what} failed ({status}): {stderr}")]
     CommandFailed {
         what: String,

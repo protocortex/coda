@@ -3,7 +3,7 @@
 //! The temporary copy of the repository an attempt works in.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -20,6 +20,24 @@ const IDENTITY: [&str; 6] = [
     "-c",
     "commit.gpgsign=false",
 ];
+
+/// Resolves the existing path given for `option` to an absolute one. Attempts
+/// run child processes in other directories, where a relative path would
+/// point somewhere else.
+pub fn resolve_existing(option: &'static str, path: &Path) -> Result<PathBuf, SelfhostError> {
+    path.canonicalize().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => SelfhostError::MissingPath {
+            option,
+            path: path.to_path_buf(),
+        },
+        _ => io_error(path, e),
+    })
+}
+
+/// Makes `path` absolute against the current directory; it need not exist yet.
+pub fn make_absolute(path: &Path) -> Result<PathBuf, SelfhostError> {
+    std::path::absolute(path).map_err(|e| io_error(path, e))
+}
 
 /// Copies the tracked regular files of the git repository at `source` into
 /// `dest` and commits them there as the baseline the attempt is diffed against.

@@ -13,6 +13,7 @@ use coda_selfhost::live::{LiveOptions, require_key, run_live};
 use coda_selfhost::process::{ProcessError, handle_interrupts};
 use coda_selfhost::scrub::{first_invalid_json_line, scrub};
 use coda_selfhost::verify::{VerifyPlan, verify_workdir};
+use coda_selfhost::workspace::{make_absolute, resolve_existing};
 
 const ATTEMPT_LIMIT: Duration = Duration::from_mins(30);
 /// Where `--write-transcript` puts the scrubbed transcripts, under the source.
@@ -121,6 +122,8 @@ fn execute(command: Command, env: &[(String, String)]) -> Result<bool, SelfhostE
             cargo_test_args,
         } => {
             let say = |line: &str| eprintln!("[selfhost] {}", scrub(line, env));
+            let workdir = make_absolute(&workdir)?;
+            let target_dir = target_dir.as_deref().map(make_absolute).transpose()?;
             say(&format!("verifying {}", workdir.display()));
             let verdict = verify_workdir(&VerifyPlan {
                 workdir: &workdir,
@@ -149,6 +152,8 @@ fn execute(command: Command, env: &[(String, String)]) -> Result<bool, SelfhostE
             if matches!(backend, Backend::Anthropic) {
                 require_key(&api_key_env)?;
             }
+            let coda = resolve_existing("--coda", &coda)?;
+            let source = resolve_existing("--source", &source)?;
             let out = source.join(TRANSCRIPT_DIR);
             let provider = |_: u32, _: &Path| match backend {
                 Backend::Anthropic => Provider::Anthropic {
