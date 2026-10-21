@@ -136,6 +136,7 @@ fn config(script: std::path::PathBuf) -> Config {
         ModelAlias {
             provider: "faux".to_owned(),
             model: "script-1".to_owned(),
+            context_window: None,
         },
     );
     config

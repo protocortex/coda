@@ -78,6 +78,9 @@ A name that picks a provider and a model. Both keys are required in a section.
 | --- | --- | --- | --- |
 | `provider` | string | none | The provider that serves the model: `anthropic`, `openai_compat` or `faux`. `claude_code` and `codex` are not accepted. |
 | `model` | string | none | The model id sent to that provider. |
+| `context_window` | integer | none | Optional. The model's context window in tokens. It replaces the built-in value for this provider and model. Must be above 0. Two aliases of the same provider and model must not set different values. |
+
+The built-in defaults cover `claude-sonnet-5-5` and `claude-sonnet-4-5` (200000 tokens) and `gpt-4o` (128000 tokens).
 
 ## `[telemetry]`
 
@@ -139,6 +142,7 @@ script = "/path/to/script.json"
 [models.local]
 provider = "openai_compat"
 model = "llama3"
+context_window = 32000
 
 [telemetry]
 otlp_endpoint = "http://localhost:4318"

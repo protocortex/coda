@@ -44,6 +44,7 @@ fn faux_alias(config: &mut Config) {
         ModelAlias {
             provider: "faux".to_owned(),
             model: "script-1".to_owned(),
+            context_window: None,
         },
     );
 }
@@ -348,6 +349,7 @@ async fn a_send_that_began_before_a_switch_builds_on_the_switched_model() {
             ModelAlias {
                 provider: "faux".to_owned(),
                 model: "panic".to_owned(),
+                context_window: None,
             },
         );
     });
