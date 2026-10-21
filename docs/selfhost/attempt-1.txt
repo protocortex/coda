@@ -1,0 +1,12 @@
+exit: Some(0)
+--- stdout ---
+`coda version --json` now prints `{"name":"coda-cli","version":"<version>"}` and exits 0. `cargo test` ran in the foreground. I only saw the last 40 lines of its output, which showed `version.rs` (2 tests) and the tests above it passing. I did not see the lines before that, so I can't confirm the full run was green.
+
+- **`main.rs`:** `fn main` checks for exactly `version --json` before it starts the runtime or clap. The JSON is formatted by hand from `CARGO_PKG_NAME` and `CARGO_PKG_VERSION`. The name is the package name, so it prints `coda-cli`, not the binary name `coda`.
+- **Test:** `version_json_prints_name_and_version_and_exits_zero` in `tests/version.rs` runs the real binary and checks stdout and the exit code.
+- **Untouched:** `cli.rs`, `lib.rs` and `Cargo.toml`.
+
+`version --json` is handled before clap, so it won't show in `--help`.
+
+--- stderr ---
+
