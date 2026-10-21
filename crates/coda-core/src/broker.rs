@@ -1304,11 +1304,21 @@ mod tests {
         }
     }
 
+    /// With a single live subscriber, tracing rebuilds callsite interest from
+    /// the calling thread's default alone, so a parallel test hitting a span
+    /// with no subscriber caches it as disabled for the whole process. A
+    /// process-wide subscriber keeps every callsite enabled.
+    fn keep_callsites_enabled() {
+        let _ = tracing::subscriber::set_global_default(Registry::default());
+        tracing::callsite::rebuild_interest_cache();
+    }
+
     #[tokio::test]
     async fn each_decision_runs_in_a_span_that_carries_the_outcome() {
         // Arrange
         let spans = Spans::default();
         let _guard = tracing::subscriber::set_default(Registry::default().with(spans.clone()));
+        keep_callsites_enabled();
         let fixture = Fixture::new();
         let broker = fixture
             .broker(fixture.config("/ws", PermissionMode::DenyAll))
