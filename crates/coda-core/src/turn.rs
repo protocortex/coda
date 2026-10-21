@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use coda_protocol::types::{PermissionDecision, SessionId};
 use coda_providers::gate::PermissionGate;
@@ -24,7 +25,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{Instrument, info, info_span, warn};
 
 use crate::budget::TokenBudget;
-use crate::compact::CompactionAck;
+use crate::compact::{
+    self as summary, CompactError, CompactionAck, KEEP_RECENT_MESSAGES, summary_message,
+};
 use crate::economy::{cap_ends, compact};
 use crate::prompt::{Conversation, Message, ToolCall};
 
@@ -40,6 +43,8 @@ const PROMPT_CANCELLED: &str = "not run: the turn was cancelled while asking per
 pub const PROVIDER_CALL_SPAN: &str = "coda.provider.call";
 /// Name of the span around one tool call.
 pub const TOOL_CALL_SPAN: &str = "coda.tool.call";
+/// Longest wait for the daemon to confirm that a compaction is stored.
+const STORE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest compaction error text shown to the model.
 const MAX_ERROR_CHARS: usize = 200;
 
@@ -62,6 +67,8 @@ pub enum StopCondition {
     Paused,
     /// The model hit its output limit.
     MaxTokens,
+    /// The older conversation could not be summarized to make room.
+    CompactionFailed,
 }
 
 impl StopCondition {
@@ -77,6 +84,7 @@ impl StopCondition {
             Self::Refused => "refused",
             Self::Paused => "paused",
             Self::MaxTokens => "max_tokens",
+            Self::CompactionFailed => "compaction_failed",
         }
     }
 }
@@ -106,7 +114,7 @@ pub enum TurnEvent {
     },
     /// A model call finished and used these tokens.
     Usage(Usage),
-    /// The context window is full; compaction is not available.
+    /// The context window is full and compaction could not make room.
     ContextOverflow,
     /// The older messages were summarized. The loop waits for `ack` before it
     /// retries, so the event can be stored first.
@@ -164,7 +172,7 @@ impl CancelToken {
         Arc::clone(&self.flag)
     }
 
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         while !self.is_cancelled() {
             self.wake.notified().await;
         }
@@ -226,6 +234,18 @@ pub struct TurnLoop<P, G> {
     conversation: Conversation,
     events: UnboundedSender<TurnEvent>,
     cancel: CancelToken,
+    context_window: Option<u32>,
+    /// Whether this send already tried to compact ahead of a request.
+    compacted_ahead: bool,
+}
+
+/// How a compaction attempt ended.
+enum Compacted {
+    Done,
+    /// Too little history to summarize.
+    Nothing,
+    Cancelled,
+    Failed,
 }
 
 impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
@@ -251,7 +271,18 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             conversation,
             events,
             cancel: CancelToken::default(),
+            context_window: None,
+            compacted_ahead: false,
         }
+    }
+
+    /// Sets the model's context window in tokens. With one, a request that
+    /// nears it is compacted before it is sent; without one, only an overflow
+    /// the provider reports triggers compaction.
+    #[must_use]
+    pub fn with_context_window(mut self, window: Option<u32>) -> Self {
+        self.context_window = window;
+        self
     }
 
     /// The handle that cancels a running send.
@@ -278,6 +309,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     /// context overflow, and [`TurnError::StreamEnded`] for a truncated stream.
     pub async fn send(&mut self, text: &str) -> Result<StopCondition, TurnError> {
         self.conversation.push(Message::User(text.to_owned()));
+        self.compacted_ahead = false;
         let result = self.run().await;
         if !matches!(
             self.conversation.messages().last(),
@@ -300,23 +332,13 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                 info!(%exhausted, "model call refused");
                 return Ok(StopCondition::BudgetExhausted);
             }
-            let call = info_span!(
-                PROVIDER_CALL_SPAN,
-                { CODA_SESSION_ID } = %self.config.session,
-            );
-            let mut draft = Draft::default();
-            let streamed = self.stream_reply(&mut draft).instrument(call).await;
-            // Tokens were spent even when the stream failed or was cancelled.
-            if let Some(usage) = draft.usage {
-                self.budget.record(usage);
-                self.emit(TurnEvent::Usage(usage));
-            }
-            let reply = match streamed? {
+            let reply = match self.call_model().await? {
                 Streamed::Reply(reply) => reply,
                 Streamed::Overflow => {
                     self.emit(TurnEvent::ContextOverflow);
                     return Ok(StopCondition::ContextOverflow);
                 }
+                Streamed::CompactionFailed => return Ok(StopCondition::CompactionFailed),
                 Streamed::Cancelled => return Ok(StopCondition::Cancelled),
             };
             // Calls from a reply that did not stop for tools are dropped: nothing
@@ -353,6 +375,122 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             }
         }
         Ok(StopCondition::MaxTurns)
+    }
+
+    /// One model call. A request near the window is compacted first, and an
+    /// overflow compacts once and retries once.
+    async fn call_model(&mut self) -> Result<Streamed, TurnError> {
+        let mut compacted = false;
+        if self.should_compact_ahead() {
+            self.compacted_ahead = true;
+            match self.compact().await {
+                Compacted::Done => compacted = true,
+                Compacted::Cancelled => return Ok(Streamed::Cancelled),
+                // The request may still fit; an overflow gets one more try.
+                Compacted::Nothing | Compacted::Failed => {}
+            }
+        }
+        loop {
+            let streamed = self.stream_once().await?;
+            if compacted || !matches!(streamed, Streamed::Overflow) {
+                return Ok(streamed);
+            }
+            match self.compact().await {
+                Compacted::Done => compacted = true,
+                Compacted::Nothing => return Ok(Streamed::Overflow),
+                Compacted::Cancelled => return Ok(Streamed::Cancelled),
+                Compacted::Failed => return Ok(Streamed::CompactionFailed),
+            }
+        }
+    }
+
+    async fn stream_once(&mut self) -> Result<Streamed, TurnError> {
+        let call = info_span!(
+            PROVIDER_CALL_SPAN,
+            { CODA_SESSION_ID } = %self.config.session,
+        );
+        let mut draft = Draft::default();
+        let streamed = self.stream_reply(&mut draft).instrument(call).await;
+        // Tokens were spent even when the stream failed or was cancelled.
+        if let Some(usage) = draft.usage {
+            self.budget.record(usage);
+            self.emit(TurnEvent::Usage(usage));
+        }
+        streamed
+    }
+
+    /// Compacting ahead is tried once per send, and only when there is
+    /// something new to summarize.
+    fn should_compact_ahead(&self) -> bool {
+        !self.compacted_ahead
+            && self.context_window.is_some_and(|window| {
+                summary::request_bytes(&self.conversation) >= summary::proactive_limit_bytes(window)
+            })
+            && summary::worth_compacting(self.conversation.messages())
+    }
+
+    /// Replaces the older messages with a summary the daemon has stored.
+    async fn compact(&mut self) -> Compacted {
+        let messages = self.conversation.messages();
+        let Some(split) = summary::split_point(messages, KEEP_RECENT_MESSAGES) else {
+            return Compacted::Nothing;
+        };
+        let (replaced, kept) = (split, messages.len() - split);
+        let transcript = summary::render(&messages[..split]);
+        let chunk = summary::chunk_bytes(self.context_window);
+        let made = summary::summarize(&self.provider, &self.cancel, &transcript, chunk).await;
+        let made = match made {
+            Ok(made) => made,
+            Err(CompactError::Cancelled) => return Compacted::Cancelled,
+            Err(error) => {
+                warn!(%error, "the conversation could not be summarized");
+                return Compacted::Failed;
+            }
+        };
+        for usage in made.usage {
+            self.budget.record(usage);
+            self.emit(TurnEvent::Usage(usage));
+        }
+        match self.store_compaction(&made.text, replaced, kept).await {
+            Some(true) => {}
+            Some(false) => {
+                warn!("the compaction could not be stored; the history is unchanged");
+                return Compacted::Failed;
+            }
+            None => return Compacted::Cancelled,
+        }
+        self.conversation
+            .replace_prefix(replaced, Message::User(summary_message(&made.text)));
+        info!(
+            replaced,
+            kept,
+            summary_chars = made.text.chars().count(),
+            "conversation compacted"
+        );
+        Compacted::Done
+    }
+
+    /// Hands the compaction to whoever stores events and waits for the answer:
+    /// `Some(stored)`, where a late answer counts as not stored, or `None`
+    /// when the user cancels first.
+    async fn store_compaction(&self, text: &str, replaced: usize, kept: usize) -> Option<bool> {
+        let (ack, stored) = CompactionAck::channel();
+        let event = TurnEvent::Compaction {
+            summary: text.to_owned(),
+            replaced,
+            kept,
+            ack,
+        };
+        if self.events.send(event).is_err() {
+            // Nobody is watching, so nothing is stored that could disagree.
+            return Some(true);
+        }
+        tokio::select! {
+            answer = tokio::time::timeout(STORE_TIMEOUT, stored) => {
+                Some(matches!(answer, Ok(Ok(true))))
+            }
+            () = self.cancel.cancelled() => None,
+        }
     }
 
     fn emit(&self, event: TurnEvent) {
@@ -549,6 +687,7 @@ struct Reply {
 enum Streamed {
     Reply(Reply),
     Overflow,
+    CompactionFailed,
     Cancelled,
 }
 

@@ -143,7 +143,7 @@ Every command accepts `--force`, but it only matters in two cases. A command tha
 | 2 | The token budget was used up. |
 | 3 | The context window is full. |
 | 4 | The run was cancelled. |
-| 5 | Any other stop, or a failed turn. |
+| 5 | Any other stop, or a failed turn. This includes a conversation that could not be compacted. |
 | 64 | Bad usage. |
 | 70 | The run itself failed. |
 
@@ -154,6 +154,10 @@ Every command accepts `--force`, but it only matters in two cases. A command tha
 Settings live in `config.toml` under `CODA_HOME`. Without `CODA_HOME`, Coda uses `$HOME/.config/coda`. See [docs/config.md](docs/config.md) for every key, its default and its checks.
 
 Backends: `claude_code`, `codex`, `anthropic`, `openai_compat` and `faux`. Each is a `[providers.<name>]` section.
+
+## Context and compaction
+
+Each model has a context window. Coda knows it for the models it names (see [docs/config.md](docs/config.md)) and you can set it with `context_window` on a `[models.<alias>]` section. When a request reaches 80% of a known window, or the provider reports that a request is too large, Coda asks the same model to summarize the older messages, keeps the most recent ones as they are, and retries the request once. A tool call and its results are never split. The summary is stored as a `compaction` event, with its text kept apart from the event log, and a resumed session replays it. The summary is sent as a user message that says it is background data, never as a system prompt. If the summary cannot be made, the run stops as `compaction_failed` (exit code 5). If the request is still too large after compaction, it stops as `context_overflow` (exit code 3). A model with no known window is compacted only after an overflow.
 
 ## Permissions
 

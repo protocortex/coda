@@ -12,6 +12,7 @@ use coda_core::history::{
 };
 use coda_core::prompt::{Conversation, Message, Prefix};
 use coda_core::turn::{StopCondition, ToolSet, TurnConfig, TurnEvent, TurnLoop};
+use coda_protocol::events::{COMPACTION_KIND, Event};
 use coda_protocol::types::{BackendKind, Mode, OriginalId, PermissionDecision, SessionId, TurnId};
 use coda_providers::anthropic::request::{RequestSettings, build_body as anthropic_body};
 use coda_providers::faux::{FauxProvider, Turn};
@@ -128,8 +129,27 @@ impl Rig {
     /// Sends `text` and stores the events the way the daemon does.
     async fn send(&mut self, text: &str) -> StopCondition {
         self.store(USER_MESSAGE_KIND, &json!({ "text": text }));
-        let stop = self.turn_loop.send(text).await.unwrap();
+        let mut seen = Vec::new();
+        let stop = {
+            let send = self.turn_loop.send(text);
+            tokio::pin!(send);
+            loop {
+                tokio::select! {
+                    stop = &mut send => break stop.unwrap(),
+                    Some(event) = self.events.recv() => {
+                        // The daemon stores a compaction before the loop goes on.
+                        if let TurnEvent::Compaction { ack, .. } = &event {
+                            ack.confirm(true);
+                        }
+                        seen.push(event);
+                    }
+                }
+            }
+        };
         while let Ok(event) = self.events.try_recv() {
+            seen.push(event);
+        }
+        for event in seen {
             match event {
                 TurnEvent::Assistant { text, tool_calls } => {
                     let kept: Vec<_> = tool_calls
@@ -148,6 +168,22 @@ impl Rig {
                     let original = self.keep(text);
                     let body = tool_finished_body(&tool, &call_id, Some(&original), is_error);
                     self.store(TOOL_FINISHED_KIND, &body);
+                }
+                TurnEvent::Compaction {
+                    summary,
+                    replaced,
+                    kept,
+                    ..
+                } => {
+                    let summary = self.keep(summary);
+                    let event = Event::Compaction {
+                        session_id: SessionId::new("s"),
+                        turn_id: TurnId::new("1"),
+                        summary,
+                        replaced_messages: replaced.try_into().unwrap(),
+                        kept_messages: kept.try_into().unwrap(),
+                    };
+                    self.store(COMPACTION_KIND, &serde_json::to_value(event).unwrap());
                 }
                 _ => {}
             }
@@ -215,6 +251,73 @@ async fn a_replayed_tool_session_equals_the_conversation_the_live_loop_held() {
     // Assert
     let live = rig.turn_loop.conversation().messages().to_vec();
     assert_eq!(live.len(), 9, "{live:?}");
+    assert_eq!(rig.replayed(), live);
+}
+
+#[tokio::test]
+async fn a_replayed_compaction_equals_the_conversation_the_live_loop_held() {
+    // Arrange
+    let overflow = Turn {
+        events: Vec::new(),
+        error: Some(ProviderError::ContextWindowExceeded),
+    };
+    let mut rig = Rig::new(vec![
+        tool_turn(&[("c1", "{}"), ("c2", "{}")]),
+        text_turn("first answer"),
+        text_turn("second answer"),
+        text_turn("third answer"),
+        overflow,
+        text_turn("the summary"),
+        text_turn("fourth answer"),
+        text_turn("fifth answer"),
+    ]);
+    for question in ["one", "two", "three"] {
+        rig.send(question).await;
+    }
+
+    // Act
+    rig.send("four").await;
+    let right_after = rig.turn_loop.conversation().messages().to_vec();
+    rig.send("five").await;
+
+    // Assert
+    assert!(matches!(&right_after[0], Message::User(text) if text.contains("the summary")));
+    assert_eq!(right_after.len(), 8, "{right_after:?}");
+    let live = rig.turn_loop.conversation().messages().to_vec();
+    assert_eq!(rig.replayed(), live);
+}
+
+#[tokio::test]
+async fn a_second_compaction_on_top_of_a_first_replays_to_the_live_conversation() {
+    // Arrange
+    let overflow = || Turn {
+        events: Vec::new(),
+        error: Some(ProviderError::ContextWindowExceeded),
+    };
+    let mut script = vec![tool_turn(&[("c1", "{}")])];
+    script.extend(["a1", "a2", "a3"].map(text_turn));
+    script.extend([overflow(), text_turn("first summary"), text_turn("a4")]);
+    script.extend(["a5", "a6", "a7"].map(text_turn));
+    script.extend([overflow(), text_turn("second summary"), text_turn("a8")]);
+    let mut rig = Rig::new(script);
+    for question in ["one", "two", "three", "four", "five", "six", "seven"] {
+        rig.send(question).await;
+    }
+
+    // Act
+    rig.send("eight").await;
+
+    // Assert
+    let live = rig.turn_loop.conversation().messages().to_vec();
+    let summaries = live
+        .iter()
+        .filter(|m| matches!(m, Message::User(text) if text.contains("summary_of_earlier")))
+        .count();
+    assert_eq!(
+        summaries, 1,
+        "the second summary replaced the first: {live:?}"
+    );
+    assert!(matches!(&live[0], Message::User(text) if text.contains("second summary")));
     assert_eq!(rig.replayed(), live);
 }
 

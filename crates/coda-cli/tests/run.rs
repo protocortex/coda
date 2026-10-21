@@ -126,6 +126,33 @@ async fn each_stop_condition_exits_with_its_own_code() {
     }
 }
 
+/// Three tool rounds, so a run holds more messages than compaction keeps.
+fn long_run() -> Vec<Value> {
+    vec![tool_turn("missing", &json!({})); 3]
+}
+
+#[tokio::test]
+async fn a_run_whose_summary_fails_exits_five_with_its_own_message() {
+    // Arrange
+    let mut script = long_run();
+    script.extend([
+        overflow_turn(),
+        json!({"events": [], "error": {"class": "fatal", "message": "refused"}}),
+    ]);
+    let rig = rig(&script, "");
+
+    // Act
+    let outcome = run(&rig, &[]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::from(5), "{}", outcome.err);
+    assert!(
+        outcome.err.contains("could not be compacted"),
+        "{}",
+        outcome.err
+    );
+}
+
 #[tokio::test]
 async fn a_cancelled_run_exits_four() {
     // Arrange

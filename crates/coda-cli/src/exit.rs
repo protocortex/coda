@@ -17,7 +17,8 @@ pub const RUN_BUDGET_EXHAUSTED: u8 = 2;
 pub const RUN_CONTEXT_OVERFLOW: u8 = 3;
 /// The turn was cancelled.
 pub const RUN_CANCELLED: u8 = 4;
-/// The turn stopped for another reason, or failed outright.
+/// The turn stopped for another reason, or failed outright. This includes a
+/// compaction that could not summarize the conversation.
 pub const RUN_OTHER: u8 = 5;
 /// The command line was invalid.
 pub const USAGE: u8 = 64;
