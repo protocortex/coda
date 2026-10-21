@@ -26,8 +26,11 @@
 //! environment facts, and `pid_path` receives the `sleep` pid. `upgrade_status` makes the app-server answer the
 //! upgrade with that HTTP status and `version` sets the version it reports. `no_thread_id` makes `thread/start`
 //! answer without a thread id, `exit_early` exits before the socket exists and `hang_start` parks
-//! before it creates one. `available_decisions` is sent with approval requests, and
-//! `hang_after_cancel` parks after a `cancel` answer, and `ignore_interrupt` makes the app-server park on `turn/interrupt`.
+//! before it creates one. The app-server serves any number of turns, lists every
+//! prompt it got under `prompts`, and in `stall` waits for `turn/interrupt`
+//! (`grandchild` parks instead, so only a kill ends it). `available_decisions` is
+//! sent with approval requests, `reject_turn_start` refuses `turn/start`, `hang_after_cancel` parks after a `cancel` answer,
+//! and `ignore_interrupt` makes the app-server park on `turn/interrupt`.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -348,13 +351,20 @@ mod app_server {
                         &json!({"id": id, "result": {"thread": thread}}),
                     )?;
                 }
+                "turn/start" if control_value("reject_turn_start").is_some() => send(
+                    &mut stream,
+                    &json!({"id": id, "error": {"code": -32000, "message": "refused"}}),
+                )?,
                 "turn/start" => {
                     send(
                         &mut stream,
                         &json!({"id": id, "result": {"turn": {"id": "turn-1"}}}),
                     )?;
                     let prompt = params["input"][0]["text"].as_str().unwrap_or_default();
-                    run_turn(&mut stream, prompt)?;
+                    record_prompt(prompt)?;
+                    // A seeded prompt repeats earlier ones, so only its last paragraph triggers.
+                    let latest = prompt.rsplit("\n\n").next().unwrap_or(prompt);
+                    run_turn(&mut stream, latest)?;
                 }
                 _ => {}
             }
@@ -413,17 +423,44 @@ mod app_server {
             }
             return Ok(false);
         }
-        update_report("interrupt_params", &message["params"])?;
+        end_interrupted(stream, &message)?;
+        Ok(true)
+    }
+
+    /// Answers a `turn/interrupt` and ends the turn, or parks when told to ignore it.
+    fn end_interrupted(stream: &mut UnixStream, request: &Value) -> io::Result<()> {
+        update_report("interrupt_params", &request["params"])?;
         if control_value("ignore_interrupt").is_some() {
             park();
         }
-        send(stream, &json!({"id": message["id"], "result": {}}))?;
+        send(stream, &json!({"id": request["id"], "result": {}}))?;
         notify(
             stream,
             "turn/completed",
             &json!({"turn": {"status": "interrupted"}}),
-        )?;
-        Ok(true)
+        )
+    }
+
+    /// Holds the turn open until the client interrupts it.
+    fn await_interrupt(stream: &mut UnixStream) -> io::Result<()> {
+        loop {
+            let message = read_json(stream)?;
+            if message["method"] == "turn/interrupt" {
+                return end_interrupted(stream, &message);
+            }
+        }
+    }
+
+    /// Adds `prompt` to the report's `prompts`, oldest first.
+    fn record_prompt(prompt: &str) -> io::Result<()> {
+        let Some(path) = control_path("report_path") else {
+            return Ok(());
+        };
+        let mut report: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        let mut prompts = report["prompts"].as_array().cloned().unwrap_or_default();
+        prompts.push(json!(prompt));
+        report["prompts"] = json!(prompts);
+        std::fs::write(path, report.to_string())
     }
 
     /// Sends a close frame, records whether the client answered it with one, and exits.
@@ -445,11 +482,12 @@ mod app_server {
             stream.write_all(&OVERSIZED_HEADER)?;
             return Ok(());
         }
-        if prompt.contains("stall") || prompt.contains("grandchild") {
-            if prompt.contains("grandchild") {
-                start_grandchild()?;
-            }
+        if prompt.contains("grandchild") {
+            start_grandchild()?;
             park();
+        }
+        if prompt.contains("stall") {
+            return await_interrupt(stream);
         }
         if prompt.contains("ping") {
             write_frame(stream, FIN | OP_PING, b"hb")?;

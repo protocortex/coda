@@ -17,6 +17,7 @@ First release.
 - The daemon, its Unix socket protocol and the commands `run`, `status`, `ping`, `grant`, `usage` and `doctor`.
 - Providers `claude_code`, `codex`, `anthropic`, `openai_compat` and `faux`, all off until enabled in `config.toml`.
 - Release-versioned database migrations: a database written by a newer release is refused.
+- A `history_not_restored` event for a Codex thread that could not be given the earlier conversation.
 - Context windows per model, with a `context_window` override, and compaction of the conversation when a request nears the window or overflows it.
 
 [Unreleased]: https://github.com/protocortex/coda/compare/v0.1.0...HEAD

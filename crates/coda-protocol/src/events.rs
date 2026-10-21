@@ -24,6 +24,8 @@ pub const RESULT_KIND: &str = "result";
 pub const USAGE_KIND: &str = "usage";
 /// Stored event kind of the notice that approvals cannot be answered.
 pub const APPROVALS_UNAVAILABLE_KIND: &str = "approvals_unavailable";
+/// Stored event kind of the notice that earlier turns could not be given to a new thread.
+pub const HISTORY_NOT_RESTORED_KIND: &str = "history_not_restored";
 /// Stored event kind of a piece of streamed model text.
 pub const STREAM_DELTA_KIND: &str = "stream_delta";
 /// Stored event kind of a backend process that ended unexpectedly.
@@ -93,6 +95,13 @@ pub enum Event {
         /// Why no approver is reachable.
         reason: String,
     },
+    /// A new backend thread could not be given the conversation so far.
+    HistoryNotRestored {
+        /// Affected session.
+        session_id: SessionId,
+        /// Why the earlier turns are missing.
+        reason: String,
+    },
     /// A piece of streamed model text.
     StreamDelta {
         /// Session of the turn.
@@ -156,6 +165,7 @@ mod tests {
             RESULT_KIND,
             USAGE_KIND,
             APPROVALS_UNAVAILABLE_KIND,
+            HISTORY_NOT_RESTORED_KIND,
             STREAM_DELTA_KIND,
             BACKEND_CRASHED_KIND,
             TURN_INTERRUPTED_KIND,

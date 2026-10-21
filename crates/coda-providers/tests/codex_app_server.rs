@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use coda_protocol::events::Event;
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
-use coda_providers::claude_session::{ENV_ALLOWLIST, TurnOutcome};
+use coda_providers::claude_session::{CancelHandle, ENV_ALLOWLIST, TurnOutcome};
 use coda_providers::codex_app_server::{AppServerError, AppServerSpec, CodexAppServerSession};
 use coda_providers::codex_exec::SandboxMode;
 use coda_providers::gate::PermissionGate;
@@ -486,15 +486,15 @@ async fn a_close_frame_or_exit_mid_turn_is_a_crash() {
                 exit_code: Some(exit_code)
             }
         );
-        assert_eq!(
-            events,
-            vec![Event::BackendCrashed {
-                session_id: SessionId::new("s-1"),
-                exit_code: Some(exit_code),
+        assert!(matches!(
+            events.as_slice(),
+            [Event::BackendCrashed {
+                exit_code: Some(code),
                 will_restart: false,
-                detail: None,
-            }]
-        );
+                detail: Some(_),
+                ..
+            }] if *code == exit_code
+        ));
     }
 }
 
@@ -758,4 +758,97 @@ async fn a_server_that_exits_before_listening_fails_the_start_quickly() {
         result,
         Err(AppServerError::ExitedEarly { exit_code: Some(5) })
     ));
+}
+
+/// Cancels once the fake has received a prompt, so the turn is known to be running.
+fn cancel_once_prompted(fixture: &Fixture, handle: CancelHandle) {
+    let report = fixture.cwd.path().join(REPORT_FILE);
+    tokio::spawn(async move {
+        loop {
+            let prompted = fs::read_to_string(&report)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .is_some_and(|value| value["prompts"].is_array());
+            if prompted {
+                return handle.cancel();
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    });
+}
+
+#[tokio::test]
+async fn two_turns_run_on_the_same_server() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+    let pid = session.pid();
+
+    // Act
+    let (first, _) = turn(&mut session, "one").await;
+    let (second, _) = turn(&mut session, "two").await;
+
+    // Assert
+    assert_eq!(first, TurnOutcome::Completed { is_error: false });
+    assert_eq!(second, TurnOutcome::Completed { is_error: false });
+    assert_eq!(session.pid(), pid);
+    assert_eq!(fixture.report()["prompts"], json!(["one", "two"]));
+}
+
+#[tokio::test]
+async fn a_cancel_interrupts_the_turn_and_the_server_takes_the_next_one() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+    let pid = session.pid();
+    cancel_once_prompted(&fixture, session.cancel_handle());
+
+    // Act
+    let (cancelled, events) = turn(&mut session, "stall").await;
+    let (next, _) = turn(&mut session, "after").await;
+
+    // Assert
+    assert_eq!(cancelled, TurnOutcome::Cancelled);
+    assert!(matches!(events.as_slice(), [Event::TurnInterrupted { .. }]));
+    assert_eq!(fixture.report()["interrupt_params"]["turnId"], "turn-1");
+    assert_eq!(next, TurnOutcome::Completed { is_error: false });
+    assert_eq!(session.pid(), pid);
+}
+
+#[tokio::test]
+async fn a_cancel_the_server_ignores_kills_it_after_the_timeout() {
+    // Arrange
+    let fixture = Fixture::new(&json!({"ignore_interrupt": true}));
+    let mut session = fixture.session().await;
+    cancel_once_prompted(&fixture, session.cancel_handle());
+
+    // Act
+    let (outcome, _) = turn(&mut session, "stall").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Cancelled);
+    assert_gone_soon(fixture.pid(true)).await;
+    assert_eq!(session.pid(), None);
+}
+
+#[tokio::test]
+async fn a_server_that_died_mid_turn_is_reported_and_cannot_take_another_turn() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+
+    // Act
+    let (outcome, events) = turn(&mut session, "crash").await;
+    let reusable = session.is_reusable();
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Crashed { exit_code: Some(3) });
+    assert!(matches!(
+        events.as_slice(),
+        [Event::BackendCrashed {
+            detail: Some(_),
+            ..
+        }]
+    ));
+    assert!(!reusable);
 }

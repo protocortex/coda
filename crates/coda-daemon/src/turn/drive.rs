@@ -133,9 +133,10 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
         let crashed = matches!(result, Ok(TurnOutcome::Crashed { .. }))
             && !cancel.is_cancelled()
             && !self.turns.stopping.load(Ordering::SeqCst);
-        // Starting again resends the prompt, so it is safe only before any tool was asked for.
-        let tools_started = self.watched.tool_requested();
-        let will_restart = crashed && may_restart && !tools_started;
+        // Starting again resends the prompt, so it is safe only before any tool was
+        // asked for, and only for a backend that holds no state of its own.
+        let replayable = !self.watched.tool_requested() && self.child.restartable();
+        let will_restart = crashed && may_restart && replayable;
         if let Some(Event::BackendCrashed {
             session_id,
             exit_code,
@@ -151,11 +152,11 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
             });
         }
         self.outcome = Some(result);
-        if crashed && tools_started {
-            warn!(session = %self.record.id, turn = %self.turn, "the backend crashed after tools had started; not replaying the prompt, failing the turn");
+        if crashed && !replayable {
+            warn!(session = %self.record.id, turn = %self.turn, "the backend crashed and the prompt cannot be replayed; failing the turn");
             self.fail_turn();
         }
-        if !crashed || tools_started {
+        if !crashed || !replayable {
             return Step::Finished;
         }
         // The next run resumes the backend's conversation, and the old group must be gone first.

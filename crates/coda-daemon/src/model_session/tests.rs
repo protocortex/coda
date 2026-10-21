@@ -15,7 +15,7 @@ use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::{EnvReader, MAX_IDLE_LOOPS, ModelSessions, keep_recent, lock};
+use super::{EnvReader, MAX_IDLE_LOOPS, ModelSessions};
 use crate::dispatch::Dispatcher;
 use crate::gate::Brokers;
 use crate::state::DaemonState;
@@ -616,7 +616,7 @@ async fn a_panic_in_the_session_task_ends_the_turn_and_the_next_send_starts_over
     rig.send("one").await;
     rig.wait_for_results(1).await;
     rig.wait_until_idle().await;
-    let idle_loops = lock(&rig.turns.models.loops).len();
+    let idle_loops = rig.turns.models.loops.len();
     let after_first = (
         rig.pending().await.len(),
         idle_loops,
@@ -629,24 +629,6 @@ async fn a_panic_in_the_session_task_ends_the_turn_and_the_next_send_starts_over
     assert_eq!(rig.bodies("result").await[0]["is_error"], true);
     assert_eq!(after_first, (0, 0, 0));
     assert_eq!(rig.bodies(CONVERSATION_RESET_KIND).await.len(), 0);
-}
-
-#[test]
-fn the_oldest_conversation_is_evicted_once_more_than_the_maximum_are_kept() {
-    // Arrange
-    let mut kept = Vec::new();
-    let id = |n: &str| SessionId::new(n);
-
-    // Act
-    let evictions: Vec<Option<SessionId>> = ["1", "2", "3"]
-        .into_iter()
-        .map(|n| keep_recent(&mut kept, id(n), n, 2))
-        .collect();
-
-    // Assert
-    assert_eq!(evictions, [None, None, Some(id("1"))]);
-    let names: Vec<_> = kept.iter().map(|(_, n)| *n).collect();
-    assert_eq!(names, ["2", "3"]);
 }
 
 fn user_message(text: &str) -> Value {
@@ -665,7 +647,7 @@ async fn a_rebuilt_loop_continues_with_the_stored_history_and_stores_no_reset() 
     rig.send("first").await;
     rig.wait_for_results(1).await;
     rig.wait_until_idle().await;
-    lock(&rig.turns.models.loops).clear();
+    rig.turns.models.loops.clear();
 
     // Act
     rig.send("second").await;
@@ -696,9 +678,7 @@ async fn a_conversation_evicted_from_the_idle_cache_continues_with_its_history()
         rig.send_as(&other, "filler").await;
         rig.wait_idle(&other).await;
     }
-    let evicted = !lock(&rig.turns.models.loops)
-        .iter()
-        .any(|(id, _)| *id == first);
+    let evicted = !rig.turns.models.loops.holds(&first);
 
     // Act
     rig.send_as(&first, "again").await;
@@ -1004,7 +984,7 @@ async fn a_compaction_is_stored_apart_from_its_summary_and_replays_in_a_fresh_lo
         rig.wait_for_results(n + 1).await;
         rig.wait_until_idle().await;
     }
-    lock(&rig.turns.models.loops).clear();
+    rig.turns.models.loops.clear();
 
     // Act
     rig.send("q7").await;

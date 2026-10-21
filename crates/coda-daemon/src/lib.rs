@@ -6,6 +6,7 @@ pub mod backends;
 pub mod dispatch;
 pub mod gate;
 pub mod grants_rpc;
+mod idle_pool;
 pub mod lock;
 pub mod model_session;
 pub mod pidfile;

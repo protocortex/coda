@@ -39,6 +39,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::{Instrument, info, warn};
 
 use crate::gate::{BrokerGate, Brokers};
+use crate::idle_pool::IdlePool;
 use crate::subscribe::{Hub, HubError};
 use crate::trace::backend_span;
 use crate::turn::{Reservation, TurnError, Turns, store_event};
@@ -162,7 +163,7 @@ pub struct ModelSessions {
     /// token and turn once it runs; never held across an await.
     running: Mutex<HashMap<SessionId, Reservation<(CancelToken, TurnId)>>>,
     /// Idle conversations, least recently used first.
-    loops: Mutex<Vec<(SessionId, ModelLoop)>>,
+    loops: IdlePool<ModelLoop>,
     /// Limits of conversations a model switch dropped, until the next send
     /// builds the replacement.
     carried_limits: Mutex<HashMap<SessionId, Limits>>,
@@ -187,7 +188,7 @@ impl ModelSessions {
             env: allowlisted_env(DEFAULT_ENV_ALLOWLIST, env),
             key_reader,
             running: Mutex::default(),
-            loops: Mutex::default(),
+            loops: IdlePool::new(MAX_IDLE_LOOPS),
             carried_limits: Mutex::default(),
         })
     }
@@ -368,14 +369,11 @@ impl ModelSessions {
     }
 
     fn take_loop(&self, session: &SessionId) -> Option<ModelLoop> {
-        let mut loops = lock(&self.loops);
-        let at = loops.iter().position(|(id, _)| id == session)?;
-        Some(loops.remove(at).1)
+        self.loops.take(session)
     }
 
     fn keep_loop(&self, session: SessionId, model_loop: ModelLoop) {
-        let mut loops = lock(&self.loops);
-        if let Some(evicted) = keep_recent(&mut loops, session, model_loop, MAX_IDLE_LOOPS) {
+        if let Some((evicted, _)) = self.loops.keep(session, model_loop) {
             info!(session = %evicted, "dropped the least recently used idle conversation");
         }
     }
@@ -605,18 +603,6 @@ impl Slot {
             reservation.arm(armed, |(cancel, _)| cancel.cancel());
         }
     }
-}
-
-/// Appends `item`, then drops the oldest entry when more than `max` are kept
-/// and returns the session it belonged to.
-fn keep_recent<T>(
-    items: &mut Vec<(SessionId, T)>,
-    session: SessionId,
-    item: T,
-    max: usize,
-) -> Option<SessionId> {
-    items.push((session, item));
-    (items.len() > max).then(|| items.remove(0).0)
 }
 
 /// Ends a turn: expires its open prompts, records its result, finishes it.

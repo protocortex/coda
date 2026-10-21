@@ -19,7 +19,7 @@ use coda_providers::claude_session::{
     AdapterError, CancelHandle, ClaudeSession, SessionSpec, TurnOutcome,
 };
 use coda_providers::codex::{
-    CodexLaunch, CodexSession, CodexSessionError, SandboxError, SandboxMode, SpawnHook,
+    Carried, CodexLaunch, CodexSession, CodexSessionError, SandboxError, SandboxMode, SpawnHook,
     resolve_sandbox,
 };
 use coda_providers::detect::DetectedBinary;
@@ -228,8 +228,8 @@ pub struct CodexStart {
     pub cwd: PathBuf,
     pub session_id: SessionId,
     pub resume: Option<String>,
-    /// Whether earlier turns exist that an app-server thread cannot see.
-    pub continued: bool,
+    /// The earlier conversation, which a new app-server thread cannot see.
+    pub carried: Carried,
     pub parent_env: Vec<(OsString, OsString)>,
     /// Directory that holds the child's pidfile.
     pub pidfile_dir: PathBuf,
@@ -261,7 +261,7 @@ pub async fn start_codex_session(start: CodexStart) -> Result<CodexSession, Star
         sandbox: start.settings.sandbox,
         verified_versions: start.settings.verified_versions,
         binary_verified: start.settings.binary_verified,
-        continued: start.continued,
+        carried: start.carried,
         parent_env: start.parent_env,
     };
     Ok(CodexSession::start(launch, Some(record_pid)).await?)
@@ -290,6 +290,32 @@ impl AgentSession {
         match self {
             Self::Claude(session) => session.cancel_handle(),
             Self::Codex(session) => session.cancel_handle(),
+        }
+    }
+
+    /// The backend child's process id, until it has been reaped.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Claude(session) => session.pid(),
+            Self::Codex(session) => session.pid(),
+        }
+    }
+
+    /// Whether the session is a running server that can take another turn.
+    pub fn is_reusable(&mut self) -> bool {
+        match self {
+            Self::Claude(_) => false,
+            Self::Codex(session) => session.is_reusable(),
+        }
+    }
+
+    /// Whether a crashed turn may be started again from its prompt.
+    #[must_use]
+    pub fn restartable(&self) -> bool {
+        match self {
+            Self::Claude(_) => true,
+            Self::Codex(session) => session.restartable(),
         }
     }
 
@@ -346,7 +372,7 @@ mod tests {
 
     use coda_protocol::types::{BackendKind, SessionId};
     use coda_providers::backend::AgentBackend;
-    use coda_providers::codex::SandboxError;
+    use coda_providers::codex::{Carried, SandboxError};
     use coda_providers::codex_exec::SandboxMode;
     use coda_store::Store;
 
@@ -480,7 +506,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             session_id: SessionId::new("s-1"),
             resume: None,
-            continued: false,
+            carried: Carried::Nothing,
             parent_env: Vec::new(),
             pidfile_dir: dir.path().to_path_buf(),
         }

@@ -9,13 +9,18 @@
 
 use coda_protocol::events::{
     APPROVALS_UNAVAILABLE_KIND, APPROVE_KIND, BACKEND_CRASHED_KIND, COMPACTION_KIND, DENY_KIND,
-    RESULT_KIND, STREAM_DELTA_KIND, TIMEOUT_KIND, TURN_INTERRUPTED_KIND, USAGE_KIND,
+    HISTORY_NOT_RESTORED_KIND, RESULT_KIND, STREAM_DELTA_KIND, TIMEOUT_KIND, TURN_INTERRUPTED_KIND,
+    USAGE_KIND,
 };
 use coda_protocol::types::{OriginalId, SessionId};
 use coda_store::{Store, StoreError, StoredEvent};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
+
+mod transcript;
+
+pub use self::transcript::Transcript;
 
 use crate::compact::{SUMMARY_UNAVAILABLE, summary_message};
 use crate::prompt::{Conversation, Message, Prefix, ToolCall};
@@ -49,6 +54,7 @@ const BOOKKEEPING_KINDS: &[&str] = &[
     BACKEND_CRASHED_KIND,
     CONTEXT_OVERFLOW_KIND,
     DENY_KIND,
+    HISTORY_NOT_RESTORED_KIND,
     MODEL_SWITCHED_KIND,
     PERMISSION_REQUEST_KIND,
     RESULT_KIND,
@@ -192,10 +198,7 @@ impl Rebuild {
         for event in &page {
             self.apply(event, &lookup);
         }
-        Ok(match page.last() {
-            Some(last) if page.len() == PAGE_SIZE as usize => Some(last.seq),
-            _ => None,
-        })
+        Ok(next_after(&page))
     }
 
     /// Ends the last send and returns the conversation.
@@ -332,6 +335,14 @@ fn resolve(id: &str, lookup: ResultLookup<'_>) -> Option<String> {
 
 /// Parses the body of a known kind; a body that does not fit is skipped with a
 /// warning that names the event, never its content.
+/// Where the next page starts: after the last event of a full page, else nowhere.
+fn next_after(page: &[StoredEvent]) -> Option<u64> {
+    match page.last() {
+        Some(last) if page.len() == PAGE_SIZE as usize => Some(last.seq),
+        _ => None,
+    }
+}
+
 fn parse<T: for<'de> Deserialize<'de>>(event: &StoredEvent) -> Option<T> {
     match serde_json::from_str(&event.body) {
         Ok(body) => Some(body),
