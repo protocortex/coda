@@ -109,6 +109,12 @@ pub(crate) mod capture {
     pub(crate) fn install() -> (Spans, DefaultGuard) {
         let spans = Spans::default();
         let guard = tracing::subscriber::set_default(Registry::default().with(spans.clone()));
+        // With a single live subscriber, tracing rebuilds callsite interest from
+        // the calling thread's default alone, so a parallel test hitting a span
+        // with no subscriber caches it as disabled for the whole process. A
+        // process-wide subscriber keeps every callsite enabled.
+        let _ = tracing::subscriber::set_global_default(Registry::default());
+        tracing::callsite::rebuild_interest_cache();
         (spans, guard)
     }
 }
