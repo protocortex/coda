@@ -4,7 +4,7 @@
 //! records every decision, and waits for a client on a prompt verdict.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -280,17 +280,29 @@ impl Broker {
         let Some((repo, tool, cwd, pattern)) = self.grant_fields(request) else {
             return Ok(false);
         };
+        // Grants saved with the path spelled as the agent sent it still apply.
+        let spelled = grant_pattern(
+            &request.tool,
+            request.command.as_deref(),
+            &request.target_paths,
+        );
         let found = self
             .with_store(move |store| {
-                store.lookup_grant(&GrantKey {
-                    repo_path: &repo,
-                    tool: &tool,
-                    cwd: &cwd,
-                    pattern: &pattern,
-                })
+                for pattern in [&pattern, &spelled] {
+                    let key = GrantKey {
+                        repo_path: &repo,
+                        tool: &tool,
+                        cwd: &cwd,
+                        pattern,
+                    };
+                    if store.lookup_grant(&key)?.is_some() {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             })
             .await?;
-        Ok(found.is_some())
+        Ok(found)
     }
 
     /// Repo, tool, cwd and pattern, the exact fields a grant is keyed by.
@@ -309,7 +321,7 @@ impl Broker {
             grant_pattern(
                 &request.tool,
                 request.command.as_deref(),
-                &request.target_paths,
+                &relative_targets(&request.target_paths, &cwd),
             ),
         ))
     }
@@ -465,6 +477,34 @@ fn parse_grant(entry: &str) -> Result<(String, String), BrokerError> {
             entry: entry.to_owned(),
         }),
     }
+}
+
+/// The targets spelled relative to `cwd` when they lie under it, so a grant
+/// written as `edit:src/a.rs` also covers the absolute path a delegated agent
+/// sends. A path that cannot be shown to lie under `cwd` is kept as given.
+fn relative_targets(targets: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
+    targets
+        .iter()
+        .map(|target| {
+            if target.is_relative() {
+                return target.clone();
+            }
+            // A file that exists is resolved whole, so a symlink to a file
+            // elsewhere is not mistaken for its in-repo name; a new file has
+            // only its directory resolved.
+            let resolved = std::fs::canonicalize(target).unwrap_or_else(|_| {
+                match (target.parent(), target.file_name()) {
+                    (Some(parent), Some(name)) => canonical(parent).join(name),
+                    _ => target.clone(),
+                }
+            });
+            resolved
+                .strip_prefix(cwd)
+                .ok()
+                .filter(|inside| !inside.components().any(|c| c == Component::ParentDir))
+                .map_or_else(|| target.clone(), Path::to_path_buf)
+        })
+        .collect()
 }
 
 /// `path` canonicalized, or as given when it cannot be resolved.
@@ -849,6 +889,124 @@ mod tests {
             broker.verdict(&fixture.bash("cargo test")).await.unwrap(),
             Verdict::Allow
         );
+    }
+
+    #[tokio::test]
+    async fn a_relative_edit_grant_covers_the_absolute_path_a_delegated_agent_sends() {
+        // Arrange
+        let fixture = Fixture::new();
+        let mut config = fixture.config("/ws", PermissionMode::Prompt);
+        config.grants = vec!["edit:src/a.rs".to_owned()];
+        let broker = fixture.broker(config).await;
+        let cwd = fixture.real("/ws/x");
+        let absolute = |path: &str| ToolRequest {
+            tool: Tool::Edit,
+            target_paths: vec![cwd.join(path)],
+            command: None,
+            cwd: cwd.clone(),
+        };
+
+        // Act
+        let granted = broker.verdict(&absolute("src/a.rs")).await.unwrap();
+        let other = broker.verdict(&absolute("src/b.rs")).await.unwrap();
+
+        // Assert
+        assert_eq!(granted, Verdict::Allow);
+        assert_eq!(other, Verdict::Prompt);
+    }
+
+    fn edit_at(cwd: &Path, target: PathBuf) -> ToolRequest {
+        ToolRequest {
+            tool: Tool::Edit,
+            target_paths: vec![target],
+            command: None,
+            cwd: cwd.to_path_buf(),
+        }
+    }
+
+    async fn broker_granting(fixture: &Fixture, grant: &str) -> Broker {
+        let mut config = fixture.config("/ws", PermissionMode::Prompt);
+        config.grants = vec![grant.to_owned()];
+        fixture.broker(config).await
+    }
+
+    #[tokio::test]
+    async fn an_absolute_edit_grant_keeps_covering_the_same_absolute_path() {
+        // Arrange
+        let fixture = Fixture::new();
+        let cwd = fixture.real("/ws/x");
+        let target = cwd.join("src/a.rs");
+        let broker = broker_granting(&fixture, &format!("edit:{}", target.display())).await;
+
+        // Act
+        let verdict = broker.verdict(&edit_at(&cwd, target)).await.unwrap();
+
+        // Assert
+        assert_eq!(verdict, Verdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn an_edit_grant_never_covers_a_path_outside_the_working_directory() {
+        // Arrange
+        let fixture = Fixture::new();
+        let cwd = fixture.real("/ws/x");
+        let broker = broker_granting(&fixture, "edit:src/a.rs").await;
+        let outside = fixture.real("/other");
+        std::fs::write(outside.join("a.rs"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, cwd.join("src")).unwrap();
+        let cases = [
+            ("elsewhere on disk", PathBuf::from("/etc/src/a.rs")),
+            ("another repository", fixture.real("/other/src/a.rs")),
+            ("a sibling through ..", cwd.join("../y/src/a.rs")),
+            ("far above through ..", cwd.join("../../../../etc/src/a.rs")),
+            ("a symlinked parent", cwd.join("src/a.rs")),
+        ];
+
+        for (name, target) in cases {
+            // Act
+            let verdict = broker.verdict(&edit_at(&cwd, target)).await.unwrap();
+
+            // Assert
+            assert_ne!(verdict, Verdict::Allow, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_edit_grant_does_not_cover_a_request_from_an_unknown_directory() {
+        // Arrange
+        let fixture = Fixture::new();
+        let broker = broker_granting(&fixture, "edit:src/a.rs").await;
+        let missing = fixture.real("/ws/x/missing");
+
+        // Act
+        let verdict = broker
+            .verdict(&edit_at(&missing, missing.join("src/a.rs")))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(verdict, Verdict::Prompt);
+    }
+
+    #[tokio::test]
+    async fn a_symlink_to_a_file_outside_the_repo_does_not_match_a_grant_on_its_name() {
+        // Arrange
+        let fixture = Fixture::new();
+        let cwd = fixture.real("/ws/x");
+        let broker = broker_granting(&fixture, "edit:src/a.rs").await;
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        let secret = fixture.real("/other/secret.rs");
+        std::fs::write(&secret, b"x").unwrap();
+        std::os::unix::fs::symlink(&secret, cwd.join("src/a.rs")).unwrap();
+
+        // Act
+        let verdict = broker
+            .verdict(&edit_at(&cwd, cwd.join("src/a.rs")))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_ne!(verdict, Verdict::Allow);
     }
 
     #[tokio::test]

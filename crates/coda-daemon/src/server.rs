@@ -388,6 +388,8 @@ async fn read_requests(
         let read = match read {
             Ok(Ok(0)) => return,
             Ok(Ok(n)) => n,
+            // A client following a turn only listens, so it is not idle.
+            Err(_) if connection.is_subscribed() => continue,
             Err(_) => {
                 debug!("closing an idle connection");
                 return;
@@ -910,6 +912,30 @@ mod tests {
 
         // Assert
         assert_eq!(message, None);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_subscribed_connection_is_not_closed_for_sending_no_requests() {
+        // Arrange
+        let dir = short_dir();
+        let mut config = config(&dir, own_uid(&dir));
+        config.timing.idle_timeout = Duration::from_millis(100);
+        let (hub, session, _data) = hub_with_events(8, &[]).await;
+        let server = TestServer::serve(Server::bind(config.clone()).unwrap().with_hub(hub));
+        let mut client = TestClient::connect(&config).await;
+        client
+            .send(&subscribe_request(1, &session, &json!(0)))
+            .await;
+        assert!(client.recv().await.is_some());
+
+        // Act
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        client.send(&ping(2)).await;
+        let answer = client.recv().await;
+
+        // Assert
+        assert!(matches!(answer, Some(Message::Response(_))));
         server.stop().await;
     }
 
