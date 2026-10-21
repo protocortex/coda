@@ -222,7 +222,7 @@ fn the_readme_has_the_account_risk_notice() {
 
 fn flags_in(text: &str) -> BTreeSet<String> {
     text.lines()
-        .filter(|line| !line.contains("cargo "))
+        .filter(|line| !line.contains("cargo ") && !line.contains("curl "))
         .flat_map(|line| line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')))
         .filter(|word| {
             word.starts_with("--")

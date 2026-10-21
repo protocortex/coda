@@ -14,6 +14,26 @@ Coda has not verified that the Anthropic terms allow this use of the `claude` bi
 
 The claude_code and codex backends stay disabled until you enable them. Set `enabled = true` under `[providers.claude_code]` or `[providers.codex]` only after you have read the terms. The `anthropic`, `openai_compat` and `faux` providers use an API key or a script, not a subscription.
 
+## Install
+
+Install a release build into `~/.local/bin`. The script downloads the archive for your platform (Linux or macOS, x86_64 or arm64), checks it against the release `SHA256SUMS`, and installs it. It never uses `sudo`. Set `CODA_INSTALL_DIR` to install elsewhere and `CODA_VERSION` to pick another release.
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/protocortex/coda/v0.1.0/scripts/install.sh | sh
+```
+
+Or build the same tag from source:
+
+```sh
+cargo install --locked --git https://github.com/protocortex/coda --tag v0.1.0 coda-cli
+```
+
+`SHA256SUMS` comes from the same release as the archive, so it detects a corrupted download, not tampering. To tie an archive to this repository's release workflow, check its attestation with the GitHub CLI:
+
+```sh
+gh attestation verify coda-0.1.0-x86_64-unknown-linux-gnu.tar.gz -R protocortex/coda
+```
+
 ## Build
 
 You need a stable Rust toolchain. The repository pins one in `rust-toolchain.toml`.

@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # A dry run: builds the archives and keeps them as workflow artifacts only.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: rustup show
+      - id: check
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "coda-cli") | .version')
+          [ -n "$version" ] || { echo "::error::could not read the workspace version"; exit 1; }
+
+          if [ "$REF_TYPE" = tag ]; then
+            [ "$REF_NAME" = "v$version" ] || {
+              echo "::error::tag $REF_NAME does not match the workspace version $version"
+              exit 1
+            }
+            git merge-base --is-ancestor HEAD origin/main || {
+              echo "::error::tag $REF_NAME is not on the main branch"
+              exit 1
+            }
+            if grep -qE "^## \[$version\] - Unreleased" CHANGELOG.md; then
+              echo "::error::CHANGELOG.md section for $version is still marked Unreleased"
+              exit 1
+            fi
+          fi
+
+          grep -qE "^## \[$version\]" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # macos-13 is retired, so Intel macOS is cross-built from arm64.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - run: rustup target add "$TARGET"
+      - run: cargo build --locked --release -p coda-cli --target "$TARGET"
+      - name: Package the archive
+        run: |
+          name="coda-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/coda" LICENSE NOTICE README.md "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coda-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: coda-*
+          merge-multiple: true
+          path: dist
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Extract the release notes
+        run: |
+          awk -v header="## [$VERSION]" '
+            index($0, header) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found && /^\[[^]]+\]: / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "::error::empty release notes for $VERSION"; exit 1; }
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS
+          --verify-tag --title "coda $VERSION" --notes-file notes.md
