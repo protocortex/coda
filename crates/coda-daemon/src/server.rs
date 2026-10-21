@@ -524,8 +524,8 @@ mod tests {
     }
 
     impl TestServer {
-        fn start(config: ServerConfig) -> Self {
-            Self::serve(Server::bind(config).unwrap())
+        fn start(config: &ServerConfig) -> Self {
+            Self::serve(crate::lock::retry_while_held(|| Server::bind(config.clone())).unwrap())
         }
 
         fn serve(bound: BoundServer) -> Self {
@@ -658,7 +658,7 @@ mod tests {
         drop(std::os::unix::net::UnixListener::bind(&config.socket_path).unwrap());
 
         // Act
-        let server = TestServer::start(config.clone());
+        let server = TestServer::start(&config);
 
         // Assert
         let mut client = TestClient::connect(&config).await;
@@ -706,7 +706,7 @@ mod tests {
         // Arrange
         let dir = short_dir();
         let config = config(&dir, own_uid(&dir));
-        let server = TestServer::start(config.clone());
+        let server = TestServer::start(&config);
         let mut client = TestClient::connect(&config).await;
 
         // Act
@@ -726,7 +726,7 @@ mod tests {
         // Arrange
         let dir = short_dir();
         let config = config(&dir, own_uid(&dir));
-        let server = TestServer::start(config.clone());
+        let server = TestServer::start(&config);
         let mut client = TestClient::connect(&config).await;
         let mut bytes = encode_frame(ping(1).to_string().as_bytes()).unwrap();
         bytes.extend(encode_frame(ping(2).to_string().as_bytes()).unwrap());
@@ -759,7 +759,7 @@ mod tests {
         // Arrange
         let dir = short_dir();
         let config = config(&dir, own_uid(&dir));
-        let server = TestServer::start(config.clone());
+        let server = TestServer::start(&config);
         let mut client = TestClient::connect(&config).await;
         let cases = [
             (b"{oops".to_vec(), PARSE_ERROR),
@@ -793,7 +793,7 @@ mod tests {
         // Arrange
         let dir = short_dir();
         let config = config(&dir, own_uid(&dir));
-        let server = TestServer::start(config.clone());
+        let server = TestServer::start(&config);
         let mut dropped = TestClient::connect(&config).await;
         dropped.send_raw(&[0, 0, 0, 9, b'{']).await;
 
@@ -812,7 +812,7 @@ mod tests {
         // Arrange
         let dir = short_dir();
         let config = config(&dir, own_uid(&dir));
-        let server = TestServer::start(config.clone());
+        let server = TestServer::start(&config);
         let mut client = TestClient::connect(&config).await;
 
         // Act
@@ -831,7 +831,7 @@ mod tests {
         // Arrange
         let dir = short_dir();
         let config = config(&dir, own_uid(&dir));
-        let server = TestServer::start(config.clone());
+        let server = TestServer::start(&config);
         let mut client = TestClient::connect(&config).await;
         client.send(&ping(1)).await;
         client.recv().await;
@@ -841,7 +841,7 @@ mod tests {
 
         // Assert
         assert!(!config.socket_path.exists());
-        assert!(Server::bind(config).is_ok());
+        assert!(crate::lock::retry_while_held(|| Server::bind(config.clone())).is_ok());
     }
 
     #[tokio::test]
@@ -904,7 +904,7 @@ mod tests {
         let dir = short_dir();
         let mut config = config(&dir, own_uid(&dir));
         config.timing.idle_timeout = Duration::from_millis(30);
-        let server = TestServer::start(config.clone());
+        let server = TestServer::start(&config);
         let mut client = TestClient::connect(&config).await;
 
         // Act
@@ -945,7 +945,7 @@ mod tests {
         let dir = short_dir();
         let mut config = config(&dir, own_uid(&dir));
         config.max_connections = 1;
-        let server = TestServer::start(config.clone());
+        let server = TestServer::start(&config);
         let mut first = TestClient::connect(&config).await;
         first.send(&ping(1)).await;
         assert!(first.recv().await.is_some());
@@ -1075,7 +1075,7 @@ mod tests {
         // Arrange
         let dir = short_dir();
         let config = config(&dir, own_uid(&dir));
-        let server = TestServer::start(config.clone());
+        let server = TestServer::start(&config);
         let mut client = TestClient::connect(&config).await;
 
         // Act

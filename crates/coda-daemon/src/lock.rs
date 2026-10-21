@@ -56,6 +56,27 @@ impl InstanceLock {
     }
 }
 
+/// Retries `attempt` while a lock or socket this test just released is still held. A child forked by a
+/// concurrent test inherits every open descriptor until it execs, so a released
+/// lock or closed listener can stay live for a few milliseconds.
+#[cfg(test)]
+pub(crate) fn retry_while_held<T>(
+    mut attempt: impl FnMut() -> Result<T, crate::server::ServerError>,
+) -> Result<T, crate::server::ServerError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match attempt() {
+            Err(
+                crate::server::ServerError::Lock(LockError::AlreadyRunning { .. })
+                | crate::server::ServerError::SocketInUse { .. },
+            ) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,7 +118,7 @@ mod tests {
         drop(InstanceLock::acquire(&path).unwrap());
 
         // Act
-        let again = InstanceLock::acquire(&path);
+        let again = retry_while_held(|| Ok(InstanceLock::acquire(&path)?));
 
         // Assert
         assert!(again.is_ok());
