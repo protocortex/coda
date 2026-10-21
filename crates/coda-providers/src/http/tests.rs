@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::{
-    BaseUrlError, IdleWatch, KeySource, MAX_ERROR_BODY_BYTES, TransportWording, build_client,
+    BaseUrlError, Idle, IdleWatch, KeySource, MAX_ERROR_BODY_BYTES, TransportWording, build_client,
     is_retryable_status, validate_base_url,
 };
-use crate::model::{ProviderError, SystemClock, TokioSleeper};
+use crate::model::{Clock, ProviderError, SystemClock, TokioSleeper};
 
 const WORDING: TransportWording = TransportWording {
     idle: "idle",
@@ -227,4 +227,37 @@ fn a_key_header_is_sensitive_and_a_bad_key_is_named_by_variable_only() {
     let message = refused.to_string();
     assert!(message.contains("MY_KEY"));
     assert!(!message.contains("bad"));
+}
+
+/// A clock that follows tokio's paused time.
+struct PausedClock {
+    origin: Instant,
+    started: tokio::time::Instant,
+}
+
+impl PausedClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            started: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl Clock for PausedClock {
+    fn now(&self) -> Instant {
+        self.origin + self.started.elapsed()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_future_is_given_up_on_once_the_idle_timeout_passes() {
+    // Arrange
+    let watch = IdleWatch::new(TokioSleeper, PausedClock::new(), Duration::from_millis(500));
+
+    // Act
+    let result = watch.within_idle(std::future::pending::<()>()).await;
+
+    // Assert
+    assert!(matches!(result, Err(Idle)));
 }

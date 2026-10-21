@@ -27,6 +27,8 @@ use crate::model::{
     StreamItem, SystemClock, TokioSleeper,
 };
 
+/// The Display text of `BaseUrlError` no longer carries the provider name;
+/// the provider adds it ("the Anthropic ...").
 pub use crate::http::{BaseUrlError, IDLE_CHECK_INTERVAL, validate_base_url};
 
 /// Events buffered between the network task and the consumer.
