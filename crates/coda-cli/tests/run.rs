@@ -359,3 +359,92 @@ async fn the_prompt_is_read_from_input_when_the_flag_is_missing() {
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
     assert_eq!(outcome.out, "heard\n");
 }
+
+/// A home whose config enables the delegated Claude Code backend, played by `fake-claude`.
+fn claude_rig(extra: &str) -> Rig {
+    let home = short_dir();
+    let work = short_dir();
+    let fake = coda_testkit::paths::fake_claude_path().unwrap();
+    let config = format!(
+        "[providers.claude_code]\nenabled = true\nbinary = {:?}\n\n{extra}",
+        fake.display().to_string()
+    );
+    std::fs::write(home.path().join("config.toml"), config).unwrap();
+    let ctx = context(home.path());
+    Rig {
+        _stop: StopDaemon::new(home.path()),
+        home,
+        work,
+        ctx,
+    }
+}
+
+async fn run_prompt(rig: &Rig, prompt: &str) -> Outcome {
+    let cwd = rig.work.path().display().to_string();
+    cli(
+        &rig.ctx,
+        &["coda", "run", "--prompt", prompt, "--cwd", &cwd],
+        "",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_delegated_backend_that_keeps_crashing_ends_the_run_with_exit_five() {
+    // Arrange
+    let rig = claude_rig("[timing]\nrestart_backoff_ms = 10\n");
+
+    // Act
+    let outcome = run_prompt(&rig, "please crash").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::from(5), "{}", outcome.err);
+    assert!(outcome.err.contains("coda:"), "{}", outcome.err);
+}
+
+#[tokio::test]
+async fn an_interrupted_delegated_run_exits_four() {
+    // Arrange
+    let rig = claude_rig("");
+    let stdout = std::fs::File::create(rig.home.path().join("run.out")).unwrap();
+    let stderr = std::fs::File::create(rig.home.path().join("run.err")).unwrap();
+    let mut child = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_coda"))
+            .args(["run", "--prompt", "please stall", "--cwd"])
+            .arg(rig.work.path())
+            .env("CODA_HOME", rig.home.path())
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .unwrap(),
+    );
+    let client = connect(rig.home.path()).await;
+    tokio::time::timeout(WAIT, async {
+        while running_session(&client).await.is_none() {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("the send never reached the daemon");
+
+    // Act
+    let interrupted = Command::new("kill")
+        .args(["-INT", &child.0.id().to_string()])
+        .status()
+        .unwrap();
+    let status = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                return status;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("coda run did not exit after the interrupt");
+
+    // Assert
+    assert!(interrupted.success());
+    assert_eq!(status.code(), Some(4), "{status:?}");
+}

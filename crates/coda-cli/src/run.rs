@@ -39,6 +39,7 @@ const CLAUDE_CODE_KEY: &str = "claude_code";
 const CODEX_KEY: &str = "codex";
 const STREAM_DELTA_KIND: &str = "stream_delta";
 const RESULT_KIND: &str = "result";
+const TURN_INTERRUPTED_KIND: &str = "turn_interrupted";
 
 /// How long an interrupted run waits for the daemon to answer the send, and
 /// then, separately, for it to end the turn. A second Ctrl-C ends either wait.
@@ -61,6 +62,8 @@ struct EventParams {
 struct Finish {
     condition: Option<String>,
     failed: bool,
+    /// The daemon cut the turn short instead of reporting a result.
+    cut_short: bool,
 }
 
 /// Runs the prompt, from `--prompt` or else standard input, in a new session
@@ -271,7 +274,23 @@ async fn follow(
                             writeln!(io.out)?;
                         }
                         let failed = body["is_error"].as_bool().unwrap_or(true);
-                        return Ok(Finish { condition, failed });
+                        return Ok(Finish {
+                            condition,
+                            failed,
+                            cut_short: false,
+                        });
+                    }
+                    // A delegated backend that is cancelled or goes silent ends
+                    // its turn this way, with no result event after it.
+                    TURN_INTERRUPTED_KIND => {
+                        if printed {
+                            writeln!(io.out)?;
+                        }
+                        return Ok(Finish {
+                            condition: interrupted.then(|| CANCELLED.to_owned()),
+                            failed: true,
+                            cut_short: true,
+                        });
                     }
                     _ => {}
                 }
@@ -326,15 +345,17 @@ async fn deny(client: &Client, params: Value) -> Result<(), CliError> {
 }
 
 fn report(finish: &Finish, io: &mut Io<'_>) -> std::io::Result<ExitCode> {
-    let code = match finish.condition.as_deref() {
-        Some(condition) => exit_code(condition),
-        None => exit::RUN_OTHER,
+    // A delegated backend reports a result without a stop condition.
+    let code = match (finish.condition.as_deref(), finish.failed) {
+        (Some(condition), _) => exit_code(condition),
+        (None, false) => exit::RUN_END_TURN,
+        (None, true) => exit::RUN_OTHER,
     };
     if code == exit::RUN_OTHER {
-        let reason = match (&finish.condition, finish.failed) {
+        let reason = match (&finish.condition, finish.cut_short) {
             (Some(condition), _) => format!("the run stopped: {condition}"),
-            (None, true) => "the run failed; see the daemon log".to_owned(),
-            (None, false) => "the run ended without a stop reason".to_owned(),
+            (None, true) => "the run was cut short; see the daemon log".to_owned(),
+            (None, false) => "the run failed; see the daemon log".to_owned(),
         };
         writeln!(io.err, "coda: {reason}")?;
     }

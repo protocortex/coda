@@ -66,8 +66,9 @@ them to coda's broker; the copy is a git repository, which `codex exec`
 requires. Codex also runs its own tool loop.
 
 `--backend claude-code` writes `[providers.claude_code]` with `enabled = true`
-and so runs the delegated backend: the `claude` binary found on `PATH`, signed
-in as you, under your subscription. No API key is needed and the key check is
+and `[timing] idle_timeout_ms = 600000` (Claude Code does not announce the tool
+it runs unasked, so a long `cargo test` would trip the 60 second default), and so runs the delegated backend: the `claude` binary
+found on `PATH`, signed in as you, under your subscription. No API key is needed and the key check is
 skipped. The run is headless use of Claude Code, which the user confirmed
 (OI-1); the account risk notice in
 [README](../README.md#account-risk-notice) applies to it.

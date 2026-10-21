@@ -478,6 +478,16 @@ impl Connection {
         )
     }
 
+    /// Whether this connection follows a session.
+    #[must_use]
+    pub fn is_subscribed(&self) -> bool {
+        self.hub.as_ref().is_some_and(|hub| {
+            hub.sessions()
+                .values()
+                .any(|entries| entries.iter().any(|e| e.connection == self.id))
+        })
+    }
+
     /// A connection with no hub behind it; subscribing fails.
     #[must_use]
     pub fn detached() -> (Self, Outbox) {
