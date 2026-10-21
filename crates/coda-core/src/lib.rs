@@ -5,6 +5,7 @@
 pub mod broker;
 pub mod budget;
 pub mod economy;
+pub mod history;
 pub mod prompt;
 pub mod tools;
 pub mod turn;

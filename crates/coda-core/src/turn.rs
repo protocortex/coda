@@ -28,11 +28,11 @@ use crate::economy::{cap_ends, compact};
 use crate::prompt::{Conversation, Message, ToolCall};
 
 /// What the model is told about a call that never ran because the turn stopped.
-const SKIPPED: &str = "not run: the turn stopped before this call";
+pub(crate) const SKIPPED: &str = "not run: the turn stopped before this call";
 /// Arguments assumed for a call that streamed none, as no-argument tools do.
-const EMPTY_ARGUMENTS: &str = "{}";
+pub(crate) const EMPTY_ARGUMENTS: &str = "{}";
 /// Stored for a send that ended before the model replied, so roles keep alternating.
-const NO_REPLY: &str = "[no reply: the turn stopped early]";
+pub(crate) const NO_REPLY: &str = "[no reply: the turn stopped early]";
 /// What the model is told about a call whose permission prompt was cancelled.
 const PROMPT_CANCELLED: &str = "not run: the turn was cancelled while asking permission";
 /// Name of the span around one model call.
@@ -89,8 +89,19 @@ pub enum TurnEvent {
     ToolFinished {
         /// The tool that was called.
         tool: String,
+        /// The call this answers.
+        call_id: String,
+        /// What the model was told.
+        text: String,
         /// True when the model got an error back.
         is_error: bool,
+    },
+    /// The model replied; this is the assistant message added to the history.
+    Assistant {
+        /// The answer text.
+        text: String,
+        /// The calls it made.
+        tool_calls: Vec<ToolCall>,
     },
     /// A model call finished and used these tokens.
     Usage(Usage),
@@ -307,6 +318,10 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             } else {
                 reply.text
             };
+            self.emit(TurnEvent::Assistant {
+                text: text.clone(),
+                tool_calls: calls.clone(),
+            });
             self.conversation.push(Message::Assistant {
                 text,
                 tool_calls: calls.clone(),
@@ -424,6 +439,8 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             };
             self.emit(TurnEvent::ToolFinished {
                 tool: call.name.clone(),
+                call_id: call.id.clone(),
+                text: outcome.text.clone(),
                 is_error: outcome.is_error,
             });
             self.conversation.push(Message::ToolResult {

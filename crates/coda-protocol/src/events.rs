@@ -14,6 +14,22 @@ use crate::types::{RequestId, SessionId, TokenUsage, TurnId};
 pub const EVENT_NOTIFICATION: &str = "session.event";
 /// Stored event kind of a permission request that ended without an answer.
 pub const TIMEOUT_KIND: &str = "timeout";
+/// Stored event kind of an approved permission request.
+pub const APPROVE_KIND: &str = "approve";
+/// Stored event kind of a denied permission request.
+pub const DENY_KIND: &str = "deny";
+/// Stored event kind of a finished turn.
+pub const RESULT_KIND: &str = "result";
+/// Stored event kind of a turn's token usage.
+pub const USAGE_KIND: &str = "usage";
+/// Stored event kind of the notice that approvals cannot be answered.
+pub const APPROVALS_UNAVAILABLE_KIND: &str = "approvals_unavailable";
+/// Stored event kind of a piece of streamed model text.
+pub const STREAM_DELTA_KIND: &str = "stream_delta";
+/// Stored event kind of a backend process that ended unexpectedly.
+pub const BACKEND_CRASHED_KIND: &str = "backend_crashed";
+/// Stored event kind of a turn that was cut short.
+pub const TURN_INTERRUPTED_KIND: &str = "turn_interrupted";
 
 /// One event of a session.
 ///
@@ -113,6 +129,35 @@ mod tests {
     use super::*;
     use crate::types::{RequestId, SessionId, TurnId};
     use serde_json::json;
+
+    #[test]
+    fn the_kind_constants_name_the_variants_they_stand_for() {
+        // Arrange
+        let kinds = [
+            TIMEOUT_KIND,
+            APPROVE_KIND,
+            DENY_KIND,
+            RESULT_KIND,
+            USAGE_KIND,
+            APPROVALS_UNAVAILABLE_KIND,
+            STREAM_DELTA_KIND,
+            BACKEND_CRASHED_KIND,
+            TURN_INTERRUPTED_KIND,
+        ];
+
+        for kind in kinds {
+            // Act
+            let fields = json!({
+                "type": kind, "session_id": "s", "request_id": "r", "tool": "t",
+                "turn_id": "t", "is_error": false, "reason": "x", "text": "",
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            });
+            let event: Event = serde_json::from_value(fields).unwrap();
+
+            // Assert
+            assert_eq!(serde_json::to_value(&event).unwrap()["type"], kind);
+        }
+    }
 
     #[test]
     fn approval_outcomes_carry_only_ids_and_tool_name() {

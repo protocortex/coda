@@ -766,6 +766,32 @@ async fn the_tool_output_canary_is_content_in_originals_and_nowhere_else() {
     assert_eq!(rig.bodies("tool_finished").await[0]["is_error"], false);
 }
 
+#[tokio::test]
+async fn the_tool_argument_canary_is_content_in_originals_and_nowhere_else() {
+    // Arrange
+    let canary = "CANARY-TOOL-ARGUMENT-0b7d13";
+    let edit = json!({"path": "a.txt", "old_string": "needle", "new_string": canary});
+    let calls = tool_turn(&[("c1", "edit", edit)]);
+    let mut rig = Rig::new(Mode::AcceptEdits, &[calls, text_turn("done")]);
+
+    // Act
+    rig.send("change it").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let db = rig.db();
+    assert!(dump(&db, "originals").contains(canary), "originals control");
+    for table in ["events", "event_log", "usage", "turns"] {
+        assert!(!dump(&db, table).contains(canary), "{table} holds the file");
+    }
+    let stored = rig.bodies("assistant_message").await;
+    assert!(
+        stored[0]["tool_calls"][0]["arguments"].is_string(),
+        "{stored:?}"
+    );
+}
+
 fn indexed_symbols(rig: &Rig, name: &str) -> i64 {
     rig.db()
         .query_row(
