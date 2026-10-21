@@ -119,6 +119,8 @@ pub struct ProviderConfig {
     pub verified_versions: Vec<String>,
     /// Script file replayed by the `faux` backend.
     pub script: Option<PathBuf>,
+    /// File the `faux` backend appends one JSON line per model request to.
+    pub request_log: Option<PathBuf>,
     /// API root of a model provider; the provider's own default when unset.
     pub base_url: Option<String>,
     /// Model a session uses when it names none.

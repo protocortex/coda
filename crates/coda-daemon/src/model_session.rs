@@ -16,11 +16,10 @@ use std::time::Duration;
 use coda_config::config::{Config, ProviderConfig};
 use coda_core::broker::BrokerError;
 use coda_core::history::{
-    ASSISTANT_MESSAGE_KIND, TOOL_FINISHED_KIND, assistant_body, empty_text_id, tool_finished_body,
+    ASSISTANT_MESSAGE_KIND, Rebuild, TOOL_FINISHED_KIND, assistant_body, empty_text_id,
+    tool_finished_body,
 };
-pub use coda_core::history::{
-    CONTEXT_OVERFLOW_KIND, CONVERSATION_RESET_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND,
-};
+pub use coda_core::history::{CONTEXT_OVERFLOW_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND};
 use coda_core::prompt::{Conversation, Prefix, PromptError};
 use coda_core::tools::{BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index};
 use coda_core::turn::{CancelToken, TurnConfig, TurnEvent, TurnLoop};
@@ -74,6 +73,8 @@ pub enum ModelError {
     Prompt(#[from] PromptError),
     #[error(transparent)]
     Broker(#[from] BrokerError),
+    #[error(transparent)]
+    Hub(#[from] HubError),
 }
 
 /// Why a session could not be switched to another model.
@@ -221,7 +222,7 @@ impl ModelSessions {
         let id = session.clone();
         let record = self.hub.with_store(move |s| s.load_session(&id)).await?;
         info!(session = %session, step = "build_loop", "preparing the model session");
-        let (model_loop, rebuilt) = self.loop_for_send(&record, limits).await?;
+        let model_loop = self.loop_for_send(&record, limits).await?;
         info!(session = %session, step = "begin_turn", "recording the user message");
         let turn = match Turns::begin(&self.hub, &session, &text).await {
             Ok(turn) => turn,
@@ -236,11 +237,6 @@ impl ModelSessions {
         let cancel = model_loop.turn_loop.cancel_token();
         cancel.reset();
         slot.arm((cancel, turn.clone()));
-        if rebuilt {
-            let body = json!({});
-            let reset = publish_kind(&self.hub, &session, &turn, CONVERSATION_RESET_KIND, &body);
-            log_failure(reset.await);
-        }
         self.keep_prompt(&session, &text).await;
         let span = backend_span(&session, &turn, backend_name(record.backend));
         let sessions = Arc::clone(self);
@@ -259,12 +255,11 @@ impl ModelSessions {
     ///
     /// The steps: reserve the session so no send can start, resolve the alias
     /// and build its client to prove it is usable, store the resolved model id,
-    /// drop the idle conversation and record the switch. The conversation does
-    /// not carry over: the next send starts a new one with a fresh prefix, which
-    /// the `conversation_reset` event marks, while the send limits of the
-    /// dropped loop are kept for it. The alias name lives only in the switch
-    /// event, so a later change to the aliases cannot reinterpret the stored
-    /// model. Only `session` is touched.
+    /// drop the idle loop and record the switch. The next send builds a new loop
+    /// with a fresh prefix and the history rebuilt from the stored events, and
+    /// keeps the send limits of the dropped loop. The alias name lives only in
+    /// the switch event, so a later change to the aliases cannot reinterpret the
+    /// stored model. Only `session` is touched.
     ///
     /// # Errors
     /// Returns [`SwitchError::Busy`] while a send runs,
@@ -314,7 +309,6 @@ impl ModelSessions {
             "alias": alias,
             "provider": backend_name(record.backend),
             "model": target.model,
-            "conversation": "reset",
         });
         log_failure(publish_kind(&self.hub, session, &turn, MODEL_SWITCHED_KIND, &body).await);
         let id = session.clone();
@@ -386,12 +380,6 @@ impl ModelSessions {
         }
     }
 
-    async fn has_history(&self, session: &SessionId) -> bool {
-        let id = session.clone();
-        let load = move |s: &coda_store::Store| s.load_events(&id, 0, 1);
-        self.hub.with_store(load).await.is_ok_and(|e| !e.is_empty())
-    }
-
     fn reserve(self: &Arc<Self>, session: &SessionId) -> Result<Slot, TurnError> {
         self.reserve_as(session, Reservation::default())
     }
@@ -455,15 +443,15 @@ impl ModelSessions {
         }
     }
 
-    /// The idle loop of the session, or a new one and whether it replaces a
-    /// conversation that had history.
+    /// The idle loop of the session, or a new one that continues from the
+    /// history the session stored.
     async fn loop_for_send(
         &self,
         record: &SessionRecord,
         limits: Limits,
-    ) -> Result<(ModelLoop, bool), ModelError> {
+    ) -> Result<ModelLoop, ModelError> {
         if let Some(model_loop) = self.take_loop(&record.id) {
-            return Ok((model_loop, false));
+            return Ok(model_loop);
         }
         let limits = lock(&self.carried_limits)
             .get(&record.id)
@@ -471,7 +459,33 @@ impl ModelSessions {
             .unwrap_or(limits);
         let built = self.build(record, limits).await?;
         lock(&self.carried_limits).remove(&record.id);
-        Ok((built, self.has_history(&record.id).await))
+        Ok(built)
+    }
+
+    /// Rebuilds the conversation one page of events at a time, so the store is
+    /// free for other users between pages.
+    async fn stored_conversation(
+        &self,
+        session: &SessionId,
+        prefix: Prefix,
+    ) -> Result<Conversation, HubError> {
+        let mut rebuild = Rebuild::new(prefix);
+        let mut after = 0;
+        loop {
+            let id = session.clone();
+            let (back, next) = self
+                .hub
+                .with_store(move |store| {
+                    let next = rebuild.apply_page(store, &id, after)?;
+                    Ok((rebuild, next))
+                })
+                .await?;
+            rebuild = back;
+            match next {
+                Some(last) => after = last,
+                None => return Ok(rebuild.finish()),
+            }
+        }
     }
 
     async fn build(&self, record: &SessionRecord, limits: Limits) -> Result<ModelLoop, ModelError> {
@@ -492,6 +506,7 @@ impl ModelSessions {
             StoreOriginals::new(self.hub.store_handle(), record.id.clone()),
         )?;
         let prefix = Prefix::new(SYSTEM_PROMPT, tools.schemas, "")?;
+        let conversation = self.stored_conversation(&record.id, prefix).await?;
         let turn = Arc::new(Mutex::new(TurnId::new(NO_TURN)));
         let broker = self
             .brokers
@@ -504,7 +519,7 @@ impl ModelSessions {
             gate,
             tools.tools,
             self.hub.store_handle(),
-            Conversation::new(prefix),
+            conversation,
             TurnConfig {
                 session: record.id.clone(),
                 cwd: PathBuf::from(&record.cwd),

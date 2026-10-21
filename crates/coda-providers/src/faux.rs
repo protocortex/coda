@@ -4,16 +4,22 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use coda_config::config::Config;
 use serde::Deserialize;
+use serde_json::{Value, json};
 
-use crate::model::{ModelEvent, ModelProvider, ModelRequest, ModelStream, ProviderError};
+use crate::model::{
+    ModelEvent, ModelProvider, ModelRequest, ModelStream, ProviderError, RequestMessage,
+};
 
 const CONFIG_KEY: &str = "faux";
+/// The request log holds conversation content, so only its owner reads it.
+const REQUEST_LOG_MODE: u32 = 0o600;
 
 /// Largest script file accepted, in bytes.
 pub const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
@@ -63,6 +69,7 @@ pub enum FauxError {
 #[derive(Debug)]
 pub struct FauxProvider {
     turns: Mutex<VecDeque<Turn>>,
+    request_log: Option<PathBuf>,
 }
 
 impl FauxProvider {
@@ -71,7 +78,16 @@ impl FauxProvider {
     pub fn new(turns: Vec<Turn>) -> Self {
         Self {
             turns: Mutex::new(turns.into()),
+            request_log: None,
         }
+    }
+
+    /// Appends one JSON line per request to `path`, so a test can see what the
+    /// model was sent.
+    #[must_use]
+    pub fn with_request_log(mut self, path: PathBuf) -> Self {
+        self.request_log = Some(path);
+        self
     }
 
     /// Builds a provider from the script named by `providers.faux.script`.
@@ -80,12 +96,17 @@ impl FauxProvider {
     /// Returns [`FauxError::NoScript`] when no script is configured, or the
     /// errors of [`FauxProvider::from_script_file`].
     pub fn from_config(config: &Config) -> Result<Self, FauxError> {
-        let script = config
-            .providers
-            .get(CONFIG_KEY)
+        let section = config.providers.get(CONFIG_KEY);
+        let script = section
             .and_then(|section| section.script.as_deref())
             .ok_or(FauxError::NoScript)?;
-        Self::from_script_file(script)
+        let provider = Self::from_script_file(script)?;
+        Ok(
+            match section.and_then(|section| section.request_log.clone()) {
+                Some(path) => provider.with_request_log(path),
+                None => provider,
+            },
+        )
     }
 
     /// Builds a provider from a JSON file holding a list of turns.
@@ -129,6 +150,26 @@ impl FauxProvider {
 }
 
 impl FauxProvider {
+    fn log_request(&self, request: &ModelRequest) -> Result<(), ProviderError> {
+        let Some(path) = &self.request_log else {
+            return Ok(());
+        };
+        let line =
+            json!({ "messages": request.messages.iter().map(message_json).collect::<Vec<_>>() });
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(REQUEST_LOG_MODE)
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{line}"))
+            .map_err(|error| ProviderError::Fatal {
+                message: format!(
+                    "cannot write the faux request log {}: {error}",
+                    path.display()
+                ),
+            })
+    }
+
     fn open(&self) -> Result<ModelStream, ProviderError> {
         let turn = self.next_turn()?;
         let (sender, stream) = ModelStream::channel(turn.events.len() + 1);
@@ -147,9 +188,28 @@ impl FauxProvider {
 impl ModelProvider for FauxProvider {
     fn stream(
         &self,
-        _request: ModelRequest,
+        request: ModelRequest,
     ) -> impl Future<Output = Result<ModelStream, ProviderError>> + Send {
-        std::future::ready(self.open())
+        std::future::ready(self.log_request(&request).and_then(|()| self.open()))
+    }
+}
+
+fn message_json(message: &RequestMessage) -> Value {
+    match message {
+        RequestMessage::User(text) => json!({ "role": "user", "text": text }),
+        RequestMessage::Assistant { text, tool_calls } => json!({
+            "role": "assistant",
+            "text": text,
+            "tool_calls": tool_calls
+                .iter()
+                .map(|call| json!({ "id": call.id, "name": call.name, "arguments": call.arguments }))
+                .collect::<Vec<_>>(),
+        }),
+        RequestMessage::ToolResult {
+            call_id,
+            text,
+            is_error,
+        } => json!({ "role": "tool", "call_id": call_id, "text": text, "is_error": is_error }),
     }
 }
 

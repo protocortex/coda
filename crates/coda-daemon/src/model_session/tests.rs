@@ -15,7 +15,7 @@ use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::{CONVERSATION_RESET_KIND, EnvReader, ModelSessions, keep_recent, lock};
+use super::{EnvReader, MAX_IDLE_LOOPS, ModelSessions, keep_recent, lock};
 use crate::dispatch::Dispatcher;
 use crate::gate::Brokers;
 use crate::state::DaemonState;
@@ -23,11 +23,13 @@ use crate::subscribe::{Connection, Hub, Outbox};
 use crate::trace::capture::{Spans, install};
 use crate::turn::{BACKEND_UNSUPPORTED, TurnConfig, Turns};
 use crate::watchdog::Timing;
+use coda_core::history::CONVERSATION_RESET_KIND;
 use coda_core::turn::{CancelToken, PROVIDER_CALL_SPAN, TOOL_CALL_SPAN};
 
 const WAIT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(20);
 const QUEUE: usize = 256;
+const REQUEST_LOG: &str = "requests.jsonl";
 const PROMPT_CANARY: &str = "CANARY-PROMPT-7f3a91";
 /// The first original a fresh store hands out is the prompt of the first send.
 const PROMPT_ORIGINAL_ID: &str = "1";
@@ -99,6 +101,7 @@ impl Rig {
             ProviderConfig {
                 enabled,
                 script: Some(script_path),
+                request_log: Some(data.path().join(REQUEST_LOG)),
                 ..ProviderConfig::default()
             },
         );
@@ -156,8 +159,24 @@ impl Rig {
     }
 
     async fn send(&mut self, text: &str) -> Value {
-        let params = json!({"session_id": self.session, "text": text});
+        let session = self.session.clone();
+        self.send_as(&session, text).await
+    }
+
+    async fn send_as(&mut self, session: &SessionId, text: &str) -> Value {
+        let params = json!({"session_id": session, "text": text});
         self.call("session.send", params).await
+    }
+
+    /// The messages of every request the faux provider received, oldest first.
+    fn requests(&self) -> Vec<Vec<Value>> {
+        let log = std::fs::read_to_string(self.data.path().join(REQUEST_LOG)).unwrap_or_default();
+        log.lines()
+            .map(|line| {
+                let request: Value = serde_json::from_str(line).unwrap();
+                request["messages"].as_array().unwrap().clone()
+            })
+            .collect()
     }
 
     async fn events(&self) -> Vec<StoredEvent> {
@@ -241,8 +260,12 @@ impl Rig {
     }
 
     async fn wait_until_idle(&self) {
+        self.wait_idle(&self.session).await;
+    }
+
+    async fn wait_idle(&self, session: &SessionId) {
         tokio::time::timeout(WAIT, async {
-            while self.turns.is_running(&self.session) {
+            while self.turns.is_running(session) {
                 tokio::time::sleep(POLL).await;
             }
         })
@@ -603,7 +626,7 @@ async fn a_panic_in_the_session_task_ends_the_turn_and_the_next_send_starts_over
     // Assert
     assert_eq!(rig.bodies("result").await[0]["is_error"], true);
     assert_eq!(after_first, (0, 0, 0));
-    assert_eq!(rig.bodies(CONVERSATION_RESET_KIND).await.len(), 1);
+    assert_eq!(rig.bodies(CONVERSATION_RESET_KIND).await.len(), 0);
 }
 
 #[test]
@@ -624,23 +647,72 @@ fn the_oldest_conversation_is_evicted_once_more_than_the_maximum_are_kept() {
     assert_eq!(names, ["2", "3"]);
 }
 
-#[tokio::test]
-async fn only_a_rebuilt_session_with_history_stores_a_conversation_reset() {
-    // Arrange
-    let mut rig = Rig::new(Mode::Default, &[text_turn("one"), text_turn("two")]);
+fn user_message(text: &str) -> Value {
+    json!({"role": "user", "text": text})
+}
 
-    // Act
+fn assistant_message(text: &str, tool_calls: &Value) -> Value {
+    json!({"role": "assistant", "text": text, "tool_calls": tool_calls})
+}
+
+#[tokio::test]
+async fn a_rebuilt_loop_continues_with_the_stored_history_and_stores_no_reset() {
+    // Arrange
+    let calls = tool_turn(&[("c1", "read", json!({"path": "a.txt"}))]);
+    let mut rig = Rig::new(Mode::Default, &[calls, text_turn("done")]);
     rig.send("first").await;
     rig.wait_for_results(1).await;
     rig.wait_until_idle().await;
-    let after_first = rig.bodies(CONVERSATION_RESET_KIND).await.len();
     lock(&rig.turns.models.loops).clear();
+
+    // Act
     rig.send("second").await;
     rig.wait_for_results(2).await;
 
     // Assert
-    assert_eq!(after_first, 0, "a new session has nothing to reset");
-    assert_eq!(rig.bodies(CONVERSATION_RESET_KIND).await.len(), 1);
+    let read_call = json!([{"id": "c1", "name": "read", "arguments": "{\"path\":\"a.txt\"}"}]);
+    let history = vec![
+        user_message("first"),
+        assistant_message("", &read_call),
+        json!({"role": "tool", "call_id": "c1", "text": "one needle here\n", "is_error": false}),
+        assistant_message("done", &json!([])),
+        user_message("second"),
+    ];
+    assert_eq!(rig.requests()[2], history);
+    assert_eq!(rig.bodies(CONVERSATION_RESET_KIND).await.len(), 0);
+}
+
+#[tokio::test]
+async fn a_conversation_evicted_from_the_idle_cache_continues_with_its_history() {
+    // Arrange
+    let mut rig = Rig::new(Mode::Default, &[text_turn("one")]);
+    let first = rig.session.clone();
+    rig.send_as(&first, "remember me").await;
+    rig.wait_idle(&first).await;
+    for _ in 0..MAX_IDLE_LOOPS {
+        let other = rig.other_session().await;
+        rig.send_as(&other, "filler").await;
+        rig.wait_idle(&other).await;
+    }
+    let evicted = !lock(&rig.turns.models.loops)
+        .iter()
+        .any(|(id, _)| *id == first);
+
+    // Act
+    rig.send_as(&first, "again").await;
+    rig.wait_idle(&first).await;
+
+    // Assert
+    assert!(evicted, "the first conversation should be out of the cache");
+    let sent = rig.requests();
+    assert_eq!(
+        sent.last().unwrap(),
+        &vec![
+            user_message("remember me"),
+            assistant_message("one", &json!([])),
+            user_message("again"),
+        ]
+    );
 }
 
 #[tokio::test]

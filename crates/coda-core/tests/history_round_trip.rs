@@ -13,9 +13,13 @@ use coda_core::history::{
 use coda_core::prompt::{Conversation, Message, Prefix};
 use coda_core::turn::{StopCondition, ToolSet, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::types::{BackendKind, Mode, OriginalId, PermissionDecision, SessionId, TurnId};
+use coda_providers::anthropic::request::{RequestSettings, build_body as anthropic_body};
 use coda_providers::faux::{FauxProvider, Turn};
 use coda_providers::gate::PermissionGate;
-use coda_providers::model::{ModelEvent, StopReason};
+use coda_providers::model::{
+    ModelEvent, ModelProvider, ModelRequest, ModelStream, ProviderError, StopReason,
+};
+use coda_providers::openai_compat::request::build_body as openai_body;
 use coda_providers::tool_request::ToolRequest;
 use coda_store::{NewSession, Store, StoredEvent};
 use coda_tools::{Tool, ToolError, ToolOutput};
@@ -228,4 +232,83 @@ async fn a_replayed_cancelled_send_equals_the_conversation_the_live_loop_held() 
     let live = rig.turn_loop.conversation().messages().to_vec();
     assert_eq!(live.len(), 2, "{live:?}");
     assert_eq!(rig.replayed(), live);
+}
+
+/// Remembers the last request it was sent, then answers from the script.
+struct Capturing {
+    inner: FauxProvider,
+    last: Arc<Mutex<ModelRequest>>,
+}
+
+impl ModelProvider for Capturing {
+    fn stream(
+        &self,
+        request: ModelRequest,
+    ) -> impl Future<Output = Result<ModelStream, ProviderError>> + Send {
+        *self.last.lock().unwrap() = request.clone();
+        self.inner.stream(request)
+    }
+}
+
+#[tokio::test]
+async fn a_replayed_history_is_valid_for_both_wire_formats() {
+    // Arrange
+    let mut rig = Rig::new(vec![tool_turn(&[("c1", "{}")]), text_turn("done")]);
+    rig.send("use the tool").await;
+    let last = Arc::default();
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("data")).unwrap();
+    let session = store
+        .create_session(&NewSession {
+            backend: BackendKind::Faux,
+            model: None,
+            cwd: "/ws".to_owned(),
+            mode: Mode::default(),
+        })
+        .unwrap();
+    let lookup = |id: &OriginalId| {
+        rig.originals
+            .get(id.as_str().parse::<usize>().ok()?)
+            .cloned()
+    };
+    let replayed = rebuild(prefix(), &rig.stored, &lookup);
+    let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+    let mut resumed = TurnLoop::new(
+        Capturing {
+            inner: FauxProvider::new(vec![text_turn("again")]),
+            last: Arc::clone(&last),
+        },
+        AllowAll,
+        ToolSet::new(),
+        Arc::new(Mutex::new(store)),
+        replayed,
+        config(session),
+        sender,
+    );
+
+    // Act
+    resumed.send("and once more").await.unwrap();
+
+    // Assert
+    let request = last.lock().unwrap().clone();
+    let settings = RequestSettings {
+        model: "m".to_owned(),
+        max_tokens: 64,
+        system: String::new(),
+        tools: Vec::new(),
+    };
+    let anthropic = anthropic_body(&settings, &request);
+    let openai = openai_body(&settings, &request);
+    assert_eq!(
+        anthropic["messages"][2]["content"][0]["type"],
+        "tool_result"
+    );
+    assert_eq!(
+        anthropic["messages"][2]["content"][0]["content"],
+        CANNED_OUTPUT
+    );
+    assert_eq!(openai["messages"][3]["role"], "tool");
+    assert_eq!(openai["messages"][3]["content"], CANNED_OUTPUT);
+    assert_eq!(anthropic["messages"].as_array().unwrap().len(), 5);
+    assert_eq!(openai["messages"].as_array().unwrap().len(), 6);
 }
