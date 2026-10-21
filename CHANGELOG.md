@@ -6,6 +6,10 @@ All notable changes to Coda are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A release workflow that builds, checksums and attests the `coda` archives for Linux and macOS, and an `install.sh` that verifies the checksum before installing.
+
 ## [0.1.0] - Unreleased
 
 First release.
