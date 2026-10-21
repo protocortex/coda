@@ -148,8 +148,8 @@ pub enum Message {
     },
 }
 
-/// A prefix plus the messages exchanged so far. Messages are only appended,
-/// so earlier ones never change.
+/// A prefix plus the messages exchanged so far. Messages are appended, and
+/// only compaction replaces the oldest ones.
 #[derive(Debug, Clone)]
 pub struct Conversation {
     prefix: Prefix,
@@ -169,6 +169,16 @@ impl Conversation {
     /// Appends a message.
     pub fn push(&mut self, message: Message) {
         self.messages.push(message);
+    }
+
+    /// Replaces the oldest `count` messages with `message`. Returns false and
+    /// changes nothing when `count` is zero or more than the conversation holds.
+    pub fn replace_prefix(&mut self, count: usize, message: Message) -> bool {
+        if count == 0 || count > self.messages.len() {
+            return false;
+        }
+        self.messages.splice(..count, [message]);
+        true
     }
 
     /// The prefix.

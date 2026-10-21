@@ -698,6 +698,27 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
         TurnEvent::ContextOverflow => {
             publish_kind(hub, session, turn, CONTEXT_OVERFLOW_KIND, &json!({})).await
         }
+        TurnEvent::Compaction {
+            summary,
+            replaced,
+            kept,
+            ack,
+        } => {
+            let Some(summary) = keep_original(hub, session, &summary).await else {
+                ack.confirm(false);
+                return;
+            };
+            let compaction = Event::Compaction {
+                session_id: session.clone(),
+                turn_id: turn.clone(),
+                summary,
+                replaced_messages: u32::try_from(replaced).unwrap_or(u32::MAX),
+                kept_messages: u32::try_from(kept).unwrap_or(u32::MAX),
+            };
+            let stored = store_event(hub, session, turn, &compaction).await;
+            ack.confirm(stored.is_ok());
+            stored
+        }
     };
     log_failure(stored);
 }

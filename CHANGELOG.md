@@ -17,6 +17,7 @@ First release.
 - The daemon, its Unix socket protocol and the commands `run`, `status`, `ping`, `grant`, `usage` and `doctor`.
 - Providers `claude_code`, `codex`, `anthropic`, `openai_compat` and `faux`, all off until enabled in `config.toml`.
 - Release-versioned database migrations: a database written by a newer release is refused.
+- A `compaction` event in the protocol and the session log. `PROTOCOL_VERSION` stays 1, as it did when `turn_interrupted` was added: the daemon and its clients ship together.
 
 [Unreleased]: https://github.com/protocortex/coda/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/protocortex/coda/releases/tag/v0.1.0

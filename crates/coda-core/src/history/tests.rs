@@ -3,12 +3,13 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use coda_protocol::events::STREAM_DELTA_KIND;
+use coda_protocol::events::{COMPACTION_KIND, STREAM_DELTA_KIND};
 use coda_protocol::types::{OriginalId, TurnId};
 use coda_store::StoredEvent;
 use serde_json::{Value, json};
 
 use super::*;
+use crate::compact::SUMMARY_UNAVAILABLE;
 use crate::prompt::{Message, Prefix, ToolCall};
 
 #[derive(Clone, Default)]
@@ -402,4 +403,80 @@ fn bookkeeping_events_are_not_worth_a_warning() {
 
     // Assert
     assert_eq!(logs, "");
+}
+
+/// A compaction whose summary text is kept under an id that is the text itself.
+fn compaction(summary: &str, replaced: u32) -> (&'static str, Value) {
+    (
+        COMPACTION_KIND,
+        json!({
+            "type": "compaction", "session_id": "s", "turn_id": "t", "summary": summary,
+            "replaced_messages": replaced, "kept_messages": 0,
+        }),
+    )
+}
+
+fn summary_user(summary: &str) -> Message {
+    Message::User(crate::compact::summary_message(summary))
+}
+
+#[test]
+fn a_compaction_replaces_the_older_messages_with_the_labelled_summary() {
+    // Arrange
+    let events = [
+        user("one"),
+        assistant("first", &[]),
+        user("two"),
+        assistant("second", &[]),
+        user("three"),
+        compaction("they did one and two", 4),
+        assistant("third", &[]),
+    ];
+
+    // Act
+    let messages = replay(&events);
+
+    // Assert
+    assert_eq!(
+        messages,
+        [
+            summary_user("they did one and two"),
+            Message::User("three".to_owned()),
+            text_reply("third"),
+        ]
+    );
+}
+
+#[test]
+fn a_compaction_whose_summary_is_gone_leaves_a_note_in_its_place() {
+    // Arrange
+    let events = [
+        user("one"),
+        assistant("first", &[]),
+        user("two"),
+        compaction(GONE, 2),
+    ];
+
+    // Act
+    let messages = replay(&events);
+
+    // Assert
+    assert_eq!(messages[0], summary_user(SUMMARY_UNAVAILABLE));
+    assert_eq!(messages[1], Message::User("two".to_owned()));
+}
+
+#[test]
+fn a_compaction_that_replaces_more_than_exists_is_skipped_with_a_warning() {
+    // Arrange
+    let events = [user("one"), compaction("s", 9), assistant("first", &[])];
+
+    // Act
+    let (messages, logs) = replay_logged(&events);
+
+    // Assert
+    assert_eq!(
+        messages,
+        [Message::User("one".to_owned()), text_reply("first")]
+    );
+    assert!(logs.contains("skipped a compaction"), "{logs}");
 }

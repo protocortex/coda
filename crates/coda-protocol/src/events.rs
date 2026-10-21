@@ -8,7 +8,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{RequestId, SessionId, TokenUsage, TurnId};
+use crate::types::{OriginalId, RequestId, SessionId, TokenUsage, TurnId};
 
 /// Notification method that wraps an [`Event`].
 pub const EVENT_NOTIFICATION: &str = "session.event";
@@ -30,6 +30,8 @@ pub const STREAM_DELTA_KIND: &str = "stream_delta";
 pub const BACKEND_CRASHED_KIND: &str = "backend_crashed";
 /// Stored event kind of a turn that was cut short.
 pub const TURN_INTERRUPTED_KIND: &str = "turn_interrupted";
+/// Stored event kind of older messages replaced by a summary.
+pub const COMPACTION_KIND: &str = "compaction";
 
 /// One event of a session.
 ///
@@ -122,6 +124,20 @@ pub enum Event {
         /// The interrupted turn.
         turn_id: TurnId,
     },
+    /// The oldest messages of a conversation were replaced by a summary of them.
+    /// The summary text is kept in the session's originals, never in the event.
+    Compaction {
+        /// Session of the turn.
+        session_id: SessionId,
+        /// The turn that compacted.
+        turn_id: TurnId,
+        /// Where the summary text is kept.
+        summary: OriginalId,
+        /// How many of the oldest messages the summary replaced.
+        replaced_messages: u32,
+        /// How many recent messages were kept as they were.
+        kept_messages: u32,
+    },
 }
 
 #[cfg(test)]
@@ -143,6 +159,7 @@ mod tests {
             STREAM_DELTA_KIND,
             BACKEND_CRASHED_KIND,
             TURN_INTERRUPTED_KIND,
+            COMPACTION_KIND,
         ];
 
         for kind in kinds {
@@ -151,6 +168,7 @@ mod tests {
                 "type": kind, "session_id": "s", "request_id": "r", "tool": "t",
                 "turn_id": "t", "is_error": false, "reason": "x", "text": "",
                 "usage": {"input_tokens": 0, "output_tokens": 0},
+                "summary": "1", "replaced_messages": 0, "kept_messages": 0,
             });
             let event: Event = serde_json::from_value(fields).unwrap();
 
@@ -175,6 +193,28 @@ mod tests {
         assert_eq!(
             value,
             json!({"type":"deny","session_id":"s-1","request_id":"r-1","tool":"Bash"})
+        );
+    }
+
+    #[test]
+    fn compaction_carries_a_reference_and_counts_but_no_text() {
+        // Arrange
+        let event = Event::Compaction {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new("t-1"),
+            summary: OriginalId::new("7"),
+            replaced_messages: 12,
+            kept_messages: 5,
+        };
+
+        // Act
+        let value = serde_json::to_value(&event).unwrap();
+
+        // Assert
+        assert_eq!(
+            value,
+            json!({"type":"compaction","session_id":"s-1","turn_id":"t-1",
+                   "summary":"7","replaced_messages":12,"kept_messages":5})
         );
     }
 
