@@ -8,9 +8,12 @@
 //! `docs/live-recording.md`. File change approvals and `turn/interrupt` were not
 //! seen live, and the `fake-codex` the other tests use is still synthetic.
 //!
-//! Known limit: cancelling a turn kills the server's
-//! process group and closes the session. `turn/interrupt` is not used, so a
-//! cancelled turn cannot be followed by another on the same session.
+//! A denied approval answers `decline`, else `cancel`, from the request's
+//! `availableDecisions`; when neither is offered, or the field is not a list,
+//! the turn is ended with `turn/interrupt`. Cancelling a turn from the client
+//! also kills the server's process group and closes the session. A server that
+//! does not end an interrupted or cancelled turn within a short time is killed
+//! too, so a denial never leaves the turn waiting.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
@@ -20,6 +23,7 @@ use std::pin::pin;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 
 use coda_protocol::events::Event;
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
@@ -28,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, timeout_at};
 use tracing::{debug, warn};
 
 use crate::claude_session::{
@@ -61,6 +65,10 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const MAX_TRACKED_ITEMS: usize = 1024;
 const ACCEPT: &str = "accept";
 const DECLINE: &str = "decline";
+const CANCEL: &str = "cancel";
+const INTERRUPT_METHOD: &str = "turn/interrupt";
+/// How long a server gets to end an interrupted or cancelled turn before its group is killed.
+const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Why the adapter could not do what was asked.
 #[derive(Debug, thiserror::Error)]
@@ -207,6 +215,47 @@ impl Message {
     }
 }
 
+/// What `answer` leaves the turn doing.
+enum Flow {
+    Go,
+    /// The approval was answered `cancel`, so the server should end the turn.
+    Cancelled,
+    /// The connection ended while the gate was deciding.
+    Lost,
+    /// The turn was interrupted instead of answered.
+    Ended,
+}
+
+/// How an approval request is answered.
+enum Reply {
+    Decision(&'static str),
+    Interrupt,
+}
+
+/// Accepts what the gate allowed. A denial uses `decline`, else `cancel`, as the
+/// server offers them; with neither it interrupts, because any other value is
+/// not one the server listed. Only a request without the field gets the default
+/// `decline`; a field that is not a list cannot be trusted, so it interrupts too.
+fn reply_for(allowed: bool, params: &Value) -> Reply {
+    if allowed {
+        return Reply::Decision(ACCEPT);
+    }
+    let Some(field) = params.get("availableDecisions") else {
+        return Reply::Decision(DECLINE);
+    };
+    let Some(offered) = field.as_array() else {
+        return Reply::Interrupt;
+    };
+    let offers = |name: &str| offered.iter().any(|decision| decision == name);
+    if offers(DECLINE) {
+        Reply::Decision(DECLINE)
+    } else if offers(CANCEL) {
+        Reply::Decision(CANCEL)
+    } else {
+        Reply::Interrupt
+    }
+}
+
 /// A Codex thread served by one `codex app-server` process.
 #[derive(Debug)]
 pub struct CodexAppServerSession {
@@ -222,6 +271,8 @@ pub struct CodexAppServerSession {
     drift: Option<String>,
     next_id: u64,
     items: HashMap<String, Item>,
+    /// The server's id for the turn in flight, which `turn/interrupt` names.
+    server_turn: Option<String>,
     /// Messages that arrived while an approval was pending.
     queued: VecDeque<Message>,
     closed: bool,
@@ -279,6 +330,7 @@ impl CodexAppServerSession {
             drift,
             next_id: 0,
             items: HashMap::new(),
+            server_turn: None,
             queued: VecDeque::new(),
             closed: false,
         })
@@ -414,8 +466,27 @@ impl CodexAppServerSession {
     ) -> Result<Option<TurnOutcome>, AppServerError> {
         let params = json!({"threadId": self.thread_id, "input": [{"type": "text", "text": text}]});
         let turn_request = self.send_request("turn/start", params).await?;
+        self.server_turn = None;
         let mut usage = None;
-        while let Some(message) = self.next_message().await? {
+        // Set once a `cancel` answer promised that the server ends the turn.
+        let mut deadline: Option<Instant> = None;
+        loop {
+            let message = match deadline {
+                None => self.next_message().await?,
+                Some(deadline) => {
+                    if let Ok(message) = timeout_at(deadline, self.next_message()).await {
+                        message?
+                    } else {
+                        warn!("the Codex app-server did not end the cancelled turn; killing it");
+                        self.stop().await?;
+                        emit(self.result(turn_id, true));
+                        return Ok(Some(TurnOutcome::Completed { is_error: true }));
+                    }
+                }
+            };
+            let Some(message) = message else {
+                return Ok(None);
+            };
             match message {
                 Message::Notification { method, params } => {
                     if let Some(is_error) = self.notify(&method, &params, turn_id, &mut usage, emit)
@@ -424,9 +495,22 @@ impl CodexAppServerSession {
                     }
                 }
                 Message::Request { id, method, params } => {
-                    if !self.answer(&id, &method, &params, gate, emit).await? {
-                        return Ok(None);
+                    match self.answer(&id, &method, &params, gate, emit).await? {
+                        Flow::Go => {}
+                        Flow::Cancelled => deadline = Some(Instant::now() + INTERRUPT_TIMEOUT),
+                        Flow::Lost => return Ok(None),
+                        Flow::Ended => {
+                            emit(self.result(turn_id, true));
+                            return Ok(Some(TurnOutcome::Completed { is_error: true }));
+                        }
                     }
+                }
+                Message::Response {
+                    id,
+                    failed: false,
+                    result,
+                } if id == turn_request => {
+                    self.server_turn = result["turn"]["id"].as_str().map(str::to_owned);
                 }
                 Message::Response {
                     id, failed: true, ..
@@ -437,7 +521,6 @@ impl CodexAppServerSession {
                 Message::Response { .. } => {}
             }
         }
-        Ok(None)
     }
 
     /// Handles one notification; returns the turn's error flag once the turn ended.
@@ -499,7 +582,6 @@ impl CodexAppServerSession {
     }
 
     /// Answers a server request: approvals go to the gate, anything else is refused.
-    /// Returns `false` when the connection ended while the gate was deciding.
     async fn answer<G: PermissionGate>(
         &mut self,
         id: &Value,
@@ -507,11 +589,11 @@ impl CodexAppServerSession {
         params: &Value,
         gate: &G,
         emit: &mut impl FnMut(Event),
-    ) -> Result<bool, AppServerError> {
+    ) -> Result<Flow, AppServerError> {
         let Some(request) = self.tool_request(method, params) else {
             let error = json!({"code": METHOD_NOT_FOUND, "message": "method not supported"});
             self.send(&json!({"id": id, "error": error})).await?;
-            return Ok(true);
+            return Ok(Flow::Go);
         };
         // Never prompt for something the user cannot see.
         let decision = if shows_nothing(&request) {
@@ -523,7 +605,7 @@ impl CodexAppServerSession {
         } else {
             match self.decide(gate, &request).await? {
                 Some(decision) => decision,
-                None => return Ok(false),
+                None => return Ok(Flow::Lost),
             }
         };
         let allowed = matches!(
@@ -548,10 +630,49 @@ impl CodexAppServerSession {
                 tool,
             }
         });
-        let verdict = if allowed { ACCEPT } else { DECLINE };
-        self.send(&json!({"id": id, "result": {"decision": verdict}}))
-            .await?;
-        Ok(true)
+        match reply_for(allowed, params) {
+            Reply::Decision(decision) => {
+                self.send(&json!({"id": id, "result": {"decision": decision}}))
+                    .await?;
+                Ok(if decision == CANCEL {
+                    Flow::Cancelled
+                } else {
+                    Flow::Go
+                })
+            }
+            Reply::Interrupt => {
+                self.interrupt(params["turnId"].as_str()).await?;
+                Ok(Flow::Ended)
+            }
+        }
+    }
+
+    /// Asks the server to end the turn and waits for it to say so. A server that
+    /// does not answer in time has its process group killed, so it is never left
+    /// blocked on a request. `turn` overrides the turn id the server announced.
+    async fn interrupt(&mut self, turn: Option<&str>) -> Result<(), AppServerError> {
+        let turn = turn.map(str::to_owned).or_else(|| self.server_turn.clone());
+        if let Some(turn) = turn {
+            let params = json!({"threadId": self.thread_id, "turnId": turn});
+            self.send_request(INTERRUPT_METHOD, params).await?;
+            if let Ok(Ok(true)) = timeout(INTERRUPT_TIMEOUT, self.until_turn_ended()).await {
+                return Ok(());
+            }
+        }
+        warn!("the Codex app-server did not end the interrupted turn; killing it");
+        self.stop().await?;
+        Ok(())
+    }
+
+    /// Reads until the turn ends; `false` when the connection ended first.
+    async fn until_turn_ended(&mut self) -> Result<bool, AppServerError> {
+        while let Some(message) = self.next_message().await? {
+            if matches!(&message, Message::Notification { method, .. } if method == "turn/completed")
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Waits for the gate while still reading the socket, so pings are answered and a
@@ -959,7 +1080,23 @@ mod tests {
     }
 
     #[test]
-    fn the_live_declined_approval_is_answered_decline_and_the_turn_still_completes() {
+    fn a_denial_of_the_live_approval_cancels_because_it_offers_no_decline() {
+        // Arrange
+        let received = live_messages(LIVE_DECLINE, "recv");
+        let request = received
+            .iter()
+            .find(|m| m["method"] == "item/commandExecution/requestApproval")
+            .expect("the transcript holds a command approval request");
+
+        // Act
+        let reply = reply_for(false, &request["params"]);
+
+        // Assert
+        assert!(matches!(reply, Reply::Decision(CANCEL)));
+    }
+
+    #[test]
+    fn the_recorded_pre_change_answer_to_the_live_declined_approval_replays_as_decline() {
         // Arrange
         let (received, sent) = (
             live_messages(LIVE_DECLINE, "recv"),

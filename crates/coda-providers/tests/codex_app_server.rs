@@ -258,6 +258,151 @@ async fn a_declined_command_approval_answers_decline_and_the_turn_reports_it() {
     assert_eq!(seen[0].command.as_deref(), Some("rm -rf build"));
 }
 
+/// Denies one command approval that offered `offered`; returns the answer the server saw.
+async fn denial_answer(offered: Value) -> Value {
+    let fixture = Fixture::new(&json!({"available_decisions": offered}));
+    let mut session = fixture.session().await;
+    let gate = FixedGate::new(PermissionDecision::Deny);
+    let (result, _) = try_turn(&mut session, &gate, "approve-command").await;
+    assert_eq!(result.unwrap(), TurnOutcome::Completed { is_error: false });
+    fixture.report()["approval_response"].clone()
+}
+
+#[tokio::test]
+async fn a_denial_declines_when_decline_is_offered() {
+    // Arrange
+    let offered = json!(["accept", "decline", "cancel"]);
+
+    // Act
+    let answer = denial_answer(offered).await;
+
+    // Assert
+    assert_eq!(answer, json!({"decision": "decline"}));
+}
+
+#[tokio::test]
+async fn a_denial_cancels_when_decline_is_not_offered() {
+    // Arrange
+    let offered = json!(["accept", {"acceptWithExecpolicyAmendment": {}}, "cancel"]);
+
+    // Act
+    let answer = denial_answer(offered).await;
+
+    // Assert
+    assert_eq!(answer, json!({"decision": "cancel"}));
+}
+
+/// Denies one approval whose `availableDecisions` is `field`; returns the fake's report.
+async fn report_after_denial_with(field: Value) -> Value {
+    let fixture = Fixture::new(&json!({"available_decisions": field}));
+    let mut session = fixture.session().await;
+    let gate = FixedGate::new(PermissionDecision::Deny);
+    let (result, _) = try_turn(&mut session, &gate, "approve-command").await;
+    assert_eq!(result.unwrap(), TurnOutcome::Completed { is_error: true });
+    fixture.report()
+}
+
+#[tokio::test]
+async fn a_decision_list_that_is_a_string_interrupts_the_turn() {
+    // Arrange
+    let field = json!("decline");
+
+    // Act
+    let report = report_after_denial_with(field).await;
+
+    // Assert
+    assert!(report.get("approval_response").is_none());
+    assert_eq!(report["interrupt_params"]["turnId"], "turn-1");
+}
+
+#[tokio::test]
+async fn a_decision_list_that_is_an_object_or_a_number_interrupts_the_turn() {
+    for field in [json!({"decline": true}), json!(7), Value::Null] {
+        // Arrange and Act
+        let report = report_after_denial_with(field).await;
+
+        // Assert
+        assert!(report.get("approval_response").is_none());
+        assert!(report["interrupt_params"].is_object());
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_answer_the_server_never_follows_up_ends_the_turn_after_the_timeout() {
+    // Arrange
+    let fixture =
+        Fixture::new(&json!({"available_decisions": ["cancel"], "hang_after_cancel": true}));
+    let mut session = fixture.session().await;
+    let gate = FixedGate::new(PermissionDecision::Deny);
+
+    // Act
+    let (result, events) = try_turn(&mut session, &gate, "approve-command").await;
+
+    // Assert
+    assert_eq!(result.unwrap(), TurnOutcome::Completed { is_error: true });
+    assert!(matches!(
+        events.last(),
+        Some(Event::Result { is_error: true, .. })
+    ));
+    assert_gone_soon(fixture.pid(true)).await;
+    assert_eq!(session.pid(), None);
+}
+
+#[tokio::test]
+async fn a_denial_with_nothing_to_decline_with_interrupts_the_turn() {
+    // Arrange
+    let fixture = Fixture::new(&json!({"available_decisions": ["accept"]}));
+    let mut session = fixture.session().await;
+    let gate = FixedGate::new(PermissionDecision::Deny);
+
+    // Act
+    let (result, events) = try_turn(&mut session, &gate, "approve-command").await;
+
+    // Assert
+    assert_eq!(result.unwrap(), TurnOutcome::Completed { is_error: true });
+    let report = fixture.report();
+    assert!(report.get("approval_response").is_none());
+    assert_eq!(report["interrupt_params"]["turnId"], "turn-1");
+    assert!(matches!(
+        events.last(),
+        Some(Event::Result { is_error: true, .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_server_that_ignores_the_interrupt_is_killed_after_the_timeout() {
+    // Arrange
+    let fixture = Fixture::new(&json!({"available_decisions": [], "ignore_interrupt": true}));
+    let mut session = fixture.session().await;
+    let gate = FixedGate::new(PermissionDecision::Deny);
+
+    // Act
+    let (result, _) = try_turn(&mut session, &gate, "approve-command").await;
+
+    // Assert
+    assert_eq!(result.unwrap(), TurnOutcome::Completed { is_error: true });
+    assert_gone_soon(fixture.pid(true)).await;
+    assert_eq!(session.pid(), None);
+}
+
+#[tokio::test]
+async fn an_accepting_gate_still_answers_accept_whatever_is_offered() {
+    // Arrange
+    let fixture = Fixture::new(&json!({"available_decisions": ["decline", "cancel"]}));
+    let mut session = fixture.session().await;
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    let (result, _) = try_turn(&mut session, &gate, "approve-command").await;
+
+    // Assert
+    assert_eq!(result.unwrap(), TurnOutcome::Completed { is_error: false });
+    assert_eq!(
+        fixture.report()["approval_response"],
+        json!({"decision": "accept"})
+    );
+}
+
 #[tokio::test]
 async fn an_accepted_file_change_approval_uses_the_synthetic_accept_shape_and_item_paths() {
     // Arrange
