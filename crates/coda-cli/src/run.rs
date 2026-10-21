@@ -49,6 +49,7 @@ const END_TURN: &str = StopCondition::EndTurn.as_str();
 const MAX_TURNS: &str = StopCondition::MaxTurns.as_str();
 const BUDGET_EXHAUSTED: &str = StopCondition::BudgetExhausted.as_str();
 const CONTEXT_OVERFLOW: &str = StopCondition::ContextOverflow.as_str();
+const COMPACTION_FAILED: &str = StopCondition::CompactionFailed.as_str();
 const CANCELLED: &str = StopCondition::Cancelled.as_str();
 
 /// The fields of a `session.event` notification this command reads.
@@ -353,6 +354,11 @@ fn report(finish: &Finish, io: &mut Io<'_>) -> std::io::Result<ExitCode> {
     };
     if code == exit::RUN_OTHER {
         let reason = match (&finish.condition, finish.cut_short) {
+            (Some(condition), _) if condition == COMPACTION_FAILED => {
+                "the conversation could not be compacted to fit the context window; \
+                 see the daemon log"
+                    .to_owned()
+            }
             (Some(condition), _) => format!("the run stopped: {condition}"),
             (None, true) => "the run was cut short; see the daemon log".to_owned(),
             (None, false) => "the run failed; see the daemon log".to_owned(),

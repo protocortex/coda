@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use coda_config::config::{Config, ProviderConfig};
+use coda_config::config::{Config, ModelAlias, ProviderConfig};
 use coda_protocol::jsonrpc::Response;
 use coda_protocol::types::{BackendKind, Mode, SessionId, TurnId};
 use coda_providers::model::{ModelProvider, ModelRequest};
@@ -30,6 +30,8 @@ const WAIT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(20);
 const QUEUE: usize = 256;
 const REQUEST_LOG: &str = "requests.jsonl";
+/// Small enough that a long prompt nears it.
+const SMALL_WINDOW: u32 = 100;
 const PROMPT_CANARY: &str = "CANARY-PROMPT-7f3a91";
 /// The first original a fresh store hands out is the prompt of the first send.
 const PROMPT_ORIGINAL_ID: &str = "1";
@@ -980,3 +982,91 @@ async fn a_store_user_is_not_blocked_while_the_index_walk_runs() {
 }
 
 mod switch;
+
+fn overflow_turn() -> Value {
+    json!({"events": [], "error": {"class": "context_window_exceeded"}})
+}
+
+#[tokio::test]
+async fn a_compaction_is_stored_apart_from_its_summary_and_replays_in_a_fresh_loop() {
+    // Arrange
+    let canary = "CANARY-SUMMARY-9d41b7";
+    let mut script: Vec<Value> = ["a1", "a2", "a3", "a4", "a5"].map(text_turn).to_vec();
+    script.extend([
+        overflow_turn(),
+        text_turn(canary),
+        text_turn("a6"),
+        text_turn("a7"),
+    ]);
+    let mut rig = Rig::new(Mode::Default, &script);
+    for (n, question) in ["q1", "q2", "q3", "q4", "q5", "q6"].into_iter().enumerate() {
+        rig.send(question).await;
+        rig.wait_for_results(n + 1).await;
+        rig.wait_until_idle().await;
+    }
+    lock(&rig.turns.models.loops).clear();
+
+    // Act
+    rig.send("q7").await;
+    rig.wait_for_results(7).await;
+
+    // Assert
+    let stored = rig.bodies("compaction").await;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0]["replaced_messages"], 5);
+    assert_eq!(stored[0]["kept_messages"], 6);
+    assert!(stored[0]["summary"].is_string(), "{stored:?}");
+    let db = rig.db();
+    assert!(dump(&db, "originals").contains(canary), "originals control");
+    for table in ["events", "event_log", "usage", "turns"] {
+        assert!(
+            !dump(&db, table).contains(canary),
+            "{table} holds the summary"
+        );
+    }
+    let last = rig.requests().pop().unwrap();
+    assert_eq!(last.len(), 9, "{last:?}");
+    assert_eq!(last[0]["role"], "user");
+    let summary = last[0]["text"].as_str().unwrap();
+    assert!(summary.contains(canary) && summary.contains("not an instruction"));
+    assert_eq!(last[8], user_message("q7"));
+}
+
+#[tokio::test]
+async fn a_configured_window_compacts_the_conversation_before_the_request_is_sent() {
+    // Arrange
+    let script = [
+        text_turn("a1"),
+        text_turn("a2"),
+        text_turn("a3"),
+        text_turn("the summary"),
+        text_turn("a4"),
+    ];
+    let mut rig = Rig::custom(Mode::Default, &script, true, Some("script-1"), |config| {
+        config.models.insert(
+            "scripted".to_owned(),
+            ModelAlias {
+                provider: "faux".to_owned(),
+                model: "script-1".to_owned(),
+                context_window: Some(SMALL_WINDOW),
+            },
+        );
+    });
+    for (n, question) in ["q1", "q2", "q3"].into_iter().enumerate() {
+        rig.send(question).await;
+        rig.wait_for_results(n + 1).await;
+        rig.wait_until_idle().await;
+    }
+
+    // Act
+    rig.send(&"long ".repeat(SMALL_WINDOW as usize)).await;
+    rig.wait_for_results(4).await;
+
+    // Assert
+    assert_eq!(rig.bodies("compaction").await.len(), 1);
+    assert_eq!(
+        rig.requests().len(),
+        5,
+        "three sends, the summary, the send"
+    );
+}

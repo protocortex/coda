@@ -462,6 +462,15 @@ impl ModelSessions {
         Ok(built)
     }
 
+    /// The context window of the model the session runs, when it is known.
+    fn context_window(&self, record: &SessionRecord) -> Option<u32> {
+        let target = self
+            .registry
+            .select(record.backend, record.model.as_deref())
+            .ok()?;
+        self.registry.context_window(&target)
+    }
+
     /// Rebuilds the conversation one page of events at a time, so the store is
     /// free for other users between pages.
     async fn stored_conversation(
@@ -528,7 +537,8 @@ impl ModelSessions {
                 compact_threshold_bytes: COMPACT_THRESHOLD_BYTES,
             },
             sender,
-        );
+        )
+        .with_context_window(self.context_window(record));
         Ok(ModelLoop {
             turn_loop,
             events,
