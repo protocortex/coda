@@ -84,6 +84,15 @@ fn short_dir() -> tempfile::TempDir {
     dir
 }
 
+/// With a single live subscriber, tracing rebuilds callsite interest from the
+/// calling thread's default alone, so a parallel test hitting an event with no
+/// subscriber caches it as disabled for the whole process. A process-wide
+/// subscriber keeps every callsite enabled.
+fn keep_callsites_enabled() {
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::Registry::default());
+    tracing::callsite::rebuild_interest_cache();
+}
+
 async fn within<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(WAIT, future)
         .await
@@ -151,6 +160,7 @@ async fn it_shows_a_failed_connection_and_still_exits_on_quit() {
     let dir = short_dir();
     let missing = dir.path().join("none.sock");
     let logs = LogBuffer::default();
+    keep_callsites_enabled();
 
     // Act
     let app = within(
