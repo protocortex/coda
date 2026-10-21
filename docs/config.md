@@ -52,6 +52,7 @@ One section per backend. The names Coda uses are `claude_code`, `codex`, `anthro
 | `env_passthrough` | array of strings | `[]` | Extra environment variable names for the backend process. Read from the file, not used yet. |
 | `verified_versions` | array of strings | `[]` | Backend versions you have checked. They are added to the versions built in for each backend: `claude_code` has `2.1.292` and `2.1.296` built in and `codex` has `0.163.0`. |
 | `script` | string (path) | unset | Script file the `faux` provider replays. It is required for `faux`, and a file over its size limit is refused. |
+| `request_log` | string (path) | unset | File the `faux` provider appends one JSON line to for each request it receives, so a test can see what the model was sent. The file holds conversation content and is created readable by its owner only. Use it in tests, not in daily use. |
 | `base_url` | string | unset | API root. Required for `openai_compat`. The anthropic provider uses its own default when unset. |
 | `model` | string | unset | Model a session uses when it names none. |
 | `sandbox` | string | unset (read-only) | Sandbox for a Codex session: `"read-only"`, `"workspace-write"` or `"danger-full-access"`. Any other value is an error that names `providers.<name>.sandbox`. |

@@ -10,9 +10,10 @@ use coda_store::{NewSession, Store};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+use coda_core::history::CONVERSATION_RESET_KIND;
 use coda_providers::registry::RegistryError;
 
-use super::{CONVERSATION_RESET_KIND, EnvReader, QUEUE, Rig, text_turn, tool_turn};
+use super::{EnvReader, QUEUE, Rig, text_turn, tool_turn};
 use crate::gate::Brokers;
 use crate::model_session::{
     Limits, MODEL_SWITCHED_KIND, ModelError, ModelSessions, Provider, SwitchError, lock,
@@ -62,7 +63,7 @@ fn error_code(response: &Value) -> i64 {
 }
 
 #[tokio::test]
-async fn an_idle_switch_stores_the_alias_drops_the_conversation_and_records_the_event() {
+async fn an_idle_switch_stores_the_alias_and_the_next_send_continues_the_history() {
     // Arrange
     let script = [text_turn("one"), text_turn("two")];
     let mut rig = Rig::custom(Mode::Default, &script, true, None, faux_alias);
@@ -90,10 +91,17 @@ async fn an_idle_switch_stores_the_alias_drops_the_conversation_and_records_the_
             "alias": "scripted",
             "provider": "faux",
             "model": "script-1",
-            "conversation": "reset",
         })]
     );
-    assert_eq!(rig.bodies(CONVERSATION_RESET_KIND).await.len(), 1);
+    assert_eq!(rig.bodies(CONVERSATION_RESET_KIND).await.len(), 0);
+    assert_eq!(
+        rig.requests()[1],
+        [
+            json!({"role": "user", "text": "first"}),
+            json!({"role": "assistant", "text": "one", "tool_calls": []}),
+            json!({"role": "user", "text": "second"}),
+        ]
+    );
 }
 
 #[tokio::test]
