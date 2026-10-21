@@ -4,7 +4,8 @@
 
 use serde_json::Value;
 
-use super::{fatal, is_context_overflow, retryable};
+use super::is_context_overflow;
+use crate::http::{fatal, retryable};
 use crate::model::{ModelEvent, ProviderError, StopReason, Usage};
 
 const DONE_MARKER: &str = "[DONE]";

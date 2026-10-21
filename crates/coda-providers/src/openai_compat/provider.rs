@@ -6,31 +6,29 @@
 //! A retry after an idle timeout before the first byte may be billed twice,
 //! because the server can have accepted and started the first request.
 
-use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
-use reqwest::redirect;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, info_span, warn};
 
+use super::classify_status;
 use super::events::EventMapper;
 use super::request::build_body;
-use super::{classify_status, fatal, retryable};
-use crate::anthropic::Timing;
-use crate::anthropic::provider::{IDLE_CHECK_INTERVAL, validate_base_url};
 use crate::anthropic::request::RequestSettings;
-use crate::anthropic::sse::SseParser;
+use crate::http::sse::SseParser;
+use crate::http::{
+    Idle, IdleWatch, KeySource, Timing, TransportWording, build_client, fatal, retry_after,
+    validate_base_url,
+};
 use crate::model::{
     Clock, ModelEvent, ModelProvider, ModelRequest, ModelStream, ProviderError, Sleeper, StreamItem,
 };
 
 const STREAM_BUFFER: usize = 32;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPLETIONS_PATH: &str = "/chat/completions";
-const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 /// Why a base URL is refused; it is never echoed, as it may hold credentials.
 const BASE_URL_REFUSED: &str = "the openai-compat base URL must be a valid https URL, or http towards \
@@ -38,41 +36,25 @@ loopback, without credentials, query or fragment";
 const BEARER_PREFIX: &str = "Bearer ";
 const REDACTED: &str = "[redacted]";
 
-type EnvReader = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
+const WORDING: TransportWording = TransportWording {
+    idle: "the server sent nothing for longer than the idle timeout",
+    build_failed: "the request could not be built",
+    connect_failed: "could not connect to the server",
+    timed_out: "the connection to the server timed out",
+    failed: "the connection to the server failed",
+};
 
-/// Reads the optional API key from the environment on every attempt, so a
-/// rotated key applies to the next call. Only the variable name is kept.
-struct KeySource {
-    name: Option<String>,
-    read: EnvReader,
-}
-
-impl fmt::Debug for KeySource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KeySource")
-            .field("name", &self.name)
-            .finish_non_exhaustive()
-    }
-}
-
-impl KeySource {
-    /// The `Authorization` value, or `None` when no key is named or set:
-    /// local servers need none.
-    fn header(&self) -> Result<Option<HeaderValue>, ProviderError> {
-        let Some(name) = &self.name else {
-            return Ok(None);
-        };
-        let Some(key) = (self.read)(name) else {
-            return Ok(None);
-        };
-        let mut value = HeaderValue::from_str(&format!("{BEARER_PREFIX}{key}")).map_err(|_| {
-            fatal(format!(
-                "the API key in {name} is not valid in an HTTP header"
-            ))
-        })?;
-        value.set_sensitive(true);
-        Ok(Some(value))
-    }
+/// The `Authorization` value, or `None` when no key is named or set: local
+/// servers need none.
+fn key_header(key: Option<&KeySource>) -> Result<Option<HeaderValue>, ProviderError> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let Some(value) = key.read() else {
+        return Ok(None);
+    };
+    key.sensitive_header(&format!("{BEARER_PREFIX}{value}"))
+        .map(Some)
 }
 
 /// Where and how the provider calls the API.
@@ -96,11 +78,10 @@ pub struct OpenAiCompatProvider<S, C> {
 struct Inner<S, C> {
     client: reqwest::Client,
     url: String,
-    key: KeySource,
+    key: Option<KeySource>,
     settings: RequestSettings,
     timing: Timing,
-    sleeper: S,
-    clock: C,
+    watch: IdleWatch<S, C>,
 }
 
 impl<S: Sleeper + 'static, C: Clock + 'static> OpenAiCompatProvider<S, C> {
@@ -122,25 +103,16 @@ impl<S: Sleeper + 'static, C: Clock + 'static> OpenAiCompatProvider<S, C> {
             .ok()
             .filter(|base| base.query().is_none() && base.fragment().is_none())
             .ok_or_else(|| fatal(BASE_URL_REFUSED))?;
-        // A redirect would carry the key header to whatever host answers.
-        let client = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .redirect(redirect::Policy::none())
-            .build()
-            .map_err(|_| fatal("the HTTP client could not be built"))?;
+        let client = build_client()?;
         let url = format!("{}{COMPLETIONS_PATH}", base.as_str().trim_end_matches('/'));
         Ok(Self {
             inner: Arc::new(Inner {
                 client,
                 url,
-                key: KeySource {
-                    name: key_env,
-                    read: Box::new(env),
-                },
+                key: key_env.map(|name| KeySource::new(name, env)),
                 settings: options.settings,
                 timing: options.timing,
-                sleeper,
-                clock,
+                watch: IdleWatch::new(sleeper, clock, options.timing.idle_timeout),
             }),
         })
     }
@@ -182,9 +154,6 @@ impl AttemptFailure {
     }
 }
 
-/// The stream stayed silent longer than the idle timeout.
-struct Idle;
-
 impl<S: Sleeper, C: Clock> Inner<S, C> {
     /// Runs the call: attempts until one succeeds, fails for good, or runs
     /// out of tries. A turn that already delivered output is never retried.
@@ -214,7 +183,7 @@ impl<S: Sleeper, C: Clock> Inner<S, C> {
                 self.timing
                     .retry_delay(attempt, failure.retry_after.as_deref(), SystemTime::now());
             warn!(attempt, ?delay, "retrying after a retryable failure");
-            self.sleeper.sleep(delay).await;
+            self.watch.sleep(delay).await;
             attempt += 1;
         }
     }
@@ -224,7 +193,7 @@ impl<S: Sleeper, C: Clock> Inner<S, C> {
         body: &[u8],
         sender: &mpsc::Sender<StreamItem>,
     ) -> Result<(), AttemptFailure> {
-        let key_header = self.key.header().map_err(AttemptFailure::before_output)?;
+        let key_header = key_header(self.key.as_ref()).map_err(AttemptFailure::before_output)?;
         let mut pending = self
             .client
             .post(&self.url)
@@ -234,10 +203,11 @@ impl<S: Sleeper, C: Clock> Inner<S, C> {
             pending = pending.header(AUTHORIZATION, value.clone());
         }
         let response = self
-            .within_idle(pending.send(), self.clock.now())
+            .watch
+            .within_idle(pending.send())
             .await
-            .map_err(|Idle| AttemptFailure::before_output(idle_error()))?
-            .map_err(|error| AttemptFailure::before_output(transport_error(&error)))?;
+            .map_err(|Idle| AttemptFailure::before_output(WORDING.idle_error()))?
+            .map_err(|error| AttemptFailure::before_output(WORDING.transport_error(&error)))?;
         let status = response.status();
         if status.is_redirection() {
             return Err(AttemptFailure::before_output(fatal(format!(
@@ -257,12 +227,8 @@ impl<S: Sleeper, C: Clock> Inner<S, C> {
         key_header: Option<&HeaderValue>,
     ) -> AttemptFailure {
         let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let mut text = self.read_error_body(&mut response).await;
+        let retry_after = retry_after(&response);
+        let mut text = self.watch.read_error_body(&mut response).await;
         // A server may echo the credential it rejected into its message.
         if let Some(key) = key_header
             .and_then(|value| value.to_str().ok())
@@ -275,21 +241,6 @@ impl<S: Sleeper, C: Clock> Inner<S, C> {
             output_started: false,
             retry_after,
         }
-    }
-
-    /// Reads at most `MAX_ERROR_BODY_BYTES` of an error body; what cannot be
-    /// read in time or in full is simply left out.
-    async fn read_error_body(&self, response: &mut reqwest::Response) -> String {
-        let mut body = Vec::new();
-        while body.len() < MAX_ERROR_BODY_BYTES {
-            let Ok(Ok(Some(chunk))) = self.within_idle(response.chunk(), self.clock.now()).await
-            else {
-                break;
-            };
-            let room = MAX_ERROR_BODY_BYTES - body.len();
-            body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        }
-        String::from_utf8_lossy(&body).into_owned()
     }
 
     async fn read_stream(
@@ -306,10 +257,11 @@ impl<S: Sleeper, C: Clock> Inner<S, C> {
         };
         loop {
             let chunk = self
-                .within_idle(response.chunk(), self.clock.now())
+                .watch
+                .within_idle(response.chunk())
                 .await
-                .map_err(|Idle| failed(&mapper, idle_error()))?
-                .map_err(|error| failed(&mapper, transport_error(&error)))?;
+                .map_err(|Idle| failed(&mapper, WORDING.idle_error()))?
+                .map_err(|error| failed(&mapper, WORDING.transport_error(&error)))?;
             let at_end = chunk.is_none();
             let payloads = match chunk {
                 Some(bytes) => parser.push(&bytes),
@@ -338,24 +290,6 @@ impl<S: Sleeper, C: Clock> Inner<S, C> {
             }
         }
     }
-
-    /// Awaits `future`, giving up once the clock shows `idle_timeout` has
-    /// passed since `since`. Time is checked on a tick so a test drives it
-    /// through the injected clock.
-    async fn within_idle<F: Future>(&self, future: F, since: Instant) -> Result<F::Output, Idle> {
-        tokio::pin!(future);
-        loop {
-            tokio::select! {
-                output = &mut future => return Ok(output),
-                () = self.sleeper.sleep(IDLE_CHECK_INTERVAL) => {
-                    let silent = self.clock.now().saturating_duration_since(since);
-                    if silent >= self.timing.idle_timeout {
-                        return Err(Idle);
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Sends the events in order; false once the consumer has gone away.
@@ -366,23 +300,4 @@ async fn deliver(sender: &mpsc::Sender<StreamItem>, events: Vec<ModelEvent>) -> 
         }
     }
     true
-}
-
-fn idle_error() -> ProviderError {
-    retryable("the server sent nothing for longer than the idle timeout")
-}
-
-/// Describes a transport failure without the URL or any header.
-fn transport_error(error: &reqwest::Error) -> ProviderError {
-    if error.is_builder() {
-        return fatal("the request could not be built");
-    }
-    let what = if error.is_connect() {
-        "could not connect to the server"
-    } else if error.is_timeout() {
-        "the connection to the server timed out"
-    } else {
-        "the connection to the server failed"
-    };
-    retryable(what)
 }
