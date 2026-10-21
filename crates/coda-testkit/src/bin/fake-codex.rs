@@ -26,7 +26,8 @@
 //! environment facts, and `pid_path` receives the `sleep` pid. `upgrade_status` makes the app-server answer the
 //! upgrade with that HTTP status and `version` sets the version it reports. `no_thread_id` makes `thread/start`
 //! answer without a thread id, `exit_early` exits before the socket exists and `hang_start` parks
-//! before it creates one.
+//! before it creates one. `available_decisions` is sent with approval requests, and
+//! `hang_after_cancel` parks after a `cancel` answer, and `ignore_interrupt` makes the app-server park on `turn/interrupt`.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -379,21 +380,50 @@ mod app_server {
         )
     }
 
-    fn approval(stream: &mut UnixStream, method: &str, item: &Value) -> io::Result<()> {
+    /// Runs one approval; `true` means the client interrupted the turn instead of answering.
+    fn approval(stream: &mut UnixStream, method: &str, item: &Value) -> io::Result<bool> {
         notify(stream, "item/started", &json!({"item": item}))?;
         ask(stream, method, &item["id"])?;
-        respond(stream)?;
-        notify(stream, "item/completed", &json!({"item": item}))
+        if respond(stream)? {
+            return Ok(true);
+        }
+        notify(stream, "item/completed", &json!({"item": item}))?;
+        Ok(false)
     }
 
     fn ask(stream: &mut UnixStream, method: &str, item_id: &Value) -> io::Result<()> {
-        let request = json!({"id": "approval-1", "method": method, "params": {"itemId": item_id}});
+        let mut params = json!({"itemId": item_id});
+        if let Some(offered) = control_value("available_decisions") {
+            params["availableDecisions"] = offered;
+        }
+        let request = json!({"id": "approval-1", "method": method, "params": params});
         send(stream, &request)
     }
 
-    fn respond(stream: &mut UnixStream) -> io::Result<()> {
-        let response = read_json(stream)?;
-        update_report("approval_response", &response["result"])
+    /// Records the client's answer; `true` when it was `turn/interrupt`, which
+    /// ends the turn as interrupted unless `ignore_interrupt` is set.
+    fn respond(stream: &mut UnixStream) -> io::Result<bool> {
+        let message = read_json(stream)?;
+        if message["method"] != "turn/interrupt" {
+            update_report("approval_response", &message["result"])?;
+            if message["result"]["decision"] == "cancel"
+                && control_value("hang_after_cancel").is_some()
+            {
+                park();
+            }
+            return Ok(false);
+        }
+        update_report("interrupt_params", &message["params"])?;
+        if control_value("ignore_interrupt").is_some() {
+            park();
+        }
+        send(stream, &json!({"id": message["id"], "result": {}}))?;
+        notify(
+            stream,
+            "turn/completed",
+            &json!({"turn": {"status": "interrupted"}}),
+        )?;
+        Ok(true)
     }
 
     /// Sends a close frame, records whether the client answered it with one, and exits.
@@ -452,7 +482,9 @@ mod app_server {
         if prompt.contains("approve-command") {
             let item = json!({"id": "item-1", "type": "commandExecution",
                 "command": "rm -rf build", "cwd": "/work"});
-            approval(stream, "item/commandExecution/requestApproval", &item)?;
+            if approval(stream, "item/commandExecution/requestApproval", &item)? {
+                return Ok(());
+            }
         }
         if prompt.contains("approve-nocmd") {
             let item = json!({"id": "item-3", "type": "commandExecution"});
