@@ -27,6 +27,7 @@ tracing.workspace = true
 [dev-dependencies]
 coda-providers = { path = ".", features = ["testing"] }
 coda-testkit = { path = "../coda-testkit" }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -931,6 +931,34 @@ fn the_constructor_rejects_an_unsafe_base_url_without_echoing_it() {
     assert!(!error.to_string().contains("hunter2"));
 }
 
+#[test]
+fn the_constructor_names_the_provider_in_an_insecure_base_url_refusal() {
+    // Arrange
+    let mut insecure = plain_options();
+    insecure.base_url = "http://example.com".to_owned();
+
+    // Act
+    let result = AnthropicProvider::new(
+        insecure,
+        KEY_ENV,
+        secret_env,
+        RecordingSleeper::default(),
+        DrivenClock::new(),
+    );
+
+    // Assert
+    let Err(error) = result else {
+        panic!("plain http to a remote host was accepted");
+    };
+    assert_eq!(
+        error,
+        ProviderError::Fatal {
+            message: "the Anthropic base URL must use https unless it points at a loopback host"
+                .to_owned()
+        }
+    );
+}
+
 #[tokio::test]
 async fn dropping_the_stream_closes_the_connection() {
     // Arrange

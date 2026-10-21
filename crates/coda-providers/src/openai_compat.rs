@@ -4,6 +4,7 @@
 
 use serde_json::Value;
 
+use crate::http::is_retryable_status;
 use crate::model::ProviderError;
 
 pub mod events;
@@ -19,18 +20,6 @@ const OVERFLOW_MARKERS: [&str; 4] = [
     "maximum context",
 ];
 const OVERFLOW_CODE: &str = "context_length_exceeded";
-
-pub(crate) fn fatal(message: impl Into<String>) -> ProviderError {
-    ProviderError::Fatal {
-        message: message.into(),
-    }
-}
-
-pub(crate) fn retryable(message: impl Into<String>) -> ProviderError {
-    ProviderError::Retryable {
-        message: message.into(),
-    }
-}
 
 /// Classifies a non-success HTTP status and its body.
 #[must_use]
@@ -50,7 +39,7 @@ pub fn classify_status(status: u16, body: &str) -> ProviderError {
         ),
         None => format!("the server returned HTTP {status}"),
     };
-    if matches!(status, 429 | 500..) {
+    if is_retryable_status(status) {
         ProviderError::Retryable { message }
     } else {
         ProviderError::Fatal { message }

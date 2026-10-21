@@ -12,6 +12,7 @@ pub mod codex_exec;
 pub mod detect;
 pub mod faux;
 pub mod gate;
+mod http;
 mod jsonl;
 pub mod model;
 pub mod models;
