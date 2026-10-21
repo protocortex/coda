@@ -6,9 +6,13 @@ use serde_json::{Value, json};
 
 /// What every attempt is asked to do.
 pub const PROMPT: &str = "Add a `coda version --json` subcommand to crates/coda-cli/src/main.rs. \
-It prints a JSON object with the keys name and version, taken from env!(\"CARGO_PKG_NAME\") and \
-env!(\"CARGO_PKG_VERSION\") and formatted by hand, so Cargo.toml needs no change. Add a test for \
-it to crates/coda-cli/tests/version.rs, then run cargo test to confirm.";
+`fn main` there only delegates to run(), so add the check inside `fn main`, before clap parses \
+the arguments: when the arguments are exactly `version --json`, print the JSON and return \
+success. Do not edit cli.rs or lib.rs. The JSON object has the keys name and version, taken from \
+env!(\"CARGO_PKG_NAME\") and env!(\"CARGO_PKG_VERSION\") and formatted by hand, so Cargo.toml \
+needs no change. Add a test for it to crates/coda-cli/tests/version.rs. Then run exactly \
+`cargo test` in the foreground, not in the background, and wait for it to finish before you \
+answer.";
 
 /// `[permissions.grants]` entries a run is pre-approved for.
 pub const GRANTS: [&str; 3] = [
@@ -107,4 +111,37 @@ fn text_turn(text: &str) -> Value {
         {"type": "usage", "input_tokens": 5, "output_tokens": 3},
         {"type": "stop", "reason": "end_turn"},
     ]})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_prompt_pins_the_edit_to_main_before_argument_parsing() {
+        // Act
+        let prompt = PROMPT;
+
+        // Assert
+        assert!(prompt.contains("`fn main`"), "names the function to edit");
+        assert!(
+            prompt.contains("before clap"),
+            "main only delegates to run(), so the model must be told where the check goes"
+        );
+        assert!(
+            prompt.contains("Do not edit cli.rs or lib.rs"),
+            "the model must not move the change out of main.rs"
+        );
+    }
+
+    #[test]
+    fn the_prompt_asks_for_a_foreground_test_run_the_grants_cover() {
+        // Act
+        let prompt = PROMPT;
+
+        // Assert
+        assert!(prompt.contains("exactly `cargo test`"));
+        assert!(prompt.contains("in the foreground"));
+        assert!(GRANTS.contains(&"bash:cargo test"));
+    }
 }
