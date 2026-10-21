@@ -8,8 +8,8 @@
 //! holds a tool call without a result.
 
 use coda_protocol::events::{
-    APPROVALS_UNAVAILABLE_KIND, APPROVE_KIND, BACKEND_CRASHED_KIND, DENY_KIND, RESULT_KIND,
-    STREAM_DELTA_KIND, TIMEOUT_KIND, TURN_INTERRUPTED_KIND, USAGE_KIND,
+    APPROVALS_UNAVAILABLE_KIND, APPROVE_KIND, BACKEND_CRASHED_KIND, COMPACTION_KIND, DENY_KIND,
+    RESULT_KIND, STREAM_DELTA_KIND, TIMEOUT_KIND, TURN_INTERRUPTED_KIND, USAGE_KIND,
 };
 use coda_protocol::types::{OriginalId, SessionId};
 use coda_store::{Store, StoreError, StoredEvent};
@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use crate::compact::{SUMMARY_UNAVAILABLE, summary_message};
 use crate::prompt::{Conversation, Message, Prefix, ToolCall};
 use crate::turn::{EMPTY_ARGUMENTS, NO_REPLY, SKIPPED};
 
@@ -67,6 +68,13 @@ const EMPTY_TEXT_ID: &str = "";
 #[derive(Deserialize)]
 struct UserBody {
     text: String,
+}
+
+#[derive(Deserialize)]
+struct CompactionBody {
+    /// Where the summary text was kept.
+    summary: String,
+    replaced_messages: usize,
 }
 
 #[derive(Deserialize)]
@@ -216,6 +224,11 @@ impl Rebuild {
                     self.tool_result(event.seq, body, lookup);
                 }
             }
+            COMPACTION_KIND => {
+                if let Some(body) = parse::<CompactionBody>(event) {
+                    self.compaction(event.seq, &body, lookup);
+                }
+            }
             CONVERSATION_RESET_KIND => {}
             kind if BOOKKEEPING_KINDS.contains(&kind) => {
                 debug!(seq = event.seq, kind, "skipped a bookkeeping event");
@@ -264,6 +277,22 @@ impl Rebuild {
             text,
             is_error: body.is_error,
         });
+    }
+
+    /// Replaces the oldest messages with the stored summary, as the live loop did.
+    fn compaction(&mut self, seq: u64, body: &CompactionBody, lookup: ResultLookup<'_>) {
+        let summary =
+            resolve(&body.summary, lookup).unwrap_or_else(|| SUMMARY_UNAVAILABLE.to_owned());
+        let message = Message::User(summary_message(&summary));
+        if !self
+            .conversation
+            .replace_prefix(body.replaced_messages, message)
+        {
+            warn!(
+                seq,
+                "skipped a compaction that replaces more messages than exist"
+            );
+        }
     }
 
     /// Answers the calls that never got a result, as the live loop does for

@@ -127,6 +127,7 @@ golden_tests! {
     event_backend_crashed: "event.backend_crashed" => Event,
     event_backend_crashed_minimal: "event.backend_crashed.minimal" => Event,
     event_turn_interrupted: "event.turn_interrupted" => Event,
+    event_compaction: "event.compaction" => Event,
 }
 
 #[test]

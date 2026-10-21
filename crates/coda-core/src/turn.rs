@@ -24,6 +24,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{Instrument, info, info_span, warn};
 
 use crate::budget::TokenBudget;
+use crate::compact::CompactionAck;
 use crate::economy::{cap_ends, compact};
 use crate::prompt::{Conversation, Message, ToolCall};
 
@@ -107,6 +108,18 @@ pub enum TurnEvent {
     Usage(Usage),
     /// The context window is full; compaction is not available.
     ContextOverflow,
+    /// The older messages were summarized. The loop waits for `ack` before it
+    /// retries, so the event can be stored first.
+    Compaction {
+        /// The summary text, which belongs in the session's originals.
+        summary: String,
+        /// How many of the oldest messages it replaced.
+        replaced: usize,
+        /// How many recent messages were kept.
+        kept: usize,
+        /// Answered once the event is stored.
+        ack: CompactionAck,
+    },
 }
 
 /// Why a send failed outright.
