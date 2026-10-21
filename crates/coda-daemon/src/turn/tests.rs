@@ -17,6 +17,7 @@ use tempfile::TempDir;
 
 use super::{BACKEND_UNSUPPORTED, SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig, Turns};
 use crate::dispatch::Dispatcher;
+use crate::idle_pool::MAX_IDLE_SERVERS;
 use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
 use crate::supervisor::testing::RecordingSleeper;
@@ -39,6 +40,7 @@ const YIELDS_AFTER_SKIP: usize = 50;
 const QUEUE: usize = 256;
 const RESTART_BASE: Duration = Duration::from_millis(10);
 const STORE_DIR: &str = "store";
+const CODEX_REPORT: &str = "codex-report.json";
 const PROMPT_CANARY: &str = "CANARY-PROMPT-7f3a91";
 const HOME_CANARY: &str = "CANARY-HOME-c05e44";
 const ECHO_CANARY: &str = "CANARY-ECHO-19be72";
@@ -887,35 +889,202 @@ fn codex_rig(control: &Value) -> Rig {
         BackendKind::CodexAppServer,
         codex_config(),
     );
-    let file = rig.cwd.path().join("fake-codex-control.json");
-    std::fs::write(file, control.to_string()).unwrap();
+    rig.write_codex_control(control);
     rig
 }
 
+impl Rig {
+    fn write_codex_control(&self, control: &Value) {
+        let mut control = control.clone();
+        control["report_path"] = json!(self.cwd.path().join(CODEX_REPORT));
+        let file = self.cwd.path().join("fake-codex-control.json");
+        std::fs::write(file, control.to_string()).unwrap();
+    }
+
+    async fn codex_session(&self) -> SessionId {
+        let cwd = self.cwd.path().to_string_lossy().into_owned();
+        self.hub
+            .with_store_mut(move |store| {
+                store.create_session(&NewSession {
+                    backend: BackendKind::CodexAppServer,
+                    model: None,
+                    cwd,
+                    mode: Mode::Default,
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Sends `text` to `session` and waits until its turn is over.
+    async fn run_turn_of(&mut self, session: &SessionId, text: &str) {
+        self.call("session.send", json!({"session_id": session, "text": text}))
+            .await;
+        tokio::time::timeout(WAIT, async {
+            while self.turns.is_running(session) {
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .expect("the turn did not end in time");
+    }
+
+    /// The fake app-server's report of the server that is running now.
+    fn codex_report(&self) -> Value {
+        let raw = std::fs::read_to_string(self.cwd.path().join(CODEX_REPORT)).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn codex_pid(&self) -> rustix::process::Pid {
+        let pid = self.codex_report()["pid"].as_i64().unwrap();
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap()
+    }
+
+    /// Polls until the turn has ended and its slot is free; a pooled server keeps its pidfile.
+    async fn wait_until_turn_over(&self) {
+        tokio::time::timeout(WAIT, async {
+            while self.turns.is_running(&self.session) {
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .expect("the turn did not end in time");
+    }
+
+    /// Polls until the fake has received `count` prompts since it started.
+    async fn wait_for_prompts(&self, count: usize) {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let seen = std::fs::read_to_string(self.cwd.path().join(CODEX_REPORT))
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .and_then(|report| report["prompts"].as_array().map(Vec::len));
+                if seen >= Some(count) {
+                    return;
+                }
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .expect("the server did not receive the prompt in time");
+    }
+}
+
+async fn assert_gone(pid: rustix::process::Pid) {
+    tokio::time::timeout(WAIT, async {
+        while rustix::process::test_kill_process(pid).is_ok() {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("the server process is still alive");
+}
+
 #[tokio::test]
-async fn a_codex_turn_runs_on_the_app_server_and_a_later_one_says_the_thread_is_new() {
+async fn two_turns_of_a_codex_session_run_on_one_server_without_a_not_carried_notice() {
     // Arrange
     let mut rig = codex_rig(&json!({}));
 
     // Act
     let sent = rig.send("hello").await;
-    rig.wait_for("result").await;
-    rig.wait_until_idle().await;
+    rig.wait_until_turn_over().await;
+    let pid = rig.codex_pid();
+    rig.send("second").await;
+    rig.wait_until_turn_over().await;
 
     // Assert
     assert!(sent["result"]["turn_id"].is_string());
     let kinds = rig.kinds().await;
     assert!(kinds.contains(&"stream_delta".to_owned()));
     assert!(!kinds.contains(&"approvals_unavailable".to_owned()));
-    assert!(!rig.pidfile().exists());
+    assert_eq!(rig.codex_pid(), pid);
+    assert_eq!(rig.codex_report()["prompts"], json!(["hello", "second"]));
+    assert!(rig.pidfile().exists());
     assert!(!dump(&rig.db(), "events").contains("do not carry over"));
+}
+
+#[tokio::test]
+async fn a_server_that_dies_mid_turn_ends_that_turn_and_the_next_respawns_it_with_the_history() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    rig.send("hello").await;
+    rig.wait_until_turn_over().await;
+    let first = rig.codex_pid();
 
     // Act
-    rig.send("second").await;
-    rig.wait_until_idle().await;
+    rig.send("please crash").await;
+    rig.wait_until_turn_over().await;
+    let after_crash = rig.codex_pid();
+    rig.send("again").await;
+    rig.wait_until_turn_over().await;
 
     // Assert
-    assert!(dump(&rig.db(), "events").contains("do not carry over"));
+    assert_eq!(after_crash, first);
+    let crashes = rig
+        .events()
+        .await
+        .into_iter()
+        .filter(|e| e.kind == "backend_crashed")
+        .count();
+    assert_eq!(crashes, 1);
+    let crash = rig
+        .events()
+        .await
+        .into_iter()
+        .find(|e| e.kind == "backend_crashed")
+        .unwrap();
+    let body: Value = serde_json::from_str(&crash.body).unwrap();
+    assert_eq!(
+        body["detail"],
+        "the Codex app-server exited during the turn; the next turn starts a new server"
+    );
+    assert_ne!(rig.codex_pid(), first);
+    let prompts = rig.codex_report()["prompts"].to_string();
+    assert!(prompts.contains("hello") && prompts.contains("working on it"));
+    assert!(prompts.contains("again"));
+}
+
+#[tokio::test]
+async fn a_second_send_is_rejected_with_turn_running_and_a_cancel_leaves_the_server_usable() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    rig.send("please stall").await;
+    rig.wait_for_prompts(1).await;
+    let pid = rig.codex_pid();
+
+    // Act
+    let busy = rig.send("meanwhile").await;
+    let cancelled = rig
+        .call("session.cancel", json!({"session_id": rig.session}))
+        .await;
+    rig.wait_until_turn_over().await;
+    rig.send("after").await;
+    rig.wait_until_turn_over().await;
+
+    // Assert
+    assert_eq!(busy["error"]["code"], TURN_RUNNING);
+    assert_eq!(cancelled["result"]["cancelled"], true);
+    assert_eq!(rig.codex_pid(), pid);
+    assert!(rig.codex_report()["interrupt_params"]["turnId"].is_string());
+    assert!(rig.kinds().await.contains(&"turn_interrupted".to_owned()));
+}
+
+#[tokio::test]
+async fn shutting_down_stops_the_pooled_codex_server() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    rig.send("hello").await;
+    rig.wait_until_turn_over().await;
+    let pid = rig.codex_pid();
+    let idle_alive = rustix::process::test_kill_process(pid).is_ok();
+
+    // Act
+    rig.turns.shutdown().await;
+
+    // Assert
+    assert!(idle_alive);
+    assert_gone(pid).await;
+    assert!(!rig.pidfile().exists());
 }
 
 #[tokio::test]
@@ -952,4 +1121,82 @@ async fn a_codex_app_server_crash_is_stored_as_a_crash_event_without_a_fallback(
     );
     let log = dump(&rig.db(), "event_log");
     assert!(log.contains("turn_ended") && log.contains("error"), "{log}");
+}
+
+#[tokio::test]
+async fn a_respawn_that_fails_ends_the_send_with_an_error_and_is_not_retried() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    rig.send("hello").await;
+    rig.wait_until_turn_over().await;
+    let first = rig.codex_pid();
+    rig.send("please crash").await;
+    rig.wait_until_turn_over().await;
+    rig.write_codex_control(&json!({"exit_early": true}));
+
+    // Act
+    let refused = rig.send("again").await;
+
+    // Assert
+    assert!(refused["error"].is_object(), "{refused}");
+    assert!(!rig.turns.is_running(&rig.session));
+    rig.write_codex_control(&json!({}));
+    rig.send("third").await;
+    rig.wait_until_turn_over().await;
+    assert_ne!(rig.codex_pid(), first);
+    assert!(rustix::process::test_kill_process(rig.codex_pid()).is_ok());
+}
+
+#[tokio::test]
+async fn the_least_recently_used_idle_server_is_stopped_once_the_pool_is_full() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    let first = rig.session.clone();
+    rig.run_turn_of(&first, "one").await;
+    let first_pid = rig.codex_pid();
+    let mut later = Vec::new();
+
+    // Act
+    for _ in 0..MAX_IDLE_SERVERS {
+        let session = rig.codex_session().await;
+        rig.run_turn_of(&session, "filler").await;
+        later.push((session.clone(), rig.codex_pid()));
+    }
+
+    // Assert
+    assert_gone(first_pid).await;
+    assert!(!crate::backends::pidfile_path(rig.data.path(), &first).exists());
+    for (session, pid) in &later {
+        assert!(rustix::process::test_kill_process(*pid).is_ok());
+        assert!(crate::backends::pidfile_path(rig.data.path(), session).exists());
+    }
+}
+
+#[test]
+fn a_pidfile_naming_another_server_is_left_alone() {
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionId::new("s-1");
+    let pid = std::process::id();
+    let path = crate::backends::pidfile_path(dir.path(), &session);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(crate::pidfile::write(
+            &path,
+            pid,
+            std::path::Path::new("/bin/sh"),
+        ))
+        .unwrap();
+
+    // Act
+    super::remove_pidfile_of(dir.path(), &session, Some(pid + 1));
+    let kept = path.exists();
+    super::remove_pidfile_of(dir.path(), &session, Some(pid));
+
+    // Assert
+    assert!(kept);
+    assert!(!path.exists());
 }

@@ -7,8 +7,8 @@
 //! watchdog aborts a silent backend, and the child is stopped and its pidfile
 //! removed however the turn ends.
 
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use coda_config::config::{Config, PermissionMode};
+use coda_core::history::Transcript;
 use coda_protocol::events::Event;
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR};
 use coda_protocol::methods::{
@@ -24,6 +25,7 @@ use coda_protocol::methods::{
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::TurnOutcome;
+use coda_providers::codex::Carried;
 use coda_providers::detect::DEFAULT_PROBE_TIMEOUT;
 use coda_providers::gate::PermissionGate;
 use coda_providers::registry::RegistryError;
@@ -46,7 +48,9 @@ mod drive;
 use self::drive::Drive;
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
 use crate::gate::{BrokerGate, Brokers};
+use crate::idle_pool::{IdlePool, MAX_IDLE_SERVERS};
 use crate::model_session::{Limits, ModelError, ModelSessions};
+use crate::pidfile;
 use crate::subscribe::{Hub, HubError};
 use crate::supervisor::{RestartPolicy, Supervisor, TokioSleeper, Verdict};
 use crate::trace::backend_span;
@@ -66,6 +70,8 @@ const CODEX_BACKEND_NAME: &str = "codex";
 /// emit callback is synchronous and must not block, so when the store falls
 /// this far behind, further events are dropped with a warning.
 const EVENT_QUEUE_CAPACITY: usize = 1024;
+/// Bytes of earlier conversation given to a Codex thread that replaces a lost one.
+const MAX_SEED_BYTES: usize = 32 * 1024;
 
 /// How turns start their backend.
 #[derive(Debug, Clone)]
@@ -218,8 +224,9 @@ pub struct Turns {
     running: Mutex<HashMap<SessionId, Reservation<CancelHandle>>>,
     /// The backends' own session ids, so the next turn resumes the conversation.
     backend_ids: Mutex<HashMap<SessionId, String>>,
-    /// Sessions that have run an app-server turn, whose next thread starts empty.
-    codex_threads: Mutex<HashSet<SessionId>>,
+    /// Codex app-servers between turns, one per session. A turn takes its
+    /// session's server out, so turns of one session never share it at once.
+    idle: IdlePool<AgentSession>,
     supervisor: Supervisor,
     /// Set once the daemon shuts down, so no crashed backend is restarted.
     stopping: AtomicBool,
@@ -260,7 +267,7 @@ impl Turns {
             models,
             running: Mutex::default(),
             backend_ids: Mutex::default(),
-            codex_threads: Mutex::default(),
+            idle: IdlePool::new(MAX_IDLE_SERVERS),
             supervisor,
             stopping: AtomicBool::new(false),
         })
@@ -372,6 +379,9 @@ impl Turns {
             .await?;
             return Ok(AgentSession::Claude(Box::new(session)));
         }
+        if let Some(idle) = self.reuse_idle(&session_id).await {
+            return Ok(idle);
+        }
         let search_dirs = path_dirs(&parent_env);
         let settings = resolve_codex_off_worker(
             self.config.models.clone(),
@@ -379,19 +389,73 @@ impl Turns {
             DEFAULT_PROBE_TIMEOUT,
         )
         .await?;
-        let continued = self.codex_threads().contains(&session_id);
+        let carried = if record.backend == BackendKind::CodexAppServer {
+            self.carried(&session_id).await
+        } else {
+            Carried::Nothing
+        };
         let session = start_codex_session(CodexStart {
             settings,
             cwd,
-            session_id: session_id.clone(),
+            session_id,
             resume,
-            continued,
+            carried,
             parent_env,
             pidfile_dir,
         })
         .await?;
-        self.codex_threads().insert(session_id);
         Ok(AgentSession::Codex(Box::new(session)))
+    }
+
+    /// The idle server of `session` when it still runs. One that died while idle
+    /// is stopped, so the caller starts a single new one.
+    async fn reuse_idle(&self, session: &SessionId) -> Option<AgentSession> {
+        let mut idle = self.idle.take(session)?;
+        if idle.is_reusable() {
+            return Some(idle);
+        }
+        info!(session = %session, "the idle Codex server is gone; starting a new one");
+        stop(&mut idle, session).await;
+        remove_pidfile(&self.config.pidfile_dir, session);
+        None
+    }
+
+    /// The stored conversation, for a new thread to pick up where the lost one stopped.
+    async fn carried(&self, session: &SessionId) -> Carried {
+        let mut transcript = Transcript::new(MAX_SEED_BYTES);
+        let mut after = 0;
+        loop {
+            let id = session.clone();
+            let page = self
+                .hub
+                .with_store(move |store| {
+                    let next = transcript.apply_page(store, &id, after)?;
+                    Ok((transcript, next))
+                })
+                .await;
+            match page {
+                Ok((back, Some(last))) => {
+                    transcript = back;
+                    after = last;
+                }
+                Ok((back, None)) => return back.render().map_or(Carried::Nothing, Carried::Seed),
+                Err(error) => {
+                    warn!(session = %session, %error, "could not read the conversation for a new Codex thread");
+                    return Carried::Lost;
+                }
+            }
+        }
+    }
+
+    /// Keeps `child` for the session's next turn. A server the pool pushes out,
+    /// or all of them once the daemon stops, is stopped here.
+    async fn park(&self, session: &SessionId, child: AgentSession) {
+        if let Some((id, mut evicted)) = self.idle.keep(session.clone(), child) {
+            info!(session = %id, "stopping an idle Codex server");
+            let pid = evicted.pid();
+            stop(&mut evicted, &id).await;
+            remove_pidfile_of(&self.config.pidfile_dir, &id, pid);
+        }
     }
 
     /// Cancels the running turn of `session`; `false` when none is running.
@@ -412,6 +476,10 @@ impl Turns {
     pub async fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         self.models.shutdown().await;
+        for (session, mut child) in self.idle.close() {
+            stop(&mut child, &session).await;
+            remove_pidfile(&self.config.pidfile_dir, &session);
+        }
     }
 
     /// Whether `session` has a turn starting or running.
@@ -444,12 +512,6 @@ impl Turns {
 
     fn resume_id(&self, session: &SessionId) -> Option<String> {
         self.backend_ids().get(session).cloned()
-    }
-
-    fn codex_threads(&self) -> std::sync::MutexGuard<'_, HashSet<SessionId>> {
-        self.codex_threads
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn backend_ids(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, String>> {
@@ -542,18 +604,32 @@ impl Turns {
             timed_out,
             ..
         } = drive;
-        info!(session = %session, turn = %turn, step = "cleanup", "stopping the backend");
-        stop(&mut child, &session).await;
-        if let Some(backend_id) = child.session_id_from_backend() {
-            self.backend_ids()
-                .insert(session.clone(), backend_id.to_owned());
+        // A turn the watchdog aborted may still run on the server, so it is not kept.
+        let keep = !timed_out
+            && matches!(
+                outcome,
+                Some(Ok(TurnOutcome::Completed { .. } | TurnOutcome::Cancelled))
+            )
+            && child.is_reusable();
+        if keep {
+            info!(session = %session, turn = %turn, step = "cleanup", "keeping the backend for the next turn");
+            self.park(&session, child).await;
+        } else {
+            info!(session = %session, turn = %turn, step = "cleanup", "stopping the backend");
+            stop(&mut child, &session).await;
+            if let Some(backend_id) = child.session_id_from_backend() {
+                self.backend_ids()
+                    .insert(session.clone(), backend_id.to_owned());
+            }
         }
         // Dropping the emitter closes the channel, which ends the publisher.
         drop(emit);
         if publisher.await.is_err() {
             warn!(session = %session, "the event publisher stopped early");
         }
-        remove_pidfile(&self.config.pidfile_dir, &session);
+        if !keep {
+            remove_pidfile(&self.config.pidfile_dir, &session);
+        }
         if let Some(Err(e)) = &outcome {
             warn!(session = %session, error = %e, "the turn failed");
         }
@@ -703,6 +779,16 @@ pub(crate) async fn store_event(
             .await?;
     }
     Ok(())
+}
+
+/// Removes the pidfile only while it still names `pid`: a turn of the same session may
+/// have started a new server, and its pidfile is not ours to delete.
+fn remove_pidfile_of(dir: &std::path::Path, session: &SessionId, pid: Option<u32>) {
+    let names_pid =
+        pidfile::read(&pidfile_path(dir, session)).is_ok_and(|record| Some(record.pid) == pid);
+    if names_pid {
+        remove_pidfile(dir, session);
+    }
 }
 
 fn remove_pidfile(dir: &std::path::Path, session: &SessionId) {

@@ -10,10 +10,13 @@
 //!
 //! A denied approval answers `decline`, else `cancel`, from the request's
 //! `availableDecisions`; when neither is offered, or the field is not a list,
-//! the turn is ended with `turn/interrupt`. Cancelling a turn from the client
-//! also kills the server's process group and closes the session. A server that
-//! does not end an interrupted or cancelled turn within a short time is killed
-//! too, so a denial never leaves the turn waiting.
+//! the turn is ended with `turn/interrupt`. A server that does not end an
+//! interrupted or cancelled turn within a short time is killed, so a denial
+//! never leaves the turn waiting.
+//!
+//! One server serves every turn of a session. Cancelling a turn sends
+//! `turn/interrupt` and keeps the server for the next turn; a server that does
+//! not end the turn in time has its process group killed instead.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
@@ -66,6 +69,9 @@ const MAX_TRACKED_ITEMS: usize = 1024;
 const ACCEPT: &str = "accept";
 const DECLINE: &str = "decline";
 const CANCEL: &str = "cancel";
+/// Said when the server process ends mid-turn; the next turn starts a new one.
+const SERVER_DIED_DETAIL: &str =
+    "the Codex app-server exited during the turn; the next turn starts a new server";
 const INTERRUPT_METHOD: &str = "turn/interrupt";
 /// How long a server gets to end an interrupted or cancelled turn before its group is killed.
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -273,6 +279,8 @@ pub struct CodexAppServerSession {
     items: HashMap<String, Item>,
     /// The server's id for the turn in flight, which `turn/interrupt` names.
     server_turn: Option<String>,
+    /// Whether the server accepted the last `turn/start`.
+    turn_accepted: bool,
     /// Messages that arrived while an approval was pending.
     queued: VecDeque<Message>,
     closed: bool,
@@ -331,6 +339,7 @@ impl CodexAppServerSession {
             next_id: 0,
             items: HashMap::new(),
             server_turn: None,
+            turn_accepted: false,
             queued: VecDeque::new(),
             closed: false,
         })
@@ -429,8 +438,15 @@ impl CodexAppServerSession {
         if self.closed {
             return Err(AppServerError::Closed);
         }
+        self.queued.clear();
+        self.items.clear();
+        self.server_turn = None;
+        self.turn_accepted = false;
         if *self.cancel.borrow() {
-            return self.interrupted(turn_id, emit).await;
+            // Nothing is running yet, so there is nothing to interrupt.
+            self.cancel.send_replace(false);
+            emit(self.interrupted_event(turn_id));
+            return Ok(TurnOutcome::Cancelled);
         }
         let cancel = self.cancel.subscribe();
         let result = tokio::select! {
@@ -445,6 +461,21 @@ impl CodexAppServerSession {
                 Err(error)
             }
         }
+    }
+
+    /// Whether the server accepted the `turn/start` of the last turn.
+    #[must_use]
+    pub fn turn_accepted(&self) -> bool {
+        self.turn_accepted
+    }
+
+    /// Whether the server is still running and can take another turn.
+    pub fn is_reusable(&mut self) -> bool {
+        !self.closed
+            && self
+                .child
+                .as_mut()
+                .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
     }
 
     /// Stops the whole process group and refuses further turns; safe to repeat.
@@ -511,6 +542,7 @@ impl CodexAppServerSession {
                     result,
                 } if id == turn_request => {
                     self.server_turn = result["turn"]["id"].as_str().map(str::to_owned);
+                    self.turn_accepted = true;
                 }
                 Message::Response {
                     id, failed: true, ..
@@ -788,16 +820,23 @@ impl CodexAppServerSession {
         }
     }
 
+    fn interrupted_event(&self, turn_id: &TurnId) -> Event {
+        Event::TurnInterrupted {
+            session_id: self.session_id.clone(),
+            turn_id: turn_id.clone(),
+        }
+    }
+
+    /// Ends the cancelled turn on the server. The cancel is spent, so the next
+    /// turn is not cancelled with it.
     async fn interrupted(
         &mut self,
         turn_id: &TurnId,
         emit: &mut impl FnMut(Event),
     ) -> Result<TurnOutcome, AppServerError> {
-        emit(Event::TurnInterrupted {
-            session_id: self.session_id.clone(),
-            turn_id: turn_id.clone(),
-        });
-        self.stop().await?;
+        emit(self.interrupted_event(turn_id));
+        self.interrupt(None).await?;
+        self.cancel.send_replace(false);
         Ok(TurnOutcome::Cancelled)
     }
 
@@ -813,7 +852,7 @@ impl CodexAppServerSession {
             session_id: self.session_id.clone(),
             exit_code,
             will_restart: false,
-            detail: None,
+            detail: Some(SERVER_DIED_DETAIL.to_owned()),
         });
         Ok(TurnOutcome::Crashed { exit_code })
     }

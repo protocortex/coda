@@ -71,12 +71,12 @@ async fn an_idle_switch_stores_the_alias_and_the_next_send_continues_the_history
     rig.send("first").await;
     rig.wait_for_results(1).await;
     rig.wait_until_idle().await;
-    let kept_before = lock(&rig.turns.models.loops).len();
+    let kept_before = rig.turns.models.loops.len();
 
     // Act
     let params = set_model(&rig.session, "scripted");
     let response = rig.call("session.set_model", params).await;
-    let kept_after = lock(&rig.turns.models.loops).len();
+    let kept_after = rig.turns.models.loops.len();
     rig.send("second").await;
     rig.wait_for_results(2).await;
 
@@ -120,7 +120,7 @@ async fn an_unknown_alias_is_rejected_and_changes_nothing() {
     // Assert
     assert_eq!(error_code(&response), UNKNOWN_MODEL, "{response}");
     assert_eq!(stored_model(&rig.hub, &rig.session).await, None);
-    assert_eq!(lock(&rig.turns.models.loops).len(), 1);
+    assert_eq!(rig.turns.models.loops.len(), 1);
     let message = response["error"]["message"].as_str().unwrap();
     assert!(message.contains("unknown model alias `nope`"), "{message}");
     assert_eq!(rig.bodies(MODEL_SWITCHED_KIND).await.len(), 0);

@@ -123,6 +123,7 @@ golden_tests! {
     event_result: "event.result" => Event,
     event_usage: "event.usage" => Event,
     event_approvals_unavailable: "event.approvals_unavailable" => Event,
+    event_history_not_restored: "event.history_not_restored" => Event,
     event_stream_delta: "event.stream_delta" => Event,
     event_backend_crashed: "event.backend_crashed" => Event,
     event_backend_crashed_minimal: "event.backend_crashed.minimal" => Event,
