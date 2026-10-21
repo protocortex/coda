@@ -44,7 +44,7 @@ pub fn backend_span(session: &SessionId, turn: &TurnId, backend: &str) -> Span {
 pub(crate) mod capture {
     use std::collections::BTreeMap;
     use std::fmt::Debug;
-    use std::sync::{Arc, Mutex, PoisonError};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
     use tracing::field::{Field, Visit};
     use tracing::span::Attributes;
@@ -107,6 +107,13 @@ pub(crate) mod capture {
     /// Records spans on the current thread until the guard drops. Use a
     /// current-thread runtime so the code under test stays on this thread.
     pub(crate) fn install() -> (Spans, DefaultGuard) {
+        // A callsite first hit on a thread with no subscriber can cache "never
+        // interested" while other threads swap scoped subscribers in and out. An
+        // always-interested global registry keeps every callsite enabled.
+        static GLOBAL: OnceLock<()> = OnceLock::new();
+        GLOBAL.get_or_init(|| {
+            let _ = tracing::subscriber::set_global_default(Registry::default());
+        });
         let spans = Spans::default();
         let guard = tracing::subscriber::set_default(Registry::default().with(spans.clone()));
         // With a single live subscriber, tracing rebuilds callsite interest from
