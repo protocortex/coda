@@ -21,6 +21,7 @@ use crate::anthropic::request::RequestSettings;
 use crate::model::{
     ModelProvider, ModelRequest, ModelStream, ProviderError, SystemClock, TokioSleeper,
 };
+use crate::models;
 use crate::openai_compat::provider::{OpenAiCompatOptions, OpenAiCompatProvider};
 
 /// Config key of the Anthropic provider section.
@@ -194,6 +195,23 @@ impl ModelRegistry {
         Ok(ModelTarget { backend, model })
     }
 
+    /// The context window of `target` in tokens: the `context_window` of an
+    /// alias for the same provider and model, else the built-in table, else
+    /// `None` for a model nobody knows.
+    #[must_use]
+    pub fn context_window(&self, target: &ModelTarget) -> Option<u32> {
+        let provider = provider_key(target.backend);
+        self.aliases
+            .values()
+            .find(|alias| {
+                provider == Some(alias.provider.as_str())
+                    && alias.model == target.model
+                    && alias.context_window.is_some()
+            })
+            .and_then(|alias| alias.context_window)
+            .or_else(|| models::context_window(&target.model))
+    }
+
     /// Builds the client for `target`. `env` looks up the API key variable the
     /// provider names, on every call the client makes.
     ///
@@ -260,7 +278,7 @@ mod tests {
     use coda_config::config::Config;
     use coda_protocol::types::BackendKind;
 
-    use super::{ModelRegistry, RegistryError};
+    use super::{ModelRegistry, ModelTarget, RegistryError};
 
     const CONFIG: &str = r#"
 [providers.anthropic]
@@ -322,6 +340,67 @@ model = "m"
 
     fn lookup(name: &str) -> Option<String> {
         (name == "TEAM_ANTHROPIC_KEY").then(|| "sk-secret-value".to_owned())
+    }
+
+    fn target(backend: BackendKind, model: &str) -> ModelTarget {
+        ModelTarget {
+            backend,
+            model: model.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_known_model_reports_its_published_window_and_an_unknown_one_none() {
+        // Arrange
+        let registry = registry(CONFIG);
+        let cases = [
+            ("claude-sonnet-5-5", Some(200_000)),
+            ("claude-sonnet-4-5", Some(200_000)),
+            ("gpt-4o", Some(128_000)),
+            ("claude-fast", None),
+        ];
+
+        for (model, expected) in cases {
+            // Act
+            let window = registry.context_window(&target(BackendKind::Anthropic, model));
+
+            // Assert
+            assert_eq!(window, expected, "{model}");
+        }
+    }
+
+    #[test]
+    fn an_alias_window_overrides_the_table_for_its_provider_and_model() {
+        // Arrange
+        let registry = registry(
+            "[providers.anthropic]\nenabled = true\n\
+             [models.wide]\nprovider = \"anthropic\"\nmodel = \"claude-sonnet-5-5\"\ncontext_window = 1000000\n\
+             [models.mine]\nprovider = \"openai_compat\"\nmodel = \"qwen\"\ncontext_window = 32000\n",
+        );
+
+        // Act
+        let (wide, mine, other_backend) = (
+            registry.context_window(&target(BackendKind::Anthropic, "claude-sonnet-5-5")),
+            registry.context_window(&target(BackendKind::OpenaiCompat, "qwen")),
+            registry.context_window(&target(BackendKind::OpenaiCompat, "claude-sonnet-5-5")),
+        );
+
+        // Assert
+        assert_eq!(wide, Some(1_000_000));
+        assert_eq!(mine, Some(32_000));
+        assert_eq!(other_backend, Some(200_000), "the override is per provider");
+    }
+
+    #[test]
+    fn an_alias_without_a_window_keeps_the_table_value() {
+        // Arrange
+        let registry = registry("[models.plain]\nprovider = \"anthropic\"\nmodel = \"gpt-4o\"\n");
+
+        // Act
+        let window = registry.context_window(&target(BackendKind::Anthropic, "gpt-4o"));
+
+        // Assert
+        assert_eq!(window, Some(128_000));
     }
 
     #[test]

@@ -23,6 +23,7 @@ const RUN_DIR_NAME: &str = "run";
 const SOCKET_FILE_NAME: &str = "coda.sock";
 
 const PROVIDERS_KEY: &str = "providers";
+const MODELS_KEY: &str = "models";
 const SECRET_KEY_SUFFIXES: [&str; 7] = [
     "api_key",
     "apikey",
@@ -74,6 +75,17 @@ pub enum ConfigError {
         path: String,
         /// The accepted values.
         allowed: String,
+    },
+    /// Two aliases for one provider and model give it different context windows.
+    #[error(
+        "`{second}` and `{first}` name the same model but set different context windows; \
+         keep one value"
+    )]
+    ConflictingContextWindow {
+        /// Dotted path of the alias that was read first.
+        first: String,
+        /// Dotted path of the alias that disagrees with it.
+        second: String,
     },
     /// Neither `CODA_HOME` nor `HOME` is set.
     #[error("cannot locate the config directory: neither CODA_HOME nor HOME is set")]
@@ -138,6 +150,10 @@ pub struct ModelAlias {
     pub provider: String,
     /// Model id sent to the provider.
     pub model: String,
+    /// Context window of the model in tokens, when the built-in table has no
+    /// value for it or is wrong.
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 /// The `[telemetry]` section.
@@ -199,7 +215,9 @@ impl Config {
     /// # Errors
     /// Returns [`ConfigError::Syntax`] if the text is not valid for the schema, or
     /// [`ConfigError::PlaintextSecret`] if a provider section holds a literal secret, or
-    /// [`ConfigError::InvalidValue`] if a provider `sandbox` is not a Codex sandbox.
+    /// [`ConfigError::InvalidValue`] if a provider `sandbox` is not a Codex sandbox or a
+    /// `context_window` is zero, or [`ConfigError::ConflictingContextWindow`] if two
+    /// aliases of one model disagree on it.
     pub fn from_toml_str(text: &str) -> Result<Parsed, ConfigError> {
         let value: toml::Value = toml::from_str(text)?;
         if let Some(providers) = value.get(PROVIDERS_KEY) {
@@ -209,6 +227,7 @@ impl Config {
         let config: Self =
             serde_ignored::deserialize(value, |path| unknown_keys.push(path.to_string()))?;
         config.check_sandboxes()?;
+        config.check_context_windows()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -224,6 +243,34 @@ impl Config {
                     path: format!("{PROVIDERS_KEY}.{name}.sandbox"),
                     allowed: SANDBOX_MODES.join(", "),
                 });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_context_windows(&self) -> Result<(), ConfigError> {
+        let mut seen: BTreeMap<(&str, &str), (&str, u32)> = BTreeMap::new();
+        for (name, alias) in &self.models {
+            let Some(window) = alias.context_window else {
+                continue;
+            };
+            if window == 0 {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{MODELS_KEY}.{name}.context_window"),
+                    allowed: "a whole number of tokens above 0".to_owned(),
+                });
+            }
+            let key = (alias.provider.as_str(), alias.model.as_str());
+            match seen.get(&key) {
+                Some(&(first, other)) if other != window => {
+                    return Err(ConfigError::ConflictingContextWindow {
+                        first: format!("{MODELS_KEY}.{first}.context_window"),
+                        second: format!("{MODELS_KEY}.{name}.context_window"),
+                    });
+                }
+                _ => {
+                    seen.insert(key, (name, window));
+                }
             }
         }
         Ok(())
@@ -553,6 +600,60 @@ idle_timeout_ms = 1500
         assert_eq!(provider.model.as_deref(), Some("m"));
         assert_eq!(parsed.config.models["local"].model, "qwen");
         assert_eq!(parsed.unknown_keys, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_model_alias_may_set_its_context_window() {
+        // Arrange
+        let input = "[models.big]\nprovider = \"anthropic\"\nmodel = \"m\"\ncontext_window = 1000000\n\
+                     [models.plain]\nprovider = \"anthropic\"\nmodel = \"n\"\n";
+
+        // Act
+        let parsed = parse(input);
+
+        // Assert
+        assert_eq!(parsed.config.models["big"].context_window, Some(1_000_000));
+        assert_eq!(parsed.config.models["plain"].context_window, None);
+        assert_eq!(parsed.unknown_keys, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_zero_context_window_is_rejected_naming_the_key() {
+        // Arrange
+        let input = "[models.big]\nprovider = \"anthropic\"\nmodel = \"m\"\ncontext_window = 0\n";
+
+        // Act
+        let err = Config::from_toml_str(input).unwrap_err();
+
+        // Assert
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { path, .. } if path == "models.big.context_window"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn aliases_of_one_model_must_agree_on_its_context_window() {
+        // Arrange
+        let alias = |name: &str, window: u32| {
+            format!(
+                "[models.{name}]\nprovider = \"anthropic\"\nmodel = \"m\"\ncontext_window = {window}\n"
+            )
+        };
+        let agree = format!("{}{}", alias("a", 5000), alias("b", 5000));
+        let clash = format!("{}{}", alias("a", 5000), alias("b", 9000));
+
+        // Act
+        let agreed = Config::from_toml_str(&agree);
+        let clashed = Config::from_toml_str(&clash).unwrap_err();
+
+        // Assert
+        assert!(agreed.is_ok());
+        assert!(
+            matches!(&clashed, ConfigError::ConflictingContextWindow { first, second }
+                if first == "models.a.context_window" && second == "models.b.context_window"),
+            "{clashed}"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod faux;
 pub mod gate;
 mod jsonl;
 pub mod model;
+pub mod models;
 pub mod openai_compat;
 pub mod policy;
 pub mod registry;
