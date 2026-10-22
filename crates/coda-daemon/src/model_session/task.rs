@@ -64,17 +64,17 @@ pub(super) struct ChildEnv {
     pub(super) env: Vec<(OsString, OsString)>,
     pub(super) key_reader: EnvReader,
     /// `CODA_HOME`, where the user's definitions live; `None` when the daemon
-    /// cannot tell, in which case there are none.
+    /// cannot tell, in which case only the built-in agents are offered.
     pub(super) home: Option<PathBuf>,
 }
 
 impl ChildEnv {
-    /// The agents a session in `cwd` may dispatch: the user's, and the
-    /// project's once its repository is trusted. Read afresh on every call, so
-    /// an edited file is checked against the trusted digest again.
+    /// The agents a session in `cwd` may dispatch: the built-in ones, the
+    /// user's, and the project's once its repository is trusted. Read afresh on
+    /// every call, so an edited file is checked against the trusted digest again.
     pub(super) async fn catalog(&self, cwd: &str) -> Result<Catalog, HubError> {
         let Some(home) = self.home.clone() else {
-            return Ok(Catalog::default());
+            return Ok(Catalog::builtin());
         };
         let root = repo_identity(Path::new(cwd));
         self.hub

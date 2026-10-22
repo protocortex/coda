@@ -31,7 +31,7 @@ You review diffs. Report findings only.
 | `description` | Required. Routing reads it. It must say when to use the agent ("Use when ...") and when not to ("Do not use ..."). |
 | `tier` | Required. `fast`, `standard` or `deep`. A `[routing]` table in `config.toml` maps it to a model (see [config.md](config.md)). |
 | `effort` | Required. `low`, `medium` or `high`. |
-| `tools` | Required. The only tools the agent can call. Each must be a tool Coda ships: `bash`, `code_outline`, `code_read_range`, `code_search`, `code_symbol`, `edit`, `grep`, `read`, `retrieve`. An agent is read-only because the list holds no write tool, not because its prompt says so. |
+| `tools` | Required. The only tools the agent can call. Each must be a tool Coda ships: `bash`, `code_outline`, `code_read_range`, `code_search`, `code_symbol`, `edit`, `grep`, `read`, `retrieve`. An agent without `edit` and `bash` cannot change files, because the list holds no such tool, not because its prompt says so. `bash` can still change files, so an agent that has it is not read-only, and each command it runs goes through the permission broker. |
 
 A `model` key is an error: an agent file never names a model id.
 
@@ -47,9 +47,24 @@ Frontmatter: `name`, `description`, and an optional `argument_hint` such as `<is
 
 Hooks load only from the user's `config.toml`. A hook key (`hook`, `hooks`, `pre_tool`, `post_tool`, `pre_tool_use`, `post_tool_use`, `session_start`) in any definition file is an error, and that file is not loaded.
 
+## Built-in agents
+
+Four agents ship in the binary. They are ordinary agent files that are checked by the same lint as yours, and `coda agents list` shows them as `built-in`.
+
+| Agent | Tier | Tools | Use |
+| --- | --- | --- | --- |
+| `explore` | `fast` | `code_outline`, `code_read_range`, `code_search`, `code_symbol`, `grep`, `read`, `retrieve` | Finds where something is and how it works. Reports `path:line` places. |
+| `reviewer` | `standard` | the same read-only tools | Reviews code and replies with a JSON report of classified findings (see [The result](#the-result)). |
+| `implementer` | `standard` | the read-only tools, `edit` and `bash` | Makes one clear change, runs the build or tests that cover it, and reports what it changed. |
+| `tester` | `fast` | `bash`, `code_read_range`, `grep`, `read`, `retrieve` | Runs the tests or checks it is given and reports passes and failures. It has no `edit` tool, but `bash` can still change files; its prompt tells it to run and report, not to change files. |
+
+`explore` and `reviewer` have no `bash` and no `edit`, so they cannot change anything. `tester` has no `edit` tool, but its `bash` can change files, so it is not read-only: every command it runs goes through the permission broker (see [Dispatch](#dispatch-the-task-tool)), and the user can refuse it.
+
+To change one, write a file with the same name. A user file in `<CODA_HOME>/agents/` replaces the built-in one entirely and may give it other tools. A project file in `.coda/agents/` replaces its description and prompt once the repository is trusted, but can only narrow its tools, as for a user agent. An untrusted project file changes nothing.
+
 ## Precedence and trust
 
-User files load first. A project file with the same name replaces the user definition's description and prompt. For an agent, the user's tier and effort stay, and the project's `tools` list can only narrow the user's: a tool the user definition lacks is ignored and reported. A project-only agent keeps its own `tools`.
+Built-in agents load first, then user files, then project files. A user file with the same name replaces the built-in definition. A project file with the same name replaces the description and prompt of the definition below it, built-in or user. For an agent, the tier and effort below it stay, and the project's `tools` list can only narrow the one below it: a tool the earlier definition lacks is ignored and reported. A project-only agent keeps its own `tools`.
 
 Project files are untrusted prompt input. Until you trust the repository they are listed as pending and are never used, and nothing from them is used.
 
@@ -71,7 +86,7 @@ A model-API session (the Anthropic and OpenAI-compatible providers) offers the m
 
 | Rule | Detail |
 | --- | --- |
-| Who can run | The user's agents, and a project's agents once the repository is trusted. A name that only an untrusted project file defines is refused, and the refusal names `coda agents trust`. The files are read again on every call, so an edit after trusting is caught. |
+| Who can run | The built-in agents, the user's agents, and a project's agents once the repository is trusted. A name that only an untrusted project file defines is refused, and the refusal names `coda agents trust`. The files are read again on every call, so an edit after trusting is caught. |
 | Fresh context | The child sees only the prompt. Its system prompt is the agent's body. |
 | Tools | The agent's `tools` list, kept to the tools the parent has. A child cannot start agents: every conversation loop is built in one place, which gives a loop the ability to run `task` only when a child of it would be within the depth cap (`MAX_DEPTH`, 1). A top-level session is at depth 0 and its children at depth 1, so they get none. A `task` entry in an agent file also fails lint. A child's `retrieve` reads the originals stored under the parent session's id, because the child's events are stored there. |
 | Model | The agent's tier, mapped through `[routing]`. A tier with no entry uses the session's model. The routed alias must belong to the session's provider. |

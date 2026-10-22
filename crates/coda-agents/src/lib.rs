@@ -4,6 +4,7 @@
 //!
 //! See `docs/agents.md` for the file formats and the trust rules.
 
+mod builtin;
 mod catalog;
 mod definition;
 mod digest;

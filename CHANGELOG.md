@@ -16,6 +16,7 @@ All notable changes to Coda are recorded here. The format follows
 - `coda agents lint` checks definition files for unknown tiers, efforts and tools, missing usage guidance and model ids, and a `[routing]` config table maps agent tiers to models.
 - A `task` tool that runs a named agent as a child conversation with only its tools, its tier's model and its own permission prompts, which reach the parent's client labelled with the agent. See [docs/agents.md](docs/agents.md).
 - A `task` result reports a status (`completed`, `failed` or `cancelled`), a summary and findings classified as blocking, non-blocking or suggestion. The agent's words are marked as data and capped at 16 KiB, and a malformed report is rejected.
+- Built-in agents `explore`, `reviewer`, `implementer` and `tester`, available to the `task` tool with no files. A user file of the same name replaces one, and a trusted project file can replace its prompt and narrow its tools.
 
 ## [0.1.0] - Unreleased
 
