@@ -66,6 +66,16 @@ const UPGRADED: u16 = 101;
 const METHOD_NOT_FOUND: i64 = -32601;
 /// Items remembered between `item/started` and the approval that refers to them.
 const MAX_TRACKED_ITEMS: usize = 1024;
+/// `ThreadItem` types (Codex 0.163.0 app-server schema) that run work and stay silent until done.
+const TOOL_ITEM_TYPES: [&str; 7] = [
+    "commandExecution",
+    "fileChange",
+    "mcpToolCall",
+    "dynamicToolCall",
+    "collabAgentToolCall",
+    "webSearch",
+    "imageGeneration",
+];
 const ACCEPT: &str = "accept";
 const DECLINE: &str = "decline";
 const CANCEL: &str = "cancel";
@@ -518,9 +528,11 @@ impl CodexAppServerSession {
             let Some(message) = message else {
                 return Ok(None);
             };
+            gate.progress();
             match message {
                 Message::Notification { method, params } => {
-                    if let Some(is_error) = self.notify(&method, &params, turn_id, &mut usage, emit)
+                    if let Some(is_error) =
+                        self.notify(&method, &params, gate, turn_id, &mut usage, emit)
                     {
                         return Ok(Some(TurnOutcome::Completed { is_error }));
                     }
@@ -556,10 +568,11 @@ impl CodexAppServerSession {
     }
 
     /// Handles one notification; returns the turn's error flag once the turn ended.
-    fn notify(
+    fn notify<G: PermissionGate>(
         &mut self,
         method: &str,
         params: &Value,
+        gate: &G,
         turn_id: &TurnId,
         usage: &mut Option<TokenUsage>,
         emit: &mut impl FnMut(Event),
@@ -575,16 +588,22 @@ impl CodexAppServerSession {
                 }
             }
             "item/started" => {
-                if let Some(id) = params["item"]["id"].as_str()
-                    && self.items.len() < MAX_TRACKED_ITEMS
-                {
-                    self.items
-                        .insert(id.to_owned(), Item::from_json(&params["item"]));
+                if let Some(id) = params["item"]["id"].as_str() {
+                    if TOOL_ITEM_TYPES
+                        .contains(&params["item"]["type"].as_str().unwrap_or_default())
+                    {
+                        gate.tool_started(id);
+                    }
+                    if self.items.len() < MAX_TRACKED_ITEMS {
+                        self.items
+                            .insert(id.to_owned(), Item::from_json(&params["item"]));
+                    }
                 }
             }
             "item/completed" => {
                 if let Some(id) = params["item"]["id"].as_str() {
                     self.items.remove(id);
+                    gate.tool_finished(id);
                 }
             }
             "thread/tokenUsage/updated" => add_usage(usage, &params["tokenUsage"]["last"]),

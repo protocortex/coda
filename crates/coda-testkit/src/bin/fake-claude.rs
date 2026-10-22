@@ -15,6 +15,12 @@
 //! `echo-text` sends the control file's `echo_text` back as a text delta.
 //! `tooldie` exits right after the tool call is answered, and `vanish` deletes
 //! its own binary before crashing like `crash`, so it cannot be started again.
+//! `tool-slow` runs a tool that needs no permission: it announces a `tool_use`,
+//! stays silent for `TOOL_SLOW`, then reports the `tool_result` and finishes,
+//! and `tool-hang` announces one and never reports it. `tool-flaky` announces a tool and
+//! crashes the first time (the control file's `crash_marker` remembers it), then stalls.
+//! `stream-long` streams `input_json_delta` and `thinking_delta` lines for longer than
+//! the idle limits the tests use, then finishes.
 //! `flaky` crashes like `crash` the first time and works afterwards, using
 //! the control file's `crash_marker` path to remember it already crashed.
 //!
@@ -57,6 +63,15 @@ const TOOL_DIE_TRIGGER: &str = "tooldie";
 const VANISH_TRIGGER: &str = "vanish";
 const NOISE_TRIGGER: &str = "noise";
 const CRASH_EXIT_CODE: i32 = 3;
+const TOOL_SLOW_TRIGGER: &str = "tool-slow";
+const TOOL_HANG_TRIGGER: &str = "tool-hang";
+const TOOL_FLAKY_TRIGGER: &str = "tool-flaky";
+const STREAM_LONG_TRIGGER: &str = "stream-long";
+const STREAM_STEP: Duration = Duration::from_millis(100);
+const STREAM_STEPS: u32 = 15;
+const TOOL_USE_ID: &str = "toolu-1";
+/// Silent time of a slow tool: past the idle limits the tests use.
+const TOOL_SLOW: Duration = Duration::from_millis(1500);
 
 fn emit(out: &mut impl Write, value: &serde_json::Value) -> io::Result<()> {
     writeln!(out, "{value}")?;
@@ -175,6 +190,12 @@ fn run_turn(
                 "delta":{"type":"text_delta","text":text}}}),
         )?;
     }
+    if user_line.contains(TOOL_FLAKY_TRIGGER) {
+        return run_tool_flaky(control, out);
+    }
+    if user_line.contains(STREAM_LONG_TRIGGER) {
+        return stream_long(out);
+    }
     if user_line.contains(VANISH_TRIGGER) {
         std::fs::remove_file(std::env::current_exe()?)?;
         std::process::exit(CRASH_EXIT_CODE);
@@ -191,6 +212,9 @@ fn run_turn(
     {
         park();
     }
+    if user_line.contains(TOOL_SLOW_TRIGGER) || user_line.contains(TOOL_HANG_TRIGGER) {
+        return run_unasked_tool(user_line, out);
+    }
     emit(
         out,
         &serde_json::json!({"type":"control_request","request_id":REQUEST_ID,
@@ -206,6 +230,66 @@ fn run_turn(
     emit(
         out,
         &serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
+    )?;
+    emit(out, &serde_json::json!({"type":"result","is_error":false}))
+}
+
+/// Announces a tool and crashes once; after the restart nothing is in flight and it stalls.
+fn run_tool_flaky(control: &Control, out: &mut impl Write) -> io::Result<()> {
+    match control.path("crash_marker") {
+        Some(marker) if !marker.exists() => {
+            std::fs::write(marker, b"crashed")?;
+            emit(
+                out,
+                &serde_json::json!({"type":"assistant","message":{"content":[
+                    {"type":"tool_use","id":TOOL_USE_ID,"name":"Bash","input":{"command":"ls"}}]}}),
+            )?;
+            std::process::exit(CRASH_EXIT_CODE)
+        }
+        _ => park(),
+    }
+}
+
+/// Streams tool input and thinking, which carry no text, for longer than the idle limits.
+fn stream_long(out: &mut impl Write) -> io::Result<()> {
+    for step in 0..STREAM_STEPS {
+        std::thread::sleep(STREAM_STEP);
+        let delta = if step % 2 == 0 {
+            serde_json::json!({"type":"input_json_delta","partial_json":"{"})
+        } else {
+            serde_json::json!({"type":"thinking_delta","thinking":"hm"})
+        };
+        emit(
+            out,
+            &serde_json::json!({"type":"stream_event","event":{"type":"content_block_delta","delta":delta}}),
+        )?;
+    }
+    emit(
+        out,
+        &serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"ran"}]}}),
+    )?;
+    emit(out, &serde_json::json!({"type":"result","is_error":false}))
+}
+
+/// A tool Claude Code runs without asking: announced, silent, then reported.
+fn run_unasked_tool(user_line: &str, out: &mut impl Write) -> io::Result<()> {
+    emit(
+        out,
+        &serde_json::json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":TOOL_USE_ID,"name":"Bash","input":{"command":"ls"}}]}}),
+    )?;
+    if user_line.contains(TOOL_HANG_TRIGGER) {
+        park();
+    }
+    std::thread::sleep(TOOL_SLOW);
+    emit(
+        out,
+        &serde_json::json!({"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":TOOL_USE_ID,"content":"ok"}]}}),
+    )?;
+    emit(
+        out,
+        &serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"ran"}]}}),
     )?;
     emit(out, &serde_json::json!({"type":"result","is_error":false}))
 }

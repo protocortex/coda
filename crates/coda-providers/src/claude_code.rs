@@ -28,6 +28,16 @@ pub enum Message {
         /// The message text.
         text: String,
     },
+    /// The model began a tool call; Claude Code runs it, perhaps with no permission ask.
+    ToolStarted {
+        /// Claude Code's id for the call.
+        id: String,
+    },
+    /// A tool call finished and its result went back to the model.
+    ToolFinished {
+        /// The id the call started with.
+        id: String,
+    },
     /// The turn finished.
     Result {
         /// Whether the turn ended in an error.
@@ -136,19 +146,22 @@ impl StreamParser {
         self.log.record(diagnostic);
     }
 
-    fn parse_bytes(&mut self, bytes: &[u8], line: u64) -> Option<Message> {
+    fn parse_bytes(&mut self, bytes: &[u8], line: u64) -> Vec<Message> {
         let text = String::from_utf8_lossy(bytes);
         if text.trim().is_empty() {
-            return None;
+            return Vec::new();
         }
-        self.parse_line(&text, line)
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            self.record(Diagnostic::MalformedLine { line });
+            return Vec::new();
+        };
+        self.parse_line(&value, line)
+            .into_iter()
+            .chain(tool_markers(&value))
+            .collect()
     }
 
-    fn parse_line(&mut self, text: &str, line: u64) -> Option<Message> {
-        let Ok(value) = serde_json::from_str::<Value>(text) else {
-            self.record(Diagnostic::MalformedLine { line });
-            return None;
-        };
+    fn parse_line(&mut self, value: &Value, line: u64) -> Option<Message> {
         let kind = value["type"].as_str().unwrap_or_default();
         match kind {
             "system" if value["subtype"] == "init" => {
@@ -165,14 +178,14 @@ impl StreamParser {
             }
             // Real streams also carry the model's own tool results and rate-limit updates.
             "system" | "user" | "rate_limit_event" => None,
-            "stream_event" => text_delta(&value).map(Message::TextDelta),
+            "stream_event" => text_delta(value).map(Message::TextDelta),
             "assistant" => Some(Message::Assistant {
-                text: assistant_text(&value),
+                text: assistant_text(value),
             }),
             "result" => Some(Message::Result {
                 is_error: value["is_error"].as_bool().unwrap_or(false),
             }),
-            "control_request" => self.permission_request(&value, line),
+            "control_request" => self.permission_request(value, line),
             other => {
                 self.record(Diagnostic::UnknownType {
                     line,
@@ -223,6 +236,25 @@ fn text_delta(value: &Value) -> Option<String> {
         return None;
     }
     event["delta"]["text"].as_str().map(str::to_owned)
+}
+
+/// The tool calls an assistant message starts and a user message finishes.
+fn tool_markers(value: &Value) -> Vec<Message> {
+    let (block_type, id_key, make): (_, _, fn(String) -> Message) = match value["type"].as_str() {
+        Some("assistant") => ("tool_use", "id", |id| Message::ToolStarted { id }),
+        Some("user") => ("tool_result", "tool_use_id", |id| Message::ToolFinished {
+            id,
+        }),
+        _ => return Vec::new(),
+    };
+    value["message"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == block_type)
+        .filter_map(|block| block[id_key].as_str())
+        .map(|id| make(id.to_owned()))
+        .collect()
 }
 
 fn assistant_text(value: &Value) -> String {
@@ -412,6 +444,34 @@ mod tests {
             vec![Message::Assistant {
                 text: "ab".to_owned()
             }]
+        );
+    }
+
+    #[test]
+    fn a_tool_use_starts_a_tool_and_its_result_finishes_it() {
+        // Arrange
+        let mut parser = StreamParser::new();
+        let started = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}"#;
+        let finished =
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#;
+
+        // Act
+        let messages = feed_lines(&mut parser, &[started, finished]);
+
+        // Assert
+        assert_eq!(
+            messages,
+            vec![
+                Message::Assistant {
+                    text: String::new()
+                },
+                Message::ToolStarted {
+                    id: "t1".to_owned()
+                },
+                Message::ToolFinished {
+                    id: "t1".to_owned()
+                },
+            ]
         );
     }
 

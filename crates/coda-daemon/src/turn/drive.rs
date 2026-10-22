@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use super::{CancelHandle, Turns, WatchedGate, remove_pidfile, stop};
 use crate::backends::{AgentError, AgentSession};
 use crate::supervisor::{Attempt, Step};
-use crate::watchdog::{Phase, Watchdog};
+use crate::watchdog::Watchdog;
 
 /// How the last run of the backend ended. `None` means it crashed and could not be started again.
 pub(super) type Outcome = Option<Result<TurnOutcome, AgentError>>;
@@ -180,7 +180,7 @@ impl<E: FnMut(Event) + Send> Attempt for Drive<'_, E> {
             if !self.restart().await {
                 return Step::Finished;
             }
-            self.watchdog.set(Phase::Idle);
+            self.watchdog.reset();
         }
         self.run_once(may_restart).await
     }

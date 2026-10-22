@@ -23,6 +23,8 @@ fn kinds(messages: &[Message]) -> Vec<&'static str> {
             Message::Init { .. } => "init",
             Message::TextDelta(_) => "delta",
             Message::Assistant { .. } => "assistant",
+            Message::ToolStarted { .. } => "tool-start",
+            Message::ToolFinished { .. } => "tool-end",
             Message::Result { .. } => "result",
             Message::PermissionRequest(_) => "ask",
             Message::InvalidPermissionRequest { .. } => "invalid",

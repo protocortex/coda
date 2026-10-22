@@ -216,7 +216,7 @@ impl Config {
     /// Returns [`ConfigError::Syntax`] if the text is not valid for the schema, or
     /// [`ConfigError::PlaintextSecret`] if a provider section holds a literal secret, or
     /// [`ConfigError::InvalidValue`] if a provider `sandbox` is not a Codex sandbox or a
-    /// `context_window` is zero, or [`ConfigError::ConflictingContextWindow`] if two
+    /// `context_window` or `timing.delegated_tool_ms` is zero, or [`ConfigError::ConflictingContextWindow`] if two
     /// aliases of one model disagree on it.
     pub fn from_toml_str(text: &str) -> Result<Parsed, ConfigError> {
         let value: toml::Value = toml::from_str(text)?;
@@ -228,6 +228,7 @@ impl Config {
             serde_ignored::deserialize(value, |path| unknown_keys.push(path.to_string()))?;
         config.check_sandboxes()?;
         config.check_context_windows()?;
+        config.check_timing()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -244,6 +245,16 @@ impl Config {
                     allowed: SANDBOX_MODES.join(", "),
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn check_timing(&self) -> Result<(), ConfigError> {
+        if self.timing.delegated_tool.is_zero() {
+            return Err(ConfigError::InvalidValue {
+                path: "timing.delegated_tool_ms".to_owned(),
+                allowed: "a whole number of milliseconds above 0".to_owned(),
+            });
         }
         Ok(())
     }
@@ -518,6 +529,7 @@ idle_timeout_ms = 1500
             std::time::Duration::from_millis(1500)
         );
         assert_eq!(c.timing.tool_execution, std::time::Duration::from_secs(300));
+        assert_eq!(c.timing.delegated_tool, std::time::Duration::from_mins(15));
         assert_eq!(parsed.unknown_keys, Vec::<String>::new());
     }
 
@@ -628,6 +640,21 @@ idle_timeout_ms = 1500
         // Assert
         assert!(
             matches!(&err, ConfigError::InvalidValue { path, .. } if path == "models.big.context_window"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_zero_delegated_tool_bound_is_rejected_naming_the_key() {
+        // Arrange
+        let input = "[timing]\ndelegated_tool_ms = 0\n";
+
+        // Act
+        let err = Config::from_toml_str(input).unwrap_err();
+
+        // Assert
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { path, .. } if path == "timing.delegated_tool_ms"),
             "{err}"
         );
     }

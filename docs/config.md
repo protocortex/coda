@@ -95,12 +95,13 @@ Each value is an integer number of milliseconds. A key left out keeps its defaul
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `idle_timeout_ms` | `60000` | How long a backend may stay silent before it counts as stuck. |
+| `idle_timeout_ms` | `60000` | How long a backend may stay silent before it counts as stuck. Does not apply while a delegated backend runs a tool of its own; `delegated_tool_ms` does. |
 | `retry_backoff_base_ms` | `500` | First delay between provider retries. |
 | `retry_backoff_max_ms` | `30000` | Upper bound for the retry delay. |
 | `restart_backoff_ms` | `1000` | Delay before a crashed backend restarts. |
 | `permission_default_deny_ms` | `120000` | How long a permission prompt waits before it is denied. |
-| `tool_execution_ms` | `300000` | Longest run time of one tool call. |
+| `tool_execution_ms` | `300000` | Longest run time of one of coda's own tool calls (the tools coda runs itself, not a delegated backend's). |
+| `delegated_tool_ms` | `900000` | How long a delegated backend (Claude Code, Codex) may stay silent while a tool runs, before the turn is aborted. It covers tools the backend started on its own and tool calls coda approved for it. Above Claude Code's 10 minute Bash maximum; must not be zero. |
 
 ## Example
 
@@ -155,4 +156,5 @@ retry_backoff_max_ms = 30000
 restart_backoff_ms = 1000
 permission_default_deny_ms = 120000
 tool_execution_ms = 300000
+delegated_tool_ms = 900000
 ```
