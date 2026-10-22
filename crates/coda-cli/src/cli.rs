@@ -51,6 +51,24 @@ pub enum Command {
     /// 64 bad usage, 70 the check itself failed. They stay clear of the codes
     /// 0 to 5 that `run` uses.
     Doctor(DoctorArgs),
+    /// Check, list and trust agent, skill and command definitions.
+    #[command(subcommand)]
+    Agents(AgentsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentsCommand {
+    /// List the usable definitions and the project files waiting for trust.
+    List,
+    /// Trust the project definitions of the current repository.
+    Trust(TrustArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TrustArgs {
+    /// Stop trusting them instead.
+    #[arg(long)]
+    pub revoke: bool,
 }
 
 #[derive(Debug, Args)]

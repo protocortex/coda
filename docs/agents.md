@@ -47,8 +47,16 @@ Frontmatter: `name`, `description`, and an optional `argument_hint` such as `<is
 
 Hooks load only from the user's `config.toml`. A hook key (`hook`, `hooks`, `pre_tool`, `post_tool`, `pre_tool_use`, `post_tool_use`, `session_start`) in any definition file is an error, and that file is not loaded.
 
-## Precedence
+## Precedence and trust
 
 User files load first. A project file with the same name replaces the user definition's description and prompt. For an agent, the user's tier and effort stay, and the project's `tools` list can only narrow the user's: a tool the user definition lacks is ignored and reported. A project-only agent keeps its own `tools`.
 
-Project files are untrusted prompt input. At present they are only listed as pending: they are never used.
+Project files are untrusted prompt input. Until you trust the repository they are listed as pending and are never used, and nothing from them is used.
+
+```
+coda agents list            # usable definitions and pending project files
+coda agents trust           # trust the project definitions of the current repository
+coda agents trust --revoke  # stop trusting them
+```
+
+The decision is stored per repository root in the Coda database, with a digest of the trusted files: the sorted relative paths and content hashes of `.coda/agents`, `.coda/skills` and `.coda/commands` (`*.md`). If any of those files is edited, added or removed afterwards, every project definition goes back to pending and `coda agents list` says they changed since they were trusted. Review the files, then run `coda agents trust` again. The digest is taken over the same bytes that are parsed, so a file edited while Coda loads cannot slip unreviewed text in. Only the store-backed loader can admit project files; nothing else can mark a repository as trusted.
