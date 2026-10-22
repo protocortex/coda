@@ -7,8 +7,8 @@
 //! the exact bytes read matches the digest the user trusted, which only the
 //! store-backed [`Catalog::load_trusted`] can supply; otherwise they are listed
 //! as pending and never returned. A project file may replace the description
-//! and prompt of a user definition, and may narrow an agent's tools, but never
-//! widen them.
+//! and prompt of a user or built-in definition, and may narrow an agent's
+//! tools, but never widen them.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use coda_store::{Store, StoreError};
 use tracing::{debug, warn};
 
+use crate::builtin;
 use crate::definition::{
     AgentDef, CommandDef, Issue, SkillDef, parse_agent, parse_command, parse_skill,
 };
@@ -55,6 +56,8 @@ impl PendingReason {
 /// Where a definition came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
+    /// Ships in the binary.
+    Builtin,
     User,
     Project,
 }
@@ -64,6 +67,7 @@ impl Source {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Builtin => "built-in",
             Self::User => "user",
             Self::Project => "project",
         }
@@ -263,8 +267,16 @@ impl Catalog {
         Self::load_with(user_dir, project_root, Admit::Everything).problems
     }
 
-    fn load_with(user_dir: &Path, project_root: Option<&Path>, admit: Admit<'_>) -> Self {
+    /// Only the agents that ship in the binary.
+    #[must_use]
+    pub fn builtin() -> Self {
         let mut catalog = Self::default();
+        catalog.absorb(builtin::snapshot(), Source::Builtin);
+        catalog
+    }
+
+    fn load_with(user_dir: &Path, project_root: Option<&Path>, admit: Admit<'_>) -> Self {
+        let mut catalog = Self::builtin();
         debug!(dir = %user_dir.display(), "loading user definitions");
         catalog.absorb(Snapshot::take(user_dir), Source::User);
         let Some(root) = project_root else {
@@ -402,7 +414,7 @@ impl Catalog {
                 &incoming.path,
                 "tools",
                 format!(
-                    "a project file cannot add tools to a user agent; ignored: {}",
+                    "a project file cannot add tools to a built-in or user agent; ignored: {}",
                     names.join(", ")
                 ),
             ));

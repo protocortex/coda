@@ -196,7 +196,8 @@ fn user_files_load_without_any_project() {
     let catalog = Catalog::load(user.path(), None);
 
     // Assert
-    assert_eq!(catalog.agents().count(), 1);
+    let from_user = catalog.agents().filter(|e| e.source == Source::User);
+    assert_eq!(from_user.count(), 1);
     assert_eq!(catalog.skills().count(), 1);
     assert_eq!(catalog.commands().count(), 1);
     assert_eq!(catalog.pending(), []);

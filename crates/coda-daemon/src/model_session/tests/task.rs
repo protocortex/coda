@@ -21,7 +21,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use super::{HOME_DIR, Rig, dump, text_turn, tool_turn, user_message};
 use crate::gate::BrokerGate;
-use crate::model_session::task::{ChildRunner, LoopParts, child_target, status_of};
+use crate::model_session::task::{ChildEnv, ChildRunner, LoopParts, child_target, status_of};
 use crate::model_session::{COMPACT_THRESHOLD_BYTES, Provider};
 use crate::turn::Turns;
 
@@ -618,6 +618,64 @@ async fn a_project_agent_runs_only_after_its_repository_is_trusted() {
     assert_eq!(refusal["is_error"], true);
     assert!(text_of(refusal).contains("coda agents trust"));
     assert_eq!(lines[3]["system"], "Local.\n");
+}
+
+#[tokio::test]
+async fn a_built_in_agent_runs_with_no_definition_files_and_only_its_read_tools() {
+    // Arrange
+    let script = [
+        task_call("t1", "explore"),
+        text_turn("the needle is in a.txt:1"),
+        text_turn("parent done"),
+    ];
+    let mut rig = Rig::new(Mode::Default, &script);
+
+    // Act
+    rig.send("where is the needle").await;
+    finish(&rig, 1).await;
+
+    // Assert
+    let lines = rig.request_lines();
+    assert_eq!(lines.len(), 3);
+    let child = &lines[1];
+    assert!(
+        child["system"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are a code search agent.")
+    );
+    let tools = child["tools"].as_array().unwrap();
+    assert!(tools.contains(&json!("grep")) && tools.contains(&json!("read")));
+    for writer in ["bash", "edit", "task"] {
+        assert!(!tools.contains(&json!(writer)), "{writer}");
+    }
+    let answer = text_of(&tool_results(&lines[2])[0]).to_owned();
+    assert!(
+        answer.contains("summary: the needle is in a.txt:1"),
+        "{answer}"
+    );
+}
+
+#[tokio::test]
+async fn a_daemon_that_cannot_find_the_users_directory_still_offers_the_built_ins() {
+    // Arrange
+    let rig = Rig::new(Mode::Default, &[]);
+    let shared = &rig.turns.models.children;
+    let env = ChildEnv {
+        hub: Arc::clone(&shared.hub),
+        config: shared.config.clone(),
+        registry: shared.registry.clone(),
+        env: shared.env.clone(),
+        key_reader: Arc::clone(&shared.key_reader),
+        home: None,
+    };
+
+    // Act
+    let agents = env.agents(rig.cwd.to_str().unwrap()).await;
+
+    // Assert
+    let names: Vec<&str> = agents.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["explore", "implementer", "reviewer", "tester"]);
 }
 
 #[test]

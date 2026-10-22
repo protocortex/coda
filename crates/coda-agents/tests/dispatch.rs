@@ -76,12 +76,12 @@ fn an_unknown_agent_is_refused_and_the_available_ones_are_named() {
     let refused = catalog.dispatchable("nope");
 
     // Assert
-    let available = vec!["a".to_owned(), "b".to_owned()];
+    let available = ["a", "b", "explore", "implementer", "reviewer", "tester"].map(str::to_owned);
     assert_eq!(
         refused.unwrap_err(),
         DispatchError::Unknown {
             name: "nope".to_owned(),
-            available
+            available: available.to_vec()
         }
     );
 }

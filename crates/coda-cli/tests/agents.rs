@@ -42,6 +42,33 @@ async fn lint_passes_on_good_files() {
 }
 
 #[tokio::test]
+async fn list_names_the_built_in_agents_and_a_user_file_of_the_same_name_replaces_one() {
+    // Arrange
+    let dir = repo();
+    write(
+        dir.path(),
+        "agents/reviewer.md",
+        &GOOD_AGENT.replace("scout", "reviewer"),
+    );
+    let ctx = context(dir.path());
+
+    // Act
+    let outcome = cli(&ctx, &["coda", "agents", "list"], "").await;
+
+    // Assert
+    let lines: Vec<&str> = outcome.out.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "agent explore (built-in)",
+            "agent implementer (built-in)",
+            "agent reviewer (user)",
+            "agent tester (built-in)",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn lint_names_the_file_and_field_of_every_error_and_fails() {
     // Arrange
     let dir = repo();
