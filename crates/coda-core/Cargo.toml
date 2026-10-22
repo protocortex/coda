@@ -15,10 +15,11 @@ coda-providers = { path = "../coda-providers" }
 coda-store = { path = "../coda-store" }
 coda-telemetry = { path = "../coda-telemetry" }
 coda-tools = { path = "../coda-tools" }
+rustix = { workspace = true, features = ["process"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 tracing.workspace = true
 
 [dev-dependencies]
