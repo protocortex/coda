@@ -15,7 +15,7 @@ use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::{BACKEND_UNSUPPORTED, SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig, Turns};
+use super::{BACKEND_UNSUPPORTED, Reservation, SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig, Turns};
 use crate::dispatch::Dispatcher;
 use crate::idle_pool::MAX_IDLE_SERVERS;
 use crate::state::DaemonState;
@@ -1569,4 +1569,48 @@ async fn a_live_turn_is_refused_at_once_by_send_and_close() {
     assert_eq!(busy["error"]["code"], TURN_RUNNING);
     assert_eq!(closed["error"]["code"], TURN_RUNNING);
     assert!(waited < REFUSED_AT_ONCE, "{waited:?}");
+}
+
+#[test]
+fn a_cancel_marks_a_cancellable_reservation_as_winding_down_and_an_uncancellable_one_not() {
+    // Arrange
+    let mut armed = Reservation::<()>::default();
+    armed.arm((), |()| {});
+    let mut early = Reservation::<()>::default();
+    let mut fixed = Reservation::<()>::uncancellable();
+
+    // Act
+    let results = [
+        armed.request_cancel(|()| {}),
+        early.request_cancel(|()| {}),
+        fixed.request_cancel(|()| {}),
+    ];
+
+    // Assert
+    assert_eq!(results, [true, true, false]);
+    assert!(armed.is_winding_down());
+    assert!(early.is_winding_down());
+    assert!(!fixed.is_winding_down());
+}
+
+#[tokio::test]
+async fn a_close_right_after_a_cancel_waits_for_the_turn_and_stops_its_server() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    rig.send("please stall").await;
+    rig.wait_for_prompts(1).await;
+    let pid = rig.codex_pid();
+    let session = rig.session.clone();
+
+    // Act
+    // The turn task has not run since the cancel, so it has not yet said it is ending.
+    let cancelled = rig
+        .call("session.cancel", json!({"session_id": session}))
+        .await;
+    let closed = rig.call("session.close", close_params(&session)).await;
+
+    // Assert
+    assert_eq!(cancelled["result"]["cancelled"], true);
+    assert!(closed["error"].is_null(), "{closed}");
+    assert_gone(pid).await;
 }
