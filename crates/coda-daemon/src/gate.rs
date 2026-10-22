@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use coda_core::broker::{Broker, BrokerConfig, BrokerError, PendingNotice, resolve_repo};
+use coda_core::broker::{
+    Broker, BrokerConfig, BrokerError, PendingNotice, RunGrants, resolve_repo,
+};
 use coda_protocol::events::{Event, TIMEOUT_KIND};
 use coda_protocol::methods::PermissionRespondParams;
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
@@ -166,6 +168,25 @@ impl BrokerGate {
 impl Drop for BrokerGate {
     fn drop(&mut self) {
         self.announcer.abort();
+    }
+}
+
+impl BrokerGate {
+    /// Decides a call made by the sub-agent `agent` of this session. The prompt
+    /// is announced like the session's own, with the agent's name on it, and an
+    /// "always allow" answer is kept in the run's `grants`, not stored.
+    pub async fn request_for_agent(
+        &self,
+        request: &ToolRequest,
+        agent: &str,
+        grants: &RunGrants,
+    ) -> PermissionDecision {
+        Watched {
+            inner: Box::pin(self.broker.request_for_agent(request, agent, grants)),
+            gate: self,
+            done: false,
+        }
+        .await
     }
 }
 

@@ -18,7 +18,7 @@ use coda_providers::model::{
 use coda_providers::tool_request::{Tool as RequestTool, ToolRequest};
 use coda_store::Store;
 use coda_telemetry::attrs::{CODA_SESSION_ID, CODA_TOOL_NAME};
-use coda_tools::Tool;
+use coda_tools::{Tool, task as task_tool};
 use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
@@ -30,6 +30,7 @@ use crate::compact::{
 };
 use crate::economy::{cap_ends, compact};
 use crate::prompt::{Conversation, Message, ToolCall};
+use crate::task::{TaskRequest, TaskRunner};
 
 /// What the model is told about a call that never ran because the turn stopped.
 pub(crate) const SKIPPED: &str = "not run: the turn stopped before this call";
@@ -37,6 +38,8 @@ pub(crate) const SKIPPED: &str = "not run: the turn stopped before this call";
 pub(crate) const EMPTY_ARGUMENTS: &str = "{}";
 /// Stored for a send that ended before the model replied, so roles keep alternating.
 pub(crate) const NO_REPLY: &str = "[no reply: the turn stopped early]";
+/// What the model is told when it calls `task` in a session that cannot dispatch.
+const NO_TASKS: &str = "the task tool is not available here: sub-agents cannot start sub-agents";
 /// What the model is told about a call whose permission prompt was cancelled.
 const PROMPT_CANCELLED: &str = "not run: the turn was cancelled while asking permission";
 /// Name of the span around one model call.
@@ -128,6 +131,15 @@ pub enum TurnEvent {
         /// Answered once the event is stored.
         ack: CompactionAck,
     },
+    /// An event of a sub-agent's run, passed up the session's own channel so it
+    /// is stored in order with the session's events: after the call that started
+    /// the sub-agent and before that call's result.
+    Child {
+        /// The sub-agent that produced it.
+        agent: String,
+        /// What happened in its run.
+        event: Box<TurnEvent>,
+    },
 }
 
 /// Why a send failed outright.
@@ -206,6 +218,14 @@ impl ToolSet {
         self.tools.insert(tool.name(), tool);
         self
     }
+
+    /// Drops every tool whose name is not in `allowed`.
+    #[must_use]
+    pub fn only(mut self, allowed: &[String]) -> Self {
+        self.tools
+            .retain(|name, _| allowed.iter().any(|allowed| allowed == name));
+        self
+    }
 }
 
 /// Limits and identity of one session's loop.
@@ -235,6 +255,8 @@ pub struct TurnLoop<P, G> {
     events: UnboundedSender<TurnEvent>,
     cancel: CancelToken,
     context_window: Option<u32>,
+    /// Runs the sub-agents the `task` tool names; `None` where `task` is not offered.
+    tasks: Option<Arc<dyn TaskRunner>>,
     /// Whether this send already tried to compact ahead of a request.
     compacted_ahead: bool,
 }
@@ -272,6 +294,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             events,
             cancel: CancelToken::default(),
             context_window: None,
+            tasks: None,
             compacted_ahead: false,
         }
     }
@@ -282,6 +305,27 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     #[must_use]
     pub fn with_context_window(mut self, window: Option<u32>) -> Self {
         self.context_window = window;
+        self
+    }
+
+    /// Lets the model call `task`, running its sub-agents with `runner`.
+    #[must_use]
+    pub fn with_tasks(mut self, runner: Arc<dyn TaskRunner>) -> Self {
+        self.tasks = Some(runner);
+        self
+    }
+
+    /// Whether the model can call `task` in this loop.
+    #[must_use]
+    pub fn can_dispatch(&self) -> bool {
+        self.tasks.is_some()
+    }
+
+    /// Uses `cancel` as this loop's cancel signal, so cancelling it stops this
+    /// loop too. A sub-agent shares its parent's signal this way.
+    #[must_use]
+    pub fn with_cancel_token(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
         self
     }
 
@@ -588,6 +632,10 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             } else {
                 self.run_tool(&call).await
             };
+            if let Some(usage) = outcome.usage {
+                self.budget.record(usage);
+                self.emit(TurnEvent::Usage(usage));
+            }
             self.emit(TurnEvent::ToolFinished {
                 tool: call.name.clone(),
                 call_id: call.id.clone(),
@@ -625,23 +673,46 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         self.run_tool_inner(call).instrument(span).await
     }
 
+    /// Runs the sub-agent a `task` call names. Dispatching asks no permission:
+    /// each call the sub-agent makes is decided by the session's broker.
+    async fn run_task(&self, call: &ToolCall) -> ToolOutcome {
+        let Some(runner) = &self.tasks else {
+            return ToolOutcome::error(NO_TASKS.to_owned());
+        };
+        let args = match parse_arguments(call).and_then(|input| {
+            task_tool::parse(&input).map_err(|error| ToolOutcome::error(error.to_string()))
+        }) {
+            Ok(args) => args,
+            Err(refusal) => return refusal,
+        };
+        let done = runner
+            .run(TaskRequest {
+                agent: args.agent,
+                prompt: args.prompt,
+                budget: self.budget.remaining(),
+                max_turns: self.config.max_turns,
+                cancel: self.cancel.clone(),
+            })
+            .await;
+        ToolOutcome {
+            text: done.text,
+            is_error: done.is_error,
+            // A child that never ran spent nothing, and an empty usage event is noise.
+            usage: Some(done.usage)
+                .filter(|used| used.input_tokens != 0 || used.output_tokens != 0),
+        }
+    }
+
     async fn run_tool_inner(&self, call: &ToolCall) -> ToolOutcome {
+        if call.name == task_tool::NAME {
+            return self.run_task(call).await;
+        }
         let Some(tool) = self.tools.tools.get(call.name.as_str()) else {
             return ToolOutcome::error(format!("unknown tool {}", call.name));
         };
-        let arguments = if call.arguments.is_empty() {
-            EMPTY_ARGUMENTS
-        } else {
-            &call.arguments
-        };
-        let input: Value = match serde_json::from_str(arguments) {
+        let input = match parse_arguments(call) {
             Ok(input) => input,
-            Err(error) => {
-                return ToolOutcome::error(format!(
-                    "the arguments for {} are not valid JSON: {error}",
-                    call.name
-                ));
-            }
+            Err(refusal) => return refusal,
         };
         let request = tool_request(&call.name, &input, &self.config.cwd);
         let decision = tokio::select! {
@@ -694,6 +765,8 @@ enum Streamed {
 struct ToolOutcome {
     text: String,
     is_error: bool,
+    /// Tokens the call spent on a model, for a call that ran a sub-agent.
+    usage: Option<Usage>,
 }
 
 impl ToolOutcome {
@@ -701,8 +774,24 @@ impl ToolOutcome {
         Self {
             text,
             is_error: true,
+            usage: None,
         }
     }
+}
+
+/// The JSON arguments of `call`; the refusal the model is told when they do not parse.
+fn parse_arguments(call: &ToolCall) -> Result<Value, ToolOutcome> {
+    let arguments = if call.arguments.is_empty() {
+        EMPTY_ARGUMENTS
+    } else {
+        &call.arguments
+    };
+    serde_json::from_str(arguments).map_err(|error| {
+        ToolOutcome::error(format!(
+            "the arguments for {} are not valid JSON: {error}",
+            call.name
+        ))
+    })
 }
 
 /// A tool call ready to run off the async threads.
@@ -721,6 +810,7 @@ impl ToolWork {
             Ok(output) => ToolOutcome {
                 text: self.shrink(output.text),
                 is_error: false,
+                usage: None,
             },
             Err(error) => ToolOutcome::error(error.to_string()),
         }

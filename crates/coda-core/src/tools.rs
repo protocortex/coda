@@ -24,7 +24,7 @@ use coda_tools::grep::GrepTool;
 use coda_tools::read::ReadTool;
 use coda_tools::retrieve::RetrieveTool;
 use coda_tools::sandbox::{Sandbox, SandboxError};
-use coda_tools::{DEFAULT_MAX_OUTPUT_BYTES, Tool, ToolError, ToolOutput};
+use coda_tools::{DEFAULT_MAX_OUTPUT_BYTES, Tool, ToolError, ToolOutput, task};
 use serde_json::Value;
 use serde_json::json;
 
@@ -48,6 +48,42 @@ pub struct BaseTools {
     pub tools: ToolSet,
     /// One schema per tool, ordered by name.
     pub schemas: Vec<ToolSchema>,
+}
+
+impl BaseTools {
+    /// Keeps only the tools named in `allowed`, with their schemas. A name that
+    /// is not a base tool is ignored.
+    #[must_use]
+    pub fn narrowed(self, allowed: &[String]) -> Self {
+        Self {
+            tools: self.tools.only(allowed),
+            schemas: self
+                .schemas
+                .into_iter()
+                .filter(|schema| allowed.contains(&schema.name))
+                .collect(),
+        }
+    }
+}
+
+/// The schema of the `task` tool. `agents` are the names and descriptions of
+/// the agents it can run, shown to the model so it can choose one.
+#[must_use]
+pub fn task_schema(agents: &[(String, String)]) -> ToolSchema {
+    let listed: Vec<String> = agents
+        .iter()
+        .map(|(name, about)| format!("\n- {name}: {about}"))
+        .collect();
+    let description = format!("{}\nAgents:{}", task::DESCRIPTION, listed.concat());
+    schema(
+        task::NAME,
+        &description,
+        &json!({
+            "agent": {"type": "string", "description": "The name of the agent to run."},
+            "prompt": {"type": "string", "description": "What the agent should do, with all it needs to know."},
+        }),
+        &["agent", "prompt"],
+    )
 }
 
 /// Why the base tools could not be set up.
@@ -411,7 +447,7 @@ mod tests {
 
     use super::{
         BaseToolsConfig, RefreshAfterEdit, StoreCodeIndex, StoreOriginals, base_tools,
-        refresh_index,
+        refresh_index, task_schema,
     };
 
     const NAMES: [&str; 9] = [
@@ -515,6 +551,20 @@ mod tests {
                 schema.name
             );
         }
+    }
+
+    #[test]
+    fn the_task_schema_requires_an_agent_and_a_prompt_and_lists_the_agents() {
+        // Arrange
+        let agents = [("explore".to_owned(), "Searches.".to_owned())];
+
+        // Act
+        let schema = task_schema(&agents);
+
+        // Assert
+        assert_eq!(schema.name, "task");
+        assert_eq!(schema.input_schema["required"], json!(["agent", "prompt"]));
+        assert!(schema.description.ends_with("\n- explore: Searches."));
     }
 
     #[test]

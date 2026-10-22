@@ -30,6 +30,8 @@ const WAIT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(20);
 const QUEUE: usize = 256;
 const REQUEST_LOG: &str = "requests.jsonl";
+/// Where the daemon finds user definitions: `CODA_HOME`, inside the data directory.
+const HOME_DIR: &str = "home";
 /// Small enough that a long prompt nears it.
 const SMALL_WINDOW: u32 = 100;
 const PROMPT_CANARY: &str = "CANARY-PROMPT-7f3a91";
@@ -123,7 +125,10 @@ impl Rig {
             TurnConfig {
                 binary: None,
                 pidfile_dir: data.path().to_path_buf(),
-                parent_env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+                parent_env: vec![
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    ("CODA_HOME".into(), data.path().join(HOME_DIR).into()),
+                ],
                 timing: Timing::default(),
                 models,
             },
@@ -170,14 +175,21 @@ impl Rig {
         self.call("session.send", params).await
     }
 
-    /// The messages of every request the faux provider received, oldest first.
-    fn requests(&self) -> Vec<Vec<Value>> {
+    /// Every request the faux provider received, oldest first: its `system`,
+    /// `tools` and `messages`.
+    fn request_lines(&self) -> Vec<Value> {
         let log = std::fs::read_to_string(self.data.path().join(REQUEST_LOG)).unwrap_or_default();
         log.lines()
-            .map(|line| {
-                let request: Value = serde_json::from_str(line).unwrap();
-                request["messages"].as_array().unwrap().clone()
-            })
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// The messages of every request the faux provider received, oldest first.
+    fn requests(&self) -> Vec<Vec<Value>> {
+        let lines = self.request_lines();
+        lines
+            .iter()
+            .map(|request| request["messages"].as_array().unwrap().clone())
             .collect()
     }
 
@@ -962,6 +974,7 @@ async fn a_store_user_is_not_blocked_while_the_index_walk_runs() {
 }
 
 mod switch;
+mod task;
 
 fn overflow_turn() -> Value {
     json!({"events": [], "error": {"class": "context_window_exceeded"}})
