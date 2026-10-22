@@ -163,7 +163,7 @@ Every command accepts `--force`, but it only matters in two cases. A command tha
 | 2 | The token budget was used up. |
 | 3 | The context window is full. |
 | 4 | The run was cancelled. |
-| 5 | Any other stop, or a failed turn. This includes a conversation that could not be compacted. |
+| 5 | Any other stop, or a failed turn. This includes a conversation that could not be compacted (`compaction_failed`) and a blocking `session_start` hook that failed (`hook_blocked`), whose reason goes to standard error. |
 | 64 | Bad usage. |
 | 70 | The run itself failed. |
 

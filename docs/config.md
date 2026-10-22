@@ -115,6 +115,43 @@ Each value is an integer number of milliseconds. A key left out keeps its defaul
 | `tool_execution_ms` | `300000` | Longest run time of one of coda's own tool calls (the tools coda runs itself, not a delegated backend's). |
 | `delegated_tool_ms` | `900000` | How long a delegated backend (Claude Code, Codex) may stay silent while a tool runs, before the turn is aborted. It covers tools the backend started on its own and tool calls coda approved for it. Above Claude Code's 10 minute Bash maximum; must not be zero. |
 
+## `[[hooks]]`
+
+A hook is a program coda runs at a point in a model-API session (`anthropic`, `openai_compat`, `faux`). Hooks run in coda's own tool path. Claude Code and Codex run their own tools and coda only sees the calls it is asked to approve through its permission broker, so no coda hook runs for those sessions. Hooks come from this file only. A project file or a definition file cannot add one.
+
+An entry is a table in an array, so it has no single default. The keys:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `event` | string | Required. `"session_start"` (before the first turn of a conversation, once), `"pre_tool"` (after a tool call is allowed, before the tool runs) or `"post_tool"` (after the tool ran). |
+| `command` | array of strings | Required. The program and its arguments. There is no shell, so a string is an error. Use `["/bin/sh", "-c", "..."]` for a shell. |
+| `blocking` | boolean | Default `false`. When true, a failing hook stops the action. When false, a failure is logged and the action goes on. |
+| `timeout_ms` | integer | Default `10000`, from 1 to `300000`. A hook that outlives it fails and its whole process group is killed. |
+
+A hook runs in the session's directory with the environment bash gets (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TZ`) and no API key. It gets one JSON object on standard input:
+
+| Event | Fields |
+| --- | --- |
+| all | `event`, `session`, `cwd` |
+| `session_start` | `resumed` (the conversation already had messages when the daemon built it) |
+| `pre_tool` | `tool`, `arguments` (cut at 8 KiB; then `arguments_truncated` is true and `arguments` is text) |
+| `post_tool` | `tool`, `is_error`, `result` (cut at 4 KiB; then `result_truncated` is true) |
+
+A hook fails when it cannot start, exits with a status other than 0, or times out. What a failure does:
+
+- A failing blocking `session_start` hook stops the turn before the model is called, and the next send tries it again. `coda run` prints the reason on standard error, prints nothing on standard output and exits 5 (the stop condition is `hook_blocked`). The terminal UI shows the reason as a notice. The reason is never sent to the model.
+- A failing blocking `pre_tool` hook stops the tool. The model gets an error naming the hook and the end of its standard error.
+- A failing blocking `post_tool` hook replaces the tool's result with that error.
+- A failing hook that is not blocking is logged as `hook failed, continuing: event=<event> hook=<program> reason=<why>`.
+
+`session_start` runs once for each turn loop of a session, on its first send, not once per send. The daemon keeps a session's loop between sends, so the hook runs again, with `resumed` true, whenever the daemon builds the loop again from the stored history: after a daemon restart, after `/model` switches the session's model, after a change to the skills or to the trust decision rebuilds the loop, and after an idle loop is dropped to make room or when the session is closed.
+
+A sub-agent started by the `task` tool (see [agents.md](agents.md#dispatch-the-task-tool)) runs the `pre_tool` and `post_tool` hooks for its own tool calls, so a blocking hook stops a sub-agent's call as it stops the session's, and a sub-agent is no way around one. It runs no `session_start` hook: that event marks the start of the session, not of a sub-agent. The session's `task` call runs no hook, because dispatching asks no permission and does nothing on the machine; the sub-agent's tool calls are what the hooks see. The `session` in a sub-agent's payload is the id of the session that started it.
+
+A hook that times out or whose turn is cancelled is killed together with everything it started (its process group). A hook that exits on its own is not followed: coda signals nothing after the hook's own process has ended, because its process group id may belong to someone else by then, so a process the hook left running keeps running. Only the end of the hook's standard error is read, and only for a failed hook, for at most half a second after it exits.
+
+A key the schema does not know in a hook entry is an error, so a misspelled `blocking` never turns a guard into a log line.
+
 ## Example
 
 This file uses every key. It is checked against the parser when the tests run.
@@ -169,4 +206,10 @@ restart_backoff_ms = 1000
 permission_default_deny_ms = 120000
 tool_execution_ms = 300000
 delegated_tool_ms = 900000
+
+[[hooks]]
+event = "pre_tool"
+command = ["/usr/local/bin/check-tool", "strict"]
+blocking = true
+timeout_ms = 5000
 ```
