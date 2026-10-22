@@ -92,6 +92,24 @@ fn a_bad_tier_effort_and_tool_are_each_named() {
 }
 
 #[test]
+fn the_task_tool_cannot_be_allowed_to_an_agent_because_agents_cannot_nest() {
+    // Arrange
+    let text = agent_text("").replace("\"grep\"", "\"task\"");
+
+    // Act
+    let issues = parse_agent(&text, "reviewer").unwrap_err();
+
+    // Assert
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].field, "tools");
+    assert!(
+        issues[0].message.contains("cannot start sub-agents"),
+        "{}",
+        issues[0].message
+    );
+}
+
+#[test]
 fn a_description_must_say_when_to_use_and_when_not_to() {
     // Arrange
     let text = agent_text("").replace(DESCRIPTION, "Reviews diffs.");

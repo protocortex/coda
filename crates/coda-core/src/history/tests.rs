@@ -405,6 +405,29 @@ fn bookkeeping_events_are_not_worth_a_warning() {
     assert_eq!(logs, "");
 }
 
+#[test]
+fn a_childs_events_leave_the_parents_history_alone_and_cost_no_warning() {
+    // Arrange
+    let child = (
+        CHILD_EVENT_KIND,
+        json!({"agent": "scout", "kind": "assistant_message"}),
+    );
+    let task = [
+        user("go"),
+        assistant("", &[call("t1")]),
+        finished("t1", "result", false),
+    ];
+    let [asked, called, answered] = task.clone();
+    let with_child = [asked, called, child.clone(), child, answered];
+
+    // Act
+    let (replayed, logs) = replay_logged(&with_child);
+
+    // Assert
+    assert_eq!(replayed, replay(&task));
+    assert_eq!(logs, "");
+}
+
 /// A compaction whose summary text is kept under an id that is the text itself.
 fn compaction(summary: &str, replaced: u32) -> (&'static str, Value) {
     (

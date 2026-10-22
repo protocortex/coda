@@ -3,6 +3,7 @@
 //! The seam between a backend adapter and whoever answers permission requests.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use coda_protocol::types::PermissionDecision;
 
@@ -25,4 +26,24 @@ pub trait PermissionGate: Send + Sync {
 
     /// The backend reports tool `id` finished.
     fn tool_finished(&self, _id: &str) {}
+}
+
+/// A shared gate answers as the gate it points to, so one session's gate can
+/// serve both its own loop and the sub-agents it starts.
+impl<G: PermissionGate> PermissionGate for Arc<G> {
+    fn request(&self, request: &ToolRequest) -> impl Future<Output = PermissionDecision> + Send {
+        (**self).request(request)
+    }
+
+    fn progress(&self) {
+        (**self).progress();
+    }
+
+    fn tool_started(&self, id: &str) {
+        (**self).tool_started(id);
+    }
+
+    fn tool_finished(&self, id: &str) {
+        (**self).tool_finished(id);
+    }
 }

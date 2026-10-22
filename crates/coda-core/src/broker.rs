@@ -3,7 +3,7 @@
 //! The permission broker: applies the shared policy with store-backed grants,
 //! records every decision, and waits for a client on a prompt verdict.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -193,6 +193,14 @@ impl Broker {
     /// # Errors
     /// Returns [`BrokerError::Store`] when the grant lookup fails.
     pub async fn verdict(&self, request: &ToolRequest) -> Result<Verdict, BrokerError> {
+        self.verdict_with(request, None).await
+    }
+
+    async fn verdict_with(
+        &self,
+        request: &ToolRequest,
+        run: Option<&RunGrants>,
+    ) -> Result<Verdict, BrokerError> {
         let workspace_root = &self.config.workspace_root;
         let targets: Vec<ClassifiedTarget> = request
             .target_paths
@@ -202,7 +210,7 @@ impl Broker {
                 target: classify_target(workspace_root, path),
             })
             .collect();
-        let granted = self.is_granted(request).await?;
+        let granted = self.is_granted(request, run).await?;
         Ok(decide(&PolicyInput {
             mode: self.config.mode,
             tool: &request.tool,
@@ -263,23 +271,31 @@ impl Broker {
         self.expired.subscribe()
     }
 
-    async fn decide_request(
-        &self,
-        request: &ToolRequest,
-    ) -> Result<PermissionDecision, BrokerError> {
-        let decision = match self.verdict(request).await? {
+    async fn decide_request(&self, ask: Ask<'_>) -> Result<PermissionDecision, BrokerError> {
+        let run = ask.agent.map(|agent| agent.grants);
+        let decision = match self.verdict_with(ask.request, run).await? {
             Verdict::Allow => PermissionDecision::AllowOnce,
             Verdict::Deny => PermissionDecision::Deny,
-            Verdict::Prompt => return self.prompt(request).await,
+            Verdict::Prompt => return self.prompt(ask).await,
         };
-        self.record_decision(request, decision).await?;
+        self.record_decision(ask, decision).await?;
         Ok(decision)
     }
 
-    async fn is_granted(&self, request: &ToolRequest) -> Result<bool, BrokerError> {
-        let Some((repo, tool, cwd, pattern)) = self.grant_fields(request) else {
+    /// Whether a stored grant, or a grant of the sub-agent run `run`, covers
+    /// `request`. Both are keyed alike, and the policy treats them alike.
+    async fn is_granted(
+        &self,
+        request: &ToolRequest,
+        run: Option<&RunGrants>,
+    ) -> Result<bool, BrokerError> {
+        let Some(fields) = self.grant_fields(request) else {
             return Ok(false);
         };
+        if run.is_some_and(|run| run.has(&fields)) {
+            return Ok(true);
+        }
+        let (repo, tool, cwd, pattern) = fields;
         // Grants saved with the path spelled as the agent sent it still apply.
         let spelled = grant_pattern(
             &request.tool,
@@ -309,7 +325,7 @@ impl Broker {
     ///
     /// `None` when the request's own directory is not inside the session's
     /// repo, so such a request is never granted and never stores a grant.
-    fn grant_fields(&self, request: &ToolRequest) -> Option<(String, String, String, String)> {
+    fn grant_fields(&self, request: &ToolRequest) -> Option<GrantFields> {
         let cwd = std::fs::canonicalize(&request.cwd).ok()?;
         if repo_identity(&cwd)? != self.config.repo {
             return None;
@@ -332,13 +348,13 @@ impl Broker {
 
     async fn record_decision(
         &self,
-        request: &ToolRequest,
+        ask: Ask<'_>,
         decision: PermissionDecision,
     ) -> Result<(), BrokerError> {
         let new = NewDecision {
             session: self.config.session.clone(),
             repo_path: self.repo(),
-            command: describe(request),
+            command: ask.text(),
             decision,
         };
         self.with_store(move |store| store.record_decision(&new))
@@ -346,10 +362,12 @@ impl Broker {
     }
 
     /// Queues the request, then waits for a client or the timeout; the timeout denies.
-    async fn prompt(&self, request: &ToolRequest) -> Result<PermissionDecision, BrokerError> {
+    /// An "always allow" is stored as a grant for the session's own calls, and
+    /// kept for the run only for a sub-agent's.
+    async fn prompt(&self, ask: Ask<'_>) -> Result<PermissionDecision, BrokerError> {
         // Resolved before the wait so a retargeted link cannot move the grant.
-        let grant = self.grant_fields(request);
-        let (id, mut rx) = self.queue(request).await?;
+        let grant = self.grant_fields(ask.request);
+        let (id, mut rx) = self.queue(ask).await?;
         let mut guard = PendingGuard {
             store: Arc::clone(&self.store),
             waiting: Arc::clone(&self.waiting),
@@ -358,24 +376,27 @@ impl Broker {
         };
         let decision = match timeout(self.config.prompt_timeout, &mut rx).await {
             Ok(answer) => answer.unwrap_or(PermissionDecision::Deny),
-            Err(_) => self.deny_unanswered(request, &id, &mut rx).await,
+            Err(_) => self.deny_unanswered(ask, &id, &mut rx).await,
         };
         guard.disarm();
         self.waiting.lock().await.remove(&id);
-        if decision != PermissionDecision::AllowAlways {
+        let (PermissionDecision::AllowAlways, Some((repo, tool, cwd, pattern))) = (decision, grant)
+        else {
+            return Ok(decision);
+        };
+        if let Some(agent) = ask.agent {
+            agent.grants.add((repo, tool, cwd, pattern));
             return Ok(decision);
         }
-        if let Some((repo, tool, cwd, pattern)) = grant {
-            self.with_store(move |store| {
-                store.save_grant(&GrantKey {
-                    repo_path: &repo,
-                    tool: &tool,
-                    cwd: &cwd,
-                    pattern: &pattern,
-                })
+        self.with_store(move |store| {
+            store.save_grant(&GrantKey {
+                repo_path: &repo,
+                tool: &tool,
+                cwd: &cwd,
+                pattern: &pattern,
             })
-            .await?;
-        }
+        })
+        .await?;
         Ok(decision)
     }
 
@@ -383,13 +404,13 @@ impl Broker {
     /// an answer can never arrive for a request nobody waits on.
     async fn queue(
         &self,
-        request: &ToolRequest,
+        ask: Ask<'_>,
     ) -> Result<(RequestId, oneshot::Receiver<PermissionDecision>), BrokerError> {
         let new = NewPending {
             session: self.config.session.clone(),
-            tool: request.tool.name().to_owned(),
+            tool: ask.request.tool.name().to_owned(),
             repo_path: self.repo(),
-            command: describe(request),
+            command: ask.text(),
         };
         let notice_tool = new.tool.clone();
         let command = new.command.clone();
@@ -411,7 +432,7 @@ impl Broker {
 
     async fn deny_unanswered(
         &self,
-        request: &ToolRequest,
+        ask: Ask<'_>,
         id: &RequestId,
         rx: &mut oneshot::Receiver<PermissionDecision>,
     ) -> PermissionDecision {
@@ -422,8 +443,8 @@ impl Broker {
         if denied.is_ok() {
             let _ = self.expired.send(PendingNotice {
                 id: id.clone(),
-                tool: request.tool.name().to_owned(),
-                command: describe(request),
+                tool: ask.request.tool.name().to_owned(),
+                command: ask.text(),
             });
             return PermissionDecision::Deny;
         }
@@ -432,10 +453,7 @@ impl Broker {
             return decision;
         }
         // The stored answer never reached us, so the denial is what applied.
-        if let Err(e) = self
-            .record_decision(request, PermissionDecision::Deny)
-            .await
-        {
+        if let Err(e) = self.record_decision(ask, PermissionDecision::Deny).await {
             tracing::error!(
                 session = %self.config.session,
                 error = %e,
@@ -523,12 +541,63 @@ fn lossy(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// The text a decision is recorded under: the command, or the tool name.
-fn describe(request: &ToolRequest) -> String {
-    request
-        .command
-        .clone()
-        .unwrap_or_else(|| request.tool.name().to_owned())
+/// Repo, tool, cwd and pattern: the fields a grant is keyed by.
+type GrantFields = (String, String, String, String);
+
+/// The calls a user allowed "always" during one sub-agent run. They count as
+/// grants for that run only: the broker checks them where it checks stored
+/// grants, under the same policy, so a path that always prompts still prompts.
+/// They are never stored, so they cannot widen the session's grants.
+#[derive(Debug, Default)]
+pub struct RunGrants(Mutex<HashSet<GrantFields>>);
+
+impl RunGrants {
+    fn has(&self, fields: &GrantFields) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(fields)
+    }
+
+    fn add(&self, fields: GrantFields) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(fields);
+    }
+}
+
+/// The sub-agent a request is made for, and the grants of its run.
+#[derive(Clone, Copy)]
+struct SubAgent<'a> {
+    name: &'a str,
+    grants: &'a RunGrants,
+}
+
+/// A request, and the sub-agent it is made for when it is not the session's own.
+#[derive(Clone, Copy)]
+struct Ask<'a> {
+    request: &'a ToolRequest,
+    agent: Option<SubAgent<'a>>,
+}
+
+impl Ask<'_> {
+    /// The text a decision is recorded and announced under: the command, or the
+    /// tool name and the paths it acts on, led by the agent's name when a
+    /// sub-agent asks. A session's own call and a sub-agent's read alike.
+    fn text(&self) -> String {
+        let text = self.request.command.clone().unwrap_or_else(|| {
+            let paths = self.request.target_paths.iter().map(|p| lossy(p));
+            let words: Vec<String> = std::iter::once(self.request.tool.name().to_owned())
+                .chain(paths)
+                .collect();
+            words.join(" ")
+        });
+        match self.agent {
+            Some(agent) => format!("[{}] {text}", agent.name),
+            None => text,
+        }
+    }
 }
 
 fn outcome(decision: PermissionDecision) -> &'static str {
@@ -539,10 +608,33 @@ fn outcome(decision: PermissionDecision) -> &'static str {
     }
 }
 
-impl PermissionGate for Broker {
-    async fn request(&self, request: &ToolRequest) -> PermissionDecision {
+impl Broker {
+    /// Decides a call made by the sub-agent `agent`, under the same policy, the
+    /// session's stored grants and the `grants` of the agent's run. Its prompt
+    /// names the agent. An "always allow" answer comes back as given and is
+    /// kept in `grants`, not stored, so it covers that run only and never
+    /// widens the session's grants.
+    pub async fn request_for_agent(
+        &self,
+        request: &ToolRequest,
+        agent: &str,
+        grants: &RunGrants,
+    ) -> PermissionDecision {
+        let agent = SubAgent {
+            name: agent,
+            grants,
+        };
+        self.decide(request, Some(agent)).await
+    }
+
+    async fn decide(
+        &self,
+        request: &ToolRequest,
+        agent: Option<SubAgent<'_>>,
+    ) -> PermissionDecision {
         let span = self.decision_span(request);
-        let decided = self.decide_request(request).instrument(span.clone()).await;
+        let ask = Ask { request, agent };
+        let decided = self.decide_request(ask).instrument(span.clone()).await;
         let decision = decided.unwrap_or_else(|e| {
             tracing::error!(
                 session = %self.config.session,
@@ -553,6 +645,12 @@ impl PermissionGate for Broker {
         });
         span.record(CODA_PERMISSION_DECISION, outcome(decision));
         decision
+    }
+}
+
+impl PermissionGate for Broker {
+    async fn request(&self, request: &ToolRequest) -> PermissionDecision {
+        self.decide(request, None).await
     }
 }
 
@@ -578,7 +676,7 @@ mod tests {
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::{Layer, Registry};
 
-    use super::{Broker, BrokerConfig, BrokerError, PERMISSION_TIMEOUT, resolve_repo};
+    use super::{Broker, BrokerConfig, BrokerError, PERMISSION_TIMEOUT, RunGrants, resolve_repo};
 
     const SHORT_TIMEOUT: Duration = Duration::from_millis(100);
     const ANSWER_WAIT: Duration = Duration::from_secs(10);
@@ -716,6 +814,31 @@ mod tests {
             .unwrap()
     }
 
+    /// Runs `request` as the sub-agent `explore` and answers its prompt with
+    /// `decision`; returns the prompt's text and the decision the call got.
+    async fn ask_as_agent(
+        broker: &Arc<Broker>,
+        request: ToolRequest,
+        run: &Arc<RunGrants>,
+        decision: PermissionDecision,
+    ) -> (String, PermissionDecision) {
+        let mut notices = broker.subscribe();
+        let asking = {
+            let (broker, run) = (Arc::clone(broker), Arc::clone(run));
+            tokio::spawn(async move { broker.request_for_agent(&request, "explore", &run).await })
+        };
+        let notice = tokio::time::timeout(ANSWER_WAIT, notices.recv())
+            .await
+            .expect("the call did not prompt")
+            .unwrap();
+        broker.answer(&notice.id, decision).await.unwrap();
+        let answered = tokio::time::timeout(ANSWER_WAIT, asking)
+            .await
+            .unwrap()
+            .unwrap();
+        (notice.command, answered)
+    }
+
     #[tokio::test]
     async fn the_broker_passes_the_shared_decision_table() {
         // Arrange
@@ -817,6 +940,125 @@ mod tests {
             broker.verdict(&fixture.bash("cargo test")).await.unwrap(),
             Verdict::Allow
         );
+    }
+
+    #[tokio::test]
+    async fn a_sub_agent_uses_the_sessions_grants_and_its_prompt_names_it() {
+        // Arrange
+        let fixture = Fixture::new();
+        let broker = Arc::new(
+            fixture
+                .broker(fixture.config("/ws", PermissionMode::Prompt))
+                .await,
+        );
+        let build = fixture.bash("cargo build");
+        ask_and_answer(&broker, build.clone(), PermissionDecision::AllowAlways).await;
+        let run = Arc::new(RunGrants::default());
+
+        // Act
+        let granted = broker.request_for_agent(&build, "explore", &run).await;
+        let (asked, _) = ask_as_agent(
+            &broker,
+            fixture.bash("cargo test"),
+            &run,
+            PermissionDecision::AllowOnce,
+        )
+        .await;
+
+        // Assert
+        assert_eq!(granted, PermissionDecision::AllowOnce);
+        assert_eq!(asked, "[explore] cargo test");
+    }
+
+    #[tokio::test]
+    async fn a_run_grant_covers_the_same_call_in_that_run_is_recorded_and_is_never_stored() {
+        // Arrange
+        let fixture = Fixture::new();
+        let broker = Arc::new(
+            fixture
+                .broker(fixture.config("/ws", PermissionMode::Prompt))
+                .await,
+        );
+        let (run, other_run) = (Arc::new(RunGrants::default()), RunGrants::default());
+        let test = fixture.bash("cargo test");
+        let always = PermissionDecision::AllowAlways;
+        let (_, answer) = ask_as_agent(&broker, test.clone(), &run, always).await;
+
+        // Act
+        let again = broker.request_for_agent(&test, "explore", &run).await;
+        let elsewhere = broker.request_for_agent(&test, "explore", &other_run).await;
+        let recorded = fixture.with_store(|store| store.list_decisions(&fixture.session).unwrap());
+
+        // Assert
+        assert_eq!(answer, PermissionDecision::AllowAlways);
+        assert_eq!(again, PermissionDecision::AllowOnce);
+        assert_eq!(
+            elsewhere,
+            PermissionDecision::Deny,
+            "another run has no grant"
+        );
+        let rows: Vec<(&str, bool)> = recorded
+            .iter()
+            .map(|d| (d.command.as_str(), d.allowed))
+            .collect();
+        let allowed = ("[explore] cargo test", true);
+        assert_eq!(rows, [allowed, allowed, ("[explore] cargo test", false)]);
+        assert!(!fixture.has_grant("/ws", "bash", "/ws/x", "cargo test"));
+    }
+
+    #[tokio::test]
+    async fn a_run_grant_does_not_override_the_prompt_for_an_edit_that_changes_what_runs() {
+        // Arrange
+        let fixture = Fixture::new();
+        let broker = Arc::new(
+            fixture
+                .broker(fixture.config("/ws", PermissionMode::AcceptEdits))
+                .await,
+        );
+        let run = Arc::new(RunGrants::default());
+        let script = fixture.edit("scripts/x.sh");
+        let always = PermissionDecision::AllowAlways;
+        let (_, first) = ask_as_agent(&broker, script.clone(), &run, always).await;
+
+        // Act
+        let deny = PermissionDecision::Deny;
+        let (asked_again, second) = ask_as_agent(&broker, script, &run, deny).await;
+
+        // Assert
+        assert_eq!(first, PermissionDecision::AllowAlways);
+        assert_eq!(asked_again, "[explore] edit scripts/x.sh");
+        assert_eq!(second, PermissionDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_for_a_tool_with_no_command_names_its_paths_for_the_session_and_a_sub_agent() {
+        // Arrange
+        let fixture = Fixture::new();
+        let broker = Arc::new(
+            fixture
+                .broker(fixture.config("/ws", PermissionMode::Prompt))
+                .await,
+        );
+        let mut notices = broker.subscribe();
+        let own = {
+            let (broker, request) = (Arc::clone(&broker), fixture.edit("src/a.rs"));
+            tokio::spawn(async move { broker.request(&request).await })
+        };
+        let own_notice = tokio::time::timeout(ANSWER_WAIT, notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let deny = PermissionDecision::Deny;
+        broker.answer(&own_notice.id, deny).await.unwrap();
+        own.await.unwrap();
+        let run = Arc::new(RunGrants::default());
+
+        // Act
+        let (child, _) = ask_as_agent(&broker, fixture.edit("src/a.rs"), &run, deny).await;
+
+        // Assert
+        assert_eq!(own_notice.command, "edit src/a.rs");
+        assert_eq!(child, "[explore] edit src/a.rs");
     }
 
     #[tokio::test]
