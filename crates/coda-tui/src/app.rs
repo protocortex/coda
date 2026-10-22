@@ -60,6 +60,8 @@ pub enum LinkEvent {
     Sessions(Vec<SessionSummary>),
     /// Something the user should read, such as a failed request.
     Notice(String),
+    /// The daemon has no enabled provider.
+    SetupNeeded,
     /// The process was asked to stop, for example by a signal.
     Quit,
 }
@@ -73,6 +75,7 @@ pub struct App {
     overlay: Overlay,
     link: Option<UnboundedSender<LinkCommand>>,
     turn_running: bool,
+    setup_shown: bool,
     quit: bool,
 }
 
@@ -87,6 +90,7 @@ impl App {
             overlay: Overlay::default(),
             link: None,
             turn_running: false,
+            setup_shown: false,
             quit: false,
         }
     }
@@ -100,8 +104,11 @@ impl App {
         }
     }
 
+    /// Shows the setup guidance, once however many sources ask for it.
     pub fn show_setup_guidance(&mut self) {
-        self.chat.push_notice(SETUP_GUIDANCE);
+        if !std::mem::replace(&mut self.setup_shown, true) {
+            self.chat.push_notice(SETUP_GUIDANCE);
+        }
     }
 
     pub fn set_connection(&mut self, connection: ConnectionState) {
@@ -149,6 +156,7 @@ impl App {
             LinkEvent::UserMessage(text) => self.chat.push_user(text),
             LinkEvent::Sessions(sessions) => self.show_sessions(&sessions),
             LinkEvent::Notice(text) => self.chat.push_notice(text),
+            LinkEvent::SetupNeeded => self.show_setup_guidance(),
             LinkEvent::Quit => self.quit = true,
         }
     }
@@ -487,6 +495,20 @@ mod tests {
     }
 
     #[test]
+    fn a_setup_needed_event_shows_the_guidance_once() {
+        // Arrange
+        let mut app = App::new();
+        app.show_setup_guidance();
+
+        // Act
+        app.handle_event(LinkEvent::SetupNeeded);
+        app.handle_event(LinkEvent::SetupNeeded);
+
+        // Assert
+        assert_eq!(wide_screen(&app).matches(SETUP_GUIDANCE).count(), 1);
+    }
+
+    #[test]
     fn a_quit_event_ends_the_app() {
         // Arrange
         let mut app = App::new();
@@ -604,6 +626,7 @@ mod tests {
         LinkEvent::Session(Event::TurnInterrupted {
             session_id: SessionId::new("s-1"),
             turn_id: TurnId::new("t-1"),
+            cause: None,
         })
     }
 

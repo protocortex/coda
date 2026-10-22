@@ -27,6 +27,8 @@ pub const SESSION_CANCEL: &str = "session.cancel";
 pub const SESSION_SUBSCRIBE: &str = "session.subscribe";
 /// Reopens a stored session.
 pub const SESSION_RESUME: &str = "session.resume";
+/// Releases what the daemon holds for an idle session; its events stay stored.
+pub const SESSION_CLOSE: &str = "session.close";
 /// Lists stored sessions, without their content.
 pub const SESSION_LIST: &str = "session.list";
 /// Answers a pending permission request.
@@ -55,6 +57,7 @@ pub const METHODS: &[&str] = &[
     SESSION_SUBSCRIBE,
     SESSION_RESUME,
     SESSION_LIST,
+    SESSION_CLOSE,
     PERMISSION_RESPOND,
     GRANT_ADD,
     USAGE_SUMMARY,
@@ -139,6 +142,23 @@ pub struct SessionCancelParams {
 pub struct SessionCancelResult {
     /// Whether a running turn was cancelled.
     pub cancelled: bool,
+}
+
+/// Error code of a request refused because the session has a turn running.
+pub const TURN_RUNNING_CODE: i64 = -32003;
+
+/// Parameters of [`SESSION_CLOSE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionCloseParams {
+    /// Session to release.
+    pub session_id: SessionId,
+}
+
+/// Result of [`SESSION_CLOSE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionCloseResult {
+    /// Whether the session held a backend server or conversation that was released.
+    pub closed: bool,
 }
 
 /// Parameters of [`SESSION_SUBSCRIBE`].
@@ -339,6 +359,13 @@ pub struct DaemonStatusResult {
     pub active_turns: u32,
     /// Directory holding the daemon's database.
     pub data_dir: String,
+    /// Whether at least one backend is enabled. Absent from older daemons, which read as enabled.
+    #[serde(default = "enabled_by_default")]
+    pub any_provider_enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 /// Parameters of [`DAEMON_SHUTDOWN`].
@@ -372,6 +399,7 @@ mod tests {
             (SESSION_SUBSCRIBE, "session.subscribe"),
             (SESSION_RESUME, "session.resume"),
             (SESSION_LIST, "session.list"),
+            (SESSION_CLOSE, "session.close"),
             (PERMISSION_RESPOND, "permission.respond"),
             (GRANT_ADD, "grant.add"),
             (USAGE_SUMMARY, "usage.summary"),

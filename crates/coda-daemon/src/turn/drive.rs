@@ -4,7 +4,7 @@
 
 use std::sync::atomic::Ordering;
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, InterruptCause};
 use coda_protocol::types::TurnId;
 use coda_providers::claude_session::TurnOutcome;
 use coda_store::SessionRecord;
@@ -66,10 +66,11 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
         });
     }
 
-    fn interrupted(&mut self) {
+    fn interrupted(&mut self, cause: InterruptCause) {
         (self.emit)(Event::TurnInterrupted {
             session_id: self.record.id.clone(),
             turn_id: self.turn.clone(),
+            cause: Some(cause),
         });
     }
 
@@ -77,12 +78,17 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
     /// the daemon is shutting down in the meantime.
     async fn restart(&mut self) -> bool {
         let crashed = self.crashed_cancel.take();
-        let stopped = || {
-            crashed.as_ref().is_some_and(CancelHandle::is_cancelled)
-                || self.turns.stopping.load(Ordering::SeqCst)
-        };
+        let cancelled = || crashed.as_ref().is_some_and(CancelHandle::is_cancelled);
+        let stopping = || self.turns.stopping.load(Ordering::SeqCst);
+        let stopped = || cancelled() || stopping();
         if stopped() {
-            self.interrupted();
+            // A user's cancel outranks the shutdown that raced it.
+            let cause = if cancelled() {
+                InterruptCause::Cancelled
+            } else {
+                InterruptCause::DaemonStopping
+            };
+            self.interrupted(cause);
             self.outcome = Some(Ok(TurnOutcome::Cancelled));
             return false;
         }
@@ -127,7 +133,7 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
             }
         };
         if self.timed_out {
-            self.interrupted();
+            self.interrupted(InterruptCause::IdleTimeout);
         }
         // A crash that raced the user's cancel is the user's choice, not a failure to retry.
         let crashed = matches!(result, Ok(TurnOutcome::Crashed { .. }))

@@ -35,6 +35,41 @@ pub const TURN_INTERRUPTED_KIND: &str = "turn_interrupted";
 /// Stored event kind of older messages replaced by a summary.
 pub const COMPACTION_KIND: &str = "compaction";
 
+/// Why a turn was cut short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum InterruptCause {
+    /// A client cancelled the turn, or the daemon is shutting down.
+    Cancelled,
+    /// The backend stayed silent past a watchdog limit.
+    IdleTimeout,
+    /// The backend process went away before the turn could finish.
+    BackendLost,
+    /// The daemon stopped while the turn ran, and found it open on the next start.
+    DaemonRestarted,
+    /// The daemon is shutting down and did not start the backend again.
+    DaemonStopping,
+    /// A cause this peer does not know, sent by a newer one.
+    #[serde(other)]
+    Unknown,
+}
+
+impl InterruptCause {
+    /// The name the cause has on the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::IdleTimeout => "idle_timeout",
+            Self::BackendLost => "backend_lost",
+            Self::DaemonRestarted => "daemon_restarted",
+            Self::DaemonStopping => "daemon_stopping",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// One event of a session.
 ///
 /// Adding a variant requires a `PROTOCOL_VERSION` bump: older peers reject
@@ -132,6 +167,9 @@ pub enum Event {
         session_id: SessionId,
         /// The interrupted turn.
         turn_id: TurnId,
+        /// Why the turn was cut short; absent in events stored before it was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<InterruptCause>,
     },
     /// The oldest messages of a conversation were replaced by a summary of them.
     /// The summary text is kept in the session's originals, never in the event.
@@ -184,6 +222,27 @@ mod tests {
 
             // Assert
             assert_eq!(serde_json::to_value(&event).unwrap()["type"], kind);
+        }
+    }
+
+    #[test]
+    fn a_cause_names_itself_as_it_is_written_on_the_wire() {
+        // Arrange
+        let causes = [
+            InterruptCause::Cancelled,
+            InterruptCause::IdleTimeout,
+            InterruptCause::BackendLost,
+            InterruptCause::DaemonRestarted,
+            InterruptCause::DaemonStopping,
+            InterruptCause::Unknown,
+        ];
+
+        for cause in causes {
+            // Act
+            let written = serde_json::to_value(cause).unwrap();
+
+            // Assert
+            assert_eq!(written, json!(cause.as_str()));
         }
     }
 

@@ -475,6 +475,7 @@ dependencies = [
  "coda-daemon",
  "coda-protocol",
  "coda-store",
+ "coda-testkit",
  "crossterm",
  "ratatui",
  "rustix",

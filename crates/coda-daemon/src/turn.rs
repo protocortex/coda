@@ -14,6 +14,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use coda_config::config::{Config, PermissionMode};
 use coda_core::history::Transcript;
@@ -21,7 +22,7 @@ use coda_protocol::events::Event;
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR};
 use coda_protocol::methods::{
     PermissionRespondParams, PermissionRespondResult, SessionCancelParams, SessionCancelResult,
-    SessionSendParams, SessionSendResult,
+    SessionCloseParams, SessionCloseResult, SessionSendParams, SessionSendResult,
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::TurnOutcome;
@@ -59,7 +60,7 @@ use crate::watchdog::{Phase, Timing, Watchdog};
 /// The session named in a request does not exist.
 pub const SESSION_NOT_FOUND: i64 = -32002;
 /// The session already has a turn running.
-pub const TURN_RUNNING: i64 = -32003;
+pub const TURN_RUNNING: i64 = coda_protocol::methods::TURN_RUNNING_CODE;
 /// The session uses a backend this daemon cannot run.
 pub const BACKEND_UNSUPPORTED: i64 = -32004;
 
@@ -70,6 +71,10 @@ const CODEX_BACKEND_NAME: &str = "codex";
 /// emit callback is synchronous and must not block, so when the store falls
 /// this far behind, further events are dropped with a warning.
 const EVENT_QUEUE_CAPACITY: usize = 1024;
+/// How long a request waits for a session whose turn already emitted its terminal
+/// event. Cleanup after that event stops a backend, which can take a few seconds.
+const WIND_DOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const WIND_DOWN_POLL: Duration = Duration::from_millis(10);
 /// Bytes of earlier conversation given to a Codex thread that replaces a lost one.
 const MAX_SEED_BYTES: usize = 32 * 1024;
 
@@ -133,6 +138,8 @@ pub(crate) struct Reservation<T> {
     armed: Option<T>,
     cancel_requested: bool,
     cancellable: bool,
+    /// The turn has emitted its terminal event and only cleans up now.
+    winding_down: bool,
 }
 
 impl<T> Default for Reservation<T> {
@@ -141,6 +148,7 @@ impl<T> Default for Reservation<T> {
             armed: None,
             cancel_requested: false,
             cancellable: true,
+            winding_down: false,
         }
     }
 }
@@ -181,6 +189,16 @@ impl<T> Reservation<T> {
     /// hands on.
     pub(crate) fn rearm(&mut self, armed: T) {
         self.armed = Some(armed);
+    }
+
+    /// Marks that the turn's terminal event is out, so a request for the
+    /// session may wait for the slot instead of being refused.
+    pub(crate) fn wind_down(&mut self) {
+        self.winding_down = true;
+    }
+
+    pub(crate) fn is_winding_down(&self) -> bool {
+        self.winding_down
     }
 
     pub(crate) fn armed(&self) -> Option<&T> {
@@ -292,6 +310,7 @@ impl Turns {
             .with_store(move |store| store.load_session(&id))
             .await
             .map_err(|e| not_found_or(e, &session_id))?;
+        self.await_wind_down(&session_id).await?;
         match record.backend {
             BackendKind::ClaudeCode | BackendKind::CodexAppServer | BackendKind::CodexExec => {
                 self.send_agent(record, text).await
@@ -467,6 +486,36 @@ impl Turns {
         }
     }
 
+    /// Releases what the daemon holds for an idle `session`: its pooled backend
+    /// server and its idle model conversation. Stored events stay, so the session
+    /// can be reopened and sent to again. Returns whether anything was released;
+    /// an unknown or already closed session is not an error.
+    ///
+    /// A turn is never cancelled here, so a caller that wants the session closed
+    /// cancels it first.
+    ///
+    /// # Errors
+    /// Returns [`TurnError::Busy`] while a turn is starting or running.
+    pub async fn close(&self, session: &SessionId) -> Result<bool, TurnError> {
+        self.await_wind_down(session).await?;
+        let server = self.idle.take(session);
+        let released = server.is_some();
+        if let Some(mut server) = server {
+            info!(session = %session, "closing the session's Codex server");
+            let pid = server.pid();
+            stop(&mut server, session).await;
+            remove_pidfile_of(&self.config.pidfile_dir, session, pid);
+        }
+        let dropped = self.models.close(session);
+        Ok(released || dropped)
+    }
+
+    /// Whether any backend is enabled for new sessions.
+    #[must_use]
+    pub fn has_backends(&self) -> bool {
+        !self.models.available_backends().is_empty()
+    }
+
     /// Hands a client's answer to the gate waiting for it; `false` when the
     /// request is unknown, already answered, or belongs to another session.
     pub async fn respond(&self, params: &PermissionRespondParams) -> bool {
@@ -480,6 +529,31 @@ impl Turns {
             stop(&mut child, &session).await;
             remove_pidfile(&self.config.pidfile_dir, &session);
         }
+    }
+
+    /// Returns once `session` has no turn. A turn that already emitted its
+    /// terminal event is waited for, since a client gets that event before the
+    /// session is free; a live turn is refused at once.
+    async fn await_wind_down(&self, session: &SessionId) -> Result<(), TurnError> {
+        let wait = async {
+            while self.is_running(session) {
+                if !self.is_winding_down(session) {
+                    return Err(TurnError::Busy(session.clone()));
+                }
+                tokio::time::sleep(WIND_DOWN_POLL).await;
+            }
+            Ok(())
+        };
+        tokio::time::timeout(WIND_DOWN_TIMEOUT, wait)
+            .await
+            .unwrap_or_else(|_| Err(TurnError::Busy(session.clone())))
+    }
+
+    fn is_winding_down(&self, session: &SessionId) -> bool {
+        self.running()
+            .get(session)
+            .is_some_and(Reservation::is_winding_down)
+            || self.models.is_winding_down(session)
     }
 
     /// Whether `session` has a turn starting or running.
@@ -573,8 +647,14 @@ impl Turns {
         };
         let observer = Arc::clone(&watchdog);
         let emit_session = session.clone();
+        let turns = Arc::clone(&self);
         let emit = move |event: Event| {
             observer.observe(&event);
+            if matches!(event, Event::Result { .. } | Event::TurnInterrupted { .. })
+                && let Some(reservation) = turns.running().get_mut(&emit_session)
+            {
+                reservation.wind_down();
+            }
             if tx.try_send(event).is_err() {
                 warn!(session = %emit_session, "event queue full or closed; dropping an event");
             }
@@ -856,6 +936,17 @@ pub(crate) fn cancel(turns: Option<&Arc<Turns>>, params: Option<Value>) -> Handl
     to_value(&SessionCancelResult {
         cancelled: turns.cancel(&params.session_id),
     })
+}
+
+/// Answers `session.close`.
+pub(crate) async fn close(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
+    let turns = turns.ok_or_else(unavailable)?;
+    let params: SessionCloseParams = parse_params(params)?;
+    let closed = turns
+        .close(&params.session_id)
+        .await
+        .map_err(TurnError::into_rpc)?;
+    to_value(&SessionCloseResult { closed })
 }
 
 /// Answers `permission.respond`.

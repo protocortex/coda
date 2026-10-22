@@ -15,7 +15,7 @@ use coda_config::config::Config;
 use coda_core::turn::StopCondition;
 use coda_daemon::model_session::TURN_STOPPED_KIND;
 use coda_daemon::subscribe::PERMISSION_REQUEST_NOTIFICATION;
-use coda_protocol::events::EVENT_NOTIFICATION;
+use coda_protocol::events::{EVENT_NOTIFICATION, InterruptCause};
 use coda_protocol::methods::{
     PERMISSION_RESPOND, PermissionRequestParams, PermissionRespondParams, PermissionRespondResult,
     SESSION_CANCEL, SESSION_CREATE, SESSION_SEND, SessionCancelParams, SessionCancelResult,
@@ -65,6 +65,8 @@ struct Finish {
     failed: bool,
     /// The daemon cut the turn short instead of reporting a result.
     cut_short: bool,
+    /// Why the daemon cut the turn short, when it said.
+    cause: Option<InterruptCause>,
 }
 
 /// Runs the prompt, from `--prompt` or else standard input, in a new session
@@ -149,6 +151,10 @@ pub async fn run(
     } else {
         follow.await?
     };
+    info!(step = "close_session", session = %session, "releasing the session");
+    if let Err(failure) = client.close_session(&session).await {
+        warn!(session = %session, error = %failure, "could not close the session; the daemon evicts it later");
+    }
     Ok(report(&finish, io)?)
 }
 
@@ -279,6 +285,7 @@ async fn follow(
                             condition,
                             failed,
                             cut_short: false,
+                            cause: None,
                         });
                     }
                     // A delegated backend that is cancelled or goes silent ends
@@ -287,10 +294,17 @@ async fn follow(
                         if printed {
                             writeln!(io.out)?;
                         }
+                        // Events stored before the cause was recorded carry none.
+                        let cause = body
+                            .get("cause")
+                            .and_then(|c| serde_json::from_value(c.clone()).ok());
+                        let cancelled =
+                            cause.map_or(interrupted, |c| c == InterruptCause::Cancelled);
                         return Ok(Finish {
-                            condition: interrupted.then(|| CANCELLED.to_owned()),
+                            condition: cancelled.then(|| CANCELLED.to_owned()),
                             failed: true,
                             cut_short: true,
+                            cause,
                         });
                     }
                     _ => {}
@@ -360,7 +374,13 @@ fn report(finish: &Finish, io: &mut Io<'_>) -> std::io::Result<ExitCode> {
                     .to_owned()
             }
             (Some(condition), _) => format!("the run stopped: {condition}"),
-            (None, true) => "the run was cut short; see the daemon log".to_owned(),
+            (None, true) => match finish.cause {
+                Some(cause) => format!(
+                    "the run was cut short ({}); see the daemon log",
+                    cause.as_str()
+                ),
+                None => "the run was cut short; see the daemon log".to_owned(),
+            },
             (None, false) => "the run failed; see the daemon log".to_owned(),
         };
         writeln!(io.err, "coda: {reason}")?;

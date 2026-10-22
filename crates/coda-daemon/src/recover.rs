@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, InterruptCause};
 use coda_protocol::types::{SessionId, TurnId};
 use coda_store::{LogEventKind, Store};
 use tracing::{info, warn};
@@ -74,6 +74,7 @@ async fn interrupt_turn(
         let event = Event::TurnInterrupted {
             session_id: session.clone(),
             turn_id: turn.clone(),
+            cause: Some(InterruptCause::DaemonRestarted),
         };
         // Event first: a failure leaves the turn open for the next start
         // instead of ended with no interrupted event.
@@ -154,6 +155,30 @@ mod tests {
         // Assert
         assert_eq!((first.interrupted, second.interrupted), (1, 0));
         assert_eq!(rig.kinds().await, ["turn_interrupted"]);
+    }
+
+    #[tokio::test]
+    async fn a_recovered_turn_is_interrupted_with_the_daemon_restarted_cause() {
+        // Arrange
+        let rig = Rig::new();
+        let id = rig.session.clone();
+        rig.hub
+            .with_store_mut(move |store| store.begin_turn(&id))
+            .await
+            .unwrap();
+
+        // Act
+        recover(&rig.dir.path().join("run"), &rig.hub).await;
+
+        // Assert
+        let id = rig.session.clone();
+        let events = rig
+            .hub
+            .with_store(move |store| store.load_events(&id, 0, 10))
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&events[0].body).unwrap();
+        assert_eq!(body["cause"], "daemon_restarted");
     }
 
     #[tokio::test]

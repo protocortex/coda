@@ -9,7 +9,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, InterruptCause};
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
 use rustix::process::{Pid, Signal, kill_process_group};
 use serde_json::{Value, json};
@@ -238,11 +238,15 @@ impl ClaudeSession {
             return Err(AdapterError::Closed);
         }
         if *self.cancel.borrow() {
-            return self.interrupted(turn_id, emit).await;
+            return self
+                .interrupted(turn_id, InterruptCause::Cancelled, emit)
+                .await;
         }
         let user = json!({"type": "user", "message": {"role": "user", "content": text}});
         if !self.write_line(&user.to_string()).await? {
-            return self.interrupted(turn_id, emit).await;
+            return self
+                .interrupted(turn_id, InterruptCause::BackendLost, emit)
+                .await;
         }
         let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
         loop {
@@ -254,7 +258,7 @@ impl ClaudeSession {
             let read = tokio::select! {
                 read = self.stdout.read(&mut buffer) => read?,
                 () = cancelled(self.cancel.subscribe()) => {
-                    return self.interrupted(turn_id, emit).await;
+                    return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await;
                 }
             };
             if read == 0 {
@@ -338,7 +342,10 @@ impl ClaudeSession {
             Message::InvalidPermissionRequest { request_id } => {
                 let line = control_response(&request_id, PermissionDecision::Deny, &Value::Null);
                 if !self.write_line(&line).await? {
-                    return self.interrupted(turn_id, emit).await.map(Some);
+                    return self
+                        .interrupted(turn_id, InterruptCause::BackendLost, emit)
+                        .await
+                        .map(Some);
                 }
             }
         }
@@ -357,7 +364,7 @@ impl ClaudeSession {
         let decision = tokio::select! {
             decision = gate.request(&request) => decision,
             () = cancelled(self.cancel.subscribe()) => {
-                return self.interrupted(turn_id, emit).await.map(Some);
+                return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await.map(Some);
             }
         };
         let allowed = matches!(
@@ -385,7 +392,10 @@ impl ClaudeSession {
         let input = self.pending.remove(&ask.request_id).unwrap_or(Value::Null);
         let line = control_response(&ask.request_id, decision, &input);
         if !self.write_line(&line).await? {
-            return self.interrupted(turn_id, emit).await.map(Some);
+            return self
+                .interrupted(turn_id, InterruptCause::BackendLost, emit)
+                .await
+                .map(Some);
         }
         Ok(None)
     }
@@ -393,11 +403,13 @@ impl ClaudeSession {
     async fn interrupted(
         &mut self,
         turn_id: &TurnId,
+        cause: InterruptCause,
         emit: &mut impl FnMut(Event),
     ) -> Result<TurnOutcome, AdapterError> {
         emit(Event::TurnInterrupted {
             session_id: self.session_id.clone(),
             turn_id: turn_id.clone(),
+            cause: Some(cause),
         });
         self.shutdown().await?;
         Ok(TurnOutcome::Cancelled)

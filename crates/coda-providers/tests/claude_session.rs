@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, InterruptCause};
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
 use coda_providers::claude_code::Diagnostic;
 use coda_providers::claude_session::{
@@ -373,6 +373,7 @@ async fn cancelling_before_the_first_output_ends_the_turn_cleanly() {
     assert!(events.contains(&Event::TurnInterrupted {
         session_id: SessionId::new("s-1"),
         turn_id: TurnId::new("t-1"),
+        cause: Some(InterruptCause::Cancelled),
     }));
     assert!(shutdown.is_ok());
 }

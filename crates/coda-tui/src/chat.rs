@@ -361,6 +361,7 @@ mod tests {
                 Event::TurnInterrupted {
                     session_id: SessionId::new("s-1"),
                     turn_id: TurnId::new("t-1"),
+                    cause: None,
                 },
                 "turn interrupted",
             ),

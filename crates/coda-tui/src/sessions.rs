@@ -11,13 +11,13 @@ use coda_config::timing::Timing;
 use coda_protocol::events::{EVENT_NOTIFICATION, Event};
 use coda_protocol::jsonrpc::Notification;
 use coda_protocol::methods::{
-    DAEMON_BACKENDS, DAEMON_PING, DaemonBackendsParams, DaemonBackendsResult, PERMISSION_RESPOND,
-    PermissionRespondParams, PermissionRespondResult, PingParams, PingResult, SESSION_CANCEL,
-    SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_SEND, SESSION_SET_MODEL,
-    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
-    SessionListParams, SessionListResult, SessionResumeParams, SessionResumeResult,
-    SessionSendParams, SessionSendResult, SessionSetModelParams, SessionSetModelResult,
-    SessionSummary,
+    DAEMON_BACKENDS, DAEMON_PING, DAEMON_STATUS, DaemonBackendsParams, DaemonBackendsResult,
+    DaemonStatusParams, DaemonStatusResult, PERMISSION_RESPOND, PermissionRespondParams,
+    PermissionRespondResult, PingParams, PingResult, SESSION_CANCEL, SESSION_CREATE, SESSION_LIST,
+    SESSION_RESUME, SESSION_SEND, SESSION_SET_MODEL, SessionCancelParams, SessionCancelResult,
+    SessionCreateParams, SessionCreateResult, SessionListParams, SessionListResult,
+    SessionResumeParams, SessionResumeResult, SessionSendParams, SessionSendResult,
+    SessionSetModelParams, SessionSetModelResult, SessionSummary,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId, SessionInfo};
 use serde_json::Value;
@@ -34,6 +34,8 @@ const PERMISSION_REQUEST_NOTIFICATION: &str = "permission.request";
 const USER_MESSAGE_KIND: &str = "user_message";
 /// How often a live link is probed, since the client reports a lost link only on use.
 const LINK_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+/// How long a switch waits for the old session to close before leaving it for the quit.
+const SWITCH_CLOSE_WAIT: Duration = Duration::from_millis(500);
 const FALLBACK_CWD: &str = "/";
 /// Backend of sessions the UI starts itself.
 const DEFAULT_BACKEND: BackendKind = BackendKind::ClaudeCode;
@@ -68,6 +70,8 @@ pub enum LinkCommand {
     ListBackends,
     /// Start a new session on the named backend.
     SwitchBackend(String),
+    /// Release the session this link created and end the link.
+    Close,
 }
 
 /// Reads an event notification's params; kinds the UI has no use for give `None`.
@@ -178,13 +182,17 @@ pub async fn run_link(
     };
     let _ = events.send(LinkEvent::Connected);
     let mut link = Link::new(client, config, events);
+    link.check_setup().await;
     link.start().await;
     let mut probe = tokio::time::interval(LINK_PROBE_INTERVAL);
     loop {
         tokio::select! {
             command = commands.recv() => match command {
+                Some(LinkCommand::Close) | None => {
+                    link.close_owned().await;
+                    return;
+                }
                 Some(command) => link.handle(command).await,
-                None => return,
             },
             notification = next_notification(&mut link.subscription) => {
                 if let Some(notification) = notification {
@@ -273,6 +281,12 @@ struct Link {
     config: LinkConfig,
     subscription: Option<Subscription>,
     events: UnboundedSender<LinkEvent>,
+    /// The followed session, when this link created it. A session it only
+    /// reopened may have other users, so it is never closed here.
+    owned: Option<SessionId>,
+    /// Sessions this link created whose close was refused or timed out, such as
+    /// one with a turn still running; closed again when the link ends.
+    unclosed: Vec<SessionId>,
 }
 
 impl Link {
@@ -282,6 +296,48 @@ impl Link {
             config,
             subscription: None,
             events,
+            owned: None,
+            unclosed: Vec::new(),
+        }
+    }
+
+    /// Asks a daemon that started before `coda init` whether it has a provider.
+    async fn check_setup(&self) {
+        let status: Result<DaemonStatusResult, _> = self
+            .client
+            .request(DAEMON_STATUS, &DaemonStatusParams {})
+            .await;
+        match status {
+            Ok(status) if !status.any_provider_enabled => self.tell(LinkEvent::SetupNeeded),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "could not read the daemon status"),
+        }
+    }
+
+    /// Lets the daemon release a session this link is done with. One that cannot
+    /// be released within `wait` is remembered for [`Self::close_owned`]; a failure
+    /// that persists only leaves the daemon to evict it later.
+    async fn release(&mut self, session: SessionId, wait: Duration) {
+        match tokio::time::timeout(wait, self.client.close_session(&session)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(%error, session = %session, "could not close the session yet");
+                self.unclosed.push(session);
+            }
+            Err(_) => {
+                warn!(session = %session, "closing the session took too long");
+                self.unclosed.push(session);
+            }
+        }
+    }
+
+    /// Closes every session this link created and still holds, ignoring failures.
+    async fn close_owned(&mut self) {
+        let sessions = self.owned.take().into_iter().chain(self.unclosed.drain(..));
+        for session in sessions.collect::<Vec<_>>() {
+            if let Err(error) = self.client.close_session(&session).await {
+                warn!(%error, session = %session, "could not close the session");
+            }
         }
     }
 
@@ -340,7 +396,7 @@ impl Link {
             mode: Mode::default(),
         };
         let created: SessionCreateResult = self.client.request(SESSION_CREATE, &params).await?;
-        self.follow(created.session, None).await
+        self.follow(created.session, None, true).await
     }
 
     async fn reopen(&mut self, id: &SessionId) -> Result<(), ClientError> {
@@ -348,14 +404,18 @@ impl Link {
             session_id: id.clone(),
         };
         let resumed: SessionResumeResult = self.client.request(SESSION_RESUME, &params).await?;
-        self.follow(resumed.session, Some(REPLAY_FROM_START)).await
+        self.follow(resumed.session, Some(REPLAY_FROM_START), false)
+            .await
     }
 
+    /// Follows `info`, then closes the session this link created before it.
     async fn follow(
         &mut self,
         info: SessionInfo,
         since_seq: Option<u64>,
+        created_here: bool,
     ) -> Result<(), ClientError> {
+        let id = info.id.clone();
         follow_session(
             &self.client,
             &mut self.subscription,
@@ -363,7 +423,12 @@ impl Link {
             info,
             since_seq,
         )
-        .await
+        .await?;
+        let previous = std::mem::replace(&mut self.owned, created_here.then_some(id));
+        if let Some(previous) = previous {
+            self.release(previous, SWITCH_CLOSE_WAIT).await;
+        }
+        Ok(())
     }
 
     async fn handle(&mut self, command: LinkCommand) {
@@ -379,6 +444,8 @@ impl Link {
             LinkCommand::SetModel(alias) => self.set_model(alias).await,
             LinkCommand::ListBackends => self.list_backends().await,
             LinkCommand::SwitchBackend(name) => self.switch_backend(&name).await,
+            // `run_link` ends the link on this before it gets here.
+            LinkCommand::Close => Ok(()),
             LinkCommand::New => self.start_new().await.map_err(|e| ("start a session", e)),
             LinkCommand::Resume(id) => self
                 .reopen(&id)

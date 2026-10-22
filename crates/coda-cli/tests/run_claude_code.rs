@@ -67,7 +67,7 @@ async fn a_silent_delegated_backend_ends_the_run_with_an_error_not_a_hang() {
     // Assert
     assert_eq!(outcome.code, ExitCode::from(5), "{}", outcome.err);
     assert!(
-        outcome.err.contains("cut short"),
+        outcome.err.contains("cut short") && outcome.err.contains("idle_timeout"),
         "stderr was: {}",
         outcome.err
     );

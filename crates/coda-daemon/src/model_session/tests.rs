@@ -1050,3 +1050,55 @@ async fn a_configured_window_compacts_the_conversation_before_the_request_is_sen
         "three sends, the summary, the send"
     );
 }
+
+#[tokio::test]
+async fn closing_a_session_drops_its_idle_loop_and_keeps_its_events() {
+    // Arrange
+    let mut rig = Rig::new(Mode::Default, &[text_turn("one")]);
+    let session = rig.session.clone();
+    rig.send("hello").await;
+    rig.wait_idle(&session).await;
+    let held = rig.turns.models.loops.holds(&session);
+    let before = rig.events().await;
+
+    // Act
+    let first = rig
+        .call("session.close", json!({"session_id": session}))
+        .await;
+    let second = rig
+        .call("session.close", json!({"session_id": session}))
+        .await;
+
+    // Assert
+    assert!(held);
+    assert_eq!(first["result"]["closed"], true);
+    assert_eq!(second["result"]["closed"], false);
+    assert!(!rig.turns.models.loops.holds(&session));
+    assert_eq!(rig.events().await, before);
+}
+
+#[tokio::test]
+async fn a_send_or_close_right_after_the_result_is_accepted() {
+    // Arrange
+    let mut rig = Rig::new(Mode::Default, &[text_turn("one")]);
+    let session = rig.session.clone();
+
+    for round in 1..=8 {
+        // Act
+        let sent = rig.send("again").await;
+        while rig.bodies("result").await.len() < round {
+            tokio::task::yield_now().await;
+        }
+        let closed = rig
+            .call("session.close", json!({"session_id": session}))
+            .await;
+
+        // Assert
+        assert!(sent["error"].is_null(), "send in round {round}: {sent}");
+        assert!(
+            closed["error"].is_null(),
+            "close in round {round}: {closed}"
+        );
+        rig.wait_idle(&session).await;
+    }
+}

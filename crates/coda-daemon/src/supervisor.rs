@@ -134,12 +134,29 @@ pub(crate) mod testing {
     use super::*;
 
     /// Returns at once and remembers how long it was asked to wait.
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     pub struct RecordingSleeper {
         waits: Mutex<Vec<Duration>>,
+        on_sleep: Mutex<Option<Box<dyn Fn() + Send>>>,
+    }
+
+    impl std::fmt::Debug for RecordingSleeper {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RecordingSleeper")
+                .field("waits", &self.waits)
+                .finish_non_exhaustive()
+        }
     }
 
     impl RecordingSleeper {
+        /// Runs `hook` each time a wait is asked for, to act during a backoff.
+        pub fn on_sleep(&self, hook: impl Fn() + Send + 'static) {
+            *self
+                .on_sleep
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+        }
+
         pub fn waits(&self) -> Vec<Duration> {
             self.waits
                 .lock()
@@ -154,6 +171,13 @@ pub(crate) mod testing {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(duration);
+            let hook = self
+                .on_sleep
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(hook) = hook.as_ref() {
+                hook();
+            }
             Box::pin(std::future::ready(()))
         }
     }

@@ -360,3 +360,31 @@ async fn a_restart_that_cannot_start_the_backend_fails_the_turn() {
     assert_eq!(rig.crash_restart_flags().await, [true]);
     assert_eq!(rig.sleeper.waits(), [RESTART_BASE]);
 }
+
+#[tokio::test]
+async fn a_restart_stopped_by_the_daemon_shutting_down_is_not_reported_as_cancelled() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    let turns = Arc::clone(&rig.turns);
+    // The daemon starts shutting down while the crashed backend waits to be restarted.
+    rig.sleeper.on_sleep(move || {
+        turns
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    // Act
+    rig.send("please crash").await;
+    rig.wait_for("turn_interrupted").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let interrupted = rig
+        .events()
+        .await
+        .into_iter()
+        .find(|e| e.kind == "turn_interrupted")
+        .unwrap();
+    let body: Value = serde_json::from_str(&interrupted.body).unwrap();
+    assert_eq!(body["cause"], "daemon_stopping");
+}

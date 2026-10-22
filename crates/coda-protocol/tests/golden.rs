@@ -6,16 +6,16 @@
 use std::fs;
 use std::path::PathBuf;
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, InterruptCause};
 use coda_protocol::methods::{
     DaemonBackendsParams, DaemonBackendsResult, DaemonShutdownParams, DaemonShutdownResult,
     DaemonStatusParams, DaemonStatusResult, GrantAddParams, GrantAddResult, InitializeParams,
     InitializeResult, PermissionRequestParams, PermissionRespondParams, PermissionRespondResult,
-    PingParams, PingResult, SessionCancelParams, SessionCancelResult, SessionCreateParams,
-    SessionCreateResult, SessionListParams, SessionListResult, SessionResumeParams,
-    SessionResumeResult, SessionSendParams, SessionSendResult, SessionSetModelParams,
-    SessionSetModelResult, SessionSubscribeParams, SessionSubscribeResult, UsageSummaryParams,
-    UsageSummaryResult,
+    PingParams, PingResult, SessionCancelParams, SessionCancelResult, SessionCloseParams,
+    SessionCloseResult, SessionCreateParams, SessionCreateResult, SessionListParams,
+    SessionListResult, SessionResumeParams, SessionResumeResult, SessionSendParams,
+    SessionSendResult, SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams,
+    SessionSubscribeResult, UsageSummaryParams, UsageSummaryResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -92,6 +92,8 @@ golden_tests! {
     session_send_result: "session.send.result" => SessionSendResult,
     session_cancel_params: "session.cancel.params" => SessionCancelParams,
     session_cancel_result: "session.cancel.result" => SessionCancelResult,
+    session_close_params: "session.close.params" => SessionCloseParams,
+    session_close_result: "session.close.result" => SessionCloseResult,
     session_subscribe_params: "session.subscribe.params" => SessionSubscribeParams,
     session_subscribe_result: "session.subscribe.result" => SessionSubscribeResult,
     session_list_params: "session.list.params" => SessionListParams,
@@ -128,6 +130,7 @@ golden_tests! {
     event_backend_crashed: "event.backend_crashed" => Event,
     event_backend_crashed_minimal: "event.backend_crashed.minimal" => Event,
     event_turn_interrupted: "event.turn_interrupted" => Event,
+    event_turn_interrupted_minimal: "event.turn_interrupted.minimal" => Event,
     event_compaction: "event.compaction" => Event,
 }
 
@@ -173,4 +176,67 @@ fn usage_summary_result_without_savings_reads_as_zero_saved() {
     // Assert
     assert_eq!(result.saved_bytes, 0);
     assert_eq!(result.usage.input_tokens, 100);
+}
+
+#[test]
+fn an_interrupt_without_a_cause_reads_as_causeless() {
+    // Arrange
+    let legacy = golden("event.turn_interrupted.minimal");
+
+    // Act
+    let event: Event = serde_json::from_value(legacy).unwrap();
+
+    // Assert
+    assert!(matches!(event, Event::TurnInterrupted { cause: None, .. }));
+}
+
+#[test]
+fn an_interrupt_names_its_cause_in_snake_case() {
+    // Arrange
+    let stored = golden("event.turn_interrupted");
+
+    // Act
+    let event: Event = serde_json::from_value(stored).unwrap();
+
+    // Assert
+    assert!(matches!(
+        event,
+        Event::TurnInterrupted {
+            cause: Some(InterruptCause::IdleTimeout),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_status_from_a_daemon_without_the_provider_flag_reads_as_having_one() {
+    // Arrange
+    let legacy = golden("daemon.status.result.legacy");
+
+    // Act
+    let status: DaemonStatusResult = serde_json::from_value(legacy).unwrap();
+
+    // Assert
+    assert!(status.any_provider_enabled);
+}
+
+#[test]
+fn an_interrupt_with_a_cause_from_a_newer_peer_still_decodes() {
+    // Arrange
+    let future = json!({
+        "type": "turn_interrupted", "session_id": "s-1", "turn_id": "t-1",
+        "cause": "cause_added_by_a_newer_peer",
+    });
+
+    // Act
+    let event: Event = serde_json::from_value(future).unwrap();
+
+    // Assert
+    assert!(matches!(
+        event,
+        Event::TurnInterrupted {
+            cause: Some(InterruptCause::Unknown),
+            ..
+        }
+    ));
 }
