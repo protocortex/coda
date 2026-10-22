@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::{Tool, ToolError, ToolOutput, parse_args};
 
-const NAME: &str = "retrieve";
+pub const NAME: &str = "retrieve";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Agent tiers.
+//! Agent tiers and the `[routing]` table that maps them to model aliases.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
+use serde::Deserialize;
+
 /// How much capability and cost an agent asks for. Agent files name a tier,
-/// never a model id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// never a model id; the routing table decides the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Tier {
     /// Cheap and quick work such as search.
     Fast,
@@ -53,3 +57,9 @@ impl FromStr for Tier {
             .ok_or_else(|| UnknownTier(s.to_owned()))
     }
 }
+
+/// The `[routing]` section: a model alias per tier. A tier with no entry uses
+/// the default model.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct Routing(pub BTreeMap<Tier, String>);

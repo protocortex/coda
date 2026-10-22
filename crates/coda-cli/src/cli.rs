@@ -58,6 +58,8 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentsCommand {
+    /// Check the definition files; exits 22 when any has a problem.
+    Lint,
     /// List the usable definitions and the project files waiting for trust.
     List,
     /// Trust the project definitions of the current repository.

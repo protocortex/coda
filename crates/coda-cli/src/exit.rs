@@ -5,7 +5,7 @@
 //! `coda run` reports why the turn stopped with the codes 0 to 5. Usage and
 //! failure codes sit outside that range, so a script can tell a bad
 //! invocation or a broken run from a turn that stopped. `coda doctor` has its
-//! own pair of codes, 20 and 21, for the same reason.
+//! own pair of codes, 20 and 21, and `coda agents lint` has 22, for the same reason.
 
 /// The turn ended normally.
 pub const RUN_END_TURN: u8 = 0;
@@ -28,3 +28,5 @@ pub const FAILURE: u8 = 70;
 pub const DOCTOR_FAILURES: u8 = 20;
 /// `coda doctor` found warnings but no failing check.
 pub const DOCTOR_WARNINGS: u8 = 21;
+/// `coda agents lint` found at least one problem.
+pub const LINT_FAILURES: u8 = 22;

@@ -271,6 +271,7 @@ version = "0.1.0"
 dependencies = [
  "coda-config",
  "coda-store",
+ "coda-tools",
  "serde",
  "sha2",
  "tempfile",

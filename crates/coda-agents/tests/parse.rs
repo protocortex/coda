@@ -77,17 +77,30 @@ fn a_model_id_in_an_agent_file_is_rejected() {
 }
 
 #[test]
-fn a_bad_tier_and_effort_are_each_named() {
+fn a_bad_tier_effort_and_tool_are_each_named() {
     // Arrange
     let text = agent_text("")
         .replace("\"standard\"", "\"claude-opus\"")
-        .replace("\"high\"", "\"extreme\"");
+        .replace("\"high\"", "\"extreme\"")
+        .replace("\"grep\"", "\"teleport\"");
 
     // Act
     let result = parse_agent(&text, "reviewer");
 
     // Assert
-    assert_eq!(fields(result), ["tier", "effort"]);
+    assert_eq!(fields(result), ["tier", "effort", "tools"]);
+}
+
+#[test]
+fn a_description_must_say_when_to_use_and_when_not_to() {
+    // Arrange
+    let text = agent_text("").replace(DESCRIPTION, "Reviews diffs.");
+
+    // Act
+    let result = parse_agent(&text, "reviewer");
+
+    // Assert
+    assert_eq!(fields(result), ["description"]);
 }
 
 #[test]

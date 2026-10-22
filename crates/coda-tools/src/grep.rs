@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::sandbox::{EntryKind, Sandbox, SandboxDir, SandboxError};
 use crate::{Tool, ToolError, ToolOutput, parse_args};
 
-const NAME: &str = "grep";
+pub const NAME: &str = "grep";
 const DEFAULT_PATH: &str = ".";
 const MAX_DEPTH: usize = 64;
 /// Longest line that is matched; longer lines are skipped, never buffered whole.

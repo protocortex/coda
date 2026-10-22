@@ -169,6 +169,8 @@ Every command accepts `--force`, but it only matters in two cases. A command tha
 
 `coda doctor`: 0 healthy, 20 at least one check failed, 21 only warnings, 64 bad usage, 70 the check itself failed.
 
+`coda agents lint`: 0 no problems, 22 at least one problem, 64 bad usage, 70 the lint itself failed.
+
 ## Configuration
 
 Settings live in `config.toml` under `CODA_HOME`. Without `CODA_HOME`, Coda uses `$HOME/.config/coda`. See [docs/config.md](docs/config.md) for every key, its default and its checks.
