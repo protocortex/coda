@@ -325,7 +325,7 @@ impl CodexSession {
                 }
                 Ok(result?)
             }
-            Active::Exec(exec) => Ok(exec.run_turn(turn_id, text, emit).await?),
+            Active::Exec(exec) => Ok(exec.run_turn(turn_id, text, gate, emit).await?),
         }
     }
 

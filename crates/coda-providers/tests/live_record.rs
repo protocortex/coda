@@ -425,7 +425,12 @@ async fn codex_exec_plain_turn_then_resume() {
         let turn = TurnId::new(format!("t-{index}"));
         let outcome = tokio::time::timeout(
             CODEX_TURN_BOUND,
-            session.run_turn(&turn, prompt, &mut |event| events.push(event)),
+            session.run_turn(
+                &turn,
+                prompt,
+                &FixedGate::new(PermissionDecision::Deny),
+                &mut |event| events.push(event),
+            ),
         )
         .await;
         write!(

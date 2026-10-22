@@ -13,6 +13,8 @@ const DEFAULT_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const DEFAULT_RESTART_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_PERMISSION_DEFAULT_DENY: Duration = Duration::from_secs(120);
 const DEFAULT_TOOL_EXECUTION: Duration = Duration::from_secs(300);
+/// Above the 10 minute maximum of Claude Code's own Bash tool.
+const DEFAULT_DELEGATED_TOOL: Duration = Duration::from_mins(15);
 
 const TEST_STEP: Duration = Duration::from_millis(10);
 
@@ -38,6 +40,10 @@ pub struct Timing {
     /// Maximum run time of a single tool call.
     #[serde(rename = "tool_execution_ms", with = "millis")]
     pub tool_execution: Duration,
+    /// How long a delegated backend (Claude Code, Codex) may stay silent while a tool it
+    /// started on its own runs. Must not be zero.
+    #[serde(rename = "delegated_tool_ms", with = "millis")]
+    pub delegated_tool: Duration,
 }
 
 impl Default for Timing {
@@ -49,6 +55,7 @@ impl Default for Timing {
             restart_backoff: DEFAULT_RESTART_BACKOFF,
             permission_default_deny: DEFAULT_PERMISSION_DEFAULT_DENY,
             tool_execution: DEFAULT_TOOL_EXECUTION,
+            delegated_tool: DEFAULT_DELEGATED_TOOL,
         }
     }
 }
@@ -64,6 +71,7 @@ impl Timing {
             restart_backoff: TEST_STEP,
             permission_default_deny: TEST_STEP.saturating_mul(5),
             tool_execution: TEST_STEP.saturating_mul(10),
+            delegated_tool: TEST_STEP.saturating_mul(10),
         }
     }
 }
@@ -100,6 +108,7 @@ mod tests {
             t.restart_backoff,
             t.permission_default_deny,
             t.tool_execution,
+            t.delegated_tool,
         ] {
             assert!(d < limit, "{d:?} is not under 1s");
         }

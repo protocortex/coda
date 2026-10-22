@@ -17,8 +17,12 @@
 //! `fake-codex app-server --listen unix://PATH` serves one WebSocket connection
 //! instead (see [`app_server`]). Its prompts are `crash`, `stall` or `grandchild`
 //! (as above), `closemid`, `bigframe`, `ping`, `fragment`, `nonobject`, `approve-command`,
-//! `approve-file`, `approve-nocmd`, `approve-unknown`, `approve-heartbeat`, `approve-close`
-//! and `other-request`, and its wire shapes are SYNTHETIC too.
+//! `approve-file`, `approve-nocmd`, `approve-unknown`, `approve-heartbeat`, `approve-close`,
+//! `other-request`, `tool-slow` and `tool-hang`, and its wire shapes are SYNTHETIC too.
+//! `tool-slow` starts a command item, stays silent for `TOOL_SLOW` and completes it;
+//! `tool-hang` starts one and never completes it. `stream-long` streams lines that carry no text
+//! (reasoning deltas, `item.updated`) for longer than the idle limits the tests use.
+//! `exec` takes all three prompts.
 //!
 //! Test controls come from `fake-codex-control.json` in the working
 //! directory, because the adapter passes the child only an allowlisted
@@ -50,6 +54,11 @@ const GRANDCHILD_SECONDS: &str = "300";
 const BIG_LINE_BYTES: usize = 9 * 1024 * 1024;
 const PARK_INTERVAL: Duration = Duration::from_secs(3600);
 const CRASH_EXIT_CODE: i32 = 3;
+/// Silent time of a slow tool: past the idle limits the tests use.
+const TOOL_SLOW: Duration = Duration::from_millis(1500);
+/// Gap and count of the lines a `stream-long` prompt streams, past the idle limits the tests use.
+const STREAM_STEP: Duration = Duration::from_millis(100);
+const STREAM_STEPS: u32 = 15;
 const REFUSAL_MESSAGE: &str =
     "Not inside a trusted directory and --skip-git-repo-check was not specified.";
 
@@ -136,6 +145,25 @@ fn run_turn(args: &[String], prompt: &str, out: &mut impl Write) -> io::Result<(
     if prompt.contains("stall") || prompt.contains("grandchild") {
         park();
     }
+    if prompt.contains("tool-slow") || prompt.contains("tool-hang") {
+        let item = json!({"id": "item_9", "type": "command_execution", "command": "ls",
+            "status": "in_progress"});
+        emit(out, &json!({"type": "item.started", "item": item}))?;
+        if prompt.contains("tool-hang") {
+            park();
+        }
+        std::thread::sleep(TOOL_SLOW);
+        emit(out, &json!({"type": "item.completed", "item": item}))?;
+    }
+    if prompt.contains("stream-long") {
+        for _ in 0..STREAM_STEPS {
+            std::thread::sleep(STREAM_STEP);
+            emit(
+                out,
+                &json!({"type": "item.updated", "item": {"id": "item_8", "type": "reasoning"}}),
+            )?;
+        }
+    }
     if prompt.contains("fail") {
         return emit(
             out,
@@ -183,7 +211,10 @@ mod app_server {
 
     use serde_json::{Value, json};
 
-    use super::{CRASH_EXIT_CODE, arg_after, control_path, park, start_grandchild, write_report};
+    use super::{
+        CRASH_EXIT_CODE, STREAM_STEP, STREAM_STEPS, TOOL_SLOW, arg_after, control_path, park,
+        start_grandchild, write_report,
+    };
 
     /// Every wait is bounded so an orphaned fake cannot outlive a test run.
     const LIFETIME: Duration = Duration::from_secs(120);
@@ -549,6 +580,21 @@ mod app_server {
             notify(stream, "item/started", &json!({"item": item}))?;
             ask(stream, "item/commandExecution/requestApproval", &item["id"])?;
             return close_and_exit(stream);
+        }
+        if prompt.contains("stream-long") {
+            for _ in 0..STREAM_STEPS {
+                std::thread::sleep(STREAM_STEP);
+                notify(stream, "item/reasoning/textDelta", &json!({"delta": "hm"}))?;
+            }
+        }
+        if prompt.contains("tool-slow") || prompt.contains("tool-hang") {
+            let item = json!({"id": "item-6", "type": "commandExecution", "command": "ls"});
+            notify(stream, "item/started", &json!({"item": item}))?;
+            if prompt.contains("tool-hang") {
+                return await_interrupt(stream);
+            }
+            std::thread::sleep(TOOL_SLOW);
+            notify(stream, "item/completed", &json!({"item": item}))?;
         }
         if prompt.contains("approve-file") {
             let item = json!({"id": "item-2", "type": "fileChange",

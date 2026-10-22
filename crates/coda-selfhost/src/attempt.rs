@@ -16,7 +16,6 @@ const STATUS_LIMIT: Duration = Duration::from_secs(10);
 const PID_PREFIX: &str = "pid: ";
 const STOP_LIMIT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(25);
-const CLAUDE_IDLE_TIMEOUT_MS: u64 = 600_000;
 
 #[derive(Debug, Clone)]
 pub struct AttemptSpec<'a> {
@@ -103,12 +102,7 @@ pub fn config_toml(provider: &Provider) -> String {
         Provider::Codex => "[providers.codex]\nenabled = true\n\
                             sandbox = \"workspace-write\"\nallow_wider_sandbox = true\n"
             .to_owned(),
-        // Claude Code does not announce a tool it runs unasked, so a long
-        // `cargo test` looks silent; the default idle limit would abort it.
-        Provider::ClaudeCode => format!(
-            "[providers.claude_code]\nenabled = true\n\n\
-             [timing]\nidle_timeout_ms = {CLAUDE_IDLE_TIMEOUT_MS}\n"
-        ),
+        Provider::ClaudeCode => "[providers.claude_code]\nenabled = true\n".to_owned(),
         Provider::Anthropic { api_key_env } => format!(
             "[providers.anthropic]\nenabled = true\napi_key_env = {api_key_env:?}\nmodel = {MODEL:?}\n"
         ),
@@ -244,8 +238,7 @@ mod tests {
             config,
             "[permissions]\n\
              grants = [\"bash:cargo test\", \"bash:cargo build\", \"edit:crates/coda-cli/src/main.rs\"]\n\n\
-             [providers.claude_code]\nenabled = true\n\n\
-             [timing]\nidle_timeout_ms = 600000\n"
+             [providers.claude_code]\nenabled = true\n"
         );
     }
 

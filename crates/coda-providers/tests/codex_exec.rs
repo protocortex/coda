@@ -5,16 +5,19 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use coda_protocol::events::Event;
-use coda_protocol::types::{SessionId, TokenUsage, TurnId};
+use coda_protocol::types::{PermissionDecision, SessionId, TokenUsage, TurnId};
 use coda_providers::claude_code::Diagnostic;
 use coda_providers::claude_session::{ENV_ALLOWLIST, TurnOutcome};
 use coda_providers::codex_exec::{
     CodexError, CodexExecSession, CodexMessage, CodexParser, CodexSpec, SandboxMode,
 };
+use coda_providers::gate::PermissionGate;
+use coda_providers::tool_request::ToolRequest;
 use serde_json::Value;
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -79,11 +82,22 @@ impl Fixture {
     }
 }
 
+/// `exec` never asks for permission, so the gate only hears about running tools.
+struct NoAsk;
+
+impl PermissionGate for NoAsk {
+    fn request(&self, _request: &ToolRequest) -> impl Future<Output = PermissionDecision> + Send {
+        std::future::ready(PermissionDecision::Deny)
+    }
+}
+
 async fn turn(session: &mut CodexExecSession, text: &str) -> (TurnOutcome, Vec<Event>) {
     let mut events = Vec::new();
     let outcome = tokio::time::timeout(
         TURN_TIMEOUT,
-        session.run_turn(&TurnId::new("t-1"), text, &mut |event| events.push(event)),
+        session.run_turn(&TurnId::new("t-1"), text, &NoAsk, &mut |event| {
+            events.push(event);
+        }),
     )
     .await
     .expect("turn did not finish in time")
@@ -370,7 +384,7 @@ async fn dropping_the_session_kills_the_process_group() {
     let pid_file = fixture.cwd.path().join(PID_FILE);
     let (turn_id, mut sink) = (TurnId::new("t-1"), |_event: Event| {});
     let started = tokio::select! {
-        _ = session.run_turn(&turn_id, "grandchild", &mut sink) => false,
+        _ = session.run_turn(&turn_id, "grandchild", &NoAsk, &mut sink) => false,
         () = wait_for_file(pid_file) => true,
     };
     assert!(started, "the turn ended before the grandchild started");
@@ -422,7 +436,7 @@ async fn a_session_that_cannot_run_a_turn_fails_with_a_specific_error() {
     let mut errors = Vec::new();
     for mut session in sessions {
         let result = session
-            .run_turn(&TurnId::new("t-1"), "hi", &mut |_| {})
+            .run_turn(&TurnId::new("t-1"), "hi", &NoAsk, &mut |_| {})
             .await;
         errors.push(result.unwrap_err());
     }

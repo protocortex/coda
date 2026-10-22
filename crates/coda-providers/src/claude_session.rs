@@ -260,6 +260,7 @@ impl ClaudeSession {
             if read == 0 {
                 return self.crashed(emit).await;
             }
+            gate.progress();
             self.backlog.extend(self.parser.feed(&buffer[..read]));
         }
     }
@@ -323,6 +324,8 @@ impl ClaudeSession {
                 text,
             }),
             Message::Assistant { .. } => {}
+            Message::ToolStarted { id } => gate.tool_started(&id),
+            Message::ToolFinished { id } => gate.tool_finished(&id),
             Message::Result { is_error } => {
                 emit(Event::Result {
                     session_id: self.session_id.clone(),

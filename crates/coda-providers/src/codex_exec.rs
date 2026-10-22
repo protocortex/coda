@@ -28,11 +28,21 @@ use crate::claude_session::{
     CancelHandle, EXIT_GRACE, READ_CHUNK_BYTES, REAP_TIMEOUT, TurnOutcome, allowlisted, cancelled,
     kill_group,
 };
+use crate::gate::PermissionGate;
 use crate::jsonl::{DiagnosticLog, Framed, LineFramer, bounded};
 
 const EXEC_ARGS: &[&str] = &["exec", "--json", "--sandbox"];
 const RESUME_ARG: &str = "resume";
 /// Tells `codex exec` to read the prompt from stdin, which keeps it out of the process list.
+/// `exec --json` item types that run work and stay silent until done. The names are the
+/// `snake_case` forms found in the Codex 0.163.0 binary, not checked against a schema.
+const TOOL_ITEM_TYPES: [&str; 5] = [
+    "command_execution",
+    "file_change",
+    "mcp_tool_call",
+    "collab_tool_call",
+    "web_search",
+];
 const STDIN_PROMPT_ARG: &str = "-";
 const MAX_THREAD_ID_BYTES: usize = 128;
 /// How much of the child's error output is kept to explain a crash.
@@ -175,6 +185,16 @@ pub enum CodexMessage {
         /// Codex's thread id.
         thread_id: String,
     },
+    /// A command or file change began; the stream stays silent until it completes.
+    ToolStarted {
+        /// Codex's item id.
+        id: String,
+    },
+    /// The item that started has completed.
+    ToolFinished {
+        /// Codex's item id.
+        id: String,
+    },
     /// A complete assistant message; `exec` has no text deltas.
     AgentMessage(String),
     /// The turn finished with its token usage.
@@ -242,6 +262,12 @@ impl CodexParser {
             "item.completed" if value["item"]["type"] == "agent_message" => value["item"]["text"]
                 .as_str()
                 .map(|text| CodexMessage::AgentMessage(text.to_owned())),
+            "item.started" if is_tool_item(&value["item"]) => value["item"]["id"]
+                .as_str()
+                .map(|id| CodexMessage::ToolStarted { id: id.to_owned() }),
+            "item.completed" if is_tool_item(&value["item"]) => value["item"]["id"]
+                .as_str()
+                .map(|id| CodexMessage::ToolFinished { id: id.to_owned() }),
             "turn.completed" => Some(CodexMessage::TurnCompleted(usage_of(&value["usage"]))),
             "turn.failed" => Some(CodexMessage::TurnFailed),
             // Known events coda has no use for.
@@ -255,6 +281,10 @@ impl CodexParser {
             }
         }
     }
+}
+
+fn is_tool_item(item: &Value) -> bool {
+    TOOL_ITEM_TYPES.contains(&item["type"].as_str().unwrap_or_default())
 }
 
 fn usage_of(usage: &Value) -> TokenUsage {
@@ -338,10 +368,11 @@ impl CodexExecSession {
     /// [`CodexError::Io`] when the child cannot be read, [`CodexError::SpawnHook`] when its
     /// start cannot be recorded, and
     /// [`CodexError::InvalidThreadId`] when the thread to resume is not a plain identifier.
-    pub async fn run_turn(
+    pub async fn run_turn<G: PermissionGate>(
         &mut self,
         turn_id: &TurnId,
         text: &str,
+        gate: &G,
         emit: &mut impl FnMut(Event),
     ) -> Result<TurnOutcome, CodexError> {
         if self.closed {
@@ -353,7 +384,7 @@ impl CodexExecSession {
         self.parser = CodexParser::new();
         let spawned = self.spawn()?;
         self.announce_spawn().await?;
-        self.supervise(turn_id, text, emit, spawned).await
+        self.supervise(turn_id, text, gate, emit, spawned).await
     }
 
     async fn announce_spawn(&mut self) -> Result<(), CodexError> {
@@ -368,24 +399,26 @@ impl CodexExecSession {
     }
 
     /// Runs the exchange; an I/O error also stops the group so no descendant leaks.
-    async fn supervise<R: AsyncRead + Unpin>(
+    async fn supervise<R: AsyncRead + Unpin, G: PermissionGate>(
         &mut self,
         turn_id: &TurnId,
         text: &str,
+        gate: &G,
         emit: &mut impl FnMut(Event),
         spawned: (ChildStdin, R),
     ) -> Result<TurnOutcome, CodexError> {
-        let result = self.exchange(turn_id, text, emit, spawned).await;
+        let result = self.exchange(turn_id, text, gate, emit, spawned).await;
         if result.is_err() {
             let _ = self.reap(Duration::ZERO).await;
         }
         result
     }
 
-    async fn exchange<R: AsyncRead + Unpin>(
+    async fn exchange<R: AsyncRead + Unpin, G: PermissionGate>(
         &mut self,
         turn_id: &TurnId,
         text: &str,
+        gate: &G,
         emit: &mut impl FnMut(Event),
         (stdin, mut stdout): (ChildStdin, R),
     ) -> Result<TurnOutcome, CodexError> {
@@ -403,8 +436,9 @@ impl CodexExecSession {
             if read == 0 {
                 return self.crashed(emit).await;
             }
+            gate.progress();
             for message in self.parser.feed(&buffer[..read]) {
-                if let Some(is_error) = self.handle(message, turn_id, emit) {
+                if let Some(is_error) = self.handle(message, turn_id, gate, emit) {
                     self.reap(EXIT_GRACE).await?;
                     return Ok(TurnOutcome::Completed { is_error });
                 }
@@ -474,16 +508,19 @@ impl CodexExecSession {
     }
 
     /// Emits the events of one message; returns the turn's error flag once it ended.
-    fn handle(
+    fn handle<G: PermissionGate>(
         &mut self,
         message: CodexMessage,
         turn_id: &TurnId,
+        gate: &G,
         emit: &mut impl FnMut(Event),
     ) -> Option<bool> {
         let session_id = self.spec.session_id.clone();
         let turn_id = turn_id.clone();
         match message {
             CodexMessage::ThreadStarted { thread_id } => self.backend_session_id = Some(thread_id),
+            CodexMessage::ToolStarted { id } => gate.tool_started(&id),
+            CodexMessage::ToolFinished { id } => gate.tool_finished(&id),
             CodexMessage::AgentMessage(text) => emit(Event::StreamDelta {
                 session_id,
                 turn_id,
@@ -586,6 +623,17 @@ mod tests {
 
     use super::*;
 
+    struct NoAsk;
+
+    impl PermissionGate for NoAsk {
+        fn request(
+            &self,
+            _request: &crate::tool_request::ToolRequest,
+        ) -> impl Future<Output = coda_protocol::types::PermissionDecision> {
+            std::future::ready(coda_protocol::types::PermissionDecision::Deny)
+        }
+    }
+
     /// A stdout that fails once the fake child has started its grandchild.
     struct FailsOnceStarted(PathBuf);
 
@@ -626,6 +674,7 @@ mod tests {
             session.supervise(
                 &TurnId::new("t-1"),
                 "grandchild",
+                &NoAsk,
                 &mut |_| {},
                 (stdin, FailsOnceStarted(pid_path.clone())),
             ),
@@ -706,6 +755,9 @@ mod tests {
                     thread_id: "th-1".to_owned()
                 },
                 CodexMessage::AgentMessage("hi".to_owned()),
+                CodexMessage::ToolFinished {
+                    id: "i1".to_owned()
+                },
                 CodexMessage::TurnCompleted(TokenUsage {
                     input_tokens: 5,
                     output_tokens: 3,
@@ -716,6 +768,25 @@ mod tests {
             ]
         );
         assert_eq!(parser.diagnostics(), []);
+    }
+
+    #[test]
+    fn a_started_command_is_a_tool_in_flight_and_other_started_items_are_not() {
+        // Arrange
+        let mut parser = CodexParser::new();
+        let command = r#"{"type":"item.started","item":{"id":"i1","type":"command_execution"}}"#;
+        let message = r#"{"type":"item.started","item":{"id":"i2","type":"agent_message"}}"#;
+
+        // Act
+        let messages = feed_lines(&mut parser, &[command, message]);
+
+        // Assert
+        assert_eq!(
+            messages,
+            vec![CodexMessage::ToolStarted {
+                id: "i1".to_owned()
+            }]
+        );
     }
 
     #[test]

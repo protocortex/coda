@@ -16,4 +16,13 @@ use crate::tool_request::ToolRequest;
 pub trait PermissionGate: Send + Sync {
     /// Decides one request.
     fn request(&self, request: &ToolRequest) -> impl Future<Output = PermissionDecision> + Send;
+
+    /// The backend wrote something, whether or not it became an event; it is alive.
+    fn progress(&self) {}
+
+    /// The backend reports it began running tool `id` on its own, with no ask.
+    fn tool_started(&self, _id: &str) {}
+
+    /// The backend reports tool `id` finished.
+    fn tool_finished(&self, _id: &str) {}
 }

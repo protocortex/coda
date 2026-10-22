@@ -732,6 +732,18 @@ impl PermissionGate for WatchedGate {
         self.watchdog.set(Phase::PermissionPending);
         self.inner.request(request).await
     }
+
+    fn progress(&self) {
+        self.watchdog.touch();
+    }
+
+    fn tool_started(&self, id: &str) {
+        self.watchdog.tool_started(id);
+    }
+
+    fn tool_finished(&self, id: &str) {
+        self.watchdog.tool_finished(id);
+    }
 }
 
 async fn publish_events(

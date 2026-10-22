@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coda_protocol::events::Event;
 use coda_protocol::jsonrpc::Response;
@@ -48,7 +48,7 @@ const ECHO_CANARY: &str = "CANARY-ECHO-19be72";
 fn timing(idle_ms: u64, permission_ms: u64) -> Timing {
     Timing {
         idle: Duration::from_millis(idle_ms),
-        tool_execution: Duration::from_secs(30),
+        delegated_tool: Duration::from_secs(30),
         permission: Duration::from_millis(permission_ms),
     }
 }
@@ -486,6 +486,144 @@ async fn a_silent_backend_is_aborted_by_the_idle_timeout() {
     assert!(!rig.kinds().await.contains(&"result".to_owned()));
 }
 
+/// Short enough that a slow tool outlasts it several times over.
+const TOOL_TEST_IDLE_MS: u64 = 500;
+/// Several times the idle limit, so reaching it shows the tool bound applied, not the idle one.
+const TOOL_TEST_BOUND_MS: u64 = 4 * TOOL_TEST_IDLE_MS;
+const TOOL_TEST_LONG_BOUND_MS: u64 = 60_000;
+/// Long enough to tell from the idle limit, short enough that a stuck run fails fast.
+const TOOL_TEST_RESTART_BOUND_MS: u64 = 20_000;
+
+/// An idle limit below the fakes' silent tool, and a running-tool bound above it
+/// or, for a hung tool, below the wait a test can afford.
+fn tool_timing(tool_bound_ms: u64) -> Timing {
+    Timing {
+        idle: Duration::from_millis(TOOL_TEST_IDLE_MS),
+        delegated_tool: Duration::from_millis(tool_bound_ms),
+        permission: Duration::from_secs(20),
+    }
+}
+
+#[tokio::test]
+async fn a_claude_tool_running_silently_past_the_idle_limit_does_not_abort_the_turn() {
+    // Arrange
+    let mut rig = Rig::new(tool_timing(TOOL_TEST_LONG_BOUND_MS), Vec::new());
+
+    // Act
+    rig.send("tool-slow").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let kinds = rig.kinds().await;
+    assert!(kinds.contains(&"result".to_owned()), "{kinds:?}");
+    assert!(!kinds.contains(&"turn_interrupted".to_owned()));
+}
+
+#[tokio::test]
+async fn a_claude_tool_that_never_reports_ends_the_turn_at_the_tool_bound() {
+    // Arrange
+    let mut rig = Rig::new(tool_timing(TOOL_TEST_BOUND_MS), Vec::new());
+
+    // Act
+    let started = Instant::now();
+    rig.send("tool-hang").await;
+    rig.wait_for("turn_interrupted").await;
+    let waited = started.elapsed();
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert!(
+        waited >= Duration::from_millis(TOOL_TEST_BOUND_MS),
+        "{waited:?}"
+    );
+    assert!(!rig.kinds().await.contains(&"result".to_owned()));
+}
+
+#[tokio::test]
+async fn a_codex_command_running_silently_past_the_idle_limit_does_not_abort_the_turn() {
+    // Arrange
+    let mut rig = codex_rig_with(tool_timing(TOOL_TEST_LONG_BOUND_MS), &json!({}));
+
+    // Act
+    rig.send("tool-slow").await;
+    rig.wait_until_turn_over().await;
+
+    // Assert
+    let kinds = rig.kinds().await;
+    assert!(kinds.contains(&"result".to_owned()), "{kinds:?}");
+    assert!(!kinds.contains(&"turn_interrupted".to_owned()));
+}
+
+#[tokio::test]
+async fn a_codex_command_that_never_completes_ends_the_turn_at_the_tool_bound() {
+    // Arrange
+    let mut rig = codex_rig_with(tool_timing(TOOL_TEST_BOUND_MS), &json!({}));
+
+    // Act
+    let started = Instant::now();
+    rig.send("tool-hang").await;
+    rig.wait_for("turn_interrupted").await;
+    let waited = started.elapsed();
+    rig.wait_until_turn_over().await;
+
+    // Assert
+    assert!(
+        waited >= Duration::from_millis(TOOL_TEST_BOUND_MS),
+        "{waited:?}"
+    );
+    assert!(!rig.kinds().await.contains(&"result".to_owned()));
+}
+
+#[tokio::test]
+async fn claude_streaming_tool_input_and_thinking_past_the_idle_limit_is_not_stuck() {
+    // Arrange
+    let mut rig = Rig::new(tool_timing(TOOL_TEST_LONG_BOUND_MS), Vec::new());
+
+    // Act
+    rig.send("stream-long").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let kinds = rig.kinds().await;
+    assert!(kinds.contains(&"result".to_owned()), "{kinds:?}");
+    assert!(!kinds.contains(&"turn_interrupted".to_owned()));
+}
+
+#[tokio::test]
+async fn codex_streaming_reasoning_past_the_idle_limit_is_not_stuck() {
+    // Arrange
+    let mut rig = codex_rig_with(tool_timing(TOOL_TEST_LONG_BOUND_MS), &json!({}));
+
+    // Act
+    rig.send("stream-long").await;
+    rig.wait_until_turn_over().await;
+
+    // Assert
+    let kinds = rig.kinds().await;
+    assert!(kinds.contains(&"result".to_owned()), "{kinds:?}");
+    assert!(!kinds.contains(&"turn_interrupted".to_owned()));
+}
+
+#[tokio::test]
+async fn a_restart_drops_the_tools_the_crashed_backend_left_in_flight() {
+    // Arrange
+    let mut rig = Rig::new(tool_timing(TOOL_TEST_RESTART_BOUND_MS), Vec::new());
+    rig.control(&json!({"crash_marker": rig.cwd.path().join("crashed")}));
+
+    // Act
+    let started = Instant::now();
+    rig.send("tool-flaky").await;
+    rig.wait_for("turn_interrupted").await;
+    let waited = started.elapsed();
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert!(
+        waited < Duration::from_millis(TOOL_TEST_RESTART_BOUND_MS / 2),
+        "{waited:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_pending_permission_pauses_the_idle_timeout() {
     // Arrange
@@ -883,8 +1021,12 @@ fn codex_config() -> coda_config::config::Config {
 }
 
 fn codex_rig(control: &Value) -> Rig {
+    codex_rig_with(relaxed(), control)
+}
+
+fn codex_rig_with(timing: Timing, control: &Value) -> Rig {
     let rig = Rig::build(
-        relaxed(),
+        timing,
         Vec::new(),
         BackendKind::CodexAppServer,
         codex_config(),
