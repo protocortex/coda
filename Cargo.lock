@@ -270,7 +270,9 @@ name = "coda-agents"
 version = "0.1.0"
 dependencies = [
  "coda-config",
+ "coda-store",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror",
  "toml",
@@ -282,6 +284,7 @@ name = "coda-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "coda-agents",
  "coda-client",
  "coda-config",
  "coda-core",

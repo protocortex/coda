@@ -3,40 +3,53 @@
 //! Loads definitions from the user's config directory and the project, and
 //! merges them under the trust rules.
 //!
-//! Project files are untrusted prompt input, so for now they are only listed
-//! as pending and never returned. Once a project file is allowed to load, it
-//! may replace the description and prompt of a user definition and may narrow
-//! an agent's tools, but never widen them.
+//! Project files are untrusted prompt input. They load only when the digest of
+//! the exact bytes read matches the digest the user trusted, which only the
+//! store-backed [`Catalog::load_trusted`] can supply; otherwise they are listed
+//! as pending and never returned. A project file may replace the description
+//! and prompt of a user definition, and may narrow an agent's tools, but never
+//! widen them.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use coda_store::{Store, StoreError};
 use tracing::{debug, warn};
 
 use crate::definition::{
     AgentDef, CommandDef, Issue, SkillDef, parse_agent, parse_command, parse_skill,
 };
+use crate::digest::digest_of;
 
 /// Directory inside a repository that holds project definitions.
 pub const PROJECT_DIR: &str = ".coda";
-const AGENTS_DIR: &str = "agents";
-const SKILLS_DIR: &str = "skills";
-const COMMANDS_DIR: &str = "commands";
+pub(crate) const AGENTS_DIR: &str = "agents";
+pub(crate) const SKILLS_DIR: &str = "skills";
+pub(crate) const COMMANDS_DIR: &str = "commands";
 const SYMLINK_MESSAGE: &str = "it is a symlink, which a project cannot use to point outside itself";
 const EXTENSION: &str = "md";
 /// A definition larger than this is refused: prompts are small, and a project
 /// file is untrusted.
 const MAX_DEFINITION_BYTES: u64 = 64 * 1024;
 
-/// Whether a project's definitions may load.
+/// Why a project file is not in use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Trust {
-    /// Only tests construct this until the user can trust a repository.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Trusted,
-    Untrusted,
+pub enum PendingReason {
+    NotTrusted,
+    ChangedSinceTrust,
+}
+
+impl PendingReason {
+    /// A phrase for the user.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotTrusted => "the repository is not trusted",
+            Self::ChangedSinceTrust => "project definitions changed since they were trusted",
+        }
+    }
 }
 
 /// Where a definition came from.
@@ -75,6 +88,16 @@ impl Kind {
             Self::Command => "command",
         }
     }
+
+    pub(crate) const fn folder(self) -> &'static str {
+        match self {
+            Self::Agent => AGENTS_DIR,
+            Self::Skill => SKILLS_DIR,
+            Self::Command => COMMANDS_DIR,
+        }
+    }
+
+    const ALL: [Self; 3] = [Self::Agent, Self::Skill, Self::Command];
 }
 
 /// A loaded definition and where it came from.
@@ -85,11 +108,12 @@ pub struct Entry<T> {
     pub path: PathBuf,
 }
 
-/// A project file waiting for the user's trust decision. It has not been read.
+/// A project file that is not in use, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
     pub kind: Kind,
     pub path: PathBuf,
+    pub reason: PendingReason,
 }
 
 /// A file that was skipped, or part of one that was ignored, and why.
@@ -102,7 +126,7 @@ pub struct LoadProblem {
 }
 
 impl LoadProblem {
-    fn new(path: &Path, field: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(path: &Path, field: &str, message: impl Into<String>) -> Self {
         Self {
             path: path.to_path_buf(),
             field: field.to_owned(),
@@ -118,6 +142,70 @@ impl LoadProblem {
     }
 }
 
+/// A definition file read once; its digest and its parse use these bytes.
+#[derive(Debug)]
+pub(crate) struct DefinitionFile {
+    pub kind: Kind,
+    pub stem: String,
+    pub path: PathBuf,
+    pub text: String,
+}
+
+/// Everything read from one definitions directory.
+#[derive(Debug, Default)]
+pub(crate) struct Snapshot {
+    pub entries: Vec<(Kind, PathBuf)>,
+    pub files: Vec<DefinitionFile>,
+    pub problems: Vec<LoadProblem>,
+}
+
+impl Snapshot {
+    /// Lists and reads the `.md` files under `dir/{agents,skills,commands}`.
+    pub fn take(dir: &Path) -> Self {
+        let mut snapshot = Self::default();
+        for kind in Kind::ALL {
+            let sub_dir = dir.join(kind.folder());
+            let paths = match list_markdown(&sub_dir) {
+                Ok(paths) => paths,
+                Err(e) => {
+                    snapshot
+                        .problems
+                        .push(LoadProblem::new(&sub_dir, "directory", e.to_string()));
+                    continue;
+                }
+            };
+            for path in paths {
+                snapshot.entries.push((kind, path.clone()));
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
+                else {
+                    snapshot.problems.push(LoadProblem::new(
+                        &path,
+                        "file name",
+                        "the name is not valid UTF-8",
+                    ));
+                    continue;
+                };
+                match read_definition(&path) {
+                    Ok(text) => snapshot.files.push(DefinitionFile {
+                        kind,
+                        stem,
+                        path,
+                        text,
+                    }),
+                    Err(message) => snapshot
+                        .problems
+                        .push(LoadProblem::new(&path, "file", message)),
+                }
+            }
+        }
+        snapshot
+    }
+
+    pub fn digest(&self) -> String {
+        digest_of(&self.files, &self.problems)
+    }
+}
+
 /// Every usable definition, by name, plus what was held back or skipped.
 #[derive(Debug, Default)]
 pub struct Catalog {
@@ -128,18 +216,57 @@ pub struct Catalog {
     problems: Vec<LoadProblem>,
 }
 
+/// Which project files may load.
+#[derive(Clone, Copy)]
+enum Admit<'a> {
+    /// Those whose digest equals the stored one, if any.
+    Trusted(Option<&'a str>),
+    /// All of them; only for reporting problems, never for use.
+    Everything,
+}
+
 impl Catalog {
     /// Loads `agents/`, `skills/` and `commands/` from `user_dir`. The files
     /// under `<project_root>/.coda/` are listed as pending and not loaded. A
     /// file that does not parse is recorded in [`Catalog::problems`] and skipped.
     #[must_use]
     pub fn load(user_dir: &Path, project_root: Option<&Path>) -> Self {
-        Self::load_with(user_dir, project_root, Trust::Untrusted)
+        Self::load_with(user_dir, project_root, Admit::Trusted(None))
     }
 
-    fn load_with(user_dir: &Path, project_root: Option<&Path>, trust: Trust) -> Self {
+    /// Like [`Catalog::load`], but project files load when the user has trusted
+    /// the repository and the bytes read now still match what they trusted.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] when the trust decision cannot be read.
+    pub fn load_trusted(
+        store: &Store,
+        user_dir: &Path,
+        project_root: Option<&Path>,
+    ) -> Result<Self, StoreError> {
+        let stored = match project_root {
+            Some(root) => store.project_trust_digest(&repo_key(root))?,
+            None => None,
+        };
+        Ok(Self::load_with(
+            user_dir,
+            project_root,
+            Admit::Trusted(stored.as_deref()),
+        ))
+    }
+
+    /// Every problem in the user and project files, trusted or not. Linting
+    /// reads the files but returns no definition, so nothing from an untrusted
+    /// project can be used through it.
+    #[must_use]
+    pub fn check_all(user_dir: &Path, project_root: Option<&Path>) -> Vec<LoadProblem> {
+        Self::load_with(user_dir, project_root, Admit::Everything).problems
+    }
+
+    fn load_with(user_dir: &Path, project_root: Option<&Path>, admit: Admit<'_>) -> Self {
         let mut catalog = Self::default();
-        catalog.load_source(user_dir, Source::User);
+        debug!(dir = %user_dir.display(), "loading user definitions");
+        catalog.absorb(Snapshot::take(user_dir), Source::User);
         let Some(root) = project_root else {
             return catalog;
         };
@@ -150,11 +277,38 @@ impl Catalog {
                 .push(LoadProblem::new(&project_dir, "directory", SYMLINK_MESSAGE));
             return catalog;
         }
-        match trust {
-            Trust::Trusted => catalog.load_source(&project_dir, Source::Project),
-            Trust::Untrusted => catalog.list_pending(&project_dir),
-        }
+        debug!(dir = %project_dir.display(), "reading project definitions");
+        catalog.apply_project(Snapshot::take(&project_dir), admit);
         catalog
+    }
+
+    /// Admits `snapshot` when `admit` allows it, else lists its files as pending.
+    /// The digest is taken from the snapshot itself, so what is compared is
+    /// exactly what is parsed.
+    fn apply_project(&mut self, snapshot: Snapshot, admit: Admit<'_>) {
+        let reason = match admit {
+            Admit::Everything => None,
+            Admit::Trusted(Some(stored)) if stored == snapshot.digest() => None,
+            Admit::Trusted(Some(_)) => Some(PendingReason::ChangedSinceTrust),
+            Admit::Trusted(None) => Some(PendingReason::NotTrusted),
+        };
+        match reason {
+            None => self.absorb(snapshot, Source::Project),
+            Some(reason) => {
+                self.problems.extend(
+                    snapshot
+                        .problems
+                        .into_iter()
+                        .filter(|p| p.field == "directory"),
+                );
+                self.pending
+                    .extend(snapshot.entries.into_iter().map(|(kind, path)| Pending {
+                        kind,
+                        path,
+                        reason,
+                    }));
+            }
+        }
     }
 
     #[must_use]
@@ -184,7 +338,7 @@ impl Catalog {
         self.commands.values()
     }
 
-    /// Project files held back until the repository is trusted.
+    /// Project files that are not in use.
     #[must_use]
     pub fn pending(&self) -> &[Pending] {
         &self.pending
@@ -196,28 +350,32 @@ impl Catalog {
         &self.problems
     }
 
-    fn load_source(&mut self, dir: &Path, source: Source) {
-        debug!(dir = %dir.display(), ?source, "loading definitions");
-        for (stem, path, text) in self.read_files(&dir.join(AGENTS_DIR)) {
-            match parse_agent(&text, &stem) {
-                Ok(def) => self.add_agent(stem, Entry { def, source, path }),
-                Err(issues) => self.reject(&path, issues),
-            }
-        }
-        for (stem, path, text) in self.read_files(&dir.join(SKILLS_DIR)) {
-            match parse_skill(&text, &stem) {
-                Ok(def) => {
-                    self.skills.insert(stem, Entry { def, source, path });
-                }
-                Err(issues) => self.reject(&path, issues),
-            }
-        }
-        for (stem, path, text) in self.read_files(&dir.join(COMMANDS_DIR)) {
-            match parse_command(&text, &stem) {
-                Ok(def) => {
-                    self.commands.insert(stem, Entry { def, source, path });
-                }
-                Err(issues) => self.reject(&path, issues),
+    fn absorb(&mut self, snapshot: Snapshot, source: Source) {
+        self.problems.extend(snapshot.problems);
+        for file in snapshot.files {
+            let DefinitionFile {
+                kind,
+                stem,
+                path,
+                text,
+            } = file;
+            match kind {
+                Kind::Agent => match parse_agent(&text, &stem) {
+                    Ok(def) => self.add_agent(stem, Entry { def, source, path }),
+                    Err(issues) => self.reject(&path, issues),
+                },
+                Kind::Skill => match parse_skill(&text, &stem) {
+                    Ok(def) => {
+                        self.skills.insert(stem, Entry { def, source, path });
+                    }
+                    Err(issues) => self.reject(&path, issues),
+                },
+                Kind::Command => match parse_command(&text, &stem) {
+                    Ok(def) => {
+                        self.commands.insert(stem, Entry { def, source, path });
+                    }
+                    Err(issues) => self.reject(&path, issues),
+                },
             }
         }
     }
@@ -265,57 +423,32 @@ impl Catalog {
         );
     }
 
-    fn list_pending(&mut self, project_dir: &Path) {
-        for (kind, sub) in [
-            (Kind::Agent, AGENTS_DIR),
-            (Kind::Skill, SKILLS_DIR),
-            (Kind::Command, COMMANDS_DIR),
-        ] {
-            match list_markdown(&project_dir.join(sub)) {
-                Ok(paths) => self
-                    .pending
-                    .extend(paths.into_iter().map(|path| Pending { kind, path })),
-                Err(e) => self.problems.push(LoadProblem::new(
-                    &project_dir.join(sub),
-                    "directory",
-                    e.to_string(),
-                )),
-            }
-        }
-    }
-
     fn reject(&mut self, path: &Path, issues: Vec<Issue>) {
         warn!(path = %path.display(), "skipping an invalid definition file");
         self.problems.extend(LoadProblem::from_issues(path, issues));
     }
+}
 
-    /// Reads every readable definition file in `dir` as `(stem, path, text)`.
-    fn read_files(&mut self, dir: &Path) -> Vec<(String, PathBuf, String)> {
-        let paths = match list_markdown(dir) {
-            Ok(paths) => paths,
-            Err(e) => {
-                self.problems
-                    .push(LoadProblem::new(dir, "directory", e.to_string()));
-                return Vec::new();
-            }
-        };
-        let mut files = Vec::new();
-        for path in paths {
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
-                self.problems.push(LoadProblem::new(
-                    &path,
-                    "file name",
-                    "the name is not valid UTF-8",
-                ));
-                continue;
-            };
-            match read_definition(&path) {
-                Ok(text) => files.push((stem, path, text)),
-                Err(message) => self.problems.push(LoadProblem::new(&path, "file", message)),
-            }
-        }
-        files
-    }
+/// Records that the user trusts the project definitions of `project_root` as
+/// they are now. Later loads use them only while their bytes still match.
+///
+/// # Errors
+/// Returns [`StoreError`] when the decision cannot be written.
+pub fn trust_project(store: &mut Store, project_root: &Path) -> Result<(), StoreError> {
+    let snapshot = Snapshot::take(&project_root.join(PROJECT_DIR));
+    store.trust_project(&repo_key(project_root), &snapshot.digest())
+}
+
+/// Removes the trust decision of `project_root`; true when there was one.
+///
+/// # Errors
+/// Returns [`StoreError`] when the decision cannot be removed.
+pub fn revoke_project(store: &mut Store, project_root: &Path) -> Result<bool, StoreError> {
+    store.revoke_project_trust(&repo_key(project_root))
+}
+
+fn repo_key(project_root: &Path) -> String {
+    project_root.display().to_string()
 }
 
 /// The `.md` files of `dir`, sorted. A missing directory holds none and a
@@ -345,203 +478,88 @@ fn is_symlink(path: &Path) -> bool {
 }
 
 /// Reads a regular file of bounded size. A symlink is refused so a project
-/// cannot point a definition at a file outside it.
+/// cannot point a definition at a file outside it. The read is capped too, in
+/// case the file grew after it was measured.
 fn read_definition(path: &Path) -> Result<String, String> {
     let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("it is not a regular file".to_owned());
     }
+    let too_large = || format!("it is larger than {MAX_DEFINITION_BYTES} bytes");
     if meta.len() > MAX_DEFINITION_BYTES {
-        return Err(format!("it is larger than {MAX_DEFINITION_BYTES} bytes"));
+        return Err(too_large());
     }
-    fs::read_to_string(path).map_err(|e| e.to_string())
+    let mut text = String::new();
+    File::open(path)
+        .and_then(|file| {
+            file.take(MAX_DEFINITION_BYTES + 1)
+                .read_to_string(&mut text)
+        })
+        .map_err(|e| e.to_string())?;
+    if text.len() as u64 > MAX_DEFINITION_BYTES {
+        return Err(too_large());
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
 
     use tempfile::TempDir;
 
     use super::*;
 
-    fn agent(name: &str, prompt: &str, tools: &str) -> String {
+    fn agent(prompt: &str) -> String {
         format!(
-            "+++\nname = \"{name}\"\n\
-             description = \"Does {name}. Use when asked. Do not use otherwise.\"\n\
-             tier = \"fast\"\neffort = \"low\"\ntools = [{tools}]\n+++\n{prompt}\n"
+            "+++\nname = \"scout\"\n\
+             description = \"Scouts. Use when asked. Do not use otherwise.\"\n\
+             tier = \"fast\"\neffort = \"low\"\ntools = [\"read\"]\n+++\n{prompt}\n"
         )
     }
 
-    fn write(root: &Path, rel: &str, text: &str) {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
-    }
-
-    struct Fixture {
-        user: TempDir,
-        repo: TempDir,
-    }
-
-    fn fixture() -> Fixture {
-        Fixture {
-            user: TempDir::new().unwrap(),
-            repo: TempDir::new().unwrap(),
-        }
-    }
-
-    impl Fixture {
-        fn load(&self, trust: Trust) -> Catalog {
-            Catalog::load_with(self.user.path(), Some(self.repo.path()), trust)
-        }
-    }
-
     #[test]
-    fn a_project_agent_overrides_the_user_prompt_but_cannot_widen_tools() {
+    fn an_edit_after_the_read_cannot_change_what_a_matching_digest_admits() {
         // Arrange
-        let f = fixture();
-        write(
-            f.user.path(),
-            "agents/scout.md",
-            &agent("scout", "user prompt", "\"read\""),
-        );
-        write(
-            f.repo.path(),
-            ".coda/agents/scout.md",
-            &agent("scout", "project prompt", "\"read\", \"bash\""),
-        );
+        let repo = TempDir::new().unwrap();
+        let file = repo.path().join(".coda/agents/scout.md");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, agent("reviewed prompt")).unwrap();
+        let snapshot = Snapshot::take(&repo.path().join(PROJECT_DIR));
+        let trusted = snapshot.digest();
+        fs::write(&file, agent("swapped in after the check")).unwrap();
 
         // Act
-        let catalog = f.load(Trust::Trusted);
+        let mut catalog = Catalog::default();
+        catalog.apply_project(snapshot, Admit::Trusted(Some(&trusted)));
 
         // Assert
         let scout = catalog.agent("scout").unwrap();
-        assert_eq!(scout.def.body.trim(), "project prompt");
-        assert_eq!(scout.def.tools, ["read"]);
-        assert_eq!(scout.source, Source::Project);
-        assert!(
-            catalog
-                .problems()
-                .iter()
-                .any(|p| p.to_string().contains("bash"))
-        );
+        assert_eq!(scout.def.body.trim(), "reviewed prompt");
     }
 
     #[test]
-    fn a_project_agent_may_narrow_the_tools_of_a_user_agent() {
+    fn a_digest_of_other_bytes_admits_nothing() {
         // Arrange
-        let f = fixture();
-        write(
-            f.user.path(),
-            "agents/scout.md",
-            &agent("scout", "u", "\"read\", \"grep\""),
-        );
-        write(
-            f.repo.path(),
-            ".coda/agents/scout.md",
-            &agent("scout", "p", "\"grep\""),
-        );
+        let repo = TempDir::new().unwrap();
+        let file = repo.path().join(".coda/agents/scout.md");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, agent("reviewed prompt")).unwrap();
+        let trusted = Snapshot::take(&repo.path().join(PROJECT_DIR)).digest();
+        fs::write(&file, agent("swapped in before the read")).unwrap();
 
         // Act
-        let catalog = f.load(Trust::Trusted);
-
-        // Assert
-        assert_eq!(catalog.agent("scout").unwrap().def.tools, ["grep"]);
-    }
-
-    #[test]
-    fn a_project_only_agent_is_usable_once_trusted() {
-        // Arrange
-        let f = fixture();
-        write(
-            f.repo.path(),
-            ".coda/agents/local.md",
-            &agent("local", "p", "\"read\""),
+        let mut catalog = Catalog::default();
+        catalog.apply_project(
+            Snapshot::take(&repo.path().join(PROJECT_DIR)),
+            Admit::Trusted(Some(&trusted)),
         );
 
-        // Act
-        let catalog = f.load(Trust::Trusted);
-
         // Assert
-        assert_eq!(catalog.agent("local").unwrap().source, Source::Project);
-    }
-
-    #[test]
-    fn a_hook_key_in_a_project_file_is_rejected_and_the_file_is_not_loaded() {
-        // Arrange
-        let f = fixture();
-        let text = agent("local", "p", "\"read\"").replace("+++\np", "hooks = [\"x\"]\n+++\np");
-        write(f.repo.path(), ".coda/agents/local.md", &text);
-
-        // Act
-        let catalog = f.load(Trust::Trusted);
-
-        // Assert
-        assert!(catalog.agent("local").is_none());
-        assert!(
-            catalog
-                .problems()
-                .iter()
-                .any(|p| p.to_string().contains("hooks"))
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_symlinked_coda_directory_is_refused() {
-        // Arrange
-        let f = fixture();
-        let elsewhere = TempDir::new().unwrap();
-        write(
-            elsewhere.path(),
-            "agents/local.md",
-            &agent("local", "p", "\"read\""),
-        );
-        std::os::unix::fs::symlink(elsewhere.path(), f.repo.path().join(PROJECT_DIR)).unwrap();
-
-        // Act
-        let catalog = f.load(Trust::Trusted);
-
-        // Assert
-        assert!(catalog.agent("local").is_none());
-        assert!(
-            catalog
-                .problems()
-                .iter()
-                .any(|p| p.message.contains("symlink"))
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_symlinked_subfolder_is_refused() {
-        // Arrange
-        let f = fixture();
-        let elsewhere = TempDir::new().unwrap();
-        write(
-            elsewhere.path(),
-            "local.md",
-            &agent("local", "p", "\"read\""),
-        );
-        fs::create_dir(f.repo.path().join(PROJECT_DIR)).unwrap();
-        std::os::unix::fs::symlink(
-            elsewhere.path(),
-            f.repo.path().join(PROJECT_DIR).join(AGENTS_DIR),
-        )
-        .unwrap();
-
-        // Act
-        let catalog = f.load(Trust::Trusted);
-
-        // Assert
-        assert!(catalog.agent("local").is_none());
-        assert!(
-            catalog
-                .problems()
-                .iter()
-                .any(|p| p.message.contains("symlink"))
+        assert!(catalog.agent("scout").is_none());
+        assert_eq!(
+            catalog.pending()[0].reason,
+            PendingReason::ChangedSinceTrust
         );
     }
 }

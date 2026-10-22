@@ -14,6 +14,7 @@ mod pending;
 mod readers;
 mod savings;
 mod sessions;
+mod trust;
 mod usage;
 
 pub use decisions::{NewDecision, StoredDecision};
@@ -41,7 +42,7 @@ use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Release of this binary, recorded in the database each time it opens it.
 pub const BINARY_RELEASE: &str = env!("CARGO_PKG_VERSION");

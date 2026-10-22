@@ -2,6 +2,7 @@
 
 //! The `coda` command line: argument parsing, daemon start-up and the commands.
 
+mod agents;
 pub mod autostart;
 pub mod cli;
 mod context;
@@ -64,6 +65,7 @@ async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<ExitCode, C
     let done = match cli.command {
         Some(Command::Run(args)) => return run::run(ctx, io, force, args).await,
         Some(Command::Doctor(args)) => return doctor::run(ctx, io, args).await,
+        Some(Command::Agents(command)) => agents::run(ctx, io, &command),
         None if ctx.is_tty => tui_cmd::open(ctx, io, force).await,
         None => status::start(ctx, io, force).await,
         Some(Command::Tui) => tui_cmd::tui(ctx, io, force).await,

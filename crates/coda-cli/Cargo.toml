@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+coda-agents = { path = "../coda-agents" }
 coda-client = { path = "../coda-client" }
 coda-config = { path = "../coda-config" }
 coda-core = { path = "../coda-core" }
