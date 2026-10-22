@@ -266,6 +266,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "coda-agents"
+version = "0.1.0"
+dependencies = [
+ "coda-config",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "coda-cli"
 version = "0.1.0"
 dependencies = [

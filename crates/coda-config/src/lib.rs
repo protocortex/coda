@@ -3,4 +3,5 @@
 //! Parsing and defaults for coda's `config.toml`, plus injectable timing.
 
 pub mod config;
+pub mod routing;
 pub mod timing;
