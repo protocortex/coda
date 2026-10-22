@@ -154,8 +154,11 @@ impl FauxProvider {
         let Some(path) = &self.request_log else {
             return Ok(());
         };
-        let line =
-            json!({ "messages": request.messages.iter().map(message_json).collect::<Vec<_>>() });
+        let line = json!({
+            "system": request.system,
+            "tools": request.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
+        });
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -216,6 +219,37 @@ fn message_json(message: &RequestMessage) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ToolSchema;
+
+    #[tokio::test]
+    async fn the_request_log_records_the_system_prompt_and_the_tool_names() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.jsonl");
+        let provider = FauxProvider::new(vec![Turn {
+            events: Vec::new(),
+            error: None,
+        }])
+        .with_request_log(log.clone());
+        let tool = ToolSchema {
+            name: "grep".to_owned(),
+            description: String::new(),
+            input_schema: json!({}),
+        };
+        let request = ModelRequest {
+            system: "You are a scout.".to_owned(),
+            tools: vec![tool],
+            messages: Vec::new(),
+        };
+
+        // Act
+        provider.stream(request).await.unwrap();
+
+        // Assert
+        let line: Value = serde_json::from_str(&std::fs::read_to_string(log).unwrap()).unwrap();
+        assert_eq!(line["system"], "You are a scout.");
+        assert_eq!(line["tools"], json!(["grep"]));
+    }
 
     #[tokio::test]
     async fn poisoned_script_state_is_reported_as_poisoned_not_exhausted() {

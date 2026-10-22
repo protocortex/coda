@@ -7,6 +7,7 @@
 mod catalog;
 mod definition;
 mod digest;
+mod dispatch;
 mod frontmatter;
 
 pub use catalog::{
@@ -17,3 +18,4 @@ pub use coda_config::routing::Tier;
 pub use definition::{
     AgentDef, CommandDef, Effort, Issue, SkillDef, parse_agent, parse_command, parse_skill,
 };
+pub use dispatch::{DispatchError, child_tools};

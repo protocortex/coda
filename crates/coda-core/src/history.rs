@@ -47,11 +47,18 @@ pub const TURN_STOPPED_KIND: &str = "turn_stopped";
 /// Stored kind of a model switch.
 pub const MODEL_SWITCHED_KIND: &str = "model_switched";
 
+/// Stored kind of one event of a sub-agent's run. It wraps the event the child
+/// loop produced under the agent's name, so the parent's history never mixes
+/// with the child's: replay skips it, and the parent sees the `task` call and
+/// its result only.
+pub const CHILD_EVENT_KIND: &str = "child_event";
+
 /// Kinds the daemon stores for its own bookkeeping; the model never saw them.
 const BOOKKEEPING_KINDS: &[&str] = &[
     APPROVALS_UNAVAILABLE_KIND,
     APPROVE_KIND,
     BACKEND_CRASHED_KIND,
+    CHILD_EVENT_KIND,
     CONTEXT_OVERFLOW_KIND,
     DENY_KIND,
     HISTORY_NOT_RESTORED_KIND,

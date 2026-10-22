@@ -9,7 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use coda_config::routing::Tier;
-use coda_tools::TOOL_NAMES;
+use coda_tools::{TOOL_NAMES, task};
 use serde::Deserialize;
 
 use crate::frontmatter;
@@ -189,7 +189,12 @@ pub fn parse_agent(text: &str, stem: &str) -> Result<AgentDef, Vec<Issue>> {
         .iter()
         .filter(|t| !TOOL_NAMES.contains(&t.as_str()))
     {
-        issues.push(Issue::new("tools", format!("unknown tool `{tool}`")));
+        let message = if tool == task::NAME {
+            format!("`{tool}` cannot be allowed: sub-agents cannot start sub-agents")
+        } else {
+            format!("unknown tool `{tool}`")
+        };
+        issues.push(Issue::new("tools", message));
     }
     let (Ok(tier), Ok(effort)) = (tier, effort) else {
         return Err(issues);

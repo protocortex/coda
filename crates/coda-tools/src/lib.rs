@@ -14,6 +14,7 @@ pub mod grep;
 pub mod read;
 pub mod retrieve;
 pub mod sandbox;
+pub mod task;
 
 use std::sync::atomic::AtomicBool;
 

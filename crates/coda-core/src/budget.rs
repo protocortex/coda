@@ -53,6 +53,12 @@ impl TokenBudget {
             .saturating_add(usage.output_tokens);
     }
 
+    /// Tokens left before the limit is reached.
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        self.limit.saturating_sub(self.used)
+    }
+
     /// Whether the limit is reached, so a tool loop should stop after its
     /// current tool call.
     #[must_use]
@@ -133,6 +139,21 @@ mod tests {
                 used: 150
             })
         );
+    }
+
+    #[test]
+    fn the_remaining_tokens_shrink_with_use_and_stop_at_zero() {
+        // Arrange
+        let mut budget = TokenBudget::new(100);
+        let fresh = budget.remaining();
+
+        // Act
+        budget.record(usage(30, 20));
+        let part_used = budget.remaining();
+        budget.record(usage(90, 60));
+
+        // Assert
+        assert_eq!((fresh, part_used, budget.remaining()), (100, 50, 0));
     }
 
     #[test]
