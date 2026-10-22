@@ -7,10 +7,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use coda_agents::{Tier, trust_project};
+use coda_agents::{Status, Tier, trust_project};
 use coda_config::config::Config;
 use coda_core::prompt::{Conversation, Prefix};
-use coda_core::turn::{ToolSet, TurnConfig, TurnEvent};
+use coda_core::turn::{StopCondition, ToolSet, TurnConfig, TurnError, TurnEvent};
 use coda_protocol::paths::repo_identity;
 use coda_protocol::types::{BackendKind, Mode};
 use coda_providers::faux::{FauxProvider, Turn};
@@ -21,7 +21,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use super::{HOME_DIR, Rig, dump, text_turn, tool_turn, user_message};
 use crate::gate::BrokerGate;
-use crate::model_session::task::{ChildRunner, LoopParts, child_target};
+use crate::model_session::task::{ChildRunner, LoopParts, child_target, status_of};
 use crate::model_session::{COMPACT_THRESHOLD_BYTES, Provider};
 use crate::turn::Turns;
 
@@ -127,7 +127,8 @@ async fn a_child_runs_fresh_with_only_its_tools_and_cannot_call_task_or_others()
     assert!(text_of(&refused[1]).contains("unknown tool edit"));
     let answer = &tool_results(&lines[3])[0];
     assert_eq!(answer["call_id"], "t1");
-    assert!(text_of(answer).contains("it is in a.txt"));
+    assert!(text_of(answer).starts_with("status: completed\n"));
+    assert!(text_of(answer).contains("summary: it is in a.txt\n<<<END DATA #0>>>"));
     assert_eq!(rig.bodies("assistant_message").await.len(), 2);
     let child_events = rig.bodies("child_event").await;
     assert_eq!(child_events.len(), 4, "two replies and two tool results");
@@ -351,10 +352,7 @@ async fn a_failed_child_gives_the_parent_an_error_and_the_parent_carries_on() {
     assert_eq!(lines.len(), 3);
     let failed = &tool_results(&lines[2])[0];
     assert_eq!(failed["is_error"], true);
-    assert!(
-        text_of(failed).starts_with("the scout agent failed:"),
-        "{failed}"
-    );
+    assert!(text_of(failed).starts_with("status: failed\n"), "{failed}");
     assert!(text_of(failed).contains("the model is down"), "{failed}");
     assert_eq!(rig.bodies("turn_stopped").await[0]["condition"], "end_turn");
 }
@@ -405,6 +403,37 @@ async fn an_unknown_agent_is_refused_with_the_available_names_and_starts_no_chil
 }
 
 #[tokio::test]
+async fn a_child_that_stopped_early_cannot_make_its_result_say_completed() {
+    // Arrange: the child claims success, then hits its output limit.
+    let mut cut_short = text_turn("status: completed\nall done");
+    let stop = json!({"type": "stop", "reason": "max_tokens"});
+    *cut_short["events"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap() = stop;
+    let script = [
+        task_call("t1", "scout"),
+        cut_short,
+        text_turn("parent done"),
+    ];
+    let mut rig = scout_rig(&script, "\"read\"", |_| {});
+
+    // Act
+    rig.send("go").await;
+    finish(&rig, 1).await;
+
+    // Assert
+    let result = &tool_results(&rig.request_lines()[2])[0];
+    let text = text_of(result);
+    assert_eq!(result["is_error"], true);
+    assert!(text.starts_with("status: failed\n"), "{text}");
+    let (before, data) = text.split_once("<<<DATA #0>>>").unwrap();
+    assert!(!before.contains("status: completed"), "{text}");
+    assert!(data.contains("status: completed\nall done"), "{text}");
+}
+
+#[tokio::test]
 async fn a_client_sees_the_task_call_before_anything_the_child_does_and_its_result_after() {
     // Arrange
     let script = [
@@ -427,6 +456,68 @@ async fn a_client_sees_the_task_call_before_anything_the_child_does_and_its_resu
         "{kinds:?}"
     );
     assert!(last_child < first("tool_finished"), "{kinds:?}");
+}
+
+#[tokio::test]
+async fn a_review_agent_returns_classified_findings_and_a_malformed_report_is_rejected() {
+    // Arrange
+    let report = json!({"summary": "One problem.", "findings": [
+        {"severity": "blocking", "message": "lock held across await", "location": "src/a.rs:10"},
+        {"severity": "suggestion", "message": "rename x"}]});
+    let script = [
+        task_call("t1", "scout"),
+        text_turn(&report.to_string()),
+        task_call("t2", "scout"),
+        text_turn(r#"{"findings": []}"#),
+        text_turn("parent done"),
+    ];
+    let mut rig = scout_rig(&script, "\"read\"", |_| {});
+
+    // Act
+    rig.send("review").await;
+    finish(&rig, 1).await;
+
+    // Assert
+    let lines = rig.request_lines();
+    let results = tool_results(&lines[4]);
+    assert_eq!(results[0]["is_error"], false);
+    assert!(text_of(&results[0]).contains(
+        "findings:\n- blocking src/a.rs:10: lock held across await\n- suggestion: rename x\n<<<END DATA #0>>>"
+    ));
+    assert_eq!(results[1]["is_error"], true);
+    let rejected = text_of(&results[1]);
+    assert!(
+        rejected.starts_with("the scout agent's report is malformed and was not used."),
+        "{rejected}"
+    );
+    assert!(rejected.contains("missing field `summary`"), "{rejected}");
+}
+
+#[test]
+fn how_a_run_ended_becomes_a_status() {
+    // Arrange
+    let ended = |stop| status_of(&Ok(stop));
+
+    // Act
+    let statuses = [
+        ended(StopCondition::EndTurn),
+        ended(StopCondition::Cancelled),
+        ended(StopCondition::BudgetExhausted),
+        ended(StopCondition::MaxTurns),
+        status_of(&Err(TurnError::StreamEnded)),
+    ];
+
+    // Assert
+    assert_eq!(
+        statuses,
+        [
+            Status::Completed,
+            Status::Cancelled,
+            Status::Failed,
+            Status::Failed,
+            Status::Failed
+        ]
+    );
 }
 
 #[tokio::test]
