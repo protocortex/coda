@@ -39,6 +39,16 @@ A `model` key is an error: an agent file never names a model id.
 
 Frontmatter: `name`, `description`. The body is the instructions.
 
+A model-API session (Anthropic, OpenAI-compatible) that has any skill gets one extra tool, `skill`. The tool's description is an index with one line per skill, `- name: description`, and its only argument is the name of a skill from that index. The model sees the names and descriptions in every request and pays for nothing else. A body enters the conversation only when the model calls `skill` for it, as that call's result. An unused skill's body is never sent to the provider.
+
+A tool call, not an index in the system prompt, carries the load for three reasons. The model needs a way to ask for a body, and a file read cannot be it, because the file tools are confined to the workspace and a user skill lives outside it. The one place a body is returned is also the one place the size cap and the trust check apply. And a session with no skills gets no extra tool and no extra prompt text.
+
+The caps are fixed, in bytes or characters: the index lists at most 4 KiB of entries, in alphabetical order, with each description cut to 200 characters on one line, and says how many skills it left out (those cannot be loaded). A body longer than 32 KiB is cut and says so. A session with no skills has no `skill` tool.
+
+The skills are read again at every send. When the files or the trust decision changed since the session's last send, for example you ran `coda agents trust --revoke`, edited a project skill, or added a skill, the session's conversation is rebuilt from its stored history with the new index before the model is called. A skill that is gone is no longer in the index and a call for it is refused, and the same holds for the first send after a daemon restart. A skill body the session already loaded stays in its history after a revoke, and only new loads are refused. The rebuild keeps the tokens the session already spent, so it does not reset the session's token budget. When nothing changed, the conversation is kept as it is. The tool needs no permission prompt: it reads only definitions already admitted for the session.
+
+Trust decides what is offered. A user skill and a skill of a trusted project are instructions, like any text you write for the model. A skill of a project that is not trusted, or that changed since it was trusted, is not in the catalog, so it is not in the index and cannot be loaded. Skills apply to model-API sessions only. Claude Code and Codex sessions run their own tools and have their own skill systems. A sub-agent started by `task` has no `skill` tool: it gets only the tools in its agent file, and `skill` is not a tool an agent file can name.
+
 ## Command
 
 Frontmatter: `name`, `description`, and an optional `argument_hint` such as `<issue>`. The body is the prompt template.

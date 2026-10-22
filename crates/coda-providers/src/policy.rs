@@ -59,7 +59,10 @@ pub fn decide(input: &PolicyInput<'_>) -> Verdict {
         return Verdict::Deny;
     }
     match input.tool {
-        Tool::Retrieve | Tool::CodeSearch | Tool::CodeSymbol | Tool::CodeOutline => Verdict::Allow,
+        // Skill reads only the definitions the user already admitted for the session.
+        Tool::Retrieve | Tool::CodeSearch | Tool::CodeSymbol | Tool::CodeOutline | Tool::Skill => {
+            Verdict::Allow
+        }
         Tool::Unknown(_) => Verdict::Prompt,
         Tool::Bash => grant_or_prompt(input.granted),
         Tool::Read | Tool::Grep | Tool::CodeReadRange => {
@@ -546,6 +549,7 @@ fn bash_and_scope_rows(rows: &mut Rows, mode: PermissionMode) {
         Tool::CodeSearch,
         Tool::CodeSymbol,
         Tool::CodeOutline,
+        Tool::Skill,
     ] {
         rows.add(
             "session scope tool",

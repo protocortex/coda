@@ -29,6 +29,19 @@ impl TokenBudget {
         Self { limit, used: 0 }
     }
 
+    /// Tokens used so far.
+    #[must_use]
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+
+    /// This budget with `used` tokens already spent, for a loop that replaces
+    /// one whose calls already counted.
+    #[must_use]
+    pub fn with_used(self, used: u64) -> Self {
+        Self { used, ..self }
+    }
+
     /// Checks that another model call may start.
     ///
     /// # Errors
@@ -154,6 +167,19 @@ mod tests {
 
         // Assert
         assert_eq!((fresh, part_used, budget.remaining()), (100, 50, 0));
+    }
+
+    #[test]
+    fn a_budget_resumed_with_spent_tokens_refuses_at_the_original_limit() {
+        // Arrange
+        let mut budget = TokenBudget::new(100).with_used(70);
+
+        // Act
+        budget.record(usage(20, 10));
+
+        // Assert
+        assert_eq!(budget.used(), 100);
+        assert!(budget.is_exhausted());
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use coda_agents::{SKILL_TOOL_NAME, SkillTool};
 use coda_config::config::{Config, Dirs, ProviderConfig};
 use coda_core::broker::BrokerError;
 use coda_core::history::{
@@ -20,7 +21,7 @@ use coda_core::history::{
     tool_finished_body,
 };
 pub use coda_core::history::{CONTEXT_OVERFLOW_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND};
-use coda_core::prompt::{Conversation, Prefix, PromptError};
+use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
 use coda_core::tools::{
     BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index, task_schema,
 };
@@ -35,6 +36,7 @@ use coda_providers::registry::{
     ANTHROPIC_KEY, ModelClient, ModelRegistry, OPENAI_COMPAT_KEY, RegistryError,
 };
 use coda_store::{EventRecord, SessionRecord, StoreError};
+use coda_tools::Tool;
 use coda_tools::bash::{DEFAULT_ENV_ALLOWLIST, allowlisted_env};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -129,6 +131,26 @@ struct ModelLoop {
     events: UnboundedReceiver<TurnEvent>,
     turn: Arc<Mutex<TurnId>>,
     limits: Limits,
+    /// The skills this loop offers, to tell at the next send whether the files
+    /// or the trust decision changed.
+    skills: Option<Arc<SkillTool>>,
+}
+
+/// What a loop takes over from the idle one it replaces: the send limits and
+/// the tokens already spent, so a rebuild never hands the session a fresh budget.
+#[derive(Debug, Clone, Copy)]
+struct Carried {
+    limits: Limits,
+    used: u64,
+}
+
+impl ModelLoop {
+    fn carried(&self) -> Carried {
+        Carried {
+            limits: self.limits,
+            used: self.turn_loop.used_tokens(),
+        }
+    }
 }
 
 /// Removes a session from the running table when dropped, so a task that
@@ -169,9 +191,9 @@ pub struct ModelSessions {
     running: Mutex<HashMap<SessionId, Reservation<(CancelToken, TurnId)>>>,
     /// Idle conversations, least recently used first.
     loops: IdlePool<ModelLoop>,
-    /// Limits of conversations a model switch dropped, until the next send
-    /// builds the replacement.
-    carried_limits: Mutex<HashMap<SessionId, Limits>>,
+    /// Limits and spent tokens of conversations a rebuild dropped, until the
+    /// next send builds the replacement.
+    carried: Mutex<HashMap<SessionId, Carried>>,
     /// What the runners of the sessions' `task` calls share.
     children: Arc<task::ChildEnv>,
 }
@@ -218,7 +240,7 @@ impl ModelSessions {
             key_reader,
             running: Mutex::default(),
             loops: IdlePool::new(MAX_IDLE_LOOPS),
-            carried_limits: Mutex::default(),
+            carried: Mutex::default(),
             children,
         })
     }
@@ -234,7 +256,7 @@ impl ModelSessions {
     /// Starts a send with `text` and returns without waiting for it to end.
     /// `limits` apply only when this send has to build the session's loop; a
     /// loop kept from an earlier send keeps its own, and a model switch hands
-    /// the dropped loop's limits to the loop that replaces it.
+    /// the dropped loop's limits and spent tokens to the loop that replaces it.
     ///
     /// # Errors
     /// Returns [`TurnError::Busy`] when the session is running,
@@ -288,7 +310,7 @@ impl ModelSessions {
     /// and build its client to prove it is usable, store the resolved model id,
     /// drop the idle loop and record the switch. The next send builds a new loop
     /// with a fresh prefix and the history rebuilt from the stored events, and
-    /// keeps the send limits of the dropped loop. The alias name lives only in
+    /// keeps the send limits and spent tokens of the dropped loop. The alias name lives only in
     /// the switch event, so a later change to the aliases cannot reinterpret the
     /// stored model. Only `session` is touched.
     ///
@@ -334,7 +356,7 @@ impl ModelSessions {
             })
             .await?;
         if let Some(dropped) = self.take_loop(session) {
-            lock(&self.carried_limits).insert(session.clone(), dropped.limits);
+            lock(&self.carried).insert(session.clone(), dropped.carried());
         }
         let body = json!({
             "alias": alias,
@@ -358,7 +380,7 @@ impl ModelSessions {
     /// Drops the idle conversation of `session`; `false` when it held none.
     /// Its stored events stay, so a later send rebuilds the loop from them.
     pub(crate) fn close(&self, session: &SessionId) -> bool {
-        lock(&self.carried_limits).remove(session);
+        lock(&self.carried).remove(session);
         self.take_loop(session).is_some()
     }
 
@@ -488,22 +510,50 @@ impl ModelSessions {
     }
 
     /// The idle loop of the session, or a new one that continues from the
-    /// history the session stored.
+    /// history the session stored. An idle loop whose skills no longer match
+    /// the files and the trust decision is dropped, so a revoked or edited
+    /// project skill is gone by this send; the limits and spent tokens carry over.
     async fn loop_for_send(
         &self,
         record: &SessionRecord,
         limits: Limits,
     ) -> Result<ModelLoop, ModelError> {
+        let skills = self.skill_tool(record).await.map(Arc::new);
         if let Some(model_loop) = self.take_loop(&record.id) {
-            return Ok(model_loop);
+            if model_loop.skills == skills {
+                return Ok(model_loop);
+            }
+            info!(session = %record.id, "the skills changed; rebuilding the conversation");
+            lock(&self.carried).insert(record.id.clone(), model_loop.carried());
         }
-        let limits = lock(&self.carried_limits)
+        let carried = lock(&self.carried)
             .get(&record.id)
             .copied()
-            .unwrap_or(limits);
-        let built = self.build(record, limits).await?;
-        lock(&self.carried_limits).remove(&record.id);
+            .unwrap_or(Carried { limits, used: 0 });
+        let built = self.build(record, carried, skills).await?;
+        lock(&self.carried).remove(&record.id);
         Ok(built)
+    }
+
+    /// The skill tool for the user's skills and, once trusted, the project's.
+    /// Skills that cannot be loaded cost the session its skills, not the session.
+    async fn skill_tool(&self, record: &SessionRecord) -> Option<SkillTool> {
+        match self.children.catalog(&record.cwd).await {
+            Ok(catalog) => {
+                if !catalog.problems().is_empty() {
+                    warn!(
+                        session = %record.id,
+                        problems = catalog.problems().len(),
+                        "some definition files were skipped; run `coda agents lint` to see why"
+                    );
+                }
+                SkillTool::from_catalog(&catalog)
+            }
+            Err(error) => {
+                warn!(session = %record.id, %error, "could not load the skills; the session has none");
+                None
+            }
+        }
     }
 
     /// The context window of the model the session runs, when it is known.
@@ -541,7 +591,12 @@ impl ModelSessions {
         }
     }
 
-    async fn build(&self, record: &SessionRecord, limits: Limits) -> Result<ModelLoop, ModelError> {
+    async fn build(
+        &self,
+        record: &SessionRecord,
+        Carried { limits, used }: Carried,
+        skills: Option<Arc<SkillTool>>,
+    ) -> Result<ModelLoop, ModelError> {
         let provider = self.provider(record)?;
         let faux = if let Provider::Faux(faux) = &provider {
             Some(Arc::clone(faux))
@@ -554,7 +609,7 @@ impl ModelSessions {
         {
             warn!(%error, "the code index refresh crashed");
         }
-        let tools = base_tools(
+        let mut tools = base_tools(
             &BaseToolsConfig {
                 workdir: PathBuf::from(&record.cwd),
                 bash_timeout: self.config.timing.tool_execution,
@@ -563,6 +618,10 @@ impl ModelSessions {
             self.hub.store_handle(),
             StoreOriginals::new(self.hub.store_handle(), record.id.clone()),
         )?;
+        if let Some(skills) = &skills {
+            tools.schemas.push(skill_schema(skills));
+            tools.tools = tools.tools.with(Arc::clone(skills) as Arc<dyn Tool>);
+        }
         let mut schemas = tools.schemas;
         schemas.push(task_schema(&self.children.agents(&record.cwd).await));
         let prefix = Prefix::new(SYSTEM_PROMPT, schemas, "")?;
@@ -586,30 +645,33 @@ impl ModelSessions {
             faux,
             sender.clone(),
         );
-        let turn_loop = runner.build_loop(
-            0,
-            task::LoopParts {
-                provider,
-                window: self.context_window(record),
-                gate,
-                tools: tools.tools,
-                conversation,
-                config: TurnConfig {
-                    session: record.id.clone(),
-                    cwd: PathBuf::from(&record.cwd),
-                    max_turns: limits.max_turns.unwrap_or(self.config.max_turns),
-                    token_limit: limits.token_cap.unwrap_or(self.config.token_cap),
-                    compact_threshold_bytes: COMPACT_THRESHOLD_BYTES,
+        let turn_loop = runner
+            .build_loop(
+                0,
+                task::LoopParts {
+                    provider,
+                    window: self.context_window(record),
+                    gate,
+                    tools: tools.tools,
+                    conversation,
+                    config: TurnConfig {
+                        session: record.id.clone(),
+                        cwd: PathBuf::from(&record.cwd),
+                        max_turns: limits.max_turns.unwrap_or(self.config.max_turns),
+                        token_limit: limits.token_cap.unwrap_or(self.config.token_cap),
+                        compact_threshold_bytes: COMPACT_THRESHOLD_BYTES,
+                    },
+                    events: sender,
+                    cancel: None,
                 },
-                events: sender,
-                cancel: None,
-            },
-        );
+            )
+            .with_used_tokens(used);
         Ok(ModelLoop {
             turn_loop,
             events,
             turn,
             limits,
+            skills,
         })
     }
 
@@ -627,6 +689,7 @@ impl ModelSessions {
             mut events,
             turn: shared_turn,
             limits,
+            skills,
         } = model_loop;
         info!(session = %session, turn = %turn, step = "drive", "driving the turn loop");
         let outcome = {
@@ -663,6 +726,7 @@ impl ModelSessions {
             events,
             turn: shared_turn,
             limits,
+            skills,
         };
         self.keep_loop(session, model_loop);
     }
@@ -687,6 +751,27 @@ async fn close_turn(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, failed: 
     };
     log_failure(store_event(hub, session, turn, &result).await);
     Turns::finish(hub, session, turn, failed).await;
+}
+
+/// The schema of the skill tool: the index is its description, and only the
+/// skills listed in it can be named.
+fn skill_schema(skills: &SkillTool) -> ToolSchema {
+    ToolSchema {
+        name: SKILL_TOOL_NAME.to_owned(),
+        description: skills.description().to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "enum": skills.names(),
+                    "description": "The skill to load.",
+                },
+            },
+            "required": ["name"],
+            "additionalProperties": false,
+        }),
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

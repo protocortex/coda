@@ -22,6 +22,7 @@ use crate::registry::{MODEL_UNAVAILABLE, UNKNOWN_MODEL};
 use crate::subscribe::Hub;
 use crate::turn::{TURN_RUNNING, TurnError};
 
+const TOKEN_CAP: u64 = 30;
 const SECRET: &str = "sk-live-SECRET-VALUE-91c";
 const API_CONFIG: &str = r#"
 [providers.anthropic]
@@ -103,6 +104,32 @@ async fn an_idle_switch_stores_the_alias_and_the_next_send_continues_the_history
             json!({"role": "user", "text": "second"}),
         ]
     );
+}
+
+#[tokio::test]
+async fn a_switch_keeps_the_tokens_the_session_spent() {
+    // Arrange
+    // A read turn (8 tokens) and a reply (18) leave 4 of the 30 tokens; the
+    // rebuilt loop starts the script again, so its read turn must hit the cap.
+    let read = tool_turn(&[("c1", "read", json!({"path": "a.txt"}))]);
+    let script = [read, text_turn("done")];
+    let mut rig = Rig::custom(Mode::Default, &script, true, None, |config| {
+        faux_alias(config);
+        config.token_cap = TOKEN_CAP;
+    });
+    rig.send("first").await;
+    rig.wait_until_idle().await;
+    let params = set_model(&rig.session, "scripted");
+    rig.call("session.set_model", params).await;
+
+    // Act
+    rig.send("second").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let stops = rig.bodies("turn_stopped").await;
+    let conditions: Vec<_> = stops.iter().map(|stop| &stop["condition"]).collect();
+    assert_eq!(conditions, ["end_turn", "budget_exhausted"]);
 }
 
 #[tokio::test]

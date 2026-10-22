@@ -287,6 +287,11 @@ impl Rig {
         .expect("the turn did not finish in time");
     }
 
+    /// `CODA_HOME` of the daemon under test, where the user's skills live.
+    fn home(&self) -> PathBuf {
+        self.data.path().join(HOME_DIR)
+    }
+
     fn db(&self) -> rusqlite::Connection {
         let path = self.data.path().join("store");
         rusqlite::Connection::open(path.join(coda_store::DB_FILE_NAME)).unwrap()
@@ -973,6 +978,7 @@ async fn a_store_user_is_not_blocked_while_the_index_walk_runs() {
     assert_eq!(indexed_symbols(&rig, "f5"), 1);
 }
 
+mod skills;
 mod switch;
 mod task;
 
