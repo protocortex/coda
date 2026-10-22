@@ -341,6 +341,20 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         &self.conversation
     }
 
+    /// Tokens this loop's model calls have used against the session limit.
+    #[must_use]
+    pub fn used_tokens(&self) -> u64 {
+        self.budget.used()
+    }
+
+    /// Counts `used` tokens as already spent, so a loop that replaces another
+    /// for the same session does not hand it a fresh budget.
+    #[must_use]
+    pub fn with_used_tokens(mut self, used: u64) -> Self {
+        self.budget = self.budget.with_used(used);
+        self
+    }
+
     /// Adds the user's message and runs the loop until it stops.
     ///
     /// A cancel that arrived before the send started stops it, so the caller
@@ -852,6 +866,7 @@ fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
         "code_symbol" => RequestTool::CodeSymbol,
         "code_outline" => RequestTool::CodeOutline,
         "code_read_range" => RequestTool::CodeReadRange,
+        "skill" => RequestTool::Skill,
         other => RequestTool::Unknown(other.to_owned()),
     };
     ToolRequest {
@@ -906,6 +921,7 @@ mod tests {
             ("code_symbol", RequestTool::CodeSymbol),
             ("code_outline", RequestTool::CodeOutline),
             ("code_read_range", RequestTool::CodeReadRange),
+            ("skill", RequestTool::Skill),
         ];
 
         for (name, expected) in names {

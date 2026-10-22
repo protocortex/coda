@@ -25,6 +25,8 @@ pub enum Tool {
     CodeSymbol,
     /// Outline a file from the code index.
     CodeOutline,
+    /// Load a skill's instructions from the session's definitions.
+    Skill,
     /// A tool coda has no mapping for, with the backend's own name.
     Unknown(String),
 }
@@ -43,6 +45,7 @@ impl Tool {
             Self::CodeSearch => "code_search",
             Self::CodeSymbol => "code_symbol",
             Self::CodeOutline => "code_outline",
+            Self::Skill => "skill",
             Self::Unknown(name) => name,
         }
     }
@@ -78,6 +81,7 @@ mod tests {
             (Tool::CodeSearch, "code_search"),
             (Tool::CodeSymbol, "code_symbol"),
             (Tool::CodeOutline, "code_outline"),
+            (Tool::Skill, "skill"),
         ];
 
         for (tool, expected) in cases {
