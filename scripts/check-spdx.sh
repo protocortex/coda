@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# Fails listing every tracked .rs and .sh file without the license header.
+# Fails listing every tracked .rs, .sh, .yml and .yaml file without the license header.
 set -euo pipefail
 
 HEADER="SPDX-License-Identifier: AGPL-3.0-only"
 HEADER_LINES=3
 
-files=$(git ls-files -z '*.rs' '*.sh' | tr '\0' '\n')
+files=$(git ls-files -z '*.rs' '*.sh' '*.yml' '*.yaml' | tr '\0' '\n')
 
 missing=()
 while IFS= read -r file; do
