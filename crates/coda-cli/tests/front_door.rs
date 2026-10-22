@@ -6,6 +6,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -13,21 +14,38 @@ use coda_cli::{TuiFuture, exit};
 use coda_client::Client;
 use coda_config::config::{Config, Dirs};
 use coda_config::timing::Timing;
+use coda_store::DB_FILE_NAME;
+use coda_tui::commands::UserCommands;
 use common::{StopDaemon, cli, context, short_dir};
 
 const LAUNCH_MARKER: &str = "tui-launched";
+const COMMANDS_MARKER: &str = "tui-commands";
 const NO_TERMINAL_MESSAGE: &str = "needs an interactive terminal";
 const FAUX_ENABLED: &str = "[providers.faux]\nenabled = true\nscript = \"/x/script.json\"\n";
 
 /// Stands in for the TUI: checks the daemon answers on the socket it is given
-/// and leaves a note of how it was started.
-fn record_launch(socket: &Path, timing: Timing, needs_setup: bool) -> TuiFuture<'_> {
+/// and leaves a note of how it was started and which commands it was given.
+fn record_launch(
+    socket: &Path,
+    timing: Timing,
+    needs_setup: bool,
+    commands: UserCommands,
+) -> TuiFuture<'_> {
     Box::pin(async move {
         Client::connect(socket, timing)
             .await
             .expect("the daemon should answer before the TUI starts");
-        let note = socket.parent().unwrap().join(LAUNCH_MARKER);
-        fs::write(note, format!("needs_setup={needs_setup}")).unwrap();
+        let run_dir = socket.parent().unwrap();
+        fs::write(
+            run_dir.join(COMMANDS_MARKER),
+            commands.help_lines().join("\n"),
+        )
+        .unwrap();
+        fs::write(
+            run_dir.join(LAUNCH_MARKER),
+            format!("needs_setup={needs_setup}"),
+        )
+        .unwrap();
         Ok(())
     })
 }
@@ -171,4 +189,98 @@ async fn init_refuses_to_overwrite_an_existing_config() {
     assert_eq!(outcome.code, ExitCode::from(exit::FAILURE));
     assert!(outcome.err.contains("already exists"), "{}", outcome.err);
     assert_eq!(fs::read_to_string(&config_file).unwrap(), FAUX_ENABLED);
+}
+
+const REVIEW_COMMAND: &str = "+++\nname = \"review\"\ndescription = \"Reviews a change.\"\n\
+    argument_hint = \"<change>\"\n+++\nReview $ARGUMENTS.\n";
+const DEPLOY_COMMAND: &str = "+++\nname = \"deploy\"\ndescription = \"Ships it.\"\n+++\nDeploy.\n";
+
+fn commands_note(base: &Path) -> String {
+    let note = Dirs::from_base(base).run_dir().join(COMMANDS_MARKER);
+    fs::read_to_string(note).expect("the TUI was not launched")
+}
+
+/// A home that is also a repository root, so project definitions are looked for in it.
+fn repo_home() -> tempfile::TempDir {
+    let dir = short_dir();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    dir
+}
+
+fn write_file(base: &Path, rel: &str, text: &str) {
+    let path = base.join(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, text).unwrap();
+}
+
+#[tokio::test]
+async fn the_tui_is_given_the_users_command_files() {
+    // Arrange
+    let dir = repo_home();
+    let _stop = StopDaemon::new(dir.path());
+    write_file(dir.path(), "commands/review.md", REVIEW_COMMAND);
+    let mut ctx = context(dir.path());
+    ctx.is_tty = true;
+    ctx.launch_tui = record_launch;
+
+    // Act
+    let outcome = cli(&ctx, &["coda", "tui"], "").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let note = commands_note(dir.path());
+    assert!(
+        note.contains("/review <change>: Reviews a change. (user)"),
+        "{note}"
+    );
+}
+
+#[tokio::test]
+async fn the_tui_starts_with_a_warning_when_the_command_files_cannot_be_loaded() {
+    // Arrange
+    let dir = repo_home();
+    let _stop = StopDaemon::new(dir.path());
+    write_file(dir.path(), "commands/review.md", REVIEW_COMMAND);
+    let mut ctx = context(dir.path());
+    ctx.is_tty = true;
+    ctx.launch_tui = record_launch;
+    // The first start brings the daemon up, and it creates the store.
+    cli(&ctx, &["coda", "tui"], "").await;
+    let db = Dirs::from_base(dir.path()).data_dir().join(DB_FILE_NAME);
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Act
+    let outcome = cli(&ctx, &["coda", "tui"], "").await;
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let note = commands_note(dir.path());
+    assert!(note.contains("command files could not be loaded"), "{note}");
+    assert!(!note.contains("/review"), "{note}");
+}
+
+#[tokio::test]
+async fn a_project_command_is_pending_for_the_tui_until_the_repository_is_trusted() {
+    // Arrange
+    let dir = repo_home();
+    let _stop = StopDaemon::new(dir.path());
+    write_file(dir.path(), ".coda/commands/deploy.md", DEPLOY_COMMAND);
+    let mut ctx = context(dir.path());
+    ctx.is_tty = true;
+    ctx.launch_tui = record_launch;
+
+    // Act
+    cli(&ctx, &["coda", "tui"], "").await;
+    let before = commands_note(dir.path());
+    cli(&ctx, &["coda", "agents", "trust"], "").await;
+    cli(&ctx, &["coda", "tui"], "").await;
+    let after = commands_note(dir.path());
+
+    // Assert
+    assert!(
+        before.contains("/deploy: project command, pending"),
+        "{before}"
+    );
+    assert!(after.contains("/deploy: Ships it. (project)"), "{after}");
 }

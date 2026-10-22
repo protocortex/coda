@@ -12,6 +12,7 @@ use coda_config::timing::Timing;
 use coda_daemon::server::{Server, ServerConfig};
 use coda_daemon::state::DaemonState;
 use coda_tui::app::{ConnectionState, SETUP_GUIDANCE};
+use coda_tui::commands::UserCommands;
 use coda_tui::logs::LogBuffer;
 use coda_tui::{KeySource, UserInput, drive, run_session};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -142,6 +143,7 @@ async fn it_connects_to_a_running_daemon_and_exits_on_quit() {
             ..Timing::for_tests()
         },
         false,
+        UserCommands::default(),
         QuitAfter::new(Duration::from_millis(500)),
         never(),
     ))
@@ -170,6 +172,7 @@ async fn it_shows_a_failed_connection_and_still_exits_on_quit() {
             Path::new(&missing),
             Timing::for_tests(),
             false,
+            UserCommands::default(),
             QuitAfter::new(Duration::from_millis(300)),
             never(),
         )
@@ -207,6 +210,7 @@ async fn quitting_works_while_a_daemon_that_never_answers_is_still_connecting() 
         &socket,
         timing,
         false,
+        UserCommands::default(),
         QuitAfter::new(Duration::from_millis(100)),
         never(),
     ))
@@ -238,6 +242,7 @@ async fn it_shows_a_disconnect_when_the_daemon_dies_after_connecting() {
                 ..Timing::for_tests()
             },
             false,
+            UserCommands::default(),
             QuitAfter::new(Duration::from_secs(3)),
             never(),
         )
@@ -270,6 +275,7 @@ async fn a_shutdown_signal_ends_the_session_without_a_key() {
         &missing,
         Timing::for_tests(),
         false,
+        UserCommands::default(),
         QuitAfter::new(Duration::from_secs(60)),
         signal,
     ))
@@ -295,6 +301,7 @@ async fn the_setup_guidance_is_on_screen_when_setup_is_needed() {
         &missing,
         Timing::for_tests(),
         true,
+        UserCommands::default(),
         QuitAfter::new(Duration::from_millis(200)),
         never(),
     ))
@@ -339,6 +346,7 @@ async fn the_setup_guidance_is_on_screen_when_the_daemon_reports_no_provider() {
             ..Timing::for_tests()
         },
         false,
+        UserCommands::default(),
         QuitAfter::new(Duration::from_millis(500)),
         never(),
     ))

@@ -141,7 +141,7 @@ kill "$(coda status | sed -n 's/^pid: //p')"
 | `coda daemon` | Run the daemon in the foreground. `coda daemon restart` replaces a running one. |
 | `coda status` | Show the daemon pid, version and uptime. It fails if no daemon runs. |
 | `coda ping` | Print `pong` if a daemon answers. It fails if no daemon runs. |
-| `coda run` | Run one prompt to completion. Flags: `--prompt`, `--cwd`, `--mode`, `--max-turns`, `--token-cap`. Without `--prompt` it reads the prompt from standard input. |
+| `coda run` | Run one prompt to completion. Flags: `--prompt`, `--command`, `--args`, `--cwd`, `--mode`, `--max-turns`, `--token-cap`. Without `--prompt` or `--command` it reads the prompt from standard input. `--command <name>` runs a command file and `--args` fills its `$ARGUMENTS` (see [docs/agents.md](docs/agents.md)). |
 | `coda grant add` | Allow one command in a repository permanently. Flags: `--repo`, `--cwd`, `--tool`. |
 | `coda usage` | Show token usage and savings. `--session` limits it to one session. It asks a running daemon, or reads the database when none runs. |
 | `coda doctor` | Check the socket, lock, orphaned backends, database, schema, database release, config and backends. `--repair` removes a stale socket and kills orphaned backends. `--json` prints JSON. |

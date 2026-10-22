@@ -488,6 +488,7 @@ dependencies = [
 name = "coda-tui"
 version = "0.1.0"
 dependencies = [
+ "coda-agents",
  "coda-client",
  "coda-config",
  "coda-daemon",

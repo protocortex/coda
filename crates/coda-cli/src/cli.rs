@@ -108,6 +108,12 @@ pub struct RunArgs {
     /// The prompt to run.
     #[arg(long)]
     pub prompt: Option<String>,
+    /// Run the command file with this name; its prompt template is the prompt.
+    #[arg(long, conflicts_with = "prompt")]
+    pub command: Option<String>,
+    /// The arguments of --command, placed where its template has `$ARGUMENTS`.
+    #[arg(long, requires = "command", allow_hyphen_values = true)]
+    pub args: Option<String>,
     /// Working directory of the run.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
@@ -197,6 +203,36 @@ mod tests {
         assert_eq!(run.cwd, Some(PathBuf::from("/x")));
         assert_eq!(run.mode, ModeArg::AcceptEdits);
         assert_eq!((run.max_turns, run.token_cap), (Some(3), Some(100)));
+    }
+
+    #[test]
+    fn a_command_takes_arguments_that_may_start_with_a_dash() {
+        // Arrange
+        let args = ["coda", "run", "--command", "review", "--args", "--fast 42"];
+
+        // Act
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        // Assert
+        let Some(Command::Run(run)) = cli.command else {
+            panic!("expected the run command");
+        };
+        assert_eq!(run.command.as_deref(), Some("review"));
+        assert_eq!(run.args.as_deref(), Some("--fast 42"));
+    }
+
+    #[test]
+    fn a_command_excludes_a_prompt_and_arguments_need_a_command() {
+        for args in [
+            ["coda", "run", "--command", "review", "--prompt", "x"].as_slice(),
+            ["coda", "run", "--args", "x"].as_slice(),
+        ] {
+            // Act
+            let parsed = Cli::try_parse_from(args);
+
+            // Assert
+            assert!(parsed.is_err(), "{args:?}");
+        }
     }
 
     #[test]

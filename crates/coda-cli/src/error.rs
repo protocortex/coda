@@ -45,8 +45,19 @@ pub enum CliError {
     DaemonExited { status: ExitStatus, log: PathBuf },
     #[error("cannot grant outside a git repository; you will be prompted each time")]
     NoGitRoot,
-    #[error("no prompt: pass --prompt or write it to standard input")]
+    #[error("no prompt: pass --prompt or --command, or write the prompt to standard input")]
     EmptyPrompt,
+    #[error("no command named {0}; list the command files with `coda agents list`")]
+    UnknownCommand(String),
+    #[error(
+        "{name} is a project command that is not in use: {reason}; review the files, then run `coda agents trust`"
+    )]
+    CommandPending { name: String, reason: &'static str },
+    #[error("{name}: {source}")]
+    CommandArguments {
+        name: String,
+        source: coda_agents::ExpandError,
+    },
     #[error("the connection to the daemon was lost before the run ended")]
     RunInterrupted,
     #[error("the daemon has {activity}; use --force to restart it anyway")]

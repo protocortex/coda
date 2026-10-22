@@ -17,6 +17,7 @@ All notable changes to Coda are recorded here. The format follows
 - A `task` tool that runs a named agent as a child conversation with only its tools, its tier's model and its own permission prompts, which reach the parent's client labelled with the agent. See [docs/agents.md](docs/agents.md).
 - A `task` result reports a status (`completed`, `failed` or `cancelled`), a summary and findings classified as blocking, non-blocking or suggestion. The agent's words are marked as data and capped at 16 KiB, and a malformed report is rejected.
 - Built-in agents `explore`, `reviewer`, `implementer` and `tester`, available to the `task` tool with no files. A user file of the same name replaces one, and a trusted project file can replace its prompt and narrow its tools.
+- Command files are slash commands in the terminal UI (`/name args`, listed by the new `/help`) and run headless with `coda run --command <name> --args <text>`. `$ARGUMENTS` in the prompt template is replaced by the arguments as plain text. Only your own and trusted project commands run, and a built-in command wins a name clash.
 
 ## [0.1.0] - Unreleased
 

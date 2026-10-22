@@ -29,6 +29,7 @@ use tracing::instrument::WithSubscriber;
 use tracing::{Dispatch, warn};
 
 use app::{App, LinkEvent};
+use commands::UserCommands;
 use logs::LogBuffer;
 use sessions::{LinkCommand, LinkConfig, run_link};
 use terminal::{AnsiMode, SystemRawMode, TerminalGuard, install_panic_hook, restore_stdout};
@@ -122,7 +123,8 @@ where
 }
 
 /// Shows the connection state and runs until the user quits or `shutdown`
-/// completes. `needs_setup` adds the setup guidance to the transcript. The
+/// completes. `needs_setup` adds the setup guidance to the transcript, and
+/// `user_commands` are the slash commands from command files. The
 /// connection is made in the background, so the keys work while it is pending;
 /// a failed or lost connection is shown, not returned.
 ///
@@ -133,6 +135,7 @@ pub async fn run_session<B, K>(
     socket_path: &Path,
     timing: Timing,
     needs_setup: bool,
+    user_commands: UserCommands,
     mut keys: K,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<App, TuiError>
@@ -143,6 +146,7 @@ where
 {
     let (commands, command_rx) = mpsc::unbounded_channel();
     let mut app = App::with_link(commands.clone());
+    app.set_user_commands(user_commands);
     if needs_setup {
         app.show_setup_guidance();
     }
@@ -206,11 +210,17 @@ fn finish(session: Result<(), TuiError>, restored: io::Result<()>) -> Result<(),
 /// exit, an error, a panic or SIGTERM/SIGHUP.
 ///
 /// Log output is held back while the terminal is in raw mode and printed to
-/// stderr after it is restored. `needs_setup` is passed on to [`run_session`].
+/// stderr after it is restored. `needs_setup` and `user_commands` are passed on
+/// to [`run_session`].
 ///
 /// # Errors
 /// Returns [`TuiError`] if the terminal cannot be set up or fails while running.
-pub async fn run(socket_path: &Path, timing: Timing, needs_setup: bool) -> Result<(), TuiError> {
+pub async fn run(
+    socket_path: &Path,
+    timing: Timing,
+    needs_setup: bool,
+    user_commands: UserCommands,
+) -> Result<(), TuiError> {
     let shutdown = termination()?;
     let logs = LogBuffer::default();
     let guard = TerminalGuard::new(AnsiMode::new(io::stdout(), SystemRawMode))?;
@@ -221,6 +231,7 @@ pub async fn run(socket_path: &Path, timing: Timing, needs_setup: bool) -> Resul
         socket_path,
         timing,
         needs_setup,
+        user_commands,
         TerminalKeys,
         shutdown,
     )

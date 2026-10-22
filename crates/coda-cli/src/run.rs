@@ -27,6 +27,7 @@ use serde_json::Value;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing::{debug, info, warn};
 
+use crate::agents::command_prompt;
 use crate::autostart::{connect_unchecked, ensure_daemon};
 use crate::cli::RunArgs;
 use crate::context::{Context, Io};
@@ -89,7 +90,16 @@ pub async fn run(
     args: RunArgs,
 ) -> Result<ExitCode, CliError> {
     info!(step = "read_prompt", "reading the prompt");
-    let prompt = read_prompt(io, args.prompt)?;
+    let cwd = session_cwd(&ctx.cwd, args.cwd)?;
+    let prompt = match args.command {
+        Some(name) => command_prompt(
+            ctx,
+            Path::new(&cwd),
+            &name,
+            args.args.as_deref().unwrap_or_default(),
+        )?,
+        None => read_prompt(io, args.prompt)?,
+    };
     info!(step = "connect", "reaching the daemon");
     let client = ensure_daemon(ctx, io, force).await?;
     info!(step = "create_session", "creating the session");
@@ -98,7 +108,7 @@ pub async fn run(
             SESSION_CREATE,
             &SessionCreateParams {
                 backend: backend(ctx)?,
-                cwd: session_cwd(&ctx.cwd, args.cwd)?,
+                cwd,
                 model: None,
                 mode: args.mode.into(),
             },

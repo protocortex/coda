@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use coda_agents::{Catalog, revoke_project, trust_project};
+use coda_agents::{Catalog, Kind, revoke_project, trust_project};
 use coda_protocol::paths::repo_identity;
 use coda_store::{DB_FILE_NAME, Store};
 use coda_tui::permission::sanitize;
@@ -123,6 +123,48 @@ fn trust(ctx: &Context, io: &mut Io<'_>, args: &TrustArgs) -> Result<(), CliErro
         writeln!(io.out, "trusting project definitions in {key}")?;
     }
     Ok(())
+}
+
+/// The definitions usable from `cwd`: the user's, and those of its repository
+/// when the user trusted them.
+pub(crate) fn catalog_at(ctx: &Context, cwd: &Path) -> Result<Catalog, CliError> {
+    load_catalog(ctx, repo_identity(cwd).as_deref())
+}
+
+/// The prompt of the command file `name` with `args` in place, for a run in `cwd`.
+///
+/// # Errors
+/// Returns [`CliError::UnknownCommand`] when no command has that name,
+/// [`CliError::CommandPending`] when only a project file waiting for trust has
+/// it, [`CliError::CommandArguments`] when `args` do not fit the template, or
+/// the errors of loading the definitions.
+pub(crate) fn command_prompt(
+    ctx: &Context,
+    cwd: &Path,
+    name: &str,
+    args: &str,
+) -> Result<String, CliError> {
+    let catalog = catalog_at(ctx, cwd)?;
+    if let Some(entry) = catalog.command(name) {
+        return entry
+            .def
+            .expand(args)
+            .map_err(|source| CliError::CommandArguments {
+                name: name.to_owned(),
+                source,
+            });
+    }
+    let pending = catalog
+        .pending()
+        .iter()
+        .find(|pending| pending.kind == Kind::Command && pending.name() == Some(name));
+    Err(match pending {
+        Some(pending) => CliError::CommandPending {
+            name: name.to_owned(),
+            reason: pending.reason.as_str(),
+        },
+        None => CliError::UnknownCommand(name.to_owned()),
+    })
 }
 
 /// Loads the definitions with the stored trust decision for `repo`. No
