@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `coda agents trust` and `coda agents list`.
+//! `coda agents lint` and `coda agents trust`, in-process and as the real binary.
 
 mod common;
 
 use std::fs;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use common::{cli, context, short_dir};
 
@@ -25,6 +25,88 @@ fn repo() -> tempfile::TempDir {
     let dir = short_dir();
     fs::create_dir(dir.path().join(".git")).unwrap();
     dir
+}
+
+#[tokio::test]
+async fn lint_passes_on_good_files() {
+    // Arrange
+    let dir = repo();
+    write(dir.path(), "agents/scout.md", GOOD_AGENT);
+    let ctx = context(dir.path());
+
+    // Act
+    let outcome = cli(&ctx, &["coda", "agents", "lint"], "").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+}
+
+#[tokio::test]
+async fn lint_names_the_file_and_field_of_every_error_and_fails() {
+    // Arrange
+    let dir = repo();
+    let bad = GOOD_AGENT
+        .replace("\"fast\"", "\"turbo\"")
+        .replace("\"low\"", "\"extreme\"")
+        .replace("\"grep\"", "\"teleport\"");
+    write(dir.path(), "agents/scout.md", &bad);
+    let ctx = context(dir.path());
+
+    // Act
+    let outcome = cli(&ctx, &["coda", "agents", "lint"], "").await;
+
+    // Assert
+    assert_ne!(outcome.code, ExitCode::SUCCESS);
+    for field in ["tier", "effort", "tools"] {
+        assert!(
+            outcome.err.contains(&format!("scout.md: {field}:")),
+            "{}",
+            outcome.err
+        );
+    }
+}
+
+#[tokio::test]
+async fn lint_rejects_a_model_id_and_a_description_without_guidance() {
+    // Arrange
+    let dir = repo();
+    let bad = GOOD_AGENT
+        .replace(
+            "Finds code. Use when exploring. Do not use when editing.",
+            "Finds code.",
+        )
+        .replace("tier =", "model = \"claude-opus-4\"\ntier =");
+    write(dir.path(), "agents/scout.md", &bad);
+    let ctx = context(dir.path());
+
+    // Act
+    let outcome = cli(&ctx, &["coda", "agents", "lint"], "").await;
+
+    // Assert
+    assert_ne!(outcome.code, ExitCode::SUCCESS);
+    assert!(outcome.err.contains("scout.md: model:"), "{}", outcome.err);
+    assert!(
+        outcome.err.contains("scout.md: description:"),
+        "{}",
+        outcome.err
+    );
+}
+
+#[tokio::test]
+async fn lint_output_carries_no_terminal_escape_from_a_definition_file() {
+    // Arrange
+    let dir = repo();
+    let escaped = GOOD_AGENT.replace("\"grep\"", "\"\\u001b[2Jteleport\"");
+    write(dir.path(), "agents/scout.md", &escaped);
+    let ctx = context(dir.path());
+
+    // Act
+    let outcome = cli(&ctx, &["coda", "agents", "lint"], "").await;
+
+    // Assert
+    assert_ne!(outcome.code, ExitCode::SUCCESS);
+    assert!(outcome.err.contains("teleport"), "{}", outcome.err);
+    assert!(!outcome.err.contains('\u{1b}'), "{:?}", outcome.err);
 }
 
 #[tokio::test]
@@ -70,6 +152,7 @@ async fn editing_or_adding_a_project_file_withdraws_trust_until_trusted_again() 
         &GOOD_AGENT.replace("Explore.", "Do something else."),
     );
     let edited = cli(&ctx, &["coda", "agents", "list"], "").await;
+    let linted = cli(&ctx, &["coda", "agents", "lint"], "").await;
     cli(&ctx, &["coda", "agents", "trust"], "").await;
     write(
         dir.path(),
@@ -94,6 +177,12 @@ async fn editing_or_adding_a_project_file_withdraws_trust_until_trusted_again() 
             stale.out
         );
     }
+    assert_eq!(linted.code, ExitCode::SUCCESS);
+    assert!(
+        linted.err.contains("changed since they were trusted"),
+        "{}",
+        linted.err
+    );
     assert!(
         retrusted.out.contains("agent extra (project)"),
         "{}",
@@ -118,4 +207,33 @@ async fn trust_outside_a_git_repository_fails() {
     // Assert
     assert_ne!(outcome.code, ExitCode::SUCCESS);
     assert!(outcome.err.contains("git repository"), "{}", outcome.err);
+}
+
+#[test]
+fn the_binary_lint_exits_non_zero_on_a_bad_file_and_zero_on_a_good_one() {
+    // Arrange
+    let dir = repo();
+    write(dir.path(), "agents/scout.md", GOOD_AGENT);
+    let run = |dir: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_coda"))
+            .args(["agents", "lint"])
+            .env("CODA_HOME", dir)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+
+    // Act
+    let good = run(dir.path());
+    write(
+        dir.path(),
+        "agents/scout.md",
+        &GOOD_AGENT.replace("\"fast\"", "\"turbo\""),
+    );
+    let bad = run(dir.path());
+
+    // Assert
+    assert!(good.status.success());
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("tier"));
 }

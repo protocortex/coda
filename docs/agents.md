@@ -28,10 +28,10 @@ You review diffs. Report findings only.
 | Field | Notes |
 | --- | --- |
 | `name` | Required. |
-| `description` | Required. Routing reads it, so it should say when to use the agent and when not to. |
-| `tier` | Required. `fast`, `standard` or `deep`. |
+| `description` | Required. Routing reads it. It must say when to use the agent ("Use when ...") and when not to ("Do not use ..."). |
+| `tier` | Required. `fast`, `standard` or `deep`. A `[routing]` table in `config.toml` maps it to a model (see [config.md](config.md)). |
 | `effort` | Required. `low`, `medium` or `high`. |
-| `tools` | Required. The only tools the agent can call. Tool names, for example `read` or `grep`. An agent is read-only because the list holds no write tool, not because its prompt says so. |
+| `tools` | Required. The only tools the agent can call. Each must be a tool Coda ships: `bash`, `code_outline`, `code_read_range`, `code_search`, `code_symbol`, `edit`, `grep`, `read`, `retrieve`. An agent is read-only because the list holds no write tool, not because its prompt says so. |
 
 A `model` key is an error: an agent file never names a model id.
 
@@ -59,4 +59,8 @@ coda agents trust           # trust the project definitions of the current repos
 coda agents trust --revoke  # stop trusting them
 ```
 
-The decision is stored per repository root in the Coda database, with a digest of the trusted files: the sorted relative paths and content hashes of `.coda/agents`, `.coda/skills` and `.coda/commands` (`*.md`). If any of those files is edited, added or removed afterwards, every project definition goes back to pending and `coda agents list` says they changed since they were trusted. Review the files, then run `coda agents trust` again. The digest is taken over the same bytes that are parsed, so a file edited while Coda loads cannot slip unreviewed text in. Only the store-backed loader can admit project files; nothing else can mark a repository as trusted.
+The decision is stored per repository root in the Coda database, with a digest of the trusted files: the sorted relative paths and content hashes of `.coda/agents`, `.coda/skills` and `.coda/commands` (`*.md`). If any of those files is edited, added or removed afterwards, every project definition goes back to pending and `coda agents list` and `coda agents lint` say they changed since they were trusted. Review the files, then run `coda agents trust` again. The digest is taken over the same bytes that are parsed, so a file edited while Coda loads cannot slip unreviewed text in. Only the store-backed loader can admit project files; nothing else can mark a repository as trusted.
+
+## Lint
+
+`coda agents lint` checks the user files and the project files of the current repository, trusted or not. It reports one line per problem as `<file>: <field>: <message>` on standard error and exits 22 when there is any. It rejects an unknown tier, effort or tool, a description without when-to-use and when-not-to-use, a model id, a hook key, an unknown or missing key, and a name that does not match the file.

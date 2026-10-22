@@ -22,6 +22,20 @@ use serde_json::Value;
 
 use crate::sandbox::SandboxError;
 
+/// The name of every tool the model can call, sorted. Agent definitions are
+/// checked against it.
+pub const TOOL_NAMES: [&str; 9] = [
+    bash::NAME,
+    code::OUTLINE_NAME,
+    code::READ_RANGE_NAME,
+    code::SEARCH_NAME,
+    code::SYMBOL_NAME,
+    edit::NAME,
+    grep::NAME,
+    read::NAME,
+    retrieve::NAME,
+];
+
 /// Default cap on the bytes a tool returns in one call.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 

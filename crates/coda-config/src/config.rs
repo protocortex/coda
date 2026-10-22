@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
 
 const DEFAULT_MAX_TURNS: u32 = 50;
@@ -24,6 +25,7 @@ const SOCKET_FILE_NAME: &str = "coda.sock";
 
 const PROVIDERS_KEY: &str = "providers";
 const MODELS_KEY: &str = "models";
+const ROUTING_KEY: &str = "routing";
 const SECRET_KEY_SUFFIXES: [&str; 7] = [
     "api_key",
     "apikey",
@@ -184,6 +186,8 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     /// Timeout overrides.
     pub timing: Timing,
+    /// Model alias per agent tier.
+    pub routing: Routing,
 }
 
 impl Default for Config {
@@ -196,6 +200,7 @@ impl Default for Config {
             models: BTreeMap::new(),
             telemetry: TelemetryConfig::default(),
             timing: Timing::default(),
+            routing: Routing::default(),
         }
     }
 }
@@ -229,10 +234,30 @@ impl Config {
         config.check_sandboxes()?;
         config.check_context_windows()?;
         config.check_timing()?;
+        config.check_routing()?;
         Ok(Parsed {
             config,
             unknown_keys,
         })
+    }
+
+    /// The `[models]` alias an agent tier runs on, or `None` when the tier has
+    /// no entry and the default model applies.
+    #[must_use]
+    pub fn model_alias_for(&self, tier: Tier) -> Option<&str> {
+        self.routing.0.get(&tier).map(String::as_str)
+    }
+
+    fn check_routing(&self) -> Result<(), ConfigError> {
+        for (tier, alias) in &self.routing.0 {
+            if !self.models.contains_key(alias) {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{ROUTING_KEY}.{tier}"),
+                    allowed: format!("the name of a [{MODELS_KEY}] alias, not `{alias}`"),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn check_sandboxes(&self) -> Result<(), ConfigError> {

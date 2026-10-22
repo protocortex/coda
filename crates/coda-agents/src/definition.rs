@@ -9,6 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use coda_config::routing::Tier;
+use coda_tools::TOOL_NAMES;
 use serde::Deserialize;
 
 use crate::frontmatter;
@@ -26,6 +27,8 @@ const HOOK_KEYS: [&str; 7] = [
 ];
 const MODEL_KEY: &str = "model";
 const FRONTMATTER_FIELD: &str = "frontmatter";
+const USE_WHEN: &str = "use when";
+const DO_NOT_USE: &str = "do not use";
 
 /// One thing wrong with a definition file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +149,8 @@ struct RawCommand {
 ///
 /// # Errors
 /// Returns every [`Issue`] found: a missing, unknown or hook key, a model id,
-/// or an unknown tier or effort.
+/// an unknown tier, effort or tool, or a description that does not say when
+/// to use the agent and when not to.
 pub fn parse_agent(text: &str, stem: &str) -> Result<AgentDef, Vec<Issue>> {
     let (mut table, body) = split_table(text)?;
     let mut issues = forbidden_keys(&mut table);
@@ -155,6 +159,7 @@ pub fn parse_agent(text: &str, stem: &str) -> Result<AgentDef, Vec<Issue>> {
     }
     let raw: RawAgent = deserialize(table, &mut issues)?;
     issues.extend(check_name(&raw.name, stem));
+    issues.extend(check_description(&raw.description));
     let tier = raw.tier.parse::<Tier>();
     if tier.is_err() {
         let known: Vec<&str> = Tier::ALL.iter().map(|t| t.as_str()).collect();
@@ -178,6 +183,13 @@ pub fn parse_agent(text: &str, stem: &str) -> Result<AgentDef, Vec<Issue>> {
                 known.join(", ")
             ),
         ));
+    }
+    for tool in raw
+        .tools
+        .iter()
+        .filter(|t| !TOOL_NAMES.contains(&t.as_str()))
+    {
+        issues.push(Issue::new("tools", format!("unknown tool `{tool}`")));
     }
     let (Ok(tier), Ok(effort)) = (tier, effort) else {
         return Err(issues);
@@ -309,4 +321,18 @@ fn check_name(name: &str, stem: &str) -> Option<Issue> {
             format!("`{name}` must match the file name `{stem}`"),
         )
     })
+}
+
+fn check_description(description: &str) -> Option<Issue> {
+    let lower = description.to_lowercase();
+    let says_when_not = lower.contains(DO_NOT_USE);
+    // "Do not use when" also contains "use when"; it must not count for both.
+    let says_when = lower.replace(DO_NOT_USE, "").contains(USE_WHEN);
+    let missing = match (says_when, says_when_not) {
+        (true, true) => return None,
+        (false, true) => "when to use the agent (\"Use when ...\")",
+        (true, false) => "when not to use the agent (\"Do not use ...\")",
+        (false, false) => "when to use the agent and when not to",
+    };
+    Some(Issue::new("description", format!("it must say {missing}")))
 }

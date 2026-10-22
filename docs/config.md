@@ -82,6 +82,18 @@ A name that picks a provider and a model. Both keys are required in a section.
 
 The built-in defaults cover `claude-sonnet-5-5` and `claude-sonnet-4-5` (200000 tokens) and `gpt-4o` (128000 tokens).
 
+## `[routing]`
+
+Maps an agent tier to a `[models.<alias>]` name. Agent files name a tier, never a model id, so changing a model here changes every agent on that tier.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `fast` | string | unset | Alias for cheap, quick work such as search. |
+| `standard` | string | unset | Alias for everyday implementation and review. |
+| `deep` | string | unset | Alias for hard reasoning. |
+
+A tier with no entry uses the default model. An entry must name an alias defined under `[models]`, and a key other than the three tiers is an error. Both are checked when the file loads.
+
 ## `[telemetry]`
 
 | Key | Type | Default | Notes |

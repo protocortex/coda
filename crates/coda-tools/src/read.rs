@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::sandbox::Sandbox;
 use crate::{Tool, ToolError, ToolOutput, parse_args};
 
-const NAME: &str = "read";
+pub const NAME: &str = "read";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

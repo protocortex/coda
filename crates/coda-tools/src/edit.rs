@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::sandbox::{Sandbox, SandboxDir, SandboxError};
 use crate::{Tool, ToolError, ToolOutput, parse_args};
 
-const NAME: &str = "edit";
+pub const NAME: &str = "edit";
 
 /// Default cap on the size of a file the tool will rewrite.
 pub const DEFAULT_MAX_FILE_BYTES: usize = 1024 * 1024;

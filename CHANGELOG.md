@@ -13,6 +13,7 @@ All notable changes to Coda are recorded here. The format follows
 - A `cause` on `turn_interrupted` events (`cancelled`, `idle_timeout`, `backend_lost`, `daemon_restarted`, `daemon_stopping`). `coda run` exits 4 for a turn cancelled from another client and 5 for the other causes, naming the cause.
 - `daemon.status` reports `any_provider_enabled`, so the terminal UI shows the setup guidance when a daemon that started before `coda init` has no provider.
 - Agent, skill and command definition files with a loader, `coda agents list` and `coda agents trust`. Project definitions load only after the repository is trusted, and trust ends when they change. See [docs/agents.md](docs/agents.md).
+- `coda agents lint` checks definition files for unknown tiers, efforts and tools, missing usage guidance and model ids, and a `[routing]` config table maps agent tiers to models.
 
 ## [0.1.0] - Unreleased
 

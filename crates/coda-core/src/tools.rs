@@ -505,6 +505,7 @@ mod tests {
         assert_eq!(tools.tools.names(), NAMES);
         let schema_names: Vec<&str> = tools.schemas.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(schema_names, NAMES);
+        assert_eq!(schema_names, coda_tools::TOOL_NAMES);
         for schema in &tools.schemas {
             assert_eq!(schema.input_schema["type"], "object", "{}", schema.name);
             assert!(!schema.description.is_empty(), "{}", schema.name);

@@ -15,10 +15,10 @@ use serde_json::Value;
 use crate::sandbox::Sandbox;
 use crate::{Tool, ToolError, ToolOutput, parse_args};
 
-const SEARCH_NAME: &str = "code_search";
-const SYMBOL_NAME: &str = "code_symbol";
-const OUTLINE_NAME: &str = "code_outline";
-const READ_RANGE_NAME: &str = "code_read_range";
+pub const SEARCH_NAME: &str = "code_search";
+pub const SYMBOL_NAME: &str = "code_symbol";
+pub const OUTLINE_NAME: &str = "code_outline";
+pub const READ_RANGE_NAME: &str = "code_read_range";
 
 /// Hits `code_search` returns when the caller names no limit.
 pub const DEFAULT_SEARCH_LIMIT: usize = 20;

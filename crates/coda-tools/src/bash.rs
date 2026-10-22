@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::{Tool, ToolError, ToolOutput, parse_args};
 
-const NAME: &str = "bash";
+pub const NAME: &str = "bash";
 const SHELL: &str = "/bin/sh";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// How long to wait for the output reader after the command is gone, in case
