@@ -357,6 +357,7 @@ dependencies = [
 name = "coda-daemon"
 version = "0.1.0"
 dependencies = [
+ "coda-agents",
  "coda-config",
  "coda-core",
  "coda-protocol",

@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+coda-agents = { path = "../coda-agents" }
 coda-config = { path = "../coda-config" }
 coda-core = { path = "../coda-core" }
 coda-protocol = { path = "../coda-protocol" }

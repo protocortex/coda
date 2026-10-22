@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use coda_config::config::{Config, ProviderConfig};
+use coda_config::config::{Config, Dirs, ProviderConfig};
 use coda_core::broker::BrokerError;
 use coda_core::history::{
     ASSISTANT_MESSAGE_KIND, Rebuild, TOOL_FINISHED_KIND, assistant_body, empty_text_id,
@@ -21,7 +21,9 @@ use coda_core::history::{
 };
 pub use coda_core::history::{CONTEXT_OVERFLOW_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND};
 use coda_core::prompt::{Conversation, Prefix, PromptError};
-use coda_core::tools::{BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index};
+use coda_core::tools::{
+    BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index, task_schema,
+};
 use coda_core::turn::{CancelToken, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{Event, TIMEOUT_KIND};
 use coda_protocol::types::{
@@ -43,6 +45,8 @@ use crate::idle_pool::IdlePool;
 use crate::subscribe::{Hub, HubError};
 use crate::trace::backend_span;
 use crate::turn::{Reservation, TurnError, Turns, store_event};
+
+mod task;
 
 const FAUX_KEY: &str = "faux";
 /// Tool output above this many bytes is shortened for the model and kept whole.
@@ -93,7 +97,8 @@ pub enum SwitchError {
 
 /// The provider a session was configured with.
 enum Provider {
-    Faux(FauxProvider),
+    /// Shared with the children the session starts, which draw from the same script.
+    Faux(Arc<FauxProvider>),
     Api(ModelClient),
     /// Fails the task that drives it, to exercise panic handling.
     #[cfg(test)]
@@ -120,7 +125,7 @@ pub struct Limits {
 
 /// One session's loop with the channel its events arrive on.
 struct ModelLoop {
-    turn_loop: TurnLoop<Provider, BrokerGate>,
+    turn_loop: TurnLoop<Provider, Arc<BrokerGate>>,
     events: UnboundedReceiver<TurnEvent>,
     turn: Arc<Mutex<TurnId>>,
     limits: Limits,
@@ -167,6 +172,8 @@ pub struct ModelSessions {
     /// Limits of conversations a model switch dropped, until the next send
     /// builds the replacement.
     carried_limits: Mutex<HashMap<SessionId, Limits>>,
+    /// What the runners of the sessions' `task` calls share.
+    children: Arc<task::ChildEnv>,
 }
 
 impl ModelSessions {
@@ -180,16 +187,39 @@ impl ModelSessions {
         env: Vec<(OsString, OsString)>,
         key_reader: EnvReader,
     ) -> Arc<Self> {
+        let lookup = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        let home = match Dirs::from_lookup(lookup) {
+            Ok(dirs) => Some(dirs.base().to_path_buf()),
+            Err(error) => {
+                warn!(%error, "the user's definitions directory cannot be found; sub-agents will not see the user's agents");
+                None
+            }
+        };
+        let registry = ModelRegistry::from_config(&config);
+        let env = allowlisted_env(DEFAULT_ENV_ALLOWLIST, env);
+        let children = Arc::new(task::ChildEnv {
+            hub: Arc::clone(&hub),
+            config: config.clone(),
+            registry: registry.clone(),
+            env: env.clone(),
+            key_reader: Arc::clone(&key_reader),
+            home,
+        });
         Arc::new(Self {
             hub,
             brokers,
-            registry: ModelRegistry::from_config(&config),
+            registry,
             config,
-            env: allowlisted_env(DEFAULT_ENV_ALLOWLIST, env),
+            env,
             key_reader,
             running: Mutex::default(),
             loops: IdlePool::new(MAX_IDLE_LOOPS),
             carried_limits: Mutex::default(),
+            children,
         })
     }
 
@@ -441,7 +471,9 @@ impl ModelSessions {
                 if record.model.as_deref() == Some("panic") {
                     return Ok(Provider::Panicking);
                 }
-                Ok(Provider::Faux(FauxProvider::from_config(&self.config)?))
+                Ok(Provider::Faux(Arc::new(FauxProvider::from_config(
+                    &self.config,
+                )?)))
             }
             BackendKind::Anthropic | BackendKind::OpenaiCompat => {
                 let target = self
@@ -511,6 +543,11 @@ impl ModelSessions {
 
     async fn build(&self, record: &SessionRecord, limits: Limits) -> Result<ModelLoop, ModelError> {
         let provider = self.provider(record)?;
+        let faux = if let Provider::Faux(faux) = &provider {
+            Some(Arc::clone(faux))
+        } else {
+            None
+        };
         let (store, workdir) = (self.hub.store_handle(), PathBuf::from(&record.cwd));
         if let Err(error) =
             tokio::task::spawn_blocking(move || refresh_index(&store, &workdir)).await
@@ -526,31 +563,48 @@ impl ModelSessions {
             self.hub.store_handle(),
             StoreOriginals::new(self.hub.store_handle(), record.id.clone()),
         )?;
-        let prefix = Prefix::new(SYSTEM_PROMPT, tools.schemas, "")?;
+        let mut schemas = tools.schemas;
+        schemas.push(task_schema(&self.children.agents(&record.cwd).await));
+        let prefix = Prefix::new(SYSTEM_PROMPT, schemas, "")?;
         let conversation = self.stored_conversation(&record.id, prefix).await?;
         let turn = Arc::new(Mutex::new(TurnId::new(NO_TURN)));
         let broker = self
             .brokers
             .broker(record, self.config.timing.permission_default_deny)
             .await?;
-        let gate = BrokerGate::new(&self.hub, broker, record, Arc::clone(&turn));
+        let gate = Arc::new(BrokerGate::new(
+            &self.hub,
+            broker,
+            record,
+            Arc::clone(&turn),
+        ));
         let (sender, events) = unbounded_channel();
-        let turn_loop = TurnLoop::new(
-            provider,
-            gate,
-            tools.tools,
-            self.hub.store_handle(),
-            conversation,
-            TurnConfig {
-                session: record.id.clone(),
-                cwd: PathBuf::from(&record.cwd),
-                max_turns: limits.max_turns.unwrap_or(self.config.max_turns),
-                token_limit: limits.token_cap.unwrap_or(self.config.token_cap),
-                compact_threshold_bytes: COMPACT_THRESHOLD_BYTES,
+        let runner = task::ChildRunner::new(
+            Arc::clone(&self.children),
+            record.clone(),
+            Arc::clone(&gate),
+            faux,
+            sender.clone(),
+        );
+        let turn_loop = runner.build_loop(
+            0,
+            task::LoopParts {
+                provider,
+                window: self.context_window(record),
+                gate,
+                tools: tools.tools,
+                conversation,
+                config: TurnConfig {
+                    session: record.id.clone(),
+                    cwd: PathBuf::from(&record.cwd),
+                    max_turns: limits.max_turns.unwrap_or(self.config.max_turns),
+                    token_limit: limits.token_cap.unwrap_or(self.config.token_cap),
+                    compact_threshold_bytes: COMPACT_THRESHOLD_BYTES,
+                },
+                events: sender,
+                cancel: None,
             },
-            sender,
-        )
-        .with_context_window(self.context_window(record));
+        );
         Ok(ModelLoop {
             turn_loop,
             events,
@@ -710,6 +764,10 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
         }
         TurnEvent::ContextOverflow => {
             publish_kind(hub, session, turn, CONTEXT_OVERFLOW_KIND, &json!({})).await
+        }
+        TurnEvent::Child { agent, event } => {
+            task::publish_child_event(hub, session, turn, &agent, *event).await;
+            return;
         }
         TurnEvent::Compaction {
             summary,

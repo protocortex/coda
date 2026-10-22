@@ -8,5 +8,6 @@ pub mod compact;
 pub mod economy;
 pub mod history;
 pub mod prompt;
+pub mod task;
 pub mod tools;
 pub mod turn;
