@@ -79,7 +79,7 @@ Which commands run:
 
 ## Hooks
 
-Hooks load only from the user's `config.toml`. A hook key (`hook`, `hooks`, `pre_tool`, `post_tool`, `pre_tool_use`, `post_tool_use`, `session_start`) in any definition file is an error, and that file is not loaded.
+Hooks load only from the user's `config.toml`, as `[[hooks]]` entries. See [docs/config.md](config.md#hooks) for the events, the payload and what a failure does. A sub-agent's tool calls run the same `pre_tool` and `post_tool` hooks as the session's. A hook key (`hook`, `hooks`, `pre_tool`, `post_tool`, `pre_tool_use`, `post_tool_use`, `session_start`) in any definition file is an error, and that file is not loaded.
 
 ## Built-in agents
 

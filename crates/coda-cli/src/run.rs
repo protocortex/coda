@@ -13,7 +13,7 @@ use std::time::Duration;
 use coda_client::{Client, ClientError, Subscription};
 use coda_config::config::Config;
 use coda_core::turn::StopCondition;
-use coda_daemon::model_session::TURN_STOPPED_KIND;
+use coda_daemon::model_session::{HOOK_BLOCKED_KIND, TURN_STOPPED_KIND};
 use coda_daemon::subscribe::PERMISSION_REQUEST_NOTIFICATION;
 use coda_protocol::events::{EVENT_NOTIFICATION, InterruptCause};
 use coda_protocol::methods::{
@@ -51,6 +51,7 @@ const MAX_TURNS: &str = StopCondition::MaxTurns.as_str();
 const BUDGET_EXHAUSTED: &str = StopCondition::BudgetExhausted.as_str();
 const CONTEXT_OVERFLOW: &str = StopCondition::ContextOverflow.as_str();
 const COMPACTION_FAILED: &str = StopCondition::CompactionFailed.as_str();
+const HOOK_BLOCKED: &str = StopCondition::HookBlocked.as_str();
 const CANCELLED: &str = StopCondition::Cancelled.as_str();
 
 /// The fields of a `session.event` notification this command reads.
@@ -68,6 +69,8 @@ struct Finish {
     cut_short: bool,
     /// Why the daemon cut the turn short, when it said.
     cause: Option<InterruptCause>,
+    /// What a blocking hook said when it stopped the turn.
+    hook_reason: Option<String>,
 }
 
 /// Runs the prompt, from `--prompt` or else standard input, in a new session
@@ -253,6 +256,7 @@ async fn follow(
     io: &mut Io<'_>,
 ) -> Result<Finish, CliError> {
     let mut condition = None;
+    let mut hook_reason = None;
     let mut printed = false;
     loop {
         let notification = tokio::select! {
@@ -286,6 +290,9 @@ async fn follow(
                     TURN_STOPPED_KIND => {
                         condition = body["condition"].as_str().map(str::to_owned);
                     }
+                    HOOK_BLOCKED_KIND => {
+                        hook_reason = body["reason"].as_str().map(str::to_owned);
+                    }
                     RESULT_KIND => {
                         if printed {
                             writeln!(io.out)?;
@@ -296,6 +303,7 @@ async fn follow(
                             failed,
                             cut_short: false,
                             cause: None,
+                            hook_reason,
                         });
                     }
                     // A delegated backend that is cancelled or goes silent ends
@@ -315,6 +323,7 @@ async fn follow(
                             failed: true,
                             cut_short: true,
                             cause,
+                            hook_reason: None,
                         });
                     }
                     _ => {}
@@ -378,6 +387,7 @@ fn report(finish: &Finish, io: &mut Io<'_>) -> std::io::Result<ExitCode> {
     };
     if code == exit::RUN_OTHER {
         let reason = match (&finish.condition, finish.cut_short) {
+            (Some(condition), _) if condition == HOOK_BLOCKED => hook_blocked_message(finish),
             (Some(condition), _) if condition == COMPACTION_FAILED => {
                 "the conversation could not be compacted to fit the context window; \
                  see the daemon log"
@@ -396,6 +406,18 @@ fn report(finish: &Finish, io: &mut Io<'_>) -> std::io::Result<ExitCode> {
         writeln!(io.err, "coda: {reason}")?;
     }
     Ok(ExitCode::from(code))
+}
+
+/// What `coda run` says on standard error when a hook stopped the turn. The
+/// hook's words are folded onto one line and made safe to draw.
+fn hook_blocked_message(finish: &Finish) -> String {
+    let said = finish.hook_reason.as_deref().unwrap_or_default();
+    let shown = coda_tui::permission::sanitize_line(said);
+    if shown.is_empty() {
+        "a hook stopped the run before the model was called".to_owned()
+    } else {
+        format!("the run was stopped before the model was called: {shown}")
+    }
 }
 
 /// The exit code for a stop condition the daemon reported.

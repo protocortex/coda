@@ -25,13 +25,15 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::warn;
 
 use crate::app::LinkEvent;
-use crate::permission::{PermissionAnswer, PermissionPrompt};
+use crate::permission::{PermissionAnswer, PermissionPrompt, sanitize_line};
 use crate::status::backend_name;
 
 /// Notification that announces a request waiting for an answer.
 const PERMISSION_REQUEST_NOTIFICATION: &str = "permission.request";
 /// Stored kind of the user's own message, which the event stream carries as well.
 const USER_MESSAGE_KIND: &str = "user_message";
+/// Stored kind of the reason a blocking hook stopped a turn; shown as a notice.
+const HOOK_BLOCKED_KIND: &str = "hook_blocked";
 /// How often a live link is probed, since the client reports a lost link only on use.
 const LINK_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 /// How long a switch waits for the old session to close before leaving it for the quit.
@@ -89,6 +91,18 @@ pub fn user_message_from_params(params: &Value) -> Option<String> {
     }
     let body: Value = serde_json::from_str(params.get("body")?.as_str()?).ok()?;
     body.get("text")?.as_str().map(str::to_owned)
+}
+
+/// Reads the reason of a stored `hook_blocked` notification as a notice for
+/// the user; other kinds give `None`.
+#[must_use]
+pub fn hook_blocked_from_params(params: &Value) -> Option<String> {
+    if params.get("kind")?.as_str()? != HOOK_BLOCKED_KIND {
+        return None;
+    }
+    let body: Value = serde_json::from_str(params.get("body")?.as_str()?).ok()?;
+    let reason = sanitize_line(body.get("reason")?.as_str()?);
+    Some(format!("The turn did not start. {reason}"))
 }
 
 fn backend_names(backends: &[BackendKind]) -> String {
@@ -573,6 +587,8 @@ impl Link {
             EVENT_NOTIFICATION => {
                 if let Some(text) = user_message_from_params(params) {
                     self.tell(LinkEvent::UserMessage(text));
+                } else if let Some(notice) = hook_blocked_from_params(params) {
+                    self.tell(LinkEvent::Notice(notice));
                 } else if let Some(event) = event_from_params(params) {
                     self.tell(LinkEvent::Session(event));
                 }
@@ -752,6 +768,24 @@ mod tests {
         assert!(outcome.is_err());
         assert!(current.is_none());
         assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_hook_blocked_notification_becomes_a_one_line_notice_safe_to_draw() {
+        // Arrange
+        let reason = "blocked by the session_start hook `gate`: not on\nthis network\u{1b}[31m";
+        let body = json!({ "reason": reason });
+        let blocked = json!({"kind": "hook_blocked", "body": body.to_string()});
+        let other = json!({"kind": "result", "body": body.to_string()});
+
+        // Act
+        let notice = hook_blocked_from_params(&blocked).unwrap();
+
+        // Assert
+        assert!(notice.starts_with("The turn did not start. "), "{notice}");
+        assert!(notice.contains("not on this network"), "{notice}");
+        assert!(!notice.chars().any(char::is_control), "{notice:?}");
+        assert_eq!(hook_blocked_from_params(&other), None);
     }
 
     #[test]

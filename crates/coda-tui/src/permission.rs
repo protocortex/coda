@@ -61,6 +61,15 @@ pub fn sanitize(text: &str) -> (String, bool) {
     (shown, text.chars().nth(MAX_SHOWN_CHARS).is_some())
 }
 
+/// [`sanitize`] for text that must stay on one line, such as the words a hook
+/// wrote to its standard error: runs of white space, newlines included, become
+/// one space first.
+#[must_use]
+pub fn sanitize_line(text: &str) -> String {
+    let folded = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    sanitize(&folded).0
+}
+
 /// A request waiting for the user, with its text already sanitized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionPrompt {

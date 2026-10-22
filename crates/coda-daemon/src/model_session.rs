@@ -20,7 +20,9 @@ use coda_core::history::{
     ASSISTANT_MESSAGE_KIND, Rebuild, TOOL_FINISHED_KIND, assistant_body, empty_text_id,
     tool_finished_body,
 };
-pub use coda_core::history::{CONTEXT_OVERFLOW_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND};
+pub use coda_core::history::{
+    CONTEXT_OVERFLOW_KIND, HOOK_BLOCKED_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND,
+};
 use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
 use coda_core::tools::{
     BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index, task_schema,
@@ -853,6 +855,16 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
         TurnEvent::Child { agent, event } => {
             task::publish_child_event(hub, session, turn, &agent, *event).await;
             return;
+        }
+        TurnEvent::HookBlocked { reason } => {
+            publish_kind(
+                hub,
+                session,
+                turn,
+                HOOK_BLOCKED_KIND,
+                &json!({ "reason": reason }),
+            )
+            .await
         }
         TurnEvent::Compaction {
             summary,

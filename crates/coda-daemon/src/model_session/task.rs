@@ -25,11 +25,13 @@ use coda_agents::{
     Catalog, DispatchError, Report, Status, TaskResult, Tier, child_tools, parse_report,
 };
 use coda_config::config::Config;
+use coda_config::hooks::{HookConfig, HookEvent};
 use coda_core::broker::RunGrants;
 use coda_core::history::{
     ASSISTANT_MESSAGE_KIND, CHILD_EVENT_KIND, CONTEXT_OVERFLOW_KIND, TOOL_FINISHED_KIND,
     assistant_body, tool_finished_body,
 };
+use coda_core::hooks::HookRunner;
 use coda_core::prompt::{Conversation, Message, Prefix, PromptError};
 use coda_core::task::{TaskFuture, TaskOutcome, TaskRequest, TaskRunner};
 use coda_core::tools::{BaseToolsConfig, StoreOriginals, ToolsError, base_tools};
@@ -227,7 +229,8 @@ impl ChildRunner {
             parts.config,
             parts.events,
         )
-        .with_context_window(parts.window);
+        .with_context_window(parts.window)
+        .with_hooks(self.hooks_for(depth));
         if let Some(runner) = below {
             turn_loop = turn_loop.with_tasks(runner);
         }
@@ -235,6 +238,19 @@ impl ChildRunner {
             Some(cancel) => turn_loop.with_cancel_token(cancel),
             None => turn_loop,
         }
+    }
+
+    /// The user's hooks for a loop `depth` levels down, with the allowlisted
+    /// environment bash gets and no API key. Every loop runs the tool hooks, so
+    /// a sub-agent is no way around a blocking one. Only the session itself
+    /// runs `session_start`, which marks the start of the session, not of a
+    /// sub-agent.
+    fn hooks_for(&self, depth: u8) -> HookRunner {
+        let hooks: Vec<HookConfig> = (self.env.config.hooks.iter())
+            .filter(|hook| depth == 0 || hook.event != HookEvent::SessionStart)
+            .cloned()
+            .collect();
+        HookRunner::new(&hooks, self.env.env.clone())
     }
 
     async fn run_child(&self, request: TaskRequest) -> Result<TaskOutcome, ChildError> {
@@ -426,11 +442,13 @@ pub(super) async fn publish_child_event(
         }
         TurnEvent::ContextOverflow => (CONTEXT_OVERFLOW_KIND, json!({})),
         // Not stored: the parent counts the usage, and a child's own children
-        // send their events up the session's channel, not through this one.
+        // send their events up the session's channel, not through this one. A
+        // child runs no `session_start` hook, so it never reports one blocked.
         TurnEvent::Text(_)
         | TurnEvent::Usage(_)
         | TurnEvent::Compaction { .. }
-        | TurnEvent::Child { .. } => return,
+        | TurnEvent::Child { .. }
+        | TurnEvent::HookBlocked { .. } => return,
     };
     let wrapped = json!({ "agent": agent, "kind": kind, "body": body });
     log_failure(publish_kind(hub, session, turn, CHILD_EVENT_KIND, &wrapped).await);

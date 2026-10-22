@@ -35,6 +35,8 @@ const HOME_DIR: &str = "home";
 /// Small enough that a long prompt nears it.
 const SMALL_WINDOW: u32 = 100;
 const PROMPT_CANARY: &str = "CANARY-PROMPT-7f3a91";
+/// In the daemon's environment, where no tool or hook may see it.
+const API_KEY_CANARY: &str = "sk-env-canary-5d1e07";
 /// The first original a fresh store hands out is the prompt of the first send.
 const PROMPT_ORIGINAL_ID: &str = "1";
 
@@ -128,6 +130,7 @@ impl Rig {
                 parent_env: vec![
                     ("PATH".into(), "/usr/bin:/bin".into()),
                     ("CODA_HOME".into(), data.path().join(HOME_DIR).into()),
+                    ("ANTHROPIC_API_KEY".into(), API_KEY_CANARY.into()),
                 ],
                 timing: Timing::default(),
                 models,
@@ -978,6 +981,7 @@ async fn a_store_user_is_not_blocked_while_the_index_walk_runs() {
     assert_eq!(indexed_symbols(&rig, "f5"), 1);
 }
 
+mod hooks;
 mod skills;
 mod switch;
 mod task;

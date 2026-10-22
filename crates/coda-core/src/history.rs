@@ -42,6 +42,9 @@ pub const CONVERSATION_RESET_KIND: &str = "conversation_reset";
 pub const PERMISSION_REQUEST_KIND: &str = "permission_request";
 /// Stored kind of a context window overflow.
 pub const CONTEXT_OVERFLOW_KIND: &str = "context_overflow";
+/// Stored kind of the reason a blocking `session_start` hook stopped a turn.
+/// The body is `{"reason": ...}`; clients show it to the user and never to the model.
+pub const HOOK_BLOCKED_KIND: &str = "hook_blocked";
 /// Stored kind of the reason a send stopped.
 pub const TURN_STOPPED_KIND: &str = "turn_stopped";
 /// Stored kind of a model switch.
@@ -62,6 +65,7 @@ const BOOKKEEPING_KINDS: &[&str] = &[
     CONTEXT_OVERFLOW_KIND,
     DENY_KIND,
     HISTORY_NOT_RESTORED_KIND,
+    HOOK_BLOCKED_KIND,
     MODEL_SWITCHED_KIND,
     PERMISSION_REQUEST_KIND,
     RESULT_KIND,

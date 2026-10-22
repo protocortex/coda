@@ -29,6 +29,7 @@ use crate::compact::{
     self as summary, CompactError, CompactionAck, KEEP_RECENT_MESSAGES, summary_message,
 };
 use crate::economy::{cap_ends, compact};
+use crate::hooks::HookRunner;
 use crate::prompt::{Conversation, Message, ToolCall};
 use crate::task::{TaskRequest, TaskRunner};
 
@@ -42,6 +43,8 @@ pub(crate) const NO_REPLY: &str = "[no reply: the turn stopped early]";
 const NO_TASKS: &str = "the task tool is not available here: sub-agents cannot start sub-agents";
 /// What the model is told about a call whose permission prompt was cancelled.
 const PROMPT_CANCELLED: &str = "not run: the turn was cancelled while asking permission";
+/// What the model is told about a call whose pre-tool hook was cancelled.
+const HOOK_CANCELLED: &str = "not run: the turn was cancelled while a hook ran";
 /// Name of the span around one model call.
 pub const PROVIDER_CALL_SPAN: &str = "coda.provider.call";
 /// Name of the span around one tool call.
@@ -72,6 +75,8 @@ pub enum StopCondition {
     MaxTokens,
     /// The older conversation could not be summarized to make room.
     CompactionFailed,
+    /// A blocking `session_start` hook failed, so the turn did not start.
+    HookBlocked,
 }
 
 impl StopCondition {
@@ -88,6 +93,7 @@ impl StopCondition {
             Self::Paused => "paused",
             Self::MaxTokens => "max_tokens",
             Self::CompactionFailed => "compaction_failed",
+            Self::HookBlocked => "hook_blocked",
         }
     }
 }
@@ -119,6 +125,12 @@ pub enum TurnEvent {
     Usage(Usage),
     /// The context window is full and compaction could not make room.
     ContextOverflow,
+    /// A blocking `session_start` hook failed, so the turn did not start. The
+    /// reason is for the user, not the model, so it is not answer text.
+    HookBlocked {
+        /// Which hook failed and why.
+        reason: String,
+    },
     /// The older messages were summarized. The loop waits for `ack` before it
     /// retries, so the event can be stored first.
     Compaction {
@@ -259,6 +271,12 @@ pub struct TurnLoop<P, G> {
     tasks: Option<Arc<dyn TaskRunner>>,
     /// Whether this send already tried to compact ahead of a request.
     compacted_ahead: bool,
+    hooks: HookRunner,
+    /// Whether the `session_start` hooks passed for this loop.
+    session_started: bool,
+    /// Whether the conversation had messages when the loop was built, so a
+    /// blocked first send does not make a new session look resumed on retry.
+    resumed: bool,
 }
 
 /// How a compaction attempt ended.
@@ -283,6 +301,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         events: UnboundedSender<TurnEvent>,
     ) -> Self {
         let budget = TokenBudget::new(config.token_limit);
+        let resumed = !conversation.messages().is_empty();
         Self {
             provider,
             gate,
@@ -296,6 +315,9 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             context_window: None,
             tasks: None,
             compacted_ahead: false,
+            hooks: HookRunner::default(),
+            session_started: false,
+            resumed,
         }
     }
 
@@ -326,6 +348,13 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     #[must_use]
     pub fn with_cancel_token(mut self, cancel: CancelToken) -> Self {
         self.cancel = cancel;
+        self
+    }
+
+    /// Runs `hooks` at session start and around tool calls.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: HookRunner) -> Self {
+        self.hooks = hooks;
         self
     }
 
@@ -368,7 +397,10 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     pub async fn send(&mut self, text: &str) -> Result<StopCondition, TurnError> {
         self.conversation.push(Message::User(text.to_owned()));
         self.compacted_ahead = false;
-        let result = self.run().await;
+        let result = match self.start_session().await {
+            Some(stop) => Ok(stop),
+            None => self.run().await,
+        };
         if !matches!(
             self.conversation.messages().last(),
             Some(Message::Assistant { .. })
@@ -379,6 +411,32 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             });
         }
         result
+    }
+
+    /// Runs the `session_start` hooks once for this loop. Returns the stop
+    /// when the turn must not go on. A blocked start is tried again by the
+    /// next send.
+    async fn start_session(&mut self) -> Option<StopCondition> {
+        if self.session_started {
+            return None;
+        }
+        let started = tokio::select! {
+            started = self.hooks.session_start(&self.config.session, &self.config.cwd, self.resumed) => started,
+            () = self.cancel.cancelled() => return Some(StopCondition::Cancelled),
+        };
+        match started {
+            Ok(()) => {
+                self.session_started = true;
+                None
+            }
+            Err(blocked) => {
+                warn!(%blocked, "a session_start hook stopped the turn");
+                self.emit(TurnEvent::HookBlocked {
+                    reason: blocked.to_string(),
+                });
+                Some(StopCondition::HookBlocked)
+            }
+        }
     }
 
     async fn run(&mut self) -> Result<StopCondition, TurnError> {
@@ -740,6 +798,15 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             info!(tool = %call.name, "tool call denied");
             return ToolOutcome::error(format!("permission to run {} was denied", call.name));
         }
+        // After the permission answer, so a hook only sees calls that would run.
+        let hooked = tokio::select! {
+            hooked = self.hooks.pre_tool(&self.config.session, &self.config.cwd, &call.name, &input) => hooked,
+            () = self.cancel.cancelled() => return ToolOutcome::error(HOOK_CANCELLED.to_owned()),
+        };
+        if let Err(blocked) = hooked {
+            info!(tool = %call.name, %blocked, "tool call blocked by a hook");
+            return ToolOutcome::error(blocked.to_string());
+        }
         let work = ToolWork {
             tool: Arc::clone(tool),
             input,
@@ -748,9 +815,35 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             session: self.config.session.clone(),
             threshold: self.config.compact_threshold_bytes,
         };
-        match tokio::task::spawn_blocking(move || work.run()).await {
+        let outcome = match tokio::task::spawn_blocking(move || work.run()).await {
             Ok(outcome) => outcome,
-            Err(error) => ToolOutcome::error(format!("the {} tool crashed: {error}", call.name)),
+            Err(error) => {
+                return ToolOutcome::error(format!("the {} tool crashed: {error}", call.name));
+            }
+        };
+        self.after_tool_hooks(call, outcome).await
+    }
+
+    /// Runs the `post_tool` hooks. A blocking one that fails keeps the result
+    /// from the model and gives it the hook's reason as an error instead.
+    async fn after_tool_hooks(&self, call: &ToolCall, outcome: ToolOutcome) -> ToolOutcome {
+        let hooked = tokio::select! {
+            hooked = self.hooks.post_tool(
+                &self.config.session,
+                &self.config.cwd,
+                &call.name,
+                outcome.is_error,
+                &outcome.text,
+            ) => hooked,
+            // The tool already ran, so its result stands.
+            () = self.cancel.cancelled() => return outcome,
+        };
+        match hooked {
+            Ok(()) => outcome,
+            Err(blocked) => {
+                info!(tool = %call.name, %blocked, "tool result blocked by a hook");
+                ToolOutcome::error(blocked.to_string())
+            }
         }
     }
 }
