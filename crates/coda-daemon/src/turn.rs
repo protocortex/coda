@@ -136,17 +136,28 @@ type CancelHandle = coda_providers::claude_session::CancelHandle;
 /// table with its turn, so no flag outlives it.
 pub(crate) struct Reservation<T> {
     armed: Option<T>,
-    cancel_requested: bool,
+    cancel: CancelState,
     cancellable: bool,
     /// The turn has emitted its terminal event and only cleans up now.
     winding_down: bool,
+}
+
+/// How far a cancel of a reservation has got.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CancelState {
+    /// Nobody cancelled.
+    None,
+    /// Asked for before the backend could be cancelled; [`Reservation::arm`] applies it.
+    Pending,
+    /// Handed to the backend, which may not have reacted yet.
+    Sent,
 }
 
 impl<T> Default for Reservation<T> {
     fn default() -> Self {
         Self {
             armed: None,
-            cancel_requested: false,
+            cancel: CancelState::None,
             cancellable: true,
             winding_down: false,
         }
@@ -170,16 +181,20 @@ impl<T> Reservation<T> {
             return false;
         }
         match &self.armed {
-            Some(armed) => cancel(armed),
-            None => self.cancel_requested = true,
+            Some(armed) => {
+                cancel(armed);
+                self.cancel = CancelState::Sent;
+            }
+            None => self.cancel = CancelState::Pending,
         }
         true
     }
 
     /// Stores `armed` and applies a cancel requested while it was missing.
     pub(crate) fn arm(&mut self, armed: T, cancel: impl FnOnce(&T)) {
-        if std::mem::take(&mut self.cancel_requested) {
+        if self.cancel == CancelState::Pending {
             cancel(&armed);
+            self.cancel = CancelState::Sent;
         }
         self.armed = Some(armed);
     }
@@ -197,8 +212,10 @@ impl<T> Reservation<T> {
         self.winding_down = true;
     }
 
+    /// Whether the turn is ending: it emitted its terminal event, or it was
+    /// cancelled and the turn task has not yet said so.
     pub(crate) fn is_winding_down(&self) -> bool {
-        self.winding_down
+        self.winding_down || self.cancel != CancelState::None
     }
 
     pub(crate) fn armed(&self) -> Option<&T> {
@@ -492,7 +509,7 @@ impl Turns {
     /// an unknown or already closed session is not an error.
     ///
     /// A turn is never cancelled here, so a caller that wants the session closed
-    /// cancels it first.
+    /// cancels it first; the close then waits for that turn to end.
     ///
     /// # Errors
     /// Returns [`TurnError::Busy`] while a turn is starting or running.
@@ -533,7 +550,9 @@ impl Turns {
 
     /// Returns once `session` has no turn. A turn that already emitted its
     /// terminal event is waited for, since a client gets that event before the
-    /// session is free; a live turn is refused at once.
+    /// session is free, and so is a cancelled one, since a client that cancels
+    /// and then closes does not wait for the turn to notice; a live turn is
+    /// refused at once.
     async fn await_wind_down(&self, session: &SessionId) -> Result<(), TurnError> {
         let wait = async {
             while self.is_running(session) {
