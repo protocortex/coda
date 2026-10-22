@@ -8,7 +8,8 @@ nothing about the real protocol. The first line of every fixture is a
 (`recorded_at`), the recorder, the scenario and the prompt.
 
 Recorded on 2026-10-21 with claude 2.1.296 and codex-cli 0.163.0, using the
-user's existing subscription logins.
+user's existing subscription logins. The two app-server decline and cancel
+transcripts were re-recorded on 2026-10-22 with the same codex-cli.
 
 ## Fixtures
 
@@ -20,7 +21,8 @@ user's existing subscription logins.
 | `claude/live-text.jsonl` | a plain text turn |
 | `codex/live-exec.jsonl` | two `codex exec --json` turns; the second resumes the thread |
 | `codex/live-app-server-accept.jsonl` | app-server turn, command approval accepted |
-| `codex/live-app-server-decline.jsonl` | the same turn, approval declined |
+| `codex/live-app-server-decline.jsonl` | the same turn, approval denied: coda answers `cancel` because the server offers no `decline`, and the turn ends `interrupted` |
+| `codex/live-app-server-cancel.jsonl` | `sleep 30` approved, then the turn is cancelled: coda sends `turn/interrupt`, the server replies `{}` and ends the turn with `turn/completed` status `interrupted` |
 
 A Claude transcript is the stream `claude` wrote, with each `control_response`
 coda sent placed right after the `control_request` it answers. A Codex exec
@@ -34,7 +36,7 @@ one line per JSON-RPC text frame, `{"dir":"send"|"recv","message":{...}}`, plus 
 CODA_LIVE_TESTS=1 scripts/live-record.sh
 ```
 
-This spends quota on about seven short calls and is never run by CI. The tests in
+This spends quota on about eight short calls and is never run by CI. The tests in
 `crates/coda-providers/tests/live_record.rs` are `#[ignore]` and also need
 `CODA_LIVE_TESTS=1`. Each call has a time bound, runs in an empty temporary
 directory with a short path, and starts the CLI through coda's adapter with its
@@ -46,8 +48,8 @@ call stays cheap. The Codex shims set `CODEX_HOME` to a throwaway directory that
 the login (deleted after the run) and an empty config, so the user's MCP servers,
 plugins and skills do not load; the built-in `codex_apps` server still starts.
 The app-server shim also moves the socket and a proxy in the test logs the
-WebSocket text frames. The accept and decline recordings fail unless the gate saw
-an approval request. The Codex exec working directory is a fresh Git repository, because `codex exec` refuses to run
+WebSocket text frames. The accept, decline and cancel recordings fail unless the gate saw
+an approval request, and the cancel recording fails unless the turn ends cancelled. The Codex exec working directory is a fresh Git repository, because `codex exec` refuses to run
 anywhere else.
 
 ## Scrubbing
