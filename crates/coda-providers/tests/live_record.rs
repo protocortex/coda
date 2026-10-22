@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use coda_protocol::events::Event;
 use coda_protocol::types::{PermissionDecision, SessionId, TurnId};
-use coda_providers::claude_session::{ClaudeSession, SessionSpec, TurnOutcome};
+use coda_providers::claude_session::{CancelHandle, ClaudeSession, SessionSpec, TurnOutcome};
 use coda_providers::codex_app_server::{AppServerSpec, CodexAppServerSession};
 use coda_providers::codex_exec::{CodexExecSession, CodexSpec, SandboxMode};
 use coda_providers::gate::PermissionGate;
@@ -46,6 +46,8 @@ const CLAUDE_TURN_BOUND: Duration = Duration::from_secs(120);
 const CODEX_TURN_BOUND: Duration = Duration::from_secs(180);
 const PROXY_CONNECT_BOUND: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(10);
+/// How long the long command runs before the cancelled-turn recording interrupts it.
+const CANCEL_AFTER_APPROVAL: Duration = Duration::from_secs(3);
 const AUTH_FILE: &str = "auth.json";
 const RECORDER: &str = "coda-providers/tests/live_record.rs";
 const RECORDED_AT_FORMAT: &str = "+%Y-%m-%dT%H:%M:%SZ";
@@ -58,6 +60,9 @@ const CLAUDE_TEXT_PROMPT: &str = "Reply with the single word: ok";
 const CODEX_FIRST_PROMPT: &str = "Reply with the single word: ok";
 const CODEX_SECOND_PROMPT: &str = "Reply with the single word: done";
 const CODEX_APPROVAL_PROMPT: &str = "Run the shell command `touch hello.txt`. The sandbox is \
+    read-only, so do not try it inside the sandbox first: request escalated permissions \
+    (sandbox_permissions require_escalated) with a one line justification, and wait for approval.";
+const CODEX_LONG_COMMAND_PROMPT: &str = "Run the shell command `sleep 30`. The sandbox is \
     read-only, so do not try it inside the sandbox first: request escalated permissions \
     (sandbox_permissions require_escalated) with a one line justification, and wait for approval.";
 
@@ -91,6 +96,8 @@ impl Drop for CodexHome {
 struct FixedGate {
     decision: PermissionDecision,
     seen: Mutex<Vec<ToolRequest>>,
+    /// When set, the turn is cancelled this long after the first request is answered.
+    cancel: Option<(CancelHandle, Duration)>,
 }
 
 impl FixedGate {
@@ -98,13 +105,25 @@ impl FixedGate {
         Self {
             decision,
             seen: Mutex::new(Vec::new()),
+            cancel: None,
         }
+    }
+
+    fn cancelling(mut self, handle: CancelHandle, after: Duration) -> Self {
+        self.cancel = Some((handle, after));
+        self
     }
 }
 
 impl PermissionGate for FixedGate {
     fn request(&self, request: &ToolRequest) -> impl Future<Output = PermissionDecision> + Send {
         self.seen.lock().unwrap().push(request.clone());
+        if let Some((handle, after)) = self.cancel.clone() {
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                handle.cancel();
+            });
+        }
         std::future::ready(self.decision)
     }
 }
@@ -573,7 +592,15 @@ async fn proxy(listen_file: PathBuf, log: Arc<Mutex<Vec<Value>>>) {
     tokio::join!(up, down);
 }
 
-async fn record_app_server(out: &Path, name: &str, decision: PermissionDecision) {
+/// What one app-server recording asks Codex to do and how coda answers.
+struct AppServerRun {
+    prompt: &'static str,
+    decision: PermissionDecision,
+    /// Cancel the turn once the approval is answered, so the adapter interrupts it.
+    cancel: bool,
+}
+
+async fn record_app_server(out: &Path, name: &str, run: AppServerRun) {
     let real = find_binary("codex");
     let listen_file = out.join(format!("{name}.listen"));
     let _ = fs::remove_file(&listen_file);
@@ -610,12 +637,15 @@ async fn record_app_server(out: &Path, name: &str, decision: PermissionDecision)
     let mut outcome = None;
     let mut approvals_seen = 0;
     if let Ok(Ok(mut session)) = started {
-        let gate = FixedGate::new(decision);
+        let mut gate = FixedGate::new(run.decision);
+        if run.cancel {
+            gate = gate.cancelling(session.cancel_handle(), CANCEL_AFTER_APPROVAL);
+        }
         let mut events: Vec<Event> = Vec::new();
         let turn = TurnId::new("t-1");
         let result = tokio::time::timeout(
             CODEX_TURN_BOUND,
-            session.run_turn(&turn, CODEX_APPROVAL_PROMPT, &gate, &mut |e| events.push(e)),
+            session.run_turn(&turn, run.prompt, &gate, &mut |e| events.push(e)),
         )
         .await;
         notes = format!(
@@ -638,15 +668,20 @@ async fn record_app_server(out: &Path, name: &str, decision: PermissionDecision)
         "type": "coda_recording", "label": "live",
         "codex_version": codex_version(&real),
         "recorded_at": now(), "recorder": RECORDER,
-        "scenario": name, "prompt": CODEX_APPROVAL_PROMPT,
+        "scenario": name, "prompt": run.prompt,
         "note": "recorded through CodexAppServerSession behind a logging proxy; each line is \
                  {dir: send|recv, message} for a JSON-RPC text frame, or {dir, http} for the upgrade",
     });
     write_raw(out, name, &header, &lines);
     write_adapter_notes(out, name, &notes);
+    let ended_as_expected = if run.cancel {
+        matches!(outcome, Some(Ok(Ok(TurnOutcome::Cancelled))))
+    } else {
+        matches!(outcome, Some(Ok(Ok(TurnOutcome::Completed { .. }))))
+    };
     assert!(
-        matches!(outcome, Some(Ok(Ok(TurnOutcome::Completed { .. })))),
-        "the turn did not complete; see {name}.adapter.txt"
+        ended_as_expected,
+        "the turn did not end as the scenario expects; see {name}.adapter.txt"
     );
     assert!(
         approvals_seen > 0,
@@ -658,12 +693,34 @@ async fn record_app_server(out: &Path, name: &str, decision: PermissionDecision)
 #[tokio::test]
 async fn codex_app_server_approval_accepted() {
     let Some(out) = live_out() else { return };
-    record_app_server(&out, "codex-app-live-accept", PermissionDecision::AllowOnce).await;
+    let run = AppServerRun {
+        prompt: CODEX_APPROVAL_PROMPT,
+        decision: PermissionDecision::AllowOnce,
+        cancel: false,
+    };
+    record_app_server(&out, "codex-app-live-accept", run).await;
 }
 
 #[ignore = "spends Codex quota; needs CODA_LIVE_TESTS=1"]
 #[tokio::test]
 async fn codex_app_server_approval_declined() {
     let Some(out) = live_out() else { return };
-    record_app_server(&out, "codex-app-live-decline", PermissionDecision::Deny).await;
+    let run = AppServerRun {
+        prompt: CODEX_APPROVAL_PROMPT,
+        decision: PermissionDecision::Deny,
+        cancel: false,
+    };
+    record_app_server(&out, "codex-app-live-decline", run).await;
+}
+
+#[ignore = "spends Codex quota; needs CODA_LIVE_TESTS=1"]
+#[tokio::test]
+async fn codex_app_server_turn_cancelled_during_a_long_command() {
+    let Some(out) = live_out() else { return };
+    let run = AppServerRun {
+        prompt: CODEX_LONG_COMMAND_PROMPT,
+        decision: PermissionDecision::AllowOnce,
+        cancel: true,
+    };
+    record_app_server(&out, "codex-app-live-cancel", run).await;
 }

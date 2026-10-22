@@ -3,10 +3,10 @@
 //! The Codex `app-server` backend: one long-lived process speaking JSON over WebSocket.
 //!
 //! The server listens on a Unix socket in a directory only coda can enter. The
-//! handshake, command approvals (`accept` and `decline`), item, token usage and
-//! turn messages were checked against codex-cli 0.163.0; see
-//! `docs/live-recording.md`. File change approvals and `turn/interrupt` were not
-//! seen live, and the `fake-codex` the other tests use is still synthetic.
+//! handshake, command approvals (`accept` and `cancel`), `turn/interrupt`, item,
+//! token usage and turn messages were checked against codex-cli 0.163.0; see
+//! `docs/live-recording.md`. File change approvals and the `decline` answer were
+//! not seen live, and the `fake-codex` the other tests use is still synthetic.
 //!
 //! A denied approval answers `decline`, else `cancel`, from the request's
 //! `availableDecisions`; when neither is offered, or the field is not a list,
@@ -1058,6 +1058,8 @@ mod tests {
         include_str!("../../coda-testkit/fixtures/codex/live-app-server-accept.jsonl");
     const LIVE_DECLINE: &str =
         include_str!("../../coda-testkit/fixtures/codex/live-app-server-decline.jsonl");
+    const LIVE_CANCEL: &str =
+        include_str!("../../coda-testkit/fixtures/codex/live-app-server-cancel.jsonl");
 
     /// The JSON-RPC messages sent in direction `dir` (`recv` or `send`), in order.
     /// Fails on any line that is not JSON, so a damaged fixture cannot pass quietly.
@@ -1135,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn the_recorded_pre_change_answer_to_the_live_declined_approval_replays_as_decline() {
+    fn the_live_denied_approval_is_answered_cancel_and_the_turn_ends_interrupted() {
         // Arrange
         let (received, sent) = (
             live_messages(LIVE_DECLINE, "recv"),
@@ -1155,8 +1157,50 @@ mod tests {
 
         // Assert
         assert!(request["params"]["command"].is_string());
-        assert_eq!(answer["result"]["decision"], DECLINE);
+        assert_eq!(answer["result"]["decision"], CANCEL);
         assert_eq!(last["method"], "turn/completed");
-        assert_eq!(last["params"]["turn"]["status"], "completed");
+        assert_eq!(last["params"]["turn"]["status"], "interrupted");
+    }
+
+    #[test]
+    fn a_live_cancelled_turn_is_interrupted_by_name_and_ends_with_turn_completed() {
+        // Arrange
+        let (received, sent) = (
+            live_messages(LIVE_CANCEL, "recv"),
+            live_messages(LIVE_CANCEL, "send"),
+        );
+        let started = received
+            .iter()
+            .find(|m| m["method"] == "turn/started")
+            .expect("the transcript holds turn/started");
+
+        // Act
+        let interrupt = sent
+            .iter()
+            .find(|m| m["method"] == INTERRUPT_METHOD)
+            .expect("coda sent turn/interrupt");
+        let reply = received
+            .iter()
+            // The last match: the thread/start reply reuses the same small id.
+            .rposition(|m| m["id"] == interrupt["id"] && m.get("result").is_some())
+            .expect("the server answered turn/interrupt");
+        let ended = received
+            .iter()
+            .position(|m| m["method"] == "turn/completed")
+            .expect("the server ended the turn");
+
+        // Assert
+        assert_eq!(
+            interrupt["params"]["turnId"],
+            started["params"]["turn"]["id"]
+        );
+        assert_eq!(
+            interrupt["params"]["threadId"],
+            started["params"]["threadId"]
+        );
+        assert_eq!(received[reply]["result"], json!({}));
+        assert!(reply < ended, "turn/completed follows the interrupt reply");
+        assert_eq!(received[ended]["params"]["turn"]["status"], "interrupted");
+        assert_eq!(ended, received.len() - 1);
     }
 }

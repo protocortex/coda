@@ -47,6 +47,6 @@ fn every_committed_live_fixture_line_is_valid_json() {
         .collect();
 
     // Assert
-    assert_eq!(files.len(), 7, "expected seven live fixtures");
+    assert_eq!(files.len(), 8, "expected eight live fixtures");
     assert!(invalid.is_empty(), "invalid JSON lines: {invalid:?}");
 }

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Records live transcripts from the installed `claude` and `codex` through coda's
 # adapters, scrubs them and writes them under crates/coda-testkit/fixtures/.
-# Spends subscription quota (about seven short calls), so it needs
+# Spends subscription quota (about eight short calls), so it needs
 # CODA_LIVE_TESTS=1 and never runs in CI. Set KEEP_RAW=1 to keep the unscrubbed
 # recordings (they hold paths and ids; delete them yourself).
 # Usage: CODA_LIVE_TESTS=1 scripts/live-record.sh
@@ -44,6 +44,7 @@ scrub claude-live-readonly "$claude/live-readonly.jsonl"
 scrub codex-exec-live "$codex/live-exec.jsonl"
 scrub codex-app-live-accept "$codex/live-app-server-accept.jsonl"
 scrub codex-app-live-decline "$codex/live-app-server-decline.jsonl"
+scrub codex-app-live-cancel "$codex/live-app-server-cancel.jsonl"
 
 trap - ERR
 written=("$claude"/live-*.jsonl "$codex"/live-*.jsonl)
