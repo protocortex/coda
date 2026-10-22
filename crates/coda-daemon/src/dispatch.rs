@@ -19,9 +19,9 @@ use coda_protocol::jsonrpc::{
 use coda_protocol::methods::{
     DAEMON_BACKENDS, DAEMON_PING, DAEMON_SHUTDOWN, DAEMON_STATUS, DaemonShutdownResult, GRANT_ADD,
     INITIALIZE, InitializeParams, InitializeResult, PERMISSION_RESPOND, PROTOCOL_VERSION,
-    PingResult, SESSION_CANCEL, SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_SEND,
-    SESSION_SET_MODEL, SESSION_SUBSCRIBE, SessionSubscribeParams, SessionSubscribeResult,
-    USAGE_SUMMARY,
+    PingResult, SESSION_CANCEL, SESSION_CLOSE, SESSION_CREATE, SESSION_LIST, SESSION_RESUME,
+    SESSION_SEND, SESSION_SET_MODEL, SESSION_SUBSCRIBE, SessionSubscribeParams,
+    SessionSubscribeResult, USAGE_SUMMARY,
 };
 use coda_protocol::types::SessionId;
 use serde::de::DeserializeOwned;
@@ -154,6 +154,7 @@ impl Dispatcher {
             }
             SESSION_SEND => turn::send(self.turns.as_ref(), params).await,
             SESSION_CANCEL => turn::cancel(self.turns.as_ref(), params),
+            SESSION_CLOSE => turn::close(self.turns.as_ref(), params).await,
             SESSION_SET_MODEL => registry::set_model(self.turns.as_ref(), params).await,
             PERMISSION_RESPOND => turn::respond(self.turns.as_ref(), params).await,
             DAEMON_BACKENDS => registry::backends(self.turns.as_ref()),
@@ -175,7 +176,11 @@ impl Dispatcher {
     fn status(&self) -> HandlerResult {
         let state = self.state.as_ref().ok_or_else(not_found)?;
         let active = self.turns.as_ref().map_or(0, |turns| turns.active());
-        to_value(&state.status(active))
+        let any_provider = self
+            .turns
+            .as_ref()
+            .is_some_and(|turns| turns.has_backends());
+        to_value(&state.status(active, any_provider))
     }
 
     fn shutdown(&self) -> HandlerResult {

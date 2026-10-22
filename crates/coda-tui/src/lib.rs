@@ -30,10 +30,12 @@ use tracing::{Dispatch, warn};
 
 use app::{App, LinkEvent};
 use logs::LogBuffer;
-use sessions::{LinkConfig, run_link};
+use sessions::{LinkCommand, LinkConfig, run_link};
 use terminal::{AnsiMode, SystemRawMode, TerminalGuard, install_panic_hook, restore_stdout};
 
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long quitting waits for the link to close the session it created.
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -140,14 +142,14 @@ where
     K: KeySource + Send + 'static,
 {
     let (commands, command_rx) = mpsc::unbounded_channel();
-    let mut app = App::with_link(commands);
+    let mut app = App::with_link(commands.clone());
     if needs_setup {
         app.show_setup_guidance();
     }
     draw(&mut terminal, &app)?;
     let (sender, mut events) = mpsc::unbounded_channel();
     let dispatch = tracing::dispatcher::get_default(Dispatch::clone);
-    let link = tokio::spawn(
+    let mut link = tokio::spawn(
         run_link(
             socket_path.to_path_buf(),
             timing,
@@ -165,7 +167,10 @@ where
         drive(&mut terminal, &mut app, &mut keys, &mut events).map(|()| app)
     })
     .await;
-    // Aborting drops the client, which closes the link.
+    // The link closes the session it created before it ends; a daemon that does
+    // not answer in time is left to evict it, and aborting drops the client.
+    let _ = commands.send(LinkCommand::Close);
+    let _ = tokio::time::timeout(CLOSE_GRACE, &mut link).await;
     link.abort();
     stop.abort();
     driven?

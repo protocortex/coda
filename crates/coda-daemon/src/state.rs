@@ -52,9 +52,10 @@ impl DaemonState {
         }
     }
 
-    /// Snapshot answered to `daemon.status`; the caller knows how many turns run.
+    /// Snapshot answered to `daemon.status`; the caller knows how many turns run
+    /// and whether any backend is enabled.
     #[must_use]
-    pub fn status(&self, active_turns: u32) -> DaemonStatusResult {
+    pub fn status(&self, active_turns: u32, any_provider_enabled: bool) -> DaemonStatusResult {
         DaemonStatusResult {
             pid: std::process::id(),
             protocol_version: PROTOCOL_VERSION,
@@ -63,6 +64,7 @@ impl DaemonState {
             client_count: self.clients.load(Ordering::Relaxed),
             active_turns,
             data_dir: self.data_dir.display().to_string(),
+            any_provider_enabled,
         }
     }
 
@@ -94,7 +96,7 @@ mod tests {
         let state = DaemonState::new(PathBuf::from("/data"));
 
         // Act
-        let status = state.status(0);
+        let status = state.status(0, true);
 
         // Assert
         assert_eq!(status.pid, std::process::id());
@@ -111,10 +113,10 @@ mod tests {
         let second = state.track_client();
 
         // Act
-        let while_open = state.status(0).client_count;
+        let while_open = state.status(0, true).client_count;
         drop(first);
         drop(second);
-        let after_close = state.status(0).client_count;
+        let after_close = state.status(0, true).client_count;
 
         // Assert
         assert_eq!(while_open, 2);

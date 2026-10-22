@@ -1342,3 +1342,231 @@ fn a_pidfile_naming_another_server_is_left_alone() {
     assert!(kept);
     assert!(!path.exists());
 }
+
+fn close_params(session: &SessionId) -> Value {
+    json!({"session_id": session})
+}
+
+#[tokio::test]
+async fn closing_a_session_stops_its_pooled_codex_server_and_keeps_its_events() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    rig.send("hello").await;
+    rig.wait_until_turn_over().await;
+    let pid = rig.codex_pid();
+    let before = rig.events().await;
+    let session = rig.session.clone();
+
+    // Act
+    let closed = rig.call("session.close", close_params(&session)).await;
+
+    // Assert
+    assert_eq!(closed["result"]["closed"], true);
+    assert_gone(pid).await;
+    assert!(!rig.pidfile().exists());
+    assert_eq!(rig.events().await, before);
+}
+
+#[tokio::test]
+async fn closing_is_refused_while_a_turn_runs_and_leaves_the_server_alone() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    rig.send("please stall").await;
+    rig.wait_for_prompts(1).await;
+    let pid = rig.codex_pid();
+    let session = rig.session.clone();
+
+    // Act
+    let refused = rig.call("session.close", close_params(&session)).await;
+    rig.call("session.cancel", json!({"session_id": session}))
+        .await;
+    rig.wait_until_turn_over().await;
+
+    // Assert
+    assert_eq!(refused["error"]["code"], TURN_RUNNING);
+    assert!(rustix::process::test_kill_process(pid).is_ok());
+}
+
+#[tokio::test]
+async fn closing_twice_or_closing_an_unknown_session_succeeds_without_closing_anything() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    rig.send("hello").await;
+    rig.wait_until_turn_over().await;
+    let session = rig.session.clone();
+    rig.call("session.close", close_params(&session)).await;
+
+    // Act
+    let again = rig.call("session.close", close_params(&session)).await;
+    let unknown = rig
+        .call(
+            "session.close",
+            close_params(&SessionId::new("no-such-session")),
+        )
+        .await;
+
+    // Assert
+    assert_eq!(again["result"]["closed"], false);
+    assert_eq!(unknown["result"]["closed"], false);
+}
+
+#[tokio::test]
+async fn a_closed_session_can_take_a_new_turn_on_a_fresh_server() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    rig.send("hello").await;
+    rig.wait_until_turn_over().await;
+    let first = rig.codex_pid();
+    let session = rig.session.clone();
+    rig.call("session.close", close_params(&session)).await;
+    assert_gone(first).await;
+
+    // Act
+    rig.send("again").await;
+    rig.wait_until_turn_over().await;
+
+    // Assert
+    assert_ne!(rig.codex_pid(), first);
+}
+
+fn interrupt_cause(events: &[StoredEvent]) -> Value {
+    let event = events
+        .iter()
+        .find(|e| e.kind == "turn_interrupted")
+        .expect("no turn_interrupted event");
+    let body: Value = serde_json::from_str(&event.body).unwrap();
+    body["cause"].clone()
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_is_interrupted_with_the_cancelled_cause() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.send("hello").await;
+    rig.wait_for_pending().await;
+
+    // Act
+    rig.call("session.cancel", json!({"session_id": rig.session}))
+        .await;
+    rig.wait_for("turn_interrupted").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert_eq!(interrupt_cause(&rig.events().await), "cancelled");
+}
+
+#[tokio::test]
+async fn a_watchdog_abort_is_interrupted_with_the_idle_timeout_cause() {
+    // Arrange
+    let mut rig = Rig::new(timing(150, 20_000), Vec::new());
+
+    // Act
+    rig.send("please stall").await;
+    rig.wait_for("turn_interrupted").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert_eq!(interrupt_cause(&rig.events().await), "idle_timeout");
+}
+
+#[tokio::test]
+async fn daemon_status_reports_whether_any_provider_is_enabled() {
+    // Arrange
+    let mut bare = Rig::new(relaxed(), Vec::new());
+    let mut configured = codex_rig(&json!({}));
+
+    // Act
+    let without = bare.call("daemon.status", json!({})).await;
+    let with = configured.call("daemon.status", json!({})).await;
+
+    // Assert
+    assert_eq!(without["result"]["any_provider_enabled"], false);
+    assert_eq!(with["result"]["any_provider_enabled"], true);
+}
+
+/// Rounds of send-then-send-again, enough that a gap between the result and the
+/// freed session shows up.
+const BACK_TO_BACK_ROUNDS: usize = 8;
+/// A live turn must be refused at once, far below the wait for a winding-down one.
+const REFUSED_AT_ONCE: Duration = Duration::from_secs(1);
+
+impl Rig {
+    /// Polls without pausing, so the next request lands as soon as the result is stored.
+    async fn wait_for_result_count(&self, count: usize) {
+        tokio::time::timeout(WAIT, async {
+            while self
+                .events()
+                .await
+                .iter()
+                .filter(|e| e.kind == "result")
+                .count()
+                < count
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the result was not stored in time");
+    }
+}
+
+#[tokio::test]
+async fn a_send_right_after_the_result_is_accepted() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+
+    for round in 1..=BACK_TO_BACK_ROUNDS {
+        // Act
+        let sent = rig.send("again").await;
+        rig.wait_for_result_count(round).await;
+
+        // Assert
+        assert!(
+            sent["result"]["turn_id"].is_string(),
+            "round {round}: {sent}"
+        );
+    }
+    rig.wait_until_turn_over().await;
+}
+
+#[tokio::test]
+async fn a_close_right_after_the_result_is_accepted() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    let session = rig.session.clone();
+
+    for round in 1..=BACK_TO_BACK_ROUNDS {
+        rig.send("again").await;
+        rig.wait_for_result_count(round).await;
+
+        // Act
+        let closed = rig.call("session.close", close_params(&session)).await;
+
+        // Assert
+        assert!(closed["error"].is_null(), "round {round}: {closed}");
+        rig.wait_until_turn_over().await;
+    }
+}
+
+#[tokio::test]
+async fn a_live_turn_is_refused_at_once_by_send_and_close() {
+    // Arrange
+    let mut rig = codex_rig(&json!({}));
+    rig.send("please stall").await;
+    rig.wait_for_prompts(1).await;
+    let session = rig.session.clone();
+    let started = std::time::Instant::now();
+
+    // Act
+    let busy = rig.send("meanwhile").await;
+    let closed = rig.call("session.close", close_params(&session)).await;
+    let waited = started.elapsed();
+    rig.call("session.cancel", json!({"session_id": session}))
+        .await;
+    rig.wait_until_turn_over().await;
+
+    // Assert
+    assert_eq!(busy["error"]["code"], TURN_RUNNING);
+    assert_eq!(closed["error"]["code"], TURN_RUNNING);
+    assert!(waited < REFUSED_AT_ONCE, "{waited:?}");
+}

@@ -325,6 +325,20 @@ impl ModelSessions {
         }
     }
 
+    /// Drops the idle conversation of `session`; `false` when it held none.
+    /// Its stored events stay, so a later send rebuilds the loop from them.
+    pub(crate) fn close(&self, session: &SessionId) -> bool {
+        lock(&self.carried_limits).remove(session);
+        self.take_loop(session).is_some()
+    }
+
+    /// Whether the send of `session` has emitted its terminal event and only cleans up.
+    pub(crate) fn is_winding_down(&self, session: &SessionId) -> bool {
+        self.running()
+            .get(session)
+            .is_some_and(Reservation::is_winding_down)
+    }
+
     /// Whether `session` has a send starting or running.
     #[must_use]
     pub fn is_running(&self, session: &SessionId) -> bool {
@@ -585,6 +599,9 @@ impl ModelSessions {
                 );
             }
             Err(e) => warn!(session = %session, turn = %turn, error = %e, "the turn failed"),
+        }
+        if let Some(reservation) = self.running().get_mut(&session) {
+            reservation.wind_down();
         }
         close_turn(&self.hub, &session, &turn, failed).await;
         let model_loop = ModelLoop {

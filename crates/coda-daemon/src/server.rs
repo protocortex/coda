@@ -1173,7 +1173,7 @@ mod tests {
         client_side.read_exact(&mut reply).await.unwrap();
 
         // Act
-        let while_open = state.status(0).client_count;
+        let while_open = state.status(0, true).client_count;
         drop(client_side);
         tokio::time::timeout(RECV_TIMEOUT, task)
             .await
@@ -1182,6 +1182,6 @@ mod tests {
 
         // Assert
         assert_eq!(while_open, 1);
-        assert_eq!(state.status(0).client_count, 0);
+        assert_eq!(state.status(0, true).client_count, 0);
     }
 }

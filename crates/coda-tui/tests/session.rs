@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use coda_config::timing::Timing;
 use coda_daemon::server::{Server, ServerConfig};
+use coda_daemon::state::DaemonState;
 use coda_tui::app::{ConnectionState, SETUP_GUIDANCE};
 use coda_tui::logs::LogBuffer;
 use coda_tui::{KeySource, UserInput, drive, run_session};
@@ -311,4 +312,50 @@ async fn the_setup_guidance_is_on_screen_when_setup_is_needed() {
         .map(ratatui::buffer::Cell::symbol)
         .collect();
     assert!(text.contains(SETUP_GUIDANCE), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_setup_guidance_is_on_screen_when_the_daemon_reports_no_provider() {
+    // Arrange
+    let dir = short_dir();
+    let uid = std::fs::metadata(dir.path()).unwrap().uid();
+    let config = ServerConfig::new(dir.path().join("s.sock"), uid);
+    let socket = config.socket_path.clone();
+    // A state without turns reports no enabled provider.
+    let bound = Server::bind(config)
+        .unwrap()
+        .with_state(DaemonState::new(dir.path().to_path_buf()));
+    let (shutdown, rx) = oneshot::channel();
+    let server = tokio::spawn(bound.serve(async {
+        let _ = rx.await;
+    }));
+
+    // Act
+    let app = within(run_session(
+        terminal(),
+        &socket,
+        Timing {
+            idle_timeout: REQUEST_TIMEOUT,
+            ..Timing::for_tests()
+        },
+        false,
+        QuitAfter::new(Duration::from_millis(500)),
+        never(),
+    ))
+    .await
+    .unwrap();
+
+    // Assert
+    let mut screen = Terminal::new(TestBackend::new(SCREEN_WIDTH, SCREEN_HEIGHT)).unwrap();
+    screen.draw(|frame| app.render(frame)).unwrap();
+    let text: String = screen
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert!(text.contains(SETUP_GUIDANCE), "{text}");
+    let _ = shutdown.send(());
+    let _ = server.await;
 }

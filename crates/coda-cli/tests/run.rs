@@ -475,3 +475,107 @@ async fn an_interrupted_delegated_run_exits_four() {
     assert!(interrupted.success());
     assert_eq!(status.code(), Some(4), "{status:?}");
 }
+
+#[tokio::test]
+async fn a_delegated_run_cancelled_by_another_client_exits_four() {
+    // Arrange
+    let rig = claude_rig("");
+    let stdout = std::fs::File::create(rig.home.path().join("run.out")).unwrap();
+    let stderr = std::fs::File::create(rig.home.path().join("run.err")).unwrap();
+    let mut child = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_coda"))
+            .args(["run", "--prompt", "please stall", "--cwd"])
+            .arg(rig.work.path())
+            .env("CODA_HOME", rig.home.path())
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .unwrap(),
+    );
+    let client = connect(rig.home.path()).await;
+
+    // Act
+    // A turn whose backend is still starting answers a cancel with `cancelled: false`.
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(id) = running_session(&client).await
+                && cancel(&client, id).await.cancelled
+            {
+                return;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("the run was never cancelled");
+    let status = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                return status;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("coda run did not exit after the cancel");
+
+    // Assert
+    assert_eq!(status.code(), Some(4), "{status:?}");
+}
+
+/// A home whose config enables the Codex app-server backend, played by `fake-codex`.
+fn codex_rig() -> Rig {
+    let home = short_dir();
+    let work = short_dir();
+    let fake = coda_testkit::paths::fake_codex_path().unwrap();
+    let config = format!(
+        "[providers.codex]\nenabled = true\nbinary = {:?}\nverified_versions = [\"0.0.0-fake\"]\n",
+        fake.display().to_string()
+    );
+    std::fs::write(home.path().join("config.toml"), config).unwrap();
+    let control = json!({"report_path": work.path().join("report.json")});
+    std::fs::write(
+        work.path().join("fake-codex-control.json"),
+        control.to_string(),
+    )
+    .unwrap();
+    let ctx = context(home.path());
+    Rig {
+        _stop: StopDaemon::new(home.path()),
+        home,
+        work,
+        ctx,
+    }
+}
+
+#[tokio::test]
+async fn a_finished_run_closes_its_session_so_the_codex_server_does_not_linger() {
+    // Arrange
+    let rig = codex_rig();
+
+    // Act
+    let outcome = run_prompt(&rig, "hello").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let report = std::fs::read_to_string(rig.work.path().join("report.json")).unwrap();
+    let pid = serde_json::from_str::<Value>(&report).unwrap()["pid"]
+        .as_i64()
+        .unwrap();
+    let alive = || {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    tokio::time::timeout(WAIT, async {
+        while alive() {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("the codex server is still alive after the run");
+}

@@ -9,6 +9,9 @@ All notable changes to Coda are recorded here. The format follows
 ### Added
 
 - A release workflow that builds, checksums and attests the `coda` archives for Linux and macOS, and an `install.sh` that verifies the checksum before installing.
+- A `session.close` request that stops a session's idle Codex server or model conversation and keeps its stored events. `coda run` calls it when the turn ends, and the terminal UI calls it for a session it created when the user quits or switches away.
+- A `cause` on `turn_interrupted` events (`cancelled`, `idle_timeout`, `backend_lost`, `daemon_restarted`, `daemon_stopping`). `coda run` exits 4 for a turn cancelled from another client and 5 for the other causes, naming the cause.
+- `daemon.status` reports `any_provider_enabled`, so the terminal UI shows the setup guidance when a daemon that started before `coda init` has no provider.
 
 ## [0.1.0] - Unreleased
 

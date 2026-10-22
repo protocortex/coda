@@ -1,1 +1,1 @@
-{"type":"turn_interrupted","session_id":"s-1","turn_id":"t-1"}
+{"type":"turn_interrupted","session_id":"s-1","turn_id":"t-1","cause":"idle_timeout"}

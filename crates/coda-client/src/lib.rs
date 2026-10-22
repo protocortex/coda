@@ -16,8 +16,9 @@ use coda_config::timing::Timing;
 use coda_protocol::codec::{CodecError, encode_message};
 use coda_protocol::jsonrpc::{Id, Message, Outcome, Request, Version};
 use coda_protocol::methods::{
-    INITIALIZE, InitializeParams, InitializeResult, PROTOCOL_VERSION, SESSION_SUBSCRIBE,
-    SessionSubscribeParams, SessionSubscribeResult,
+    INITIALIZE, InitializeParams, InitializeResult, PROTOCOL_VERSION, SESSION_CLOSE,
+    SESSION_SUBSCRIBE, SessionCloseParams, SessionCloseResult, SessionSubscribeParams,
+    SessionSubscribeResult,
 };
 use coda_protocol::types::SessionId;
 use serde::Serialize;
@@ -180,6 +181,21 @@ impl Client {
             .await
             .map_err(|_| ClientError::Disconnected)?;
         response.await.map_err(|_| ClientError::Disconnected)
+    }
+
+    /// Asks the daemon to release what it holds for `session`, keeping its events.
+    /// Returns whether anything was released; an unknown or already closed session
+    /// is not an error.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Rpc`] if a turn of the session is running, or the
+    /// errors of [`Self::request`].
+    pub async fn close_session(&self, session: &SessionId) -> Result<bool, ClientError> {
+        let params = SessionCloseParams {
+            session_id: session.clone(),
+        };
+        let result: SessionCloseResult = self.request(SESSION_CLOSE, &params).await?;
+        Ok(result.closed)
     }
 
     /// Follows `session`, replaying the events after `since_seq` first.

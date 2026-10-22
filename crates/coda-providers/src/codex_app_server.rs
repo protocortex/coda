@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, InterruptCause};
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -843,6 +843,7 @@ impl CodexAppServerSession {
         Event::TurnInterrupted {
             session_id: self.session_id.clone(),
             turn_id: turn_id.clone(),
+            cause: Some(InterruptCause::Cancelled),
         }
     }
 

@@ -14,7 +14,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, InterruptCause};
 use coda_protocol::types::{SessionId, TokenUsage, TurnId};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -379,7 +379,9 @@ impl CodexExecSession {
             return Err(CodexError::Closed);
         }
         if *self.cancel.borrow() {
-            return self.interrupted(turn_id, emit).await;
+            return self
+                .interrupted(turn_id, InterruptCause::Cancelled, emit)
+                .await;
         }
         self.parser = CodexParser::new();
         let spawned = self.spawn()?;
@@ -423,14 +425,16 @@ impl CodexExecSession {
         (stdin, mut stdout): (ChildStdin, R),
     ) -> Result<TurnOutcome, CodexError> {
         if !self.send_prompt(stdin, text).await? {
-            return self.interrupted(turn_id, emit).await;
+            return self
+                .interrupted(turn_id, InterruptCause::BackendLost, emit)
+                .await;
         }
         let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
         loop {
             let read = tokio::select! {
                 read = stdout.read(&mut buffer) => read?,
                 () = cancelled(self.cancel.subscribe()) => {
-                    return self.interrupted(turn_id, emit).await;
+                    return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await;
                 }
             };
             if read == 0 {
@@ -554,11 +558,13 @@ impl CodexExecSession {
     async fn interrupted(
         &mut self,
         turn_id: &TurnId,
+        cause: InterruptCause,
         emit: &mut impl FnMut(Event),
     ) -> Result<TurnOutcome, CodexError> {
         emit(Event::TurnInterrupted {
             session_id: self.spec.session_id.clone(),
             turn_id: turn_id.clone(),
+            cause: Some(cause),
         });
         self.reap(Duration::ZERO).await?;
         Ok(TurnOutcome::Cancelled)
