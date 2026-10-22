@@ -120,6 +120,15 @@ pub struct Pending {
     pub reason: PendingReason,
 }
 
+impl Pending {
+    /// The name the file would define: its file name without `.md`. The file
+    /// is not parsed, so the name is unchecked text from an untrusted project.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.path.file_stem().and_then(|stem| stem.to_str())
+    }
+}
+
 /// A file that was skipped, or part of one that was ignored, and why.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{}: {field}: {message}", path.display())]

@@ -108,6 +108,24 @@ fn a_project_agent_may_narrow_the_tools_of_a_user_agent() {
 }
 
 #[test]
+fn a_pending_file_is_named_by_its_file_name_without_parsing_it() {
+    // Arrange
+    let f = fixture();
+    write(
+        f.repo.path(),
+        ".coda/commands/deploy.md",
+        "not even a definition",
+    );
+
+    // Act
+    let catalog = f.untrusted();
+
+    // Assert
+    let names: Vec<_> = catalog.pending().iter().map(|p| p.name()).collect();
+    assert_eq!(names, [Some("deploy")]);
+}
+
+#[test]
 fn a_project_only_agent_is_usable_once_trusted() {
     // Arrange
     let f = fixture();

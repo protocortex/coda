@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Paragraph};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chat::Chat;
-use crate::commands::{self, Command};
+use crate::commands::{self, Command, CommandError, Resolved, UserCommands};
 use crate::input::Input;
 use crate::permission::{Overlay, PermissionPrompt};
 use crate::sessions::LinkCommand;
@@ -76,6 +76,7 @@ pub struct App {
     link: Option<UnboundedSender<LinkCommand>>,
     turn_running: bool,
     setup_shown: bool,
+    user_commands: UserCommands,
     quit: bool,
 }
 
@@ -91,6 +92,7 @@ impl App {
             link: None,
             turn_running: false,
             setup_shown: false,
+            user_commands: UserCommands::default(),
             quit: false,
         }
     }
@@ -102,6 +104,15 @@ impl App {
             link: Some(link),
             ..Self::new()
         }
+    }
+
+    /// Offers the commands from command files; a failure to read them and a
+    /// name a built-in already has are reported in the transcript.
+    pub fn set_user_commands(&mut self, commands: UserCommands) {
+        for notice in commands.startup_notices() {
+            self.chat.push_notice(notice);
+        }
+        self.user_commands = commands;
     }
 
     /// Shows the setup guidance, once however many sources ask for it.
@@ -243,15 +254,42 @@ impl App {
 
     fn submit(&mut self, line: &str) {
         match commands::parse(line) {
-            Ok(None) => {
-                self.turn_running = true;
-                if !self.send(LinkCommand::Send(line.to_string())) {
-                    // Keep the typed line so it can be sent again.
-                    self.input.handle_paste(line);
-                }
-            }
+            Ok(None) => match self.user_commands.mistyped(line) {
+                Some(word) => self
+                    .chat
+                    .push_notice(CommandError::Unknown(word).to_string()),
+                None => self.send_message(line, line),
+            },
             Ok(Some(command)) => self.run_command(command),
+            // A built-in always wins, so only a word it does not know can be a command file.
+            Err(CommandError::Unknown(word)) => self.run_user_command(&word, line),
             Err(error) => self.chat.push_notice(error.to_string()),
+        }
+    }
+
+    /// Sends `text` as the user's message. `typed` is what to restore to the
+    /// input when the link is closed, so it can be sent again.
+    fn send_message(&mut self, text: &str, typed: &str) {
+        self.turn_running = true;
+        if !self.send(LinkCommand::Send(text.to_owned())) {
+            self.input.handle_paste(typed);
+        }
+    }
+
+    fn run_user_command(&mut self, word: &str, line: &str) {
+        let args = line.trim_start().strip_prefix(word).unwrap_or_default();
+        match self.user_commands.resolve(word, args) {
+            Resolved::Prompt(prompt) => self.send_message(&prompt, line),
+            Resolved::Refused(reason) => self.chat.push_notice(reason),
+            Resolved::Unknown => self
+                .chat
+                .push_notice(CommandError::Unknown(word.to_owned()).to_string()),
+        }
+    }
+
+    fn show_help(&mut self) {
+        for line in self.user_commands.help_lines() {
+            self.chat.push_notice(line);
         }
     }
 
@@ -267,6 +305,10 @@ impl App {
                 return;
             }
             Command::Backend(Some(name)) => LinkCommand::SwitchBackend(name),
+            Command::Help => {
+                self.show_help();
+                return;
+            }
             Command::Quit => {
                 self.quit = true;
                 return;

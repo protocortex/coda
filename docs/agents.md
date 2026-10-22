@@ -43,6 +43,30 @@ Frontmatter: `name`, `description`. The body is the instructions.
 
 Frontmatter: `name`, `description`, and an optional `argument_hint` such as `<issue>`. The body is the prompt template.
 
+```
++++
+name = "review"
+description = "Reviews a change."
+argument_hint = "<change>"
++++
+Review $ARGUMENTS and report problems only.
+```
+
+A command file is a slash command in the TUI and a flag of `coda run`.
+
+- **TUI.** Type `/review the parser change`. Everything after the command word is the arguments. The expanded prompt is sent as your message. `/help` lists the built-in commands, then every command file with its hint, description and source (`user` or `project`). The command files are read when the TUI starts, so restart it after you add or edit one.
+- **`coda run`.** `coda run --command review --args "the parser change"` runs the same prompt headless. `--command` cannot be combined with `--prompt`, and `--args` needs `--command`. A prompt that merely starts with `/` is never read as a command, so a pasted path cannot run one by mistake.
+
+Expansion is plain text. Every `$ARGUMENTS` in the body is replaced by the arguments, trimmed, in one pass: text in the arguments that looks like `$ARGUMENTS`, `${VAR}` or `$(cmd)` is sent as typed and is never expanded again. No shell runs and no file is included. The blank space around the finished prompt is dropped. If the body has no `$ARGUMENTS` and arguments are given, nothing is sent and the command says it takes no arguments.
+
+Which commands run:
+
+- Only your own command files and the command files of a project you trusted (`coda agents trust`) run. A project command that waits for trust is listed in `/help` as pending, with the reason, and `/name` or `--command name` refuses to run it.
+- A built-in TUI command (`/sessions`, `/new`, `/resume`, `/model`, `/backend`, `/help`, `/quit`) always wins a name clash. The command file is ignored, and the TUI says so in the transcript and in `/help`. A project command file that waits for trust is reported the same way when its name is a built-in, because trusting it would not make it run.
+- `coda run --command` has no TUI built-ins, so a file named like one (`new.md`) runs there and not in the TUI.
+- A name must match exactly: `/Deploy`, `/deploy/` and `--command ../deploy` are not `deploy`, and none reaches the model. A first word that is a command name followed only by slashes (`/deploy/`, `/deploy//`) is refused as a mistyped command, the same as `/quit/`. A first word with more after the slash, such as `/deploy/staging` or `/build/out.log`, is a path and the line is sent as a message.
+- If the command files cannot be read when the TUI starts (for example the store is unreadable), the TUI still opens with its built-ins and shows a warning.
+
 ## Hooks
 
 Hooks load only from the user's `config.toml`. A hook key (`hook`, `hooks`, `pre_tool`, `post_tool`, `pre_tool_use`, `post_tool_use`, `session_start`) in any definition file is an error, and that file is not loaded.

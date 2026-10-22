@@ -9,6 +9,7 @@ mod catalog;
 mod definition;
 mod digest;
 mod dispatch;
+mod expand;
 mod frontmatter;
 mod result;
 
@@ -21,6 +22,7 @@ pub use definition::{
     AgentDef, CommandDef, Effort, Issue, SkillDef, parse_agent, parse_command, parse_skill,
 };
 pub use dispatch::{DispatchError, child_tools};
+pub use expand::{ARGUMENTS_PLACEHOLDER, ExpandError};
 pub use result::{
     Finding, MAX_REPORT_BYTES, MalformedReport, Report, Severity, Status, TaskResult, parse_report,
 };
