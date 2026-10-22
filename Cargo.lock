@@ -273,6 +273,7 @@ dependencies = [
  "coda-store",
  "coda-tools",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror",

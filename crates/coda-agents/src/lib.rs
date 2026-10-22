@@ -9,6 +9,7 @@ mod definition;
 mod digest;
 mod dispatch;
 mod frontmatter;
+mod result;
 
 pub use catalog::{
     Catalog, Entry, Kind, LoadProblem, PROJECT_DIR, Pending, PendingReason, Source, revoke_project,
@@ -19,3 +20,6 @@ pub use definition::{
     AgentDef, CommandDef, Effort, Issue, SkillDef, parse_agent, parse_command, parse_skill,
 };
 pub use dispatch::{DispatchError, child_tools};
+pub use result::{
+    Finding, MAX_REPORT_BYTES, MalformedReport, Report, Severity, Status, TaskResult, parse_report,
+};

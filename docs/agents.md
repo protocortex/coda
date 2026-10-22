@@ -67,7 +67,7 @@ The decision is stored per repository root in the Coda database, with a digest o
 
 ## Dispatch: the `task` tool
 
-A model-API session (the Anthropic and OpenAI-compatible providers) offers the model a `task` tool with two arguments, `agent` (a name) and `prompt`. The call runs that agent as a child conversation and gives the model the child's final answer as the tool result. The tool lists the agents it can run in its description, which is built when the conversation starts. Claude Code and Codex sessions do not get `task`: those backends run their own agent loops, and Coda does not start sub-agents for them.
+A model-API session (the Anthropic and OpenAI-compatible providers) offers the model a `task` tool with two arguments, `agent` (a name) and `prompt`. The call runs that agent as a child conversation and gives the model the child's result as the tool result (see [The result](#the-result)). The tool lists the agents it can run in its description, which is built when the conversation starts. Claude Code and Codex sessions do not get `task`: those backends run their own agent loops, and Coda does not start sub-agents for them.
 
 | Rule | Detail |
 | --- | --- |
@@ -78,3 +78,16 @@ A model-API session (the Anthropic and OpenAI-compatible providers) offers the m
 | Permissions | Every call the child makes goes through the parent session's broker, so the parent's policy, mode and stored grants apply and the child never has a grant the parent lacks. A prompt reaches the parent's client with the agent's name in front of the command, or in front of the tool and path for a tool with no command, for example `[reviewer] cargo test` or `[reviewer] edit src/a.rs`. The session's own prompts name the path the same way. An "always allow" answered for a child covers that run only. It is kept with the run and checked where the broker checks stored grants, under the same rules: an edit to a path that changes what runs (for example `scripts/`, `.github/workflows/`, `.git/hooks/`, `Cargo.toml` or `build.rs`) still prompts in accept-edits mode every time, and every answered call is recorded. It is never stored, so the parent's grants do not grow. Where nobody can answer, as in `coda run`, the prompt is denied for the child as it is for the parent. Starting a child asks no permission. |
 | Cancel and budget | Cancelling the parent cancels the child. The child may spend only the tokens the parent has left, and what it spends counts against the parent's budget and shows in the usage events. |
 | Storage | The child's events are stored in the parent session, each as a `child_event` that names the agent. They are sent up the parent's own event channel, so a client sees them after the parent's reply that holds the `task` call and before that call's result. Replay skips them, so a rebuilt parent conversation holds the `task` call and its result and nothing the child did. |
+
+### The result
+
+The tool result begins with `status:`, which is `completed`, `failed` (the run hit a limit, was refused or errored) or `cancelled`, as Coda saw the run end. The agent's own report follows between `<<<DATA #n>>>` and `<<<END DATA #n>>>` markers, with a line before it telling the parent model to treat it as data. Coda picks `n` so that neither marker occurs in the report, so words in the report that imitate a marker can neither end the data early nor start a second block. The status line comes from Coda, so a report that says `status: completed` cannot change it. The report is cut at 16 KiB (`MAX_REPORT_BYTES`) on a character boundary, and a `[truncated: ...]` line after the closing marker says how much was cut.
+
+An agent's last message is its report. Plain text is the summary. So is JSON of any other shape, such as `{"name": "x"}`, and text that merely starts with `{`. A message is a report only when it is a JSON object, bare or as the whole body of one code fence, with a `summary` or a `findings` key. A review agent uses this to classify what it found:
+
+```json
+{"summary": "One problem.",
+ "findings": [{"severity": "blocking", "message": "lock held across await", "location": "src/a.rs:10"}]}
+```
+
+`summary` is required. `findings` is optional, and each finding needs a `severity` (`blocking`, `non_blocking` or `suggestion`) and a `message`. A report with a missing field, a wrong type or an unknown severity is rejected, and so is text that starts with `{` and names `"summary"` or `"findings"` but is not valid JSON: the parent gets an error that names the reason, also between markers because it can quote the agent, and none of the report.

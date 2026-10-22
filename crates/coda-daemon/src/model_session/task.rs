@@ -21,7 +21,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use coda_agents::{Catalog, DispatchError, Tier, child_tools};
+use coda_agents::{
+    Catalog, DispatchError, Report, Status, TaskResult, Tier, child_tools, parse_report,
+};
 use coda_config::config::Config;
 use coda_core::broker::RunGrants;
 use coda_core::history::{
@@ -31,7 +33,9 @@ use coda_core::history::{
 use coda_core::prompt::{Conversation, Message, Prefix, PromptError};
 use coda_core::task::{TaskFuture, TaskOutcome, TaskRequest, TaskRunner};
 use coda_core::tools::{BaseToolsConfig, StoreOriginals, ToolsError, base_tools};
-use coda_core::turn::{CancelToken, StopCondition, ToolSet, TurnConfig, TurnEvent, TurnLoop};
+use coda_core::turn::{
+    CancelToken, StopCondition, ToolSet, TurnConfig, TurnError, TurnEvent, TurnLoop,
+};
 use coda_protocol::paths::repo_identity;
 use coda_protocol::types::{BackendKind, PermissionDecision, SessionId, TurnId};
 use coda_providers::faux::FauxProvider;
@@ -122,6 +126,22 @@ pub(super) fn child_target(
     match config.model_alias_for(tier) {
         Some(alias) => registry.alias(alias, backend),
         None => registry.select(backend, stored_model),
+    }
+}
+
+/// How a child's run ended, as the parent is told.
+pub(super) fn status_of(ended: &Result<StopCondition, TurnError>) -> Status {
+    match ended {
+        Ok(StopCondition::EndTurn) => Status::Completed,
+        Ok(StopCondition::Cancelled) => Status::Cancelled,
+        _ => Status::Failed,
+    }
+}
+
+fn summary_only(summary: String) -> Report {
+    Report {
+        summary,
+        findings: Vec::new(),
     }
 }
 
@@ -312,16 +332,22 @@ impl ChildRunner {
             Some(Message::Assistant { text, .. }) => text.clone(),
             _ => String::new(),
         };
-        let (text, is_error) = match ended {
-            Ok(StopCondition::EndTurn) => (answer, false),
-            Ok(other) => (
-                format!(
-                    "[the {agent} agent stopped early: {}]\n{answer}",
-                    other.as_str()
-                ),
-                true,
+        let status = status_of(&ended);
+        // A run that did not complete leaves no report to check, only what it said last.
+        let report = match (&ended, status) {
+            (_, Status::Completed) => parse_report(&answer),
+            (Ok(stop), _) => Ok(summary_only(format!(
+                "stopped early ({}): {answer}",
+                stop.as_str()
+            ))),
+            (Err(error), _) => Ok(summary_only(format!("failed: {error}"))),
+        };
+        let (text, is_error) = match report {
+            Ok(report) => (
+                TaskResult { status, report }.render(agent),
+                status != Status::Completed,
             ),
-            Err(error) => (format!("the {agent} agent failed: {error}"), true),
+            Err(error) => (error.render(agent), true),
         };
         TaskOutcome {
             text,
