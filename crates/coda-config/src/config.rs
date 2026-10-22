@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::hooks::{HookConfig, MAX_TIMEOUT_MS};
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
 
@@ -26,6 +27,7 @@ const SOCKET_FILE_NAME: &str = "coda.sock";
 const PROVIDERS_KEY: &str = "providers";
 const MODELS_KEY: &str = "models";
 const ROUTING_KEY: &str = "routing";
+const HOOKS_KEY: &str = "hooks";
 const SECRET_KEY_SUFFIXES: [&str; 7] = [
     "api_key",
     "apikey",
@@ -188,6 +190,8 @@ pub struct Config {
     pub timing: Timing,
     /// Model alias per agent tier.
     pub routing: Routing,
+    /// Hooks run at session start and around tool calls; only this file can add them.
+    pub hooks: Vec<HookConfig>,
 }
 
 impl Default for Config {
@@ -201,6 +205,7 @@ impl Default for Config {
             telemetry: TelemetryConfig::default(),
             timing: Timing::default(),
             routing: Routing::default(),
+            hooks: Vec::new(),
         }
     }
 }
@@ -235,6 +240,7 @@ impl Config {
         config.check_context_windows()?;
         config.check_timing()?;
         config.check_routing()?;
+        config.check_hooks()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -254,6 +260,27 @@ impl Config {
                 return Err(ConfigError::InvalidValue {
                     path: format!("{ROUTING_KEY}.{tier}"),
                     allowed: format!("the name of a [{MODELS_KEY}] alias, not `{alias}`"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_hooks(&self) -> Result<(), ConfigError> {
+        for (index, hook) in self.hooks.iter().enumerate() {
+            if hook.command.first().is_none_or(String::is_empty) {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{HOOKS_KEY}[{index}].command"),
+                    allowed: "a list with the program first, then its arguments".to_owned(),
+                });
+            }
+            if hook
+                .timeout_ms
+                .is_some_and(|ms| ms == 0 || ms > MAX_TIMEOUT_MS)
+            {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{HOOKS_KEY}[{index}].timeout_ms"),
+                    allowed: format!("a whole number of milliseconds from 1 to {MAX_TIMEOUT_MS}"),
                 });
             }
         }
