@@ -248,7 +248,7 @@ impl Config {
     }
 
     /// The `[models]` alias an agent tier runs on, or `None` when the tier has
-    /// no entry and the default model applies.
+    /// no entry and the model of the session that starts the agent applies.
     #[must_use]
     pub fn model_alias_for(&self, tier: Tier) -> Option<&str> {
         self.routing.0.get(&tier).map(String::as_str)

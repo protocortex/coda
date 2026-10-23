@@ -16,8 +16,8 @@ mod result;
 mod skills;
 
 pub use catalog::{
-    Catalog, Entry, Kind, LoadProblem, PROJECT_DIR, Pending, PendingReason, Source, revoke_project,
-    trust_project,
+    Catalog, Entry, Kind, LoadProblem, PROJECT_DIR, Pending, PendingReason, Source, StoredTrust,
+    revoke_project, trust_project,
 };
 pub use coda_config::routing::Tier;
 pub use commands::CommandLookupError;
@@ -30,6 +30,4 @@ pub use result::{
     Finding, MAX_FINDING_MESSAGE_BYTES, MAX_REPORT_BYTES, MalformedReport, NO_REPLY_SUMMARY,
     Report, Severity, Status, TaskResult, parse_report,
 };
-pub use skills::{
-    MAX_INDEX_BYTES, MAX_INDEX_DESCRIPTION_CHARS, MAX_SKILL_BODY_BYTES, SKILL_TOOL_NAME, SkillTool,
-};
+pub use skills::{MAX_INDEX_BYTES, MAX_INDEX_DESCRIPTION_CHARS, MAX_SKILL_BODY_BYTES, SkillTool};

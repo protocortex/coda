@@ -283,7 +283,7 @@ fn backend(ctx: &Context, io: &mut Io<'_>) -> Result<BackendKind, CliError> {
     Ok(backend)
 }
 
-fn pick_backend(config: &Config) -> BackendKind {
+pub(crate) fn pick_backend(config: &Config) -> BackendKind {
     let enabled = |key| config.providers.get(key).is_some_and(|p| p.enabled);
     if enabled(FAUX_KEY) {
         BackendKind::Faux

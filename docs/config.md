@@ -92,7 +92,7 @@ Maps an agent tier to a `[models.<alias>]` name. Agent files name a tier, never 
 | `standard` | string | unset | Alias for everyday implementation and review. |
 | `deep` | string | unset | Alias for hard reasoning. |
 
-A tier with no entry uses the default model. An entry must name an alias defined under `[models]`, and a key other than the three tiers is an error. Both are checked when the file loads. The `task` tool runs an agent on the model its tier maps to; the alias must use the same provider as the session that starts it. See [agents.md](agents.md).
+A tier with no entry uses the model of the session that starts the agent, which is the model you switched to with `/model`, if you did. An entry must name an alias defined under `[models]`, and a key other than the three tiers is an error. Both are checked when the file loads. The `task` tool runs an agent on the model its tier maps to; the alias must use the same provider as the session that starts it, and `coda doctor` warns when an alias uses another provider than the default session provider (the one `coda run` starts on). See [agents.md](agents.md).
 
 ## `[telemetry]`
 

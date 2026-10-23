@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use coda_agents::{SKILL_TOOL_NAME, SkillTool};
+use coda_agents::SkillTool;
 use coda_config::config::{Config, Dirs, ProviderConfig};
 use coda_core::broker::BrokerError;
 use coda_core::history::{
@@ -36,8 +36,8 @@ use coda_providers::registry::{
     ANTHROPIC_KEY, ModelClient, ModelRegistry, OPENAI_COMPAT_KEY, RegistryError,
 };
 use coda_store::{EventRecord, SessionRecord, StoreError};
-use coda_tools::Tool;
 use coda_tools::bash::{DEFAULT_ENV_ALLOWLIST, allowlisted_env};
+use coda_tools::{Tool, skill};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::{Instrument, info, warn};
@@ -759,7 +759,7 @@ async fn close_turn(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, failed: 
 /// skills listed in it can be named.
 fn skill_schema(skills: &SkillTool) -> ToolSchema {
     ToolSchema {
-        name: SKILL_TOOL_NAME.to_owned(),
+        name: skill::NAME.to_owned(),
         description: skills.description().to_owned(),
         input_schema: json!({
             "type": "object",

@@ -6,9 +6,11 @@
 //! user's, and the project's once the repository is trusted. A project file
 //! that is still pending and defines no agent otherwise is named in the refusal
 //! so the model can tell the user why; [`Catalog::pending_override`] tells a
-//! caller when such a file shadows an agent that does run.
+//! caller when such a file shadows an agent that does run. A file that was
+//! skipped refuses the call too, so a typo in an override never runs the
+//! agent below it without a word.
 
-use crate::catalog::{Catalog, Entry, PendingReason};
+use crate::catalog::{Catalog, Entry, LoadProblem, PendingReason};
 use crate::definition::AgentDef;
 
 /// Why a `task` call cannot run its agent.
@@ -27,15 +29,40 @@ pub enum DispatchError {
         .reason.as_str()
     )]
     NotTrusted { name: String, reason: PendingReason },
+    /// A file that would define the agent was skipped, and the agent of the
+    /// same name below it is not run in its place.
+    #[error(
+        "the agent `{name}` was not run: a definition file for it was skipped, so the agent \
+         of that name below it is not run in its place ({}); run `coda agents lint` to see why",
+        join_problems(.problems)
+    )]
+    Skipped {
+        name: String,
+        problems: Vec<LoadProblem>,
+    },
+}
+
+fn join_problems(problems: &[LoadProblem]) -> String {
+    let lines: Vec<String> = problems.iter().map(ToString::to_string).collect();
+    lines.join("; ")
 }
 
 impl Catalog {
     /// The agent called `name`, if it may run.
     ///
     /// # Errors
-    /// Returns [`DispatchError::NotTrusted`] when only an untrusted project
-    /// file defines it, and [`DispatchError::Unknown`] otherwise.
+    /// Returns [`DispatchError::Skipped`] when a file that would define it was
+    /// skipped, even if a built-in or other agent of that name exists,
+    /// [`DispatchError::NotTrusted`] when only an untrusted project file
+    /// defines it, and [`DispatchError::Unknown`] otherwise.
     pub fn dispatchable(&self, name: &str) -> Result<&Entry<AgentDef>, DispatchError> {
+        let skipped = self.skipped_agent_files(name);
+        if !skipped.is_empty() {
+            return Err(DispatchError::Skipped {
+                name: name.to_owned(),
+                problems: skipped,
+            });
+        }
         if let Some(entry) = self.agent(name) {
             return Ok(entry);
         }

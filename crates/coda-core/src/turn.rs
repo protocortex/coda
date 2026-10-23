@@ -19,7 +19,7 @@ use coda_providers::model::{
 use coda_providers::tool_request::{Tool as RequestTool, ToolRequest};
 use coda_store::Store;
 use coda_telemetry::attrs::{CODA_SESSION_ID, CODA_TOOL_NAME};
-use coda_tools::{Tool, task as task_tool};
+use coda_tools::{Tool, skill as skill_tool, task as task_tool};
 use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
@@ -860,7 +860,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             // let it through; with none, the result stands.
             () = self.cancel.cancelled() => {
                 if self.hooks.has_blocking(HookEvent::PostTool) {
-                    self.forget(outcome.original.as_ref());
+                    self.forget(outcome.original.as_ref()).await;
                     return ToolOutcome::error(RESULT_WITHHELD.to_owned());
                 }
                 return outcome;
@@ -870,22 +870,32 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             Ok(()) => outcome,
             Err(blocked) => {
                 info!(tool = %call.name, %blocked, "tool result blocked by a hook");
-                self.forget(outcome.original.as_ref());
+                self.forget(outcome.original.as_ref()).await;
                 ToolOutcome::error(blocked.to_string())
             }
         }
     }
 
     /// Deletes the original behind a result no guard let through, so `retrieve`
-    /// cannot hand the model what the hook withheld.
-    fn forget(&self, original: Option<&OriginalId>) {
-        let Some(id) = original else {
+    /// cannot hand the model what the hook withheld. The delete runs off the
+    /// async threads, where waiting for the store lock is allowed.
+    async fn forget(&self, original: Option<&OriginalId>) {
+        let Some(id) = original.cloned() else {
             return;
         };
-        // SQLite rolls an interrupted transaction back, so a poisoned guard is safe to reuse.
-        let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Err(error) = store.delete_original(&self.config.session, id) {
-            warn!(%error, "the original of a withheld result could not be deleted");
+        let (store, session) = (Arc::clone(&self.store), self.config.session.clone());
+        let deleted = tokio::task::spawn_blocking(move || {
+            // SQLite rolls an interrupted transaction back, so a poisoned guard is safe to reuse.
+            let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
+            store.delete_original(&session, &id)
+        })
+        .await;
+        match deleted {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(%error, "the original of a withheld result could not be deleted");
+            }
+            Err(error) => warn!(%error, "the delete of a withheld result's original crashed"),
         }
     }
 }
@@ -960,7 +970,11 @@ impl ToolWork {
     fn run(self) -> ToolOutcome {
         match self.tool.call_cancellable(&self.input, &self.cancel) {
             Ok(output) => {
-                let (text, original) = self.shrink(output.text);
+                let (text, original) = if self.tool.shrinkable() {
+                    self.shrink(output.text)
+                } else {
+                    (output.text, None)
+                };
                 ToolOutcome {
                     text,
                     is_error: false,
@@ -1009,7 +1023,7 @@ fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
         "code_symbol" => RequestTool::CodeSymbol,
         "code_outline" => RequestTool::CodeOutline,
         "code_read_range" => RequestTool::CodeReadRange,
-        "skill" => RequestTool::Skill,
+        skill_tool::NAME => RequestTool::Skill,
         other => RequestTool::Unknown(other.to_owned()),
     };
     ToolRequest {
@@ -1064,7 +1078,7 @@ mod tests {
             ("code_symbol", RequestTool::CodeSymbol),
             ("code_outline", RequestTool::CodeOutline),
             ("code_read_range", RequestTool::CodeReadRange),
-            ("skill", RequestTool::Skill),
+            (skill_tool::NAME, RequestTool::Skill),
         ];
 
         for (name, expected) in names {
@@ -1074,6 +1088,7 @@ mod tests {
 
             // Assert
             assert_eq!(request.tool, expected, "{name}");
+            assert_eq!(request.tool.name(), name, "{name} round-trips");
         }
     }
 
@@ -1338,6 +1353,26 @@ mod tests {
 
     fn canned(text: Option<&str>) -> ToolSet {
         ToolSet::new().with(Arc::new(Canned(text.map(str::to_owned))))
+    }
+
+    /// A tool that cuts its own output and asks the loop not to shrink it.
+    struct Whole(String);
+
+    impl Tool for Whole {
+        fn name(&self) -> &'static str {
+            "canned"
+        }
+
+        fn call(&self, _input: &Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                text: self.0.clone(),
+                truncated: false,
+            })
+        }
+
+        fn shrinkable(&self) -> bool {
+            false
+        }
     }
 
     async fn poll_until(mut done: impl FnMut() -> bool) {
@@ -1859,6 +1894,88 @@ mod tests {
         assert!(failed.is_err());
         assert!(second.is_err());
         assert_valid_history(lp.conversation().messages());
+    }
+
+    /// How long the test's store user holds the lock at most.
+    const STORE_BUSY_LIMIT: Duration = Duration::from_secs(2);
+    const TICK: Duration = Duration::from_millis(20);
+
+    #[tokio::test]
+    async fn deleting_a_withheld_original_leaves_the_async_threads_free_while_the_store_is_busy() {
+        // Arrange
+        let fixture = Fixture::new();
+        let (lp, _events) = fixture.allowing(Vec::new(), ToolSet::new());
+        let id = {
+            let mut store = fixture.store.lock().unwrap();
+            store.store_original(&fixture.session, "withheld").unwrap()
+        };
+        let ticked = Arc::new(AtomicBool::new(false));
+        let (held, is_held) = std::sync::mpsc::channel();
+        // Holds the store until the runtime shows it can still fire a timer.
+        let busy = {
+            let (store, ticked) = (Arc::clone(&fixture.store), Arc::clone(&ticked));
+            std::thread::spawn(move || {
+                let _guard = store.lock().unwrap();
+                held.send(()).unwrap();
+                let limit = std::time::Instant::now() + STORE_BUSY_LIMIT;
+                while !ticked.load(Ordering::SeqCst) && std::time::Instant::now() < limit {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                ticked.load(Ordering::SeqCst)
+            })
+        };
+        is_held.recv().unwrap();
+        let tick = async {
+            tokio::time::sleep(TICK).await;
+            ticked.store(true, Ordering::SeqCst);
+        };
+
+        // Act
+        tokio::join!(lp.forget(Some(&id)), tick);
+        let timer_fired_meanwhile = busy.join().unwrap();
+
+        // Assert
+        assert!(
+            timer_fired_meanwhile,
+            "the delete waited for the store on the runtime"
+        );
+        let kept = fixture
+            .store
+            .lock()
+            .unwrap()
+            .load_original(&fixture.session, &id);
+        assert_eq!(kept.unwrap(), None, "the original is gone");
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_asks_not_to_be_shrunk_gets_a_long_output_to_the_model_whole() {
+        // Arrange
+        let fixture = Fixture::new();
+        let long = "a line of the log\n".repeat(2000);
+        assert!(long.len() > fixture.config().compact_threshold_bytes);
+        let tools = ToolSet::new().with(Arc::new(Whole(long.clone())));
+        let (mut lp, _events) = fixture.allowing(
+            vec![
+                tool_turn(&[("c1", "canned", "{}")], SMALL_USAGE),
+                end_turn("ok"),
+            ],
+            tools,
+        );
+
+        // Act
+        lp.send("go").await.unwrap();
+
+        // Assert
+        let (text, is_error) = tool_result(&fixture.request(1));
+        assert!(!is_error);
+        assert!(
+            text == long,
+            "the model got {} of {} bytes",
+            text.len(),
+            long.len()
+        );
+        let saved = fixture.store.lock().unwrap().saved_bytes(None).unwrap();
+        assert_eq!(saved, 0, "nothing was compacted");
     }
 
     #[tokio::test]

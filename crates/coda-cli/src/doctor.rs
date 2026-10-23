@@ -14,7 +14,9 @@ use coda_daemon::backends::{ClaudeCodeBackend, CodexBackend};
 use coda_daemon::reaper::survey_orphans;
 use coda_daemon::repair::{RepairError, RepairReport, repair};
 use coda_protocol::methods::DaemonStatusResult;
+use coda_protocol::types::BackendKind;
 use coda_providers::backend::{AgentBackend, locate, require_enabled};
+use coda_providers::registry::{ANTHROPIC_KEY, FAUX_KEY};
 use coda_store::health::DatabaseRelease;
 use coda_store::{BINARY_RELEASE, SCHEMA_VERSION, health};
 use serde::Serialize;
@@ -25,6 +27,7 @@ use crate::cli::DoctorArgs;
 use crate::context::{Context, Io};
 use crate::error::CliError;
 use crate::exit;
+use crate::run::pick_backend;
 
 const NAME_WIDTH: usize = 9;
 const STATUS_WIDTH: usize = 5;
@@ -409,12 +412,21 @@ fn check_config(path: &Path) -> (Check, Option<Config>) {
         }
     };
     match Config::from_toml_str(&text) {
-        Ok(parsed) if parsed.unknown_keys.is_empty() => {
-            (Check::ok(NAME, "valid"), Some(parsed.config))
-        }
         Ok(parsed) => {
-            let detail = format!("unknown keys ignored: {}", parsed.unknown_keys.join(", "));
-            (Check::warn(NAME, detail), Some(parsed.config))
+            let mut notes = Vec::new();
+            if !parsed.unknown_keys.is_empty() {
+                notes.push(format!(
+                    "unknown keys ignored: {}",
+                    parsed.unknown_keys.join(", ")
+                ));
+            }
+            notes.extend(routing_notes(&parsed.config));
+            let check = if notes.is_empty() {
+                Check::ok(NAME, "valid")
+            } else {
+                Check::warn(NAME, notes.join("; "))
+            };
+            (check, Some(parsed.config))
         }
         Err(ConfigError::Syntax(e)) => {
             let position = e.span().map_or_else(String::new, |span| {
@@ -426,6 +438,42 @@ fn check_config(path: &Path) -> (Check, Option<Config>) {
         }
         Err(e) => (Check::fail(NAME, e.to_string()), None),
     }
+}
+
+/// The model-API provider a session starts on by default: the backend
+/// `coda run` picks. `None` when that is Claude Code or Codex, which run their
+/// own tools and no `task` call.
+fn default_session_provider(config: &Config) -> Option<&'static str> {
+    match pick_backend(config) {
+        BackendKind::Faux => Some(FAUX_KEY),
+        // `pick_backend` never picks the OpenAI-compatible provider: with none
+        // of the others enabled it falls back to Anthropic.
+        BackendKind::Anthropic => Some(ANTHROPIC_KEY),
+        _ => None,
+    }
+}
+
+/// A warning for each `[routing]` alias whose provider is not the default
+/// session provider: a `task` child runs on its session's provider, so a
+/// session on the default one cannot use that alias.
+fn routing_notes(config: &Config) -> Vec<String> {
+    let Some(default) = default_session_provider(config) else {
+        return Vec::new();
+    };
+    let mut notes = Vec::new();
+    for (tier, alias) in &config.routing.0 {
+        let provider = config
+            .models
+            .get(alias)
+            .map(|model| model.provider.as_str());
+        if let Some(provider) = provider.filter(|provider| *provider != default) {
+            notes.push(format!(
+                "[routing] {tier} names `{alias}`, which uses {provider}, but the default session \
+                 provider is {default}; a `task` call in a session on {default} cannot use it"
+            ));
+        }
+    }
+    notes
 }
 
 async fn check_backends(config: Option<Config>) -> Check {
@@ -562,6 +610,80 @@ mod tests {
         assert_eq!(check.status, Status::Fail);
         assert!(!check.detail.contains("hunter2"));
         assert!(config.is_none());
+    }
+
+    const ANTHROPIC: &str = "[providers.anthropic]\nenabled = true\n";
+    const OPENAI: &str =
+        "[providers.openai_compat]\nenabled = true\nbase_url = \"http://localhost:1/v1\"\n";
+    const QUICK: &str = "[models.quick]\nprovider = \"anthropic\"\nmodel = \"m\"\n";
+    const GPT: &str = "[models.gpt]\nprovider = \"openai_compat\"\nmodel = \"m\"\n";
+
+    fn checked(toml: &str) -> Check {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, toml).unwrap();
+        check_config(&path).0
+    }
+
+    #[test]
+    fn a_routed_alias_of_another_provider_than_the_default_session_provider_warns() {
+        // Arrange
+        let away = format!("{ANTHROPIC}{OPENAI}{GPT}[routing]\ndeep = \"gpt\"\n");
+        let also_unknown = format!("surprise = 1\n{away}");
+
+        // Act
+        let (warned, both) = (checked(&away), checked(&also_unknown));
+
+        // Assert
+        assert_eq!(warned.status, Status::Warn, "{}", warned.detail);
+        for word in ["[routing] deep", "`gpt`", "openai_compat", "anthropic"] {
+            assert!(warned.detail.contains(word), "{word}: {}", warned.detail);
+        }
+        assert_eq!(both.status, Status::Warn);
+        assert!(both.detail.contains("surprise") && both.detail.contains("[routing] deep"));
+    }
+
+    #[test]
+    fn a_config_with_only_the_openai_compatible_provider_still_starts_on_anthropic() {
+        // Arrange
+        // `coda run` never starts an OpenAI-compatible session: with no other
+        // provider enabled it falls back to Anthropic.
+        let only_openai = format!("{OPENAI}{GPT}[routing]\ndeep = \"gpt\"\n");
+
+        // Act
+        let check = checked(&only_openai);
+
+        // Assert
+        assert_eq!(check.status, Status::Warn, "{}", check.detail);
+        assert!(
+            check
+                .detail
+                .contains("default session provider is anthropic"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn a_routed_alias_the_default_session_can_use_is_not_a_warning() {
+        for (name, toml) in [
+            (
+                "same provider",
+                format!("{ANTHROPIC}{QUICK}[routing]\nfast = \"quick\"\n"),
+            ),
+            (
+                "an agent backend is the default and runs no task call",
+                format!(
+                    "[providers.claude_code]\nenabled = true\n{QUICK}[routing]\nfast = \"quick\"\n"
+                ),
+            ),
+        ] {
+            // Act
+            let check = checked(&toml);
+
+            // Assert
+            assert_eq!(check.status, Status::Ok, "{name}: {}", check.detail);
+        }
     }
 
     #[test]

@@ -84,6 +84,20 @@ fn no_skills_means_no_tool() {
 }
 
 #[test]
+fn the_loop_is_told_not_to_shrink_a_skill_body_since_the_tool_caps_it_itself() {
+    // Arrange
+    let w = world();
+    w.user_skill("pdf", "Fills in PDF forms.", "body");
+    let tool = w.untrusted().unwrap();
+
+    // Act
+    let shrinkable = tool.shrinkable();
+
+    // Assert
+    assert!(!shrinkable);
+}
+
+#[test]
 fn the_index_lists_each_skill_by_name_and_description_and_holds_no_body() {
     // Arrange
     let w = world();

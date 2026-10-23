@@ -14,11 +14,9 @@ use coda_cli::MAX_COMMAND_INPUT_BYTES;
 use coda_config::config::Dirs;
 use coda_protocol::paths::repo_identity;
 use coda_store::Store;
-use common::{Outcome, StopDaemon, cli, cli_reading, context, short_dir};
+use common::{FauxRig as Rig, Outcome, cli, cli_reading, faux_rig};
 use serde_json::{Value, json};
-use tempfile::TempDir;
 
-const REQUEST_LOG: &str = "requests.jsonl";
 const REVIEW: &str = "+++\nname = \"review\"\ndescription = \"Reviews a change.\"\n+++\n\
     Review $ARGUMENTS and report problems only.\n";
 const ASK: &str = "+++\nname = \"ask\"\ndescription = \"Asks.\"\n+++\n$ARGUMENTS\n";
@@ -27,38 +25,13 @@ const STATUS: &str = "+++\nname = \"status\"\ndescription = \"Summarizes.\"\n+++
 const DEPLOY: &str =
     "+++\nname = \"deploy\"\ndescription = \"Ships it.\"\n+++\nDeploy $ARGUMENTS\n";
 
-struct Rig {
-    // First, so the daemon is stopped while its home directory still exists.
-    _stop: StopDaemon,
-    home: TempDir,
-    work: TempDir,
-    ctx: coda_cli::Context,
-}
-
-/// A home whose faux provider answers once and logs the requests it gets, and a
-/// work directory that is a repository.
+/// A rig whose faux provider answers once.
 fn rig() -> Rig {
-    let home = short_dir();
-    let work = short_dir();
-    fs::create_dir(work.path().join(".git")).unwrap();
-    let script = json!([{"events": [
+    let answer = json!({"events": [
         {"type": "text_delta", "text": "all done"},
         {"type": "stop", "reason": "end_turn"},
-    ]}]);
-    fs::write(home.path().join("script.json"), script.to_string()).unwrap();
-    let config = format!(
-        "[providers.faux]\nenabled = true\nscript = {:?}\nrequest_log = {:?}\n",
-        home.path().join("script.json").display().to_string(),
-        home.path().join(REQUEST_LOG).display().to_string(),
-    );
-    fs::write(home.path().join("config.toml"), config).unwrap();
-    let ctx = context(home.path());
-    Rig {
-        _stop: StopDaemon::new(home.path()),
-        home,
-        work,
-        ctx,
-    }
+    ]});
+    faux_rig(&[answer])
 }
 
 fn write(root: &Path, rel: &str, text: &str) {
@@ -86,14 +59,6 @@ impl Rig {
         let mut args = vec!["coda", "run", "--cwd", &cwd];
         args.extend_from_slice(flags);
         cli_reading(&self.ctx, &args, input).await
-    }
-
-    fn requests(&self) -> Vec<Value> {
-        fs::read_to_string(self.home.path().join(REQUEST_LOG))
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
     }
 }
 

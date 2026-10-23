@@ -14,6 +14,7 @@ pub mod grep;
 pub mod read;
 pub mod retrieve;
 pub mod sandbox;
+pub mod skill;
 pub mod task;
 
 use std::sync::atomic::AtomicBool;
@@ -140,6 +141,13 @@ pub trait Tool: Send + Sync {
     /// Returns [`ToolError`] when the arguments are invalid, the sandbox
     /// rejects a path, or reading fails.
     fn call(&self, input: &Value) -> Result<ToolOutput, ToolError>;
+
+    /// Whether the loop may shrink a long output of this tool for the model. A
+    /// tool whose output is instructions to follow, and that cuts its own
+    /// output to a cap, says no, so the model never acts on a skeleton of it.
+    fn shrinkable(&self) -> bool {
+        true
+    }
 
     /// Like [`call`](Tool::call), but a long-running tool should stop soon
     /// after `cancel` becomes true. Tools that finish quickly keep this default.

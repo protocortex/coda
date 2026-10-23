@@ -50,6 +50,55 @@ pub fn context(base: &Path) -> Context {
     ctx
 }
 
+/// The file the faux provider logs every request to, inside the home.
+pub const REQUEST_LOG: &str = "requests.jsonl";
+
+/// A home whose faux provider plays a script and logs the requests it gets, and
+/// a work directory that is a repository.
+pub struct FauxRig {
+    // First, so the daemon is stopped while its home directory still exists.
+    pub _stop: StopDaemon,
+    pub home: TempDir,
+    pub work: TempDir,
+    pub ctx: Context,
+}
+
+/// A [`FauxRig`] that plays `script`.
+pub fn faux_rig(script: &[Value]) -> FauxRig {
+    let home = short_dir();
+    let work = short_dir();
+    std::fs::create_dir(work.path().join(".git")).unwrap();
+    std::fs::write(
+        home.path().join("script.json"),
+        Value::Array(script.to_vec()).to_string(),
+    )
+    .unwrap();
+    let config = format!(
+        "[providers.faux]\nenabled = true\nscript = {:?}\nrequest_log = {:?}\n",
+        home.path().join("script.json").display().to_string(),
+        home.path().join(REQUEST_LOG).display().to_string(),
+    );
+    std::fs::write(home.path().join("config.toml"), config).unwrap();
+    let ctx = context(home.path());
+    FauxRig {
+        _stop: StopDaemon::new(home.path()),
+        home,
+        work,
+        ctx,
+    }
+}
+
+impl FauxRig {
+    /// Every request the faux provider received, oldest first.
+    pub fn requests(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.home.path().join(REQUEST_LOG))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
 pub struct Outcome {
     pub code: ExitCode,
     pub out: String,
