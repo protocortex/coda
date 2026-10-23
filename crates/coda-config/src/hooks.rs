@@ -18,7 +18,7 @@ pub const MAX_TIMEOUT_MS: u64 = 300_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
-    /// Before the first turn of a session's conversation.
+    /// Before the first send of each turn loop of a session's conversation.
     SessionStart,
     /// After a tool call is allowed and before the tool runs.
     PreTool,

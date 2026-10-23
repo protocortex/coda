@@ -117,13 +117,13 @@ Each value is an integer number of milliseconds. A key left out keeps its defaul
 
 ## `[[hooks]]`
 
-A hook is a program coda runs at a point in a model-API session (`anthropic`, `openai_compat`, `faux`). Hooks run in coda's own tool path. Claude Code and Codex run their own tools and coda only sees the calls it is asked to approve through its permission broker, so no coda hook runs for those sessions. Hooks come from this file only. A project file or a definition file cannot add one.
+A hook is a program coda runs at a point in a model-API session (`anthropic`, `openai_compat`, `faux`). Hooks run in coda's own tool path. Claude Code and Codex run their own tools and coda only sees the calls it is asked to approve through its permission broker, so no coda hook runs for those sessions. When the config has hooks and a session runs on one of those backends, the terminal UI shows a notice when the session starts and `coda run` prints one line on standard error, so a guard is never assumed to be active. Hooks come from this file only. A project file or a definition file cannot add one.
 
 An entry is a table in an array, so it has no single default. The keys:
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `event` | string | Required. `"session_start"` (before the first turn of a conversation, once), `"pre_tool"` (after a tool call is allowed, before the tool runs) or `"post_tool"` (after the tool ran). |
+| `event` | string | Required. `"session_start"` (before the first send of each turn loop, which can happen more than once in a conversation, see below), `"pre_tool"` (after a tool call is allowed, before the tool runs) or `"post_tool"` (after the tool ran, or crashed). |
 | `command` | array of strings | Required. The program and its arguments. There is no shell, so a string is an error. Use `["/bin/sh", "-c", "..."]` for a shell. The program is an absolute path or a bare name. A bare name is looked up only in the absolute entries of the hook's `PATH`: an empty or relative entry is skipped, because it would find a file of the session directory. A relative path such as `./guard.sh` is an error that names the hook, because it would run a file of the session directory, which the model can edit. |
 | `blocking` | boolean | Default `false`. When true, a failing hook stops the action. When false, a failure is logged and the action goes on. |
 | `timeout_ms` | integer | Default `10000`, from 1 to `300000`. A hook that outlives it fails and its whole process group is killed. |
@@ -133,7 +133,7 @@ A hook runs in the session's directory with the environment bash gets (`PATH`, `
 | Event | Fields |
 | --- | --- |
 | all | `event`, `session`, `cwd` |
-| `session_start` | `resumed` (the conversation already had messages when the daemon built it) |
+| `session_start` | `resumed` (a `session_start` hook already passed for this session, in an earlier turn loop) |
 | `pre_tool` | `tool`, `arguments` (the call's arguments as JSON, whole) |
 | `post_tool` | `tool`, `is_error`, `result` (the text the model will see, whole) |
 
@@ -143,12 +143,12 @@ A hook fails when it cannot start, exits with a status other than 0, or times ou
 
 - A failing blocking `session_start` hook stops the turn before the model is called, and the next send tries it again. `coda run` prints the reason on standard error, prints nothing on standard output and exits 5 (the stop condition is `hook_blocked`). The terminal UI shows the reason as a notice. The reason is never sent to the model.
 - A failing blocking `pre_tool` hook stops the tool. The model gets an error naming the hook and the reason.
-- A failing blocking `post_tool` hook replaces the tool's result with that error.
+- A failing blocking `post_tool` hook replaces the tool's result with that error. This holds for a tool that crashed too, and for a turn that is cancelled while the hook runs or just as the tool returns: with a blocking `post_tool` hook set, the model gets an error saying the result is withheld, not the unchecked result. A result withheld this way, or replaced by a hook's error, leaves no stored original for `retrieve` to return. With only hooks that are not blocking, a cancelled turn keeps the result.
 - A failing hook that is not blocking is logged as `hook failed, continuing: event=<event> hook=hooks[<index>] (<program>) reason=<why>`.
 
 A hook is named by its place in the `[[hooks]]` list, counting from 0, and its program, for example `hooks[2] (/bin/sh)`, so two shell hooks are told apart. The reason is how the hook failed (`exited with status 3`, `timed out after 5000 ms`, `could not start: ...`) and, when it wrote any, the last 1 KiB of its standard error after a colon. It is folded onto one line and has no control or format characters, so a hook cannot forge a log line, move the cursor of a terminal or hide text with a zero width or right-to-left character.
 
-`session_start` runs once for each turn loop of a session, on its first send, not once per send. The daemon keeps a session's loop between sends, so the hook runs again, with `resumed` true, whenever the daemon builds the loop again from the stored history: after a daemon restart, after `/model` switches the session's model, after a change to the skills or to the trust decision rebuilds the loop, and after an idle loop is dropped to make room or when the session is closed.
+`session_start` runs once for each turn loop of a session, on its first send, not once per send. The daemon keeps a session's loop between sends, so the hook runs again whenever the daemon builds the loop again from the stored history: after a daemon restart, after `/model` switches the session's model, after a change to the skills or to the trust decision rebuilds the loop, and after an idle loop is dropped to make room or when the session is closed. `resumed` is true when a `session_start` hook already passed for the session. The daemon stores that as a `session_started` event when the hook passes, so a blocked first send, which leaves messages in the history, is still a first start when it is tried again, and a conversation that was started before any `session_start` hook was set reports `resumed` false the first time.
 
 A sub-agent started by the `task` tool (see [agents.md](agents.md#dispatch-the-task-tool)) runs the `pre_tool` and `post_tool` hooks for its own tool calls, so a blocking hook stops a sub-agent's call as it stops the session's, and a sub-agent is no way around one. It runs no `session_start` hook: that event marks the start of the session, not of a sub-agent. The session's `task` call runs no hook, because dispatching asks no permission and does nothing on the machine; the sub-agent's tool calls are what the hooks see. The `session` in a sub-agent's payload is the id of the session that started it.
 

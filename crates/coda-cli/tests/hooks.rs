@@ -119,8 +119,11 @@ async fn a_blocking_session_start_hook_stops_the_run_and_its_reason_goes_to_stan
     );
 }
 
+/// A guard for the day a project config file is read: nothing reads
+/// `.coda/config.toml` today, so this cannot fail now. It fails when project
+/// config starts to load a hook. The definition-file half is the next test.
 #[tokio::test]
-async fn a_hook_in_a_project_file_never_runs() {
+async fn a_hook_in_a_project_config_file_never_runs() {
     // Arrange
     let out = short_dir();
     let (user, project) = (out.path().join("user.txt"), out.path().join("project.txt"));
@@ -131,15 +134,9 @@ async fn a_hook_in_a_project_file_never_runs() {
         false,
     ));
     let project_dir = rig.work.path().join(".coda");
-    std::fs::create_dir_all(project_dir.join("commands")).unwrap();
-    // The same hook as a project config file and as a key in a definition file.
+    std::fs::create_dir_all(&project_dir).unwrap();
     let entry = hook_entry("session_start", r#"echo project > "$1""#, &project, true);
     std::fs::write(project_dir.join("config.toml"), entry).unwrap();
-    let command = format!(
-        "+++\nname = \"ping\"\ndescription = \"d\"\nhooks = [{:?}]\n+++\nbody\n",
-        project.display().to_string()
-    );
-    std::fs::write(project_dir.join("commands/ping.md"), command).unwrap();
 
     // Act
     let outcome = rig.run().await;
@@ -148,4 +145,36 @@ async fn a_hook_in_a_project_file_never_runs() {
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
     assert!(user.exists(), "the user's own hook did not run");
     assert!(!project.exists(), "a project file started a hook");
+}
+
+#[tokio::test]
+async fn a_hooks_key_in_a_definition_file_is_reported_and_the_file_is_not_loaded() {
+    // Arrange
+    let repo = short_dir();
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
+    let commands = repo.path().join(".coda/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    let text = "+++\nname = \"ping\"\ndescription = \"d\"\nhooks = [\"exit 0\"]\n+++\nbody\n";
+    std::fs::write(commands.join("ping.md"), text).unwrap();
+    let ctx = context(repo.path());
+
+    // Act
+    let linted = cli(&ctx, &["coda", "agents", "lint"], "").await;
+    let ran = cli(&ctx, &["coda", "run", "--command", "ping"], "").await;
+
+    // Assert
+    assert_ne!(linted.code, ExitCode::SUCCESS);
+    assert!(linted.err.contains("ping.md: hooks:"), "{}", linted.err);
+    assert!(
+        linted
+            .err
+            .contains("hooks load only from the user's config"),
+        "{}",
+        linted.err
+    );
+    assert_ne!(
+        ran.code,
+        ExitCode::SUCCESS,
+        "the file must not load as a command"
+    );
 }

@@ -6,10 +6,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use coda_protocol::types::{PermissionDecision, SessionId};
+use coda_config::hooks::HookEvent;
+use coda_protocol::types::{OriginalId, PermissionDecision, SessionId};
 use coda_providers::gate::PermissionGate;
 use coda_providers::model::{
     ModelEvent, ModelProvider, ModelRequest, ProviderError, RequestMessage, RequestToolCall,
@@ -45,6 +46,10 @@ const NO_TASKS: &str = "the task tool is not available here: sub-agents cannot s
 const PROMPT_CANCELLED: &str = "not run: the turn was cancelled while asking permission";
 /// What the model is told about a call whose pre-tool hook was cancelled.
 const HOOK_CANCELLED: &str = "not run: the turn was cancelled while a hook ran";
+/// What the model is told about a call that ran, when the turn was cancelled
+/// before a blocking post-tool hook had checked its result.
+const RESULT_WITHHELD: &str =
+    "ran, but the result is withheld: the turn was cancelled before a hook checked it";
 /// Name of the span around one model call.
 pub const PROVIDER_CALL_SPAN: &str = "coda.provider.call";
 /// Name of the span around one tool call.
@@ -125,6 +130,9 @@ pub enum TurnEvent {
     Usage(Usage),
     /// The context window is full and compaction could not make room.
     ContextOverflow,
+    /// The `session_start` hooks passed, so a rebuilt loop for this session is
+    /// told it is resumed. Sent only where such a hook is set.
+    SessionStarted,
     /// A blocking `session_start` hook failed, so the turn did not start. The
     /// reason is for the user, not the model, so it is not answer text.
     HookBlocked {
@@ -274,8 +282,9 @@ pub struct TurnLoop<P, G> {
     hooks: HookRunner,
     /// Whether the `session_start` hooks passed for this loop.
     session_started: bool,
-    /// Whether the conversation had messages when the loop was built, so a
-    /// blocked first send does not make a new session look resumed on retry.
+    /// Whether a `session_start` hook already passed for this session, in an
+    /// earlier loop. Not whether the conversation has messages: a first send
+    /// that a hook blocked leaves some, and the retry is still a first start.
     resumed: bool,
 }
 
@@ -301,7 +310,6 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         events: UnboundedSender<TurnEvent>,
     ) -> Self {
         let budget = TokenBudget::new(config.token_limit);
-        let resumed = !conversation.messages().is_empty();
         Self {
             provider,
             gate,
@@ -317,7 +325,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             compacted_ahead: false,
             hooks: HookRunner::default(),
             session_started: false,
-            resumed,
+            resumed: false,
         }
     }
 
@@ -355,6 +363,14 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     #[must_use]
     pub fn with_hooks(mut self, hooks: HookRunner) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// Tells the loop whether a `session_start` hook already passed for this
+    /// session in an earlier loop, so the hook is told the session is resumed.
+    #[must_use]
+    pub fn with_resumed(mut self, resumed: bool) -> Self {
+        self.resumed = resumed;
         self
     }
 
@@ -427,6 +443,12 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         match started {
             Ok(()) => {
                 self.session_started = true;
+                // Only a hook that ran makes the session started; without one,
+                // a hook added later still starts the session for the first time.
+                // A resumed session is stored as started already.
+                if !self.resumed && self.hooks.has(HookEvent::SessionStart) {
+                    self.emit(TurnEvent::SessionStarted);
+                }
                 None
             }
             Err(blocked) => {
@@ -772,6 +794,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             // A child that never ran spent nothing, and an empty usage event is noise.
             usage: Some(done.usage)
                 .filter(|used| used.input_tokens != 0 || used.output_tokens != 0),
+            original: None,
         }
     }
 
@@ -817,9 +840,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         };
         let outcome = match tokio::task::spawn_blocking(move || work.run()).await {
             Ok(outcome) => outcome,
-            Err(error) => {
-                return ToolOutcome::error(format!("the {} tool crashed: {error}", call.name));
-            }
+            Err(error) => ToolOutcome::error(format!("the {} tool crashed: {error}", call.name)),
         };
         self.after_tool_hooks(call, outcome).await
     }
@@ -835,15 +856,36 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                 outcome.is_error,
                 &outcome.text,
             ) => hooked,
-            // The tool already ran, so its result stands.
-            () = self.cancel.cancelled() => return outcome,
+            // The tool already ran. A guard that never saw the result must not
+            // let it through; with none, the result stands.
+            () = self.cancel.cancelled() => {
+                if self.hooks.has_blocking(HookEvent::PostTool) {
+                    self.forget(outcome.original.as_ref());
+                    return ToolOutcome::error(RESULT_WITHHELD.to_owned());
+                }
+                return outcome;
+            }
         };
         match hooked {
             Ok(()) => outcome,
             Err(blocked) => {
                 info!(tool = %call.name, %blocked, "tool result blocked by a hook");
+                self.forget(outcome.original.as_ref());
                 ToolOutcome::error(blocked.to_string())
             }
+        }
+    }
+
+    /// Deletes the original behind a result no guard let through, so `retrieve`
+    /// cannot hand the model what the hook withheld.
+    fn forget(&self, original: Option<&OriginalId>) {
+        let Some(id) = original else {
+            return;
+        };
+        // SQLite rolls an interrupted transaction back, so a poisoned guard is safe to reuse.
+        let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Err(error) = store.delete_original(&self.config.session, id) {
+            warn!(%error, "the original of a withheld result could not be deleted");
         }
     }
 }
@@ -874,6 +916,8 @@ struct ToolOutcome {
     is_error: bool,
     /// Tokens the call spent on a model, for a call that ran a sub-agent.
     usage: Option<Usage>,
+    /// Where the full output is kept, when `text` is a shrunk version of it.
+    original: Option<OriginalId>,
 }
 
 impl ToolOutcome {
@@ -882,6 +926,7 @@ impl ToolOutcome {
             text,
             is_error: true,
             usage: None,
+            original: None,
         }
     }
 }
@@ -914,31 +959,36 @@ struct ToolWork {
 impl ToolWork {
     fn run(self) -> ToolOutcome {
         match self.tool.call_cancellable(&self.input, &self.cancel) {
-            Ok(output) => ToolOutcome {
-                text: self.shrink(output.text),
-                is_error: false,
-                usage: None,
-            },
+            Ok(output) => {
+                let (text, original) = self.shrink(output.text);
+                ToolOutcome {
+                    text,
+                    is_error: false,
+                    usage: None,
+                    original,
+                }
+            }
             Err(error) => ToolOutcome::error(error.to_string()),
         }
     }
 
-    /// Compacts oversized output. When the store cannot be used the model gets
-    /// the output's head and tail plus the reason, never an unbounded blob.
-    fn shrink(&self, text: String) -> String {
+    /// Compacts oversized output and says where the original is kept. When the
+    /// store cannot be used the model gets the output's head and tail plus the
+    /// reason, never an unbounded blob.
+    fn shrink(&self, text: String) -> (String, Option<OriginalId>) {
         if text.len() <= self.threshold {
-            return text;
+            return (text, None);
         }
         let Ok(mut store) = self.store.lock() else {
             warn!("the store lock is poisoned, passing a capped output through");
-            return capped(&text, "the output store is unavailable");
+            return (capped(&text, "the output store is unavailable"), None);
         };
         match compact(&mut store, &self.session, text.as_bytes()) {
-            Ok(compacted) => compacted.text,
+            Ok(compacted) => (compacted.text, compacted.original),
             Err(error) => {
                 warn!(%error, "compaction failed, passing a capped output through");
                 let reason: String = error.to_string().chars().take(MAX_ERROR_CHARS).collect();
-                capped(&text, &format!("compaction failed: {reason}"))
+                (capped(&text, &format!("compaction failed: {reason}")), None)
             }
         }
     }

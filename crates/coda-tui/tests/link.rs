@@ -14,7 +14,7 @@ use coda_protocol::types::{
 use coda_store::{EventRecord, NewSession, Store};
 use coda_tui::app::LinkEvent;
 use coda_tui::permission::PermissionAnswer;
-use coda_tui::sessions::{LinkCommand, LinkConfig, run_link};
+use coda_tui::sessions::{HOOKS_NOT_RUN, LinkCommand, LinkConfig, run_link};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
@@ -64,6 +64,13 @@ impl Rig {
     }
 
     fn link(&self) -> Link {
+        self.link_with(LinkConfig {
+            backend: BackendKind::Faux,
+            ..LinkConfig::default()
+        })
+    }
+
+    fn link_with(&self, config: LinkConfig) -> Link {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, events) = mpsc::unbounded_channel();
         tokio::spawn(run_link(
@@ -72,10 +79,7 @@ impl Rig {
                 idle_timeout: REQUEST_TIMEOUT,
                 ..Timing::for_tests()
             },
-            LinkConfig {
-                backend: BackendKind::Faux,
-                ..LinkConfig::default()
-            },
+            config,
             command_rx,
             event_tx,
         ));
@@ -90,7 +94,7 @@ struct Link {
 
 impl Link {
     /// Skips events until one satisfies `pick`.
-    async fn wait_for<T>(&mut self, pick: impl Fn(LinkEvent) -> Option<T>) -> T {
+    async fn wait_for<T>(&mut self, mut pick: impl FnMut(LinkEvent) -> Option<T>) -> T {
         tokio::time::timeout(WAIT, async {
             while let Some(event) = self.events.recv().await {
                 if let Some(found) = pick(event) {
@@ -138,6 +142,66 @@ async fn new_and_resume_switch_between_sessions() {
     // Assert
     assert_ne!(first.id, second.id);
     assert_eq!(back.id, first.id);
+}
+
+/// Every notice the link says up to the moment it lists the sessions, which it
+/// does after it has followed its own.
+async fn notices_before_the_sessions_are_listed(link: &mut Link) -> Vec<String> {
+    link.commands.send(LinkCommand::ListSessions).unwrap();
+    let mut notices = Vec::new();
+    link.wait_for(|event| match event {
+        LinkEvent::Notice(text) => {
+            notices.push(text);
+            None
+        }
+        LinkEvent::Sessions(_) => Some(()),
+        _ => None,
+    })
+    .await;
+    notices
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_on_a_backend_that_runs_its_own_tools_gets_one_hooks_notice() {
+    // Arrange
+    let rig = Rig::start();
+    let mut link = rig.link_with(LinkConfig {
+        backend: BackendKind::ClaudeCode,
+        hooks_configured: true,
+        ..LinkConfig::default()
+    });
+
+    // Act
+    let started = link.started().await;
+    let notices = notices_before_the_sessions_are_listed(&mut link).await;
+
+    // Assert
+    assert_eq!(started.backend, BackendKind::ClaudeCode);
+    assert_eq!(notices, [HOOKS_NOT_RUN]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_hooks_notice_without_hooks_or_on_a_backend_where_they_run() {
+    for (backend, hooks_configured) in [(BackendKind::ClaudeCode, false), (BackendKind::Faux, true)]
+    {
+        // Arrange
+        let rig = Rig::start();
+        let mut link = rig.link_with(LinkConfig {
+            backend,
+            hooks_configured,
+            ..LinkConfig::default()
+        });
+
+        // Act
+        link.started().await;
+        let notices = notices_before_the_sessions_are_listed(&mut link).await;
+
+        // Assert
+        assert!(
+            notices.is_empty(),
+            "{backend:?} {hooks_configured}: {notices:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

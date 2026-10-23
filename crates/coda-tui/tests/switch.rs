@@ -100,6 +100,7 @@ impl Rig {
             LinkConfig {
                 backend: BackendKind::Faux,
                 cwd: self.cwd.clone(),
+                hooks_configured: false,
             },
             command_rx,
             event_tx,

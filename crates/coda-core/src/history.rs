@@ -9,8 +9,8 @@
 
 use coda_protocol::events::{
     APPROVALS_UNAVAILABLE_KIND, APPROVE_KIND, BACKEND_CRASHED_KIND, COMPACTION_KIND, DENY_KIND,
-    HISTORY_NOT_RESTORED_KIND, RESULT_KIND, STREAM_DELTA_KIND, TIMEOUT_KIND, TURN_INTERRUPTED_KIND,
-    USAGE_KIND,
+    HISTORY_NOT_RESTORED_KIND, HOOK_BLOCKED_KIND, RESULT_KIND, STREAM_DELTA_KIND, TIMEOUT_KIND,
+    TURN_INTERRUPTED_KIND, USAGE_KIND,
 };
 use coda_protocol::types::{OriginalId, SessionId};
 use coda_store::{Store, StoreError, StoredEvent};
@@ -42,9 +42,9 @@ pub const CONVERSATION_RESET_KIND: &str = "conversation_reset";
 pub const PERMISSION_REQUEST_KIND: &str = "permission_request";
 /// Stored kind of a context window overflow.
 pub const CONTEXT_OVERFLOW_KIND: &str = "context_overflow";
-/// Stored kind of the reason a blocking `session_start` hook stopped a turn.
-/// The body is `{"reason": ...}`; clients show it to the user and never to the model.
-pub const HOOK_BLOCKED_KIND: &str = "hook_blocked";
+/// Stored kind of a passed `session_start` hook, so a loop built later for the
+/// session tells the hook it is resumed. The body is `{}`.
+pub const SESSION_STARTED_KIND: &str = "session_started";
 /// Stored kind of the reason a send stopped.
 pub const TURN_STOPPED_KIND: &str = "turn_stopped";
 /// Stored kind of a model switch.
@@ -180,6 +180,8 @@ pub struct Rebuild {
     conversation: Conversation,
     /// Calls of the last assistant message that have no result yet.
     unanswered: Vec<String>,
+    /// Whether a stored event says a `session_start` hook passed.
+    session_started: bool,
 }
 
 impl Rebuild {
@@ -189,7 +191,14 @@ impl Rebuild {
         Self {
             conversation: Conversation::new(prefix),
             unanswered: Vec::new(),
+            session_started: false,
         }
+    }
+
+    /// Whether the events applied so far include a passed `session_start` hook.
+    #[must_use]
+    pub fn session_started(&self) -> bool {
+        self.session_started
     }
 
     /// Applies the next page of `session`'s events after `after` and returns
@@ -244,6 +253,7 @@ impl Rebuild {
                 }
             }
             CONVERSATION_RESET_KIND => {}
+            SESSION_STARTED_KIND => self.session_started = true,
             kind if BOOKKEEPING_KINDS.contains(&kind) => {
                 debug!(seq = event.seq, kind, "skipped a bookkeeping event");
             }

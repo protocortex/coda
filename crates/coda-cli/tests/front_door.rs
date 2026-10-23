@@ -15,6 +15,7 @@ use coda_client::Client;
 use coda_config::config::{Config, Dirs};
 use coda_config::timing::Timing;
 use coda_store::DB_FILE_NAME;
+use coda_tui::Startup;
 use coda_tui::commands::UserCommands;
 use common::{StopDaemon, cli, context, short_dir};
 
@@ -28,7 +29,7 @@ const FAUX_ENABLED: &str = "[providers.faux]\nenabled = true\nscript = \"/x/scri
 fn record_launch(
     socket: &Path,
     timing: Timing,
-    needs_setup: bool,
+    startup: Startup,
     commands: UserCommands,
 ) -> TuiFuture<'_> {
     Box::pin(async move {
@@ -43,7 +44,10 @@ fn record_launch(
         .unwrap();
         fs::write(
             run_dir.join(LAUNCH_MARKER),
-            format!("needs_setup={needs_setup}"),
+            format!(
+                "needs_setup={} hooks_configured={}",
+                startup.needs_setup, startup.hooks_configured
+            ),
         )
         .unwrap();
         Ok(())
@@ -71,7 +75,7 @@ async fn bare_coda_on_a_terminal_starts_the_daemon_and_runs_the_tui() {
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
     assert_eq!(
         launch_note(dir.path()).as_deref(),
-        Some("needs_setup=true"),
+        Some("needs_setup=true hooks_configured=false"),
         "no provider is enabled in a fresh home"
     );
 }
@@ -143,7 +147,33 @@ async fn an_enabled_provider_means_the_tui_needs_no_setup() {
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
     assert_eq!(
         launch_note(dir.path()).as_deref(),
-        Some("needs_setup=false")
+        Some("needs_setup=false hooks_configured=false")
+    );
+}
+
+#[tokio::test]
+async fn a_config_with_hooks_tells_the_tui_so() {
+    // Arrange
+    let dir = short_dir();
+    let _stop = StopDaemon::new(dir.path());
+    let hooks = "[[hooks]]\nevent = \"pre_tool\"\ncommand = [\"/bin/true\"]\n";
+    fs::write(
+        Dirs::from_base(dir.path()).config_file(),
+        format!("{hooks}{FAUX_ENABLED}"),
+    )
+    .unwrap();
+    let mut ctx = context(dir.path());
+    ctx.is_tty = true;
+    ctx.launch_tui = record_launch;
+
+    // Act
+    let outcome = cli(&ctx, &["coda", "tui"], "").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert_eq!(
+        launch_note(dir.path()).as_deref(),
+        Some("needs_setup=false hooks_configured=true")
     );
 }
 

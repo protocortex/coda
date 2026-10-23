@@ -99,6 +99,7 @@ impl Rig {
             LinkConfig {
                 backend: BackendKind::CodexAppServer,
                 cwd: self.work.path().to_string_lossy().into_owned(),
+                hooks_configured: false,
             },
             command_rx,
             event_tx,
