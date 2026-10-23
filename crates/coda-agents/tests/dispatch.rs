@@ -76,12 +76,17 @@ fn an_unknown_agent_is_refused_and_the_available_ones_are_named() {
     let refused = catalog.dispatchable("nope");
 
     // Assert
-    let available = ["a", "b", "explore", "implementer", "reviewer", "tester"].map(str::to_owned);
+    let mut available: Vec<String> = Catalog::builtin()
+        .agents()
+        .map(|entry| entry.def.name.clone())
+        .chain(["a", "b"].map(str::to_owned))
+        .collect();
+    available.sort();
     assert_eq!(
         refused.unwrap_err(),
         DispatchError::Unknown {
             name: "nope".to_owned(),
-            available: available.to_vec()
+            available
         }
     );
 }

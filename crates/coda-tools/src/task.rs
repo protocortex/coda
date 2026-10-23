@@ -45,9 +45,18 @@ pub struct DepthExceeded {
 /// Reads the arguments of a `task` call.
 ///
 /// # Errors
-/// Returns [`ToolError::InvalidInput`] when a field is missing, unknown or not a string.
+/// Returns [`ToolError::InvalidInput`] when a field is missing, unknown or not
+/// a string, or when the prompt is empty or only blank space, since a child
+/// started on no instruction has nothing to do.
 pub fn parse(input: &Value) -> Result<TaskArgs, ToolError> {
-    parse_args(NAME, input)
+    let args: TaskArgs = parse_args(NAME, input)?;
+    if args.prompt.trim().is_empty() {
+        return Err(ToolError::InvalidInput {
+            tool: NAME,
+            reason: "the prompt is empty; say what the agent should do".to_owned(),
+        });
+    }
+    Ok(args)
 }
 
 /// The depth of a child started by a session at `parent_depth`.
@@ -96,6 +105,24 @@ mod tests {
             !TOOL_NAMES.contains(&NAME),
             "an agent may not be given task"
         );
+    }
+
+    #[test]
+    fn an_empty_or_blank_prompt_is_refused_before_a_child_starts() {
+        for prompt in ["", "   ", "\n\t \n"] {
+            // Arrange
+            let input = json!({"agent": "explore", "prompt": prompt});
+
+            // Act
+            let refused = parse(&input);
+
+            // Assert
+            let Err(ToolError::InvalidInput { tool, reason }) = refused else {
+                panic!("{prompt:?} was accepted: {refused:?}");
+            };
+            assert_eq!(tool, NAME);
+            assert!(reason.contains("prompt"), "{reason}");
+        }
     }
 
     #[test]

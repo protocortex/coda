@@ -67,6 +67,10 @@ fn load(tool: &SkillTool, name: &str) -> Result<String, ToolError> {
     tool.call(&json!({ "name": name })).map(|out| out.text)
 }
 
+/// What the tool puts before the body of the user skills `big` and `edge`.
+const BIG_HEADER: &str = "Skill `big` (user):\n\n";
+const EDGE_HEADER: &str = "Skill `edge` (user):\n\n";
+
 #[test]
 fn no_skills_means_no_tool() {
     // Arrange
@@ -160,8 +164,11 @@ fn a_body_over_the_cap_is_cut_and_says_so() {
 
     // Assert
     assert!(output.truncated);
-    assert!(output.text.contains("cut at"), "{}", output.text);
-    assert!(output.text.len() < MAX_SKILL_BODY_BYTES + 512);
+    let expected = format!(
+        "{BIG_HEADER}{}\n[skill cut at {MAX_SKILL_BODY_BYTES} bytes]",
+        "x".repeat(MAX_SKILL_BODY_BYTES)
+    );
+    assert_eq!(output.text, expected);
 }
 
 #[test]
@@ -206,9 +213,11 @@ fn a_character_that_straddles_the_body_cap_is_dropped_whole() {
 
     // Assert
     assert!(output.truncated);
-    assert!(!output.text.contains('\u{20ac}'), "the character was cut");
-    assert!(!output.text.contains("tail"));
-    assert!(output.text.contains("cut at"), "{}", output.text);
+    let expected = format!(
+        "{EDGE_HEADER}{}\n[skill cut at {MAX_SKILL_BODY_BYTES} bytes]",
+        "x".repeat(MAX_SKILL_BODY_BYTES - 1)
+    );
+    assert_eq!(output.text, expected);
 }
 
 #[test]
@@ -293,6 +302,40 @@ fn skills_past_the_index_cap_are_left_out_and_counted() {
     // A skill that is not in the index is not loadable either.
     let unlisted = format!("skill-{:03}", total - 1);
     assert!(load(&tool, &unlisted).is_err());
+}
+
+#[test]
+fn the_index_is_an_alphabetical_prefix_so_a_short_skill_never_fills_the_gap_a_long_one_left() {
+    // Arrange
+    let w = world();
+    let long = "d".repeat(MAX_INDEX_DESCRIPTION_CHARS);
+    // "- long-00: " is 11 bytes, then the description, then a newline.
+    let line = "- long-00: ".len() + MAX_INDEX_DESCRIPTION_CHARS + 1;
+    let fit = MAX_INDEX_BYTES / line;
+    let room_left = MAX_INDEX_BYTES - fit * line;
+    let short = "- zz-short: Tiny.\n".len();
+    assert!(room_left >= short, "the gap must be big enough to tempt");
+    for n in 0..=fit {
+        w.user_skill(&format!("long-{n:02}"), &long, "body");
+    }
+    w.user_skill("zz-short", "Tiny.", "body");
+
+    // Act
+    let tool = w.untrusted().unwrap();
+
+    // Assert
+    let names = tool.names();
+    assert_eq!(names.len(), fit, "{names:?}");
+    assert!(
+        names.iter().all(|name| name.starts_with("long-")),
+        "{names:?}"
+    );
+    assert!(load(&tool, "zz-short").is_err());
+    assert!(
+        tool.description().contains("left out of this list: 2"),
+        "{}",
+        tool.description()
+    );
 }
 
 #[test]

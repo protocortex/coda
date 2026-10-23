@@ -8,7 +8,7 @@
 //! store-backed [`Catalog::load_trusted`] can supply; otherwise they are listed
 //! as pending and never returned. A project file may replace the description
 //! and prompt of a user or built-in definition, and may narrow an agent's
-//! tools, but never widen them.
+//! tools, but never widen them or change its tier or effort.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -371,6 +371,23 @@ impl Catalog {
         &self.problems
     }
 
+    /// The held-back project agent file that would override the agent `name`,
+    /// when the catalog holds an agent of that name from a built-in or user
+    /// file. The agent in the catalog runs in its place until the repository is
+    /// trusted, so a caller can tell the user that a project version waits.
+    #[must_use]
+    pub fn pending_override(&self, name: &str) -> Option<&Pending> {
+        self.agent(name)?;
+        self.pending_agent(name)
+    }
+
+    /// The held-back project agent file called `name`.
+    pub(crate) fn pending_agent(&self, name: &str) -> Option<&Pending> {
+        self.pending
+            .iter()
+            .find(|p| p.kind == Kind::Agent && p.name() == Some(name))
+    }
+
     fn absorb(&mut self, snapshot: Snapshot, source: Source) {
         self.problems.extend(snapshot.problems);
         for file in snapshot.files {
@@ -402,7 +419,7 @@ impl Catalog {
     }
 
     fn add_agent(&mut self, stem: String, incoming: Entry<AgentDef>) {
-        let Some(user) = self
+        let Some(base) = self
             .agents
             .get(&stem)
             .filter(|_| incoming.source == Source::Project)
@@ -414,11 +431,11 @@ impl Catalog {
             .def
             .tools
             .iter()
-            .filter(|tool| !user.def.tools.contains(tool))
+            .filter(|tool| !base.def.tools.contains(tool))
             .collect();
         if !widened.is_empty() {
             let names: Vec<&str> = widened.iter().map(|t| t.as_str()).collect();
-            warn!(agent = %stem, "project agent asked for tools the user definition lacks");
+            warn!(agent = %stem, "project agent asked for tools the built-in or user definition lacks");
             self.problems.push(LoadProblem::new(
                 &incoming.path,
                 "tools",
@@ -428,7 +445,28 @@ impl Catalog {
                 ),
             ));
         }
-        let mut merged = user.def.clone();
+        let settings = [
+            ("tier", incoming.def.tier.as_str(), base.def.tier.as_str()),
+            (
+                "effort",
+                incoming.def.effort.as_str(),
+                base.def.effort.as_str(),
+            ),
+        ];
+        for (field, asked, kept) in settings
+            .into_iter()
+            .filter(|(_, asked, kept)| asked != kept)
+        {
+            warn!(agent = %stem, field, "project agent asked for another value than the built-in or user definition");
+            self.problems.push(LoadProblem::new(
+                &incoming.path,
+                field,
+                format!(
+                    "a project file cannot change the {field} of a built-in or user agent; ignored: {asked}, kept: {kept}"
+                ),
+            ));
+        }
+        let mut merged = base.def.clone();
         merged
             .tools
             .retain(|tool| incoming.def.tools.contains(tool));

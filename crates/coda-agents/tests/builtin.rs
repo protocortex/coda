@@ -5,7 +5,9 @@
 use std::fs;
 use std::path::Path;
 
-use coda_agents::{Catalog, Effort, Severity, Source, Tier, parse_report, trust_project};
+use coda_agents::{
+    Catalog, Effort, PendingReason, Severity, Source, Tier, parse_report, trust_project,
+};
 use coda_store::Store;
 use tempfile::TempDir;
 
@@ -124,7 +126,18 @@ fn the_json_example_in_the_reviewer_prompt_is_a_report_the_parser_accepts() {
     let report = parse_report(example).unwrap();
 
     // Assert
-    assert_eq!(report.findings[0].severity, Severity::Blocking);
+    let severities: Vec<Severity> = report.findings.iter().map(|f| f.severity).collect();
+    assert_eq!(
+        severities,
+        [
+            Severity::Blocking,
+            Severity::NonBlocking,
+            Severity::Suggestion
+        ]
+    );
+    assert!(report.findings.iter().all(|f| !f.message.is_empty()));
+    assert_eq!(report.findings[0].location.as_deref(), Some("src/a.rs:10"));
+    assert_eq!(report.findings[2].location, None);
 }
 
 #[test]
@@ -195,4 +208,98 @@ fn an_untrusted_project_file_leaves_the_built_in_alone() {
     assert_eq!(reviewer.source, Source::Builtin);
     assert_ne!(reviewer.def.body.trim(), "Project prompt.");
     assert_eq!(catalog.pending().len(), 1);
+}
+
+/// A project `reviewer` file with the given tier and effort.
+fn reviewer_file(tier: &str, effort: &str) -> String {
+    format!(
+        "+++\nname = \"reviewer\"\n\
+         description = \"Does reviewer. Use when asked. Do not use otherwise.\"\n\
+         tier = \"{tier}\"\neffort = \"{effort}\"\ntools = [\"read\"]\n+++\nProject prompt.\n"
+    )
+}
+
+#[test]
+fn a_project_file_with_another_tier_or_effort_than_the_built_in_is_reported_and_ignored() {
+    // Arrange
+    let project = reviewer_file("deep", "high");
+
+    // Act
+    let catalog = with_project_reviewer(true, &project);
+
+    // Assert
+    let reviewer = catalog.agent("reviewer").unwrap();
+    assert_eq!(reviewer.def.tier, Tier::Standard);
+    assert_eq!(reviewer.def.effort, Effort::Medium);
+    let problems: Vec<(String, &str)> = catalog
+        .problems()
+        .iter()
+        .map(|p| {
+            let file = p.path.file_name().unwrap().to_string_lossy().into_owned();
+            (file, p.field.as_str())
+        })
+        .collect();
+    assert_eq!(
+        problems,
+        [
+            ("reviewer.md".to_owned(), "tier"),
+            ("reviewer.md".to_owned(), "effort")
+        ]
+    );
+    let message = catalog.problems()[0].to_string();
+    assert!(
+        message.contains("deep") && message.contains("standard"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_project_file_with_the_same_tier_and_effort_as_the_built_in_reports_nothing() {
+    // Arrange
+    let project = reviewer_file("standard", "medium");
+
+    // Act
+    let catalog = with_project_reviewer(true, &project);
+
+    // Assert
+    assert_eq!(catalog.problems(), []);
+}
+
+#[test]
+fn a_held_back_project_file_is_reported_as_overriding_the_built_in_it_is_named_after() {
+    // Arrange
+    let project = agent("reviewer", "\"read\"", "Project prompt.");
+    let (held, used) = (
+        with_project_reviewer(false, &project),
+        with_project_reviewer(true, &project),
+    );
+
+    // Act
+    let overriding = held.pending_override("reviewer");
+
+    // Assert
+    let pending = overriding.unwrap();
+    assert!(pending.path.ends_with(".coda/agents/reviewer.md"));
+    assert_eq!(pending.reason, PendingReason::NotTrusted);
+    assert_eq!(held.pending_override("explore"), None);
+    assert_eq!(held.pending_override("nope"), None);
+    assert_eq!(used.pending_override("reviewer"), None, "it is in use now");
+}
+
+#[test]
+fn a_held_back_project_agent_with_no_agent_of_that_name_overrides_nothing() {
+    // Arrange
+    let repo = TempDir::new().unwrap();
+    write(
+        repo.path(),
+        ".coda/agents/local.md",
+        &agent("local", "\"read\"", "p"),
+    );
+
+    // Act
+    let catalog = Catalog::load(TempDir::new().unwrap().path(), Some(repo.path()));
+
+    // Assert
+    assert_eq!(catalog.pending().len(), 1);
+    assert_eq!(catalog.pending_override("local"), None);
 }
