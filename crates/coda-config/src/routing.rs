@@ -59,7 +59,7 @@ impl FromStr for Tier {
 }
 
 /// The `[routing]` section: a model alias per tier. A tier with no entry uses
-/// the default model.
+/// the model of the session that starts the agent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
 pub struct Routing(pub BTreeMap<Tier, String>);

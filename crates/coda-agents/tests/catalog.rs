@@ -5,7 +5,9 @@
 use std::fs;
 use std::path::Path;
 
-use coda_agents::{Catalog, CommandLookupError, PROJECT_DIR, PendingReason, Source, trust_project};
+use coda_agents::{
+    Catalog, CommandLookupError, PROJECT_DIR, PendingReason, Source, StoredTrust, trust_project,
+};
 use coda_store::Store;
 use tempfile::TempDir;
 
@@ -52,6 +54,49 @@ impl Fixture {
     fn untrusted(&self) -> Catalog {
         Catalog::load(self.user.path(), Some(self.repo.path()))
     }
+}
+
+#[test]
+fn a_trust_decision_read_earlier_admits_the_files_without_the_store() {
+    // Arrange
+    let f = fixture();
+    let file = ".coda/agents/local.md";
+    write(f.repo.path(), file, &agent("local", "reviewed", "\"read\""));
+    let trust = {
+        let mut store = Store::open(&f.data.path().join("data")).unwrap();
+        trust_project(&mut store, f.repo.path()).unwrap();
+        StoredTrust::read(&store, Some(f.repo.path())).unwrap()
+    };
+
+    // Act
+    let admitted = Catalog::load_with_trust(f.user.path(), Some(f.repo.path()), &trust);
+    write(f.repo.path(), file, &agent("local", "edited", "\"read\""));
+    let edited = Catalog::load_with_trust(f.user.path(), Some(f.repo.path()), &trust);
+
+    // Assert
+    assert_eq!(admitted.agent("local").unwrap().def.body.trim(), "reviewed");
+    assert!(edited.agent("local").is_none());
+    assert_eq!(edited.pending()[0].reason, PendingReason::ChangedSinceTrust);
+}
+
+#[test]
+fn no_stored_decision_holds_the_project_files_back() {
+    // Arrange
+    let f = fixture();
+    write(
+        f.repo.path(),
+        ".coda/agents/local.md",
+        &agent("local", "p", "\"read\""),
+    );
+    let store = Store::open(&f.data.path().join("data")).unwrap();
+    let trust = StoredTrust::read(&store, Some(f.repo.path())).unwrap();
+
+    // Act
+    let catalog = Catalog::load_with_trust(f.user.path(), Some(f.repo.path()), &trust);
+
+    // Assert
+    assert!(catalog.agent("local").is_none());
+    assert_eq!(catalog.pending()[0].reason, PendingReason::NotTrusted);
 }
 
 #[test]

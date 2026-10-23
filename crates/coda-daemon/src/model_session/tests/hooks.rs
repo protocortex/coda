@@ -392,6 +392,72 @@ async fn stored_text(rig: &Rig, id: &str) -> String {
     loaded.unwrap().unwrap()
 }
 
+/// A line of the big file the model-visible result drops.
+const SECRET_LINE: &str = "line 500 of the big file";
+
+/// The text stored under the original `id` of the rig's session, if any.
+async fn original(rig: &Rig, id: &str) -> Option<String> {
+    let (session, id) = (rig.session.clone(), OriginalId::new(id));
+    let loaded = rig
+        .hub
+        .with_store(move |store| store.load_original(&session, &id))
+        .await;
+    loaded.unwrap()
+}
+
+#[tokio::test]
+async fn cancelling_a_sub_agents_post_tool_hook_leaves_nothing_to_retrieve_of_a_compacted_result() {
+    // Arrange
+    let out = tempfile::tempdir().unwrap();
+    let up = out.path().join("up");
+    let script = r#"cat > "$1/seen"; echo up > "$1/up"; sleep 30"#;
+    let hook = shell_hook(HookEvent::PostTool, script, out.path(), true);
+    let mut turns = scout_script();
+    turns[1] = tool_turn(&[("r1", "read", json!({"path": "big.txt"}))]);
+    let mut rig = Rig::custom(Mode::Default, &turns, true, None, |config| {
+        config.hooks.push(hook);
+    });
+    install_scout(&rig);
+    // Many lines, so reading it is compacted and the original is kept. The
+    // line sits in the middle, where compaction drops it from the shrunk text.
+    let big = (0..1000)
+        .map(|n| format!("line {n} of the big file\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    assert!(big.contains(SECRET_LINE));
+    std::fs::write(rig.cwd.join("big.txt"), big).unwrap();
+    rig.send("go").await;
+    wait_for_file(&up).await;
+    let told = std::fs::read_to_string(out.path().join("seen")).unwrap();
+    let (_, tail) = told.rsplit_once("retrieve id ").expect(&told);
+    let id: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    let before = original(&rig, &id).await;
+
+    // Act
+    rig.call("session.cancel", json!({"session_id": rig.session}))
+        .await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let kept_before = before.unwrap_or_default();
+    assert!(
+        kept_before.contains(SECRET_LINE),
+        "control: original {id} held the file"
+    );
+    // A deleted id is handed out again, so it may now hold the withheld note.
+    let after = original(&rig, &id).await.unwrap_or_default();
+    assert!(
+        !after.contains(SECRET_LINE),
+        "retrieve {id} returns the file: {after}"
+    );
+    let stored = super::dump(&rig.db(), "originals");
+    assert!(
+        !stored.contains(SECRET_LINE),
+        "an original still holds the file"
+    );
+}
+
 #[tokio::test]
 async fn cancelling_a_sub_agents_post_tool_hook_withholds_the_childs_result() {
     // Arrange

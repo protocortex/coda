@@ -4,6 +4,8 @@
 
 use std::path::PathBuf;
 
+use coda_tools::skill;
+
 /// A tool a backend asks permission to run, after name mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tool {
@@ -45,7 +47,7 @@ impl Tool {
             Self::CodeSearch => "code_search",
             Self::CodeSymbol => "code_symbol",
             Self::CodeOutline => "code_outline",
-            Self::Skill => "skill",
+            Self::Skill => skill::NAME,
             Self::Unknown(name) => name,
         }
     }

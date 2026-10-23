@@ -6,6 +6,7 @@ pub mod compress;
 
 use coda_protocol::types::{OriginalId, SessionId};
 use coda_store::{MAX_ORIGINAL_BYTES, SavingRecord, Store, StoreError};
+use tracing::warn;
 
 /// Bytes kept from each end of an output too large to store.
 const OVERSIZE_KEEP_BYTES: usize = 4 * 1024;
@@ -110,11 +111,19 @@ pub fn compact(
         text.push('\n');
     }
     text.push_str(&footer(raw.len(), &id));
-    store.record_saving(&SavingRecord {
+    let saving = SavingRecord {
         session: session.clone(),
         original_bytes: byte_count(raw.len()),
         compressed_bytes: byte_count(text.len()),
-    })?;
+    };
+    if let Err(error) = store.record_saving(&saving) {
+        // The caller gets no id for the original, so a later veto of this result
+        // could not delete it.
+        if let Err(cleanup) = store.delete_original(session, &id) {
+            warn!(%cleanup, "the original of a result that was not given out could not be deleted");
+        }
+        return Err(error.into());
+    }
     Ok(Compacted {
         text,
         original: Some(id),
@@ -286,6 +295,33 @@ aaaaaaaaaa\naaaaaaaaaa\naaaaaaaaaa\n[compressed from 220 bytes, full output: ret
             }
         );
         assert_eq!(store.saved_bytes(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_original_whose_saving_could_not_be_recorded_is_not_left_behind() {
+        // Arrange
+        let (dir, mut store) = open();
+        let one = session(&mut store);
+        let db = rusqlite::Connection::open(dir.path().join("d").join(coda_store::DB_FILE_NAME))
+            .unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER no_savings BEFORE INSERT ON savings \
+             BEGIN SELECT RAISE(ABORT, 'savings are off'); END;",
+        )
+        .unwrap();
+
+        // Act
+        let failed = compact(&mut store, &one, LOG_220.as_bytes());
+
+        // Assert
+        assert!(matches!(failed, Err(EconomyError::Store(_))), "{failed:?}");
+        let kept = store
+            .originals_reader(&one)
+            .fetch_original(&OriginalId::new("1"));
+        assert!(
+            matches!(kept, Err(ReaderError::NotFound(_))),
+            "the original of a result nobody was given is still stored: {kept:?}"
+        );
     }
 
     #[test]

@@ -12,14 +12,12 @@
 
 use std::collections::BTreeMap;
 
-use coda_tools::{Tool, ToolError, ToolOutput};
+use coda_tools::{Tool, ToolError, ToolOutput, skill};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::catalog::{Catalog, Source};
 
-/// The name the model calls the tool by.
-pub const SKILL_TOOL_NAME: &str = "skill";
 /// The most bytes of a skill body the tool returns; the rest is cut.
 pub const MAX_SKILL_BODY_BYTES: usize = 32 * 1024;
 /// The most bytes of skill entries the index lists; skills past it are left out.
@@ -117,12 +115,18 @@ fn index_line(name: &str, description: &str) -> String {
 
 impl Tool for SkillTool {
     fn name(&self) -> &'static str {
-        SKILL_TOOL_NAME
+        skill::NAME
+    }
+
+    /// A body is instructions the model follows, and the tool cuts it at
+    /// [`MAX_SKILL_BODY_BYTES`] itself, so the loop must not shrink it further.
+    fn shrinkable(&self) -> bool {
+        false
     }
 
     fn call(&self, input: &Value) -> Result<ToolOutput, ToolError> {
         let invalid = |reason: String| ToolError::InvalidInput {
-            tool: SKILL_TOOL_NAME,
+            tool: skill::NAME,
             reason,
         };
         let Args { name } = Args::deserialize(input).map_err(|e| invalid(e.to_string()))?;

@@ -229,6 +229,26 @@ pub struct Catalog {
     problems: Vec<LoadProblem>,
 }
 
+/// The digest of project files a user trusted, as the store holds it. Only the
+/// store can supply one, so it stays the one way to admit project files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTrust(Option<String>);
+
+impl StoredTrust {
+    /// The decision stored for the repository `project_root`; none when the
+    /// user has not trusted it or there is no repository.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] when the trust decision cannot be read.
+    pub fn read(store: &Store, project_root: Option<&Path>) -> Result<Self, StoreError> {
+        let digest = match project_root {
+            Some(root) => store.project_trust_digest(&repo_key(root))?,
+            None => None,
+        };
+        Ok(Self(digest))
+    }
+}
+
 /// Which project files may load.
 #[derive(Clone, Copy)]
 enum Admit<'a> {
@@ -257,15 +277,19 @@ impl Catalog {
         user_dir: &Path,
         project_root: Option<&Path>,
     ) -> Result<Self, StoreError> {
-        let stored = match project_root {
-            Some(root) => store.project_trust_digest(&repo_key(root))?,
-            None => None,
-        };
-        Ok(Self::load_with(
-            user_dir,
-            project_root,
-            Admit::Trusted(stored.as_deref()),
-        ))
+        let trust = StoredTrust::read(store, project_root)?;
+        Ok(Self::load_with_trust(user_dir, project_root, &trust))
+    }
+
+    /// Like [`Catalog::load_trusted`], with the trust decision already read, so
+    /// a caller can hold the store only for the read and walk the files after.
+    #[must_use]
+    pub fn load_with_trust(
+        user_dir: &Path,
+        project_root: Option<&Path>,
+        trust: &StoredTrust,
+    ) -> Self {
+        Self::load_with(user_dir, project_root, Admit::Trusted(trust.0.as_deref()))
     }
 
     /// Every problem in the user and project files, trusted or not. Linting
@@ -395,6 +419,26 @@ impl Catalog {
     pub fn pending_override(&self, name: &str) -> Option<&Pending> {
         self.agent(name)?;
         self.pending_agent(name)
+    }
+
+    /// The problems of the agent files called `name` that did not become the
+    /// agent in the catalog. A file that was loaded and only lost a setting is
+    /// not among them, since its problems name the file the agent came from.
+    pub(crate) fn skipped_agent_files(&self, name: &str) -> Vec<LoadProblem> {
+        let in_use = self.agents.get(name).map(|entry| entry.path.as_path());
+        let names_agent_file = |path: &Path| {
+            path.extension().is_some_and(|ext| ext == EXTENSION)
+                && path.file_stem().is_some_and(|stem| stem == name)
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|folder| folder == AGENTS_DIR)
+        };
+        self.problems
+            .iter()
+            .filter(|p| names_agent_file(&p.path) && Some(p.path.as_path()) != in_use)
+            .cloned()
+            .collect()
     }
 
     /// The held-back project agent file called `name`.

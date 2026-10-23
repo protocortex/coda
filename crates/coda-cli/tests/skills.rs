@@ -13,11 +13,9 @@ use coda_agents::trust_project;
 use coda_config::config::Dirs;
 use coda_protocol::paths::repo_identity;
 use coda_store::Store;
-use common::{Outcome, StopDaemon, cli, context, short_dir};
+use common::{FauxRig as Rig, Outcome, cli, faux_rig};
 use serde_json::{Value, json};
-use tempfile::TempDir;
 
-const REQUEST_LOG: &str = "requests.jsonl";
 const PDF_BODY: &str = "PDF-BODY-MARKER fill every field";
 const DEPLOY_BODY: &str = "DEPLOY-BODY-MARKER push to staging";
 
@@ -38,40 +36,6 @@ fn skill_call_turn(name: &str) -> Value {
         {"type": "tool_call_arguments_delta", "call_id": "c1", "fragment": json!({"name": name}).to_string()},
         {"type": "stop", "reason": "tool_use"},
     ]})
-}
-
-struct Rig {
-    // First, so the daemon is stopped while its home directory still exists.
-    _stop: StopDaemon,
-    home: TempDir,
-    work: TempDir,
-    ctx: coda_cli::Context,
-}
-
-/// A home whose faux provider plays `script` and logs the requests it gets, and
-/// a work directory that is a repository.
-fn rig(script: &[Value]) -> Rig {
-    let home = short_dir();
-    let work = short_dir();
-    fs::create_dir(work.path().join(".git")).unwrap();
-    fs::write(
-        home.path().join("script.json"),
-        Value::Array(script.to_vec()).to_string(),
-    )
-    .unwrap();
-    let config = format!(
-        "[providers.faux]\nenabled = true\nscript = {:?}\nrequest_log = {:?}\n",
-        home.path().join("script.json").display().to_string(),
-        home.path().join(REQUEST_LOG).display().to_string(),
-    );
-    fs::write(home.path().join("config.toml"), config).unwrap();
-    let ctx = context(home.path());
-    Rig {
-        _stop: StopDaemon::new(home.path()),
-        home,
-        work,
-        ctx,
-    }
 }
 
 fn write(root: &Path, rel: &str, text: &str) {
@@ -103,14 +67,6 @@ impl Rig {
         )
         .await
     }
-
-    fn requests(&self) -> Vec<Value> {
-        fs::read_to_string(self.home.path().join(REQUEST_LOG))
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
 }
 
 /// Whether the model was offered the `skill` tool in `request`.
@@ -124,7 +80,7 @@ fn offers_skill(request: &Value) -> bool {
 #[tokio::test]
 async fn the_skill_tool_is_offered_and_no_body_reaches_the_provider_when_no_skill_is_used() {
     // Arrange
-    let rig = rig(&[text_turn("nothing to load")]);
+    let rig = faux_rig(&[text_turn("nothing to load")]);
     rig.user_skills();
 
     // Act
@@ -143,7 +99,7 @@ async fn the_skill_tool_is_offered_and_no_body_reaches_the_provider_when_no_skil
 #[tokio::test]
 async fn a_body_enters_the_context_only_after_the_model_asks_for_that_skill() {
     // Arrange
-    let rig = rig(&[skill_call_turn("pdf"), text_turn("filled")]);
+    let rig = faux_rig(&[skill_call_turn("pdf"), text_turn("filled")]);
     rig.user_skills();
 
     // Act
@@ -171,7 +127,7 @@ async fn a_body_enters_the_context_only_after_the_model_asks_for_that_skill() {
 #[tokio::test]
 async fn with_no_skills_the_model_is_offered_no_skill_tool() {
     // Arrange
-    let rig = rig(&[text_turn("hello")]);
+    let rig = faux_rig(&[text_turn("hello")]);
 
     // Act
     let outcome = rig.run().await;
@@ -186,7 +142,7 @@ async fn with_no_skills_the_model_is_offered_no_skill_tool() {
 #[tokio::test]
 async fn a_project_skill_is_offered_only_once_the_repository_is_trusted() {
     // Arrange
-    let rig = rig(&[text_turn("one"), text_turn("two")]);
+    let rig = faux_rig(&[text_turn("one"), text_turn("two")]);
     write(
         rig.work.path(),
         ".coda/skills/local.md",

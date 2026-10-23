@@ -10,6 +10,7 @@ use coda_protocol::types::Mode;
 use serde_json::{Value, json};
 
 use super::{Rig, assistant_message, text_turn, tool_turn, user_message};
+use crate::model_session::COMPACT_THRESHOLD_BYTES;
 
 const TOKEN_CAP: u64 = 30;
 const PROJECT_BODY: &str = "PROJECT-BODY-MARKER lint before you ship";
@@ -201,6 +202,40 @@ async fn a_skill_call_replays_from_the_store_when_the_conversation_is_rebuilt() 
     assert_eq!(requests[2][2]["is_error"], false);
     assert_eq!(requests[2][3], assistant_message("done", &json!([])));
     assert_eq!(requests[2][4], user_message("second"));
+}
+
+#[tokio::test]
+async fn a_skill_body_over_the_compaction_threshold_reaches_the_next_request_whole() {
+    // Arrange
+    // Many lines, so compaction would keep a few of them, and between the
+    // 16 KiB a tool result is compacted at and the 32 KiB skill cap.
+    let steps = (0..500)
+        .map(|n| format!("step {n}: do the careful thing and check it\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    let body = format!("{steps}END-OF-THE-SKILL");
+    assert!(body.len() > COMPACT_THRESHOLD_BYTES);
+    assert!(body.len() < coda_agents::MAX_SKILL_BODY_BYTES);
+    let script = [skill_call("big"), text_turn("done")];
+    let mut rig = Rig::new(Mode::Default, &script);
+    write(
+        &rig.home(),
+        "skills/big.md",
+        &skill_file("big", "A long one.", &body),
+    );
+
+    // Act
+    rig.send("go").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let loaded = rig.requests()[1][2]["text"].as_str().unwrap().to_owned();
+    assert!(
+        loaded.contains(&body),
+        "the model got {} bytes",
+        loaded.len()
+    );
+    assert!(!loaded.contains("retrieve id"), "the body was compacted");
 }
 
 #[tokio::test]

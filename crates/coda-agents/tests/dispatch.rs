@@ -4,7 +4,7 @@
 
 use std::fs;
 
-use coda_agents::{Catalog, DispatchError, child_tools, trust_project};
+use coda_agents::{Catalog, DispatchError, Source, child_tools, trust_project};
 use coda_store::Store;
 use tempfile::TempDir;
 
@@ -89,6 +89,106 @@ fn an_unknown_agent_is_refused_and_the_available_ones_are_named() {
             available
         }
     );
+}
+
+/// A catalog of the user's `agents/` files and, once trusted, the project's
+/// `.coda/agents/` files, given as `(file name, text)`.
+fn catalog_of(user_files: &[(&str, String)], project_files: &[(&str, String)]) -> Catalog {
+    let (user, repo, data) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    for (dir, files) in [
+        (user.path().join("agents"), user_files),
+        (repo.path().join(".coda/agents"), project_files),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+        for (file, text) in files {
+            fs::write(dir.join(file), text).unwrap();
+        }
+    }
+    let mut store = Store::open(&data.path().join("data")).unwrap();
+    trust_project(&mut store, repo.path()).unwrap();
+    Catalog::load_trusted(&store, user.path(), Some(repo.path())).unwrap()
+}
+
+#[test]
+fn a_skipped_file_named_like_a_built_in_refuses_the_dispatch_with_the_problem() {
+    // Arrange
+    let broken = agent("implementer", "\"nope\"");
+    let catalog = catalog_of(&[("implementer.md", broken)], &[]);
+
+    // Act
+    let refused = catalog.dispatchable("implementer");
+
+    // Assert
+    let Err(DispatchError::Skipped { name, problems }) = refused else {
+        panic!("the built-in ran in its place: {refused:?}");
+    };
+    assert_eq!(name, "implementer");
+    assert_eq!(problems.len(), 1);
+    let text = DispatchError::Skipped { name, problems }.to_string();
+    assert!(text.contains("implementer.md"), "{text}");
+    assert!(text.contains("unknown tool `nope`"), "{text}");
+    assert!(text.contains("coda agents lint"), "{text}");
+}
+
+#[test]
+fn a_skipped_user_file_still_refuses_when_a_valid_project_file_has_the_name() {
+    // Arrange
+    let broken = agent("reviewer", "\"nope\"");
+    let fine = agent("reviewer", "\"read\"");
+    let catalog = catalog_of(&[("reviewer.md", broken)], &[("reviewer.md", fine)]);
+
+    // Act
+    let refused = catalog.dispatchable("reviewer");
+
+    // Assert
+    assert!(
+        matches!(refused, Err(DispatchError::Skipped { .. })),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_project_file_that_only_lost_a_setting_still_runs() {
+    // Arrange
+    let asks_for_more = agent("reviewer", "\"read\", \"bash\"");
+    let catalog = catalog_of(&[], &[("reviewer.md", asks_for_more)]);
+
+    // Act
+    let allowed = catalog.dispatchable("reviewer");
+
+    // Assert
+    assert!(
+        !catalog.problems().is_empty(),
+        "the ignored tool is reported"
+    );
+    assert_eq!(allowed.unwrap().source, Source::Project);
+}
+
+#[test]
+fn a_problem_in_another_file_does_not_stop_an_agent() {
+    // Arrange
+    let other = agent("ghost", "\"nope\"");
+    let command_like = "+++\nbroken";
+    let catalog = catalog_of(&[("ghost.md", other)], &[]);
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("commands")).unwrap();
+    fs::write(dir.path().join("commands/explore.md"), command_like).unwrap();
+    let with_command = Catalog::load(dir.path(), None);
+
+    // Act
+    let (from_agents, from_commands) = (
+        catalog.dispatchable("explore"),
+        with_command.dispatchable("explore"),
+    );
+
+    // Assert
+    assert!(!catalog.problems().is_empty() && !with_command.problems().is_empty());
+    assert_eq!(from_agents.unwrap().def.name, "explore");
+    assert_eq!(from_commands.unwrap().def.name, "explore");
 }
 
 #[test]

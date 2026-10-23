@@ -234,23 +234,28 @@ pub fn refresh_index(store: &Mutex<Store>, root: &Path) {
 }
 
 /// The edit tool, followed by an index refresh after every edit that applied.
-pub struct RefreshAfterEdit {
-    edit: EditTool,
+/// The wrapped tool is generic so a test can stand in for it.
+pub struct RefreshAfterEdit<T = EditTool> {
+    edit: T,
     store: Arc<Mutex<Store>>,
     root: PathBuf,
 }
 
-impl RefreshAfterEdit {
+impl<T: Tool> RefreshAfterEdit<T> {
     /// Wraps `edit`, refreshing the index of `root` in `store` after it succeeds.
     #[must_use]
-    pub fn new(edit: EditTool, store: Arc<Mutex<Store>>, root: PathBuf) -> Self {
+    pub fn new(edit: T, store: Arc<Mutex<Store>>, root: PathBuf) -> Self {
         Self { edit, store, root }
     }
 }
 
-impl Tool for RefreshAfterEdit {
+impl<T: Tool> Tool for RefreshAfterEdit<T> {
     fn name(&self) -> &'static str {
         self.edit.name()
+    }
+
+    fn shrinkable(&self) -> bool {
+        self.edit.shrinkable()
     }
 
     fn call(&self, input: &Value) -> Result<ToolOutput, ToolError> {
@@ -786,5 +791,38 @@ mod tests {
         // Assert
         assert!(matches!(result, Err(ToolError::NoMatch { .. })));
         assert_eq!(index.symbols("alpha").unwrap().len(), 1);
+    }
+
+    /// A tool that asks the loop not to shrink its output.
+    struct Whole;
+
+    impl Tool for Whole {
+        fn name(&self) -> &'static str {
+            "whole"
+        }
+
+        fn call(&self, _input: &serde_json::Value) -> Result<coda_tools::ToolOutput, ToolError> {
+            unreachable!("only shrinkable is asked")
+        }
+
+        fn shrinkable(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn the_wrapper_passes_on_what_the_wrapped_tool_says_about_shrinking() {
+        // Arrange
+        let (_dir, store, root, _clock) = indexed_workspace();
+        let edit = EditTool::new(Sandbox::new(&root).unwrap(), DEFAULT_MAX_FILE_BYTES);
+
+        // Act
+        let wraps_whole = RefreshAfterEdit::new(Whole, Arc::clone(&store), root.clone());
+        let wraps_edit = RefreshAfterEdit::new(edit, store, root);
+
+        // Assert
+        assert!(!wraps_whole.shrinkable());
+        assert_eq!(wraps_whole.name(), "whole");
+        assert!(wraps_edit.shrinkable());
     }
 }

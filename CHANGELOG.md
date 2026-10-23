@@ -20,6 +20,13 @@ All notable changes to Coda are recorded here. The format follows
 - Built-in agents `explore`, `reviewer`, `implementer` and `tester`, available to the `task` tool with no files. A user file of the same name replaces one. A trusted project file of the same name can replace its prompt and narrow its tools, but keeps its tier and effort; `coda agents lint` reports a tier, effort or tool the project file asked for and did not get.
 - Command files are slash commands in the terminal UI (`/name args`, listed by the new `/help`) and run headless with `coda run --command <name> --args <text>`. Without `--args`, piped standard input (up to 256 KiB) is the arguments of a command that has a `$ARGUMENTS`; an unknown command fails before it is read, and a command without `$ARGUMENTS` never reads it. `$ARGUMENTS` in the prompt template is replaced by the arguments as plain text, and a prompt that is blank after that is not sent. Only your own and trusted project commands run, and a built-in TUI command wins a name clash in the TUI. The terminal UI reads trust once, when it starts. It says when definition files were skipped.
 - Skills for model-API sessions. The model is offered the skills by name and description in the description of a new `skill` tool, and a skill's body enters the conversation only when the model calls the tool for it. Only your own skills and those of a trusted project are offered.
+- `coda doctor` warns when a `[routing]` alias uses another provider than the default session provider, since a `task` call in a session on that provider cannot use it.
+
+### Fixed
+
+- A skill body between 16 and 32 KiB reaches the model whole. It was shortened like any long tool result.
+- A `task` call for an agent whose definition file was skipped is refused with the problem. It used to run the built-in or user agent of that name without a word.
+- A result that a hook withheld no longer leaves its original in the store when saving its size failed, and deleting it no longer waits for the store on the async threads.
 
 ## [0.1.0] - Unreleased
 
