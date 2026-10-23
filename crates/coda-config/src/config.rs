@@ -268,10 +268,19 @@ impl Config {
 
     fn check_hooks(&self) -> Result<(), ConfigError> {
         for (index, hook) in self.hooks.iter().enumerate() {
-            if hook.command.first().is_none_or(String::is_empty) {
+            let Some(program) = hook.command.first().filter(|program| !program.is_empty()) else {
                 return Err(ConfigError::InvalidValue {
                     path: format!("{HOOKS_KEY}[{index}].command"),
                     allowed: "a list with the program first, then its arguments".to_owned(),
+                });
+            };
+            // A relative path would run a file of the session directory, which the model can edit.
+            if program.contains(std::path::is_separator) && !Path::new(program).is_absolute() {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{HOOKS_KEY}[{index}].command"),
+                    allowed: format!(
+                        "a program that is an absolute path or a bare name found on PATH, not `{program}`"
+                    ),
                 });
             }
             if hook

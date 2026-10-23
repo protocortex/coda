@@ -25,7 +25,7 @@ use coda_agents::{
     Catalog, DispatchError, Report, Status, TaskResult, Tier, child_tools, parse_report,
 };
 use coda_config::config::Config;
-use coda_config::hooks::{HookConfig, HookEvent};
+use coda_config::hooks::HookEvent;
 use coda_core::broker::RunGrants;
 use coda_core::history::{
     ASSISTANT_MESSAGE_KIND, CHILD_EVENT_KIND, CONTEXT_OVERFLOW_KIND, TOOL_FINISHED_KIND,
@@ -246,11 +246,12 @@ impl ChildRunner {
     /// runs `session_start`, which marks the start of the session, not of a
     /// sub-agent.
     fn hooks_for(&self, depth: u8) -> HookRunner {
-        let hooks: Vec<HookConfig> = (self.env.config.hooks.iter())
-            .filter(|hook| depth == 0 || hook.event != HookEvent::SessionStart)
-            .cloned()
-            .collect();
-        HookRunner::new(&hooks, self.env.env.clone())
+        let runner = HookRunner::new(&self.env.config.hooks, self.env.env.clone());
+        if depth == 0 {
+            runner
+        } else {
+            runner.without(HookEvent::SessionStart)
+        }
     }
 
     async fn run_child(&self, request: TaskRequest) -> Result<TaskOutcome, ChildError> {

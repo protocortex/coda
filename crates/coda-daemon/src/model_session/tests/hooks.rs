@@ -9,7 +9,10 @@ use coda_config::hooks::{HookConfig, HookEvent};
 use coda_protocol::types::Mode;
 use serde_json::{Value, json};
 
+use coda_core::hooks::MAX_RESULT_BYTES;
+
 use super::{API_KEY_CANARY, Rig, text_turn, tool_turn};
+use crate::model_session::COMPACT_THRESHOLD_BYTES;
 
 /// Far longer than a hook needs: the first run of a program can be slow on a busy machine.
 const PATIENT_MS: u64 = 20_000;
@@ -201,4 +204,91 @@ async fn a_sub_agent_does_not_run_the_session_start_hooks() {
     assert_eq!(rig.request_lines().len(), 4);
     let ran = std::fs::read_to_string(&starts).unwrap();
     assert_eq!(ran, "start\n", "only the session starts, not its sub-agent");
+}
+
+/// The payloads a hook logged to `file`, one JSON object per line.
+fn payloads(file: &Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let lines = text.lines().filter(|line| !line.is_empty());
+    lines
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The compaction footer names the original's size and id.
+const FOOTER_ROOM_BYTES: usize = 256;
+
+// A hook gets every result the daemon hands the model, unless it is huge.
+const _: () = assert!(MAX_RESULT_BYTES >= COMPACT_THRESHOLD_BYTES + FOOTER_ROOM_BYTES);
+
+#[tokio::test]
+async fn a_post_tool_hook_sees_the_whole_result_the_model_sees() {
+    // Arrange
+    let out = tempfile::tempdir().unwrap();
+    let seen = out.path().join("seen.jsonl");
+    let script = r#"cat >> "$1"; echo >> "$1""#;
+    let hook = shell_hook(HookEvent::PostTool, script, &seen, true);
+    let read = tool_turn(&[("c1", "read", json!({"path": "big.txt"}))]);
+    let mut rig = Rig::custom(
+        Mode::Default,
+        &[read, text_turn("understood")],
+        true,
+        None,
+        |config| config.hooks.push(hook),
+    );
+    // Past the 4 KiB the hook used to get, and below what the daemon compacts.
+    let secret_at_the_end = "SECRET-AT-THE-END";
+    let body = format!("{}\n{secret_at_the_end}\n", "x".repeat(10 * 1024));
+    std::fs::write(rig.cwd.join("big.txt"), body).unwrap();
+
+    // Act
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let payloads = payloads(&seen);
+    assert_eq!(payloads.len(), 1);
+    let result = payloads[0]["result"].as_str().unwrap();
+    assert!(
+        result.contains(secret_at_the_end),
+        "cut at {}",
+        result.len()
+    );
+    assert!(payloads[0].get("result_truncated").is_none());
+    let second = serde_json::to_string(&rig.requests()[1]).unwrap();
+    assert!(second.contains(secret_at_the_end), "{second}");
+}
+
+#[tokio::test]
+async fn a_blocking_post_tool_hook_guards_a_sub_agents_tool_output_too() {
+    // Arrange
+    let out = tempfile::tempdir().unwrap();
+    let seen = out.path().join("seen.txt");
+    let script = r#"cat >> "$1"; echo "scout output vetoed" >&2; exit 3"#;
+    let hook = shell_hook(HookEvent::PostTool, script, &seen, true);
+    let mut rig = Rig::custom(Mode::Default, &scout_script(), true, None, |config| {
+        config.hooks.push(hook);
+    });
+    install_scout(&rig);
+
+    // Act
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let lines = rig.request_lines();
+    assert_eq!(lines.len(), 4, "the scout, then the session, ask the model");
+    let scout_next = lines[2]["messages"].to_string();
+    assert!(
+        scout_next.contains("blocked by the post_tool hook"),
+        "{scout_next}"
+    );
+    assert!(scout_next.contains("scout output vetoed"), "{scout_next}");
+    assert!(!scout_next.contains("one needle here"), "{scout_next}");
+    // The hook saw the scout's `read` and not the session's `task` call.
+    let logged = std::fs::read_to_string(&seen).unwrap();
+    assert_eq!(logged.matches("\"event\":\"post_tool\"").count(), 1);
+    assert!(logged.contains("\"tool\":\"read\""), "{logged}");
 }
