@@ -179,6 +179,34 @@ async fn a_switch_during_a_running_turn_is_rejected_and_the_turn_goes_on() {
 }
 
 #[tokio::test]
+async fn a_switch_right_after_a_cancel_waits_for_the_turn_to_end() {
+    // Arrange
+    let calls = tool_turn(&[("c1", "bash", json!({"command": "true"}))]);
+    let mut rig = Rig::custom(Mode::Default, &[calls], true, None, faux_alias);
+    rig.send("go").await;
+    rig.wait_for_pending().await;
+
+    // Act
+    // The turn task has not run since the cancel, so it has not yet said it is ending.
+    let cancelled = rig
+        .call("session.cancel", json!({"session_id": rig.session}))
+        .await;
+    let params = set_model(&rig.session, "scripted");
+    let response = rig.call("session.set_model", params).await;
+
+    // Assert
+    assert_eq!(cancelled["result"]["cancelled"], true);
+    assert_eq!(
+        response["result"]["session"]["model"], "script-1",
+        "{response}"
+    );
+    assert_eq!(
+        stored_model(&rig.hub, &rig.session).await.as_deref(),
+        Some("script-1")
+    );
+}
+
+#[tokio::test]
 async fn a_switch_changes_only_the_target_session() {
     // Arrange
     let mut rig = Rig::custom(Mode::Default, &[], true, None, faux_alias);

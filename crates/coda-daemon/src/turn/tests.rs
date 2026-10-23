@@ -15,7 +15,10 @@ use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::{BACKEND_UNSUPPORTED, Reservation, SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig, Turns};
+use super::{
+    BACKEND_UNSUPPORTED, CancelHandle, Reservation, SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig,
+    TurnState, Turns, WIND_DOWN_TIMEOUT,
+};
 use crate::dispatch::Dispatcher;
 use crate::idle_pool::MAX_IDLE_SERVERS;
 use crate::state::DaemonState;
@@ -1588,10 +1591,62 @@ fn a_cancel_marks_a_cancellable_reservation_as_winding_down_and_an_uncancellable
     ];
 
     // Assert
+    let cancelled = TurnState::WindingDown { cancelled: true };
     assert_eq!(results, [true, true, false]);
-    assert!(armed.is_winding_down());
-    assert!(early.is_winding_down());
-    assert!(!fixed.is_winding_down());
+    assert_eq!(
+        [armed.state(), early.state(), fixed.state()],
+        [cancelled, cancelled, TurnState::Live]
+    );
+}
+
+#[test]
+fn a_reservation_is_live_until_its_turn_ends_or_is_cancelled() {
+    // Arrange
+    let fresh = Reservation::<()>::default();
+    let mut ended = Reservation::<()>::default();
+    ended.wind_down();
+    let mut cancelled_after_end = Reservation::<()>::default();
+    cancelled_after_end.wind_down();
+    cancelled_after_end.request_cancel(|()| {});
+
+    // Act
+    let states = [fresh.state(), ended.state(), cancelled_after_end.state()];
+
+    // Assert
+    assert_eq!(
+        states,
+        [
+            TurnState::Live,
+            TurnState::WindingDown { cancelled: false },
+            TurnState::WindingDown { cancelled: true },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_session_with_no_reservation_is_free_and_a_reserved_one_is_live_until_cancelled() {
+    // Arrange
+    let rig = Rig::new(relaxed(), Vec::new());
+    let turns = &rig.turns;
+    let free = turns.turn_state(&rig.session);
+
+    // Act
+    let slot = turns.reserve(&rig.session).unwrap();
+    let live = turns.turn_state(&rig.session);
+    turns.cancel(&rig.session);
+    let cancelled = turns.turn_state(&rig.session);
+    drop(slot);
+
+    // Assert
+    assert_eq!(
+        [free, live, cancelled],
+        [
+            TurnState::Free,
+            TurnState::Live,
+            TurnState::WindingDown { cancelled: true },
+        ]
+    );
+    assert_eq!(turns.turn_state(&rig.session), TurnState::Free);
 }
 
 #[tokio::test]
@@ -1614,4 +1669,151 @@ async fn a_close_right_after_a_cancel_waits_for_the_turn_and_stops_its_server() 
     assert_eq!(cancelled["result"]["cancelled"], true);
     assert!(closed["error"].is_null(), "{closed}");
     assert_gone(pid).await;
+}
+
+/// Virtual time a request must stay unanswered while its turn is held, to count
+/// as waiting. Below the wait limit, so the wait has not given up yet.
+const HELD_FOR: Duration = Duration::from_secs(1);
+/// Slack above the wait limit for a wait that ends on a poll after it.
+const WAIT_OVERSHOOT: Duration = Duration::from_secs(1);
+/// The least a Codex send waits when the server ignores the interrupt: the
+/// adapter gives the interrupt two seconds before it stops the server.
+const IGNORED_INTERRUPT_WAIT: Duration = Duration::from_secs(1);
+
+#[tokio::test(start_paused = true)]
+async fn a_close_after_a_cancel_before_the_backend_runs_waits_until_the_turn_ends() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    let session = rig.session.clone();
+    // A reservation with no backend yet, held by the test in place of the turn.
+    let slot = rig.turns.reserve(&session).unwrap();
+    let cancelled = rig.turns.cancel(&session);
+    let mut close = std::pin::pin!(rig.call("session.close", close_params(&session)));
+
+    // Act
+    // Nothing before the wait reads the store, so the paused clock moves only
+    // through the wait's own sleeps.
+    let early = tokio::time::timeout(HELD_FOR, &mut close).await;
+    let held = early.is_err();
+    // Polling a finished request again would panic and hide the real failure.
+    let closed = if let Ok(answer) = early {
+        answer
+    } else {
+        drop(slot);
+        close.await
+    };
+
+    // Assert
+    assert!(cancelled);
+    assert!(held, "answered while the turn was held: {closed}");
+    assert!(closed["error"].is_null(), "{closed}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_send_after_a_cancel_before_the_backend_runs_waits_instead_of_refusing() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    let session = rig.session.clone();
+    let _slot = rig.turns.reserve(&session).unwrap();
+    rig.turns.cancel(&session);
+
+    // Act
+    // No outer timeout: it would be the only timer, and the clock would jump to
+    // it while the send reads the store. Only the wait's own limit ends this.
+    let sent = rig.send("again").await;
+
+    // Assert
+    assert_eq!(sent["error"]["code"], TURN_RUNNING, "{sent}");
+    assert_eq!(
+        sent["error"]["message"],
+        "The cancelled turn is still ending. Try again."
+    );
+}
+
+#[tokio::test]
+async fn a_send_right_after_a_cancel_waits_for_a_codex_turn_to_end() {
+    // Arrange
+    let mut rig = codex_rig(&json!({"ignore_interrupt": true}));
+    rig.send("please stall").await;
+    rig.wait_for_prompts(1).await;
+    let session = rig.session.clone();
+
+    // Act
+    // The server ignores the interrupt, so the turn ends only when the adapter
+    // gives up on it, long after a send that did not wait would be refused.
+    let cancelled = rig
+        .call("session.cancel", json!({"session_id": session}))
+        .await;
+    let started = Instant::now();
+    let sent = rig.send("again").await;
+    let waited = started.elapsed();
+    rig.wait_until_turn_over().await;
+
+    // Assert
+    assert_eq!(cancelled["result"]["cancelled"], true);
+    assert!(sent["result"]["turn_id"].is_string(), "{sent}");
+    assert!(waited >= IGNORED_INTERRUPT_WAIT, "{waited:?}");
+}
+
+/// Closes a session whose reservation no turn task will ever release, and
+/// returns the response with the virtual time the close waited.
+async fn close_with_a_stuck_reservation(stuck: Reservation<CancelHandle>) -> (Value, Duration) {
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    let session = rig.session.clone();
+    rig.turns.running().insert(session.clone(), stuck);
+    let started = tokio::time::Instant::now();
+    // Nothing before the wait reads the store, so the paused clock moves only
+    // through the wait's own sleeps and the outer bound cannot fire early.
+    let closed = tokio::time::timeout(
+        2 * WIND_DOWN_TIMEOUT,
+        rig.call("session.close", close_params(&session)),
+    )
+    .await
+    .expect("the close never gave up");
+    (closed, started.elapsed())
+}
+
+/// A reservation whose cancel is waiting for a backend that never starts.
+fn cancelled_reservation() -> Reservation<CancelHandle> {
+    let mut stuck = Reservation::default();
+    stuck.request_cancel(CancelHandle::cancel);
+    stuck
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_that_never_takes_effect_makes_close_give_up_after_the_wait_limit() {
+    // Act
+    let (closed, waited) = close_with_a_stuck_reservation(cancelled_reservation()).await;
+
+    // Assert
+    assert_eq!(closed["error"]["code"], TURN_RUNNING, "{closed}");
+    assert!(waited >= WIND_DOWN_TIMEOUT, "{waited:?}");
+    assert!(waited < WIND_DOWN_TIMEOUT + WAIT_OVERSHOOT, "{waited:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wait_that_ends_on_a_cancelled_turn_says_it_is_still_ending_and_to_try_again() {
+    // Act
+    let (closed, _) = close_with_a_stuck_reservation(cancelled_reservation()).await;
+
+    // Assert
+    assert_eq!(closed["error"]["code"], TURN_RUNNING, "{closed}");
+    assert_eq!(
+        closed["error"]["message"],
+        "The cancelled turn is still ending. Try again."
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wait_that_ends_on_a_turn_nobody_cancelled_keeps_the_running_text() {
+    // Arrange
+    let mut ended = Reservation::default();
+    ended.wind_down();
+
+    // Act
+    let (closed, _) = close_with_a_stuck_reservation(ended).await;
+
+    // Assert
+    assert_eq!(closed["error"]["code"], TURN_RUNNING, "{closed}");
+    assert_eq!(closed["error"]["message"], "A turn is already running");
 }

@@ -16,7 +16,7 @@ use tracing::error;
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
 use crate::model_session::SwitchError;
 use crate::subscribe::HubError;
-use crate::turn::{BACKEND_UNSUPPORTED, SESSION_NOT_FOUND, TURN_RUNNING, Turns};
+use crate::turn::{BACKEND_UNSUPPORTED, SESSION_NOT_FOUND, TURN_RUNNING, TurnError, Turns};
 
 /// The alias is not defined, or names a provider the session cannot use.
 pub const UNKNOWN_MODEL: i64 = -32005;
@@ -25,10 +25,15 @@ pub const UNKNOWN_MODEL: i64 = -32005;
 pub const MODEL_UNAVAILABLE: i64 = -32006;
 
 /// Answers `session.set_model`. Switching to the alias the session already
-/// has is allowed and starts a new cache prefix again.
+/// has is allowed and starts a new cache prefix again. A cancelled turn is
+/// waited for, as `session.close` and `session.send` do.
 pub(crate) async fn set_model(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
     let turns = turns.ok_or_else(|| error(METHOD_NOT_FOUND, "Method not found"))?;
     let params: SessionSetModelParams = parse_params(params)?;
+    turns
+        .await_wind_down(&params.session_id)
+        .await
+        .map_err(TurnError::into_rpc)?;
     let record = turns
         .models
         .set_model(&params.session_id, &params.model)
