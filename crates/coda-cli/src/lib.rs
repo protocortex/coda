@@ -25,6 +25,7 @@ use clap::Parser;
 use crate::cli::{Cli, Command, DaemonAction, DaemonArgs, GrantCommand};
 pub use crate::context::{Context, Io, Wait};
 pub use crate::error::CliError;
+pub use crate::run::MAX_COMMAND_INPUT_BYTES;
 pub use crate::tui_cmd::{TuiFuture, TuiLauncher};
 
 /// Runs one `coda` invocation and returns its exit code. `args` starts with the

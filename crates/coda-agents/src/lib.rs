@@ -6,6 +6,7 @@
 
 mod builtin;
 mod catalog;
+mod commands;
 mod definition;
 mod digest;
 mod dispatch;
@@ -19,6 +20,7 @@ pub use catalog::{
     trust_project,
 };
 pub use coda_config::routing::Tier;
+pub use commands::CommandLookupError;
 pub use definition::{
     AgentDef, CommandDef, Effort, Issue, SkillDef, parse_agent, parse_command, parse_skill,
 };

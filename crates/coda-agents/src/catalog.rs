@@ -10,7 +10,7 @@
 //! and prompt of a user or built-in definition, and may narrow an agent's
 //! tools, but never widen them or change its tier or effort.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -369,6 +369,22 @@ impl Catalog {
     #[must_use]
     pub fn problems(&self) -> &[LoadProblem] {
         &self.problems
+    }
+
+    /// A line that sends the user to `coda agents lint`, when any file had a
+    /// problem. It counts files, not problems, since one file can have several.
+    #[must_use]
+    pub fn problems_hint(&self) -> Option<String> {
+        let files: BTreeSet<&Path> = self.problems.iter().map(|p| p.path.as_path()).collect();
+        let noun = match files.len() {
+            0 => return None,
+            1 => "file was",
+            _ => "files were",
+        };
+        Some(format!(
+            "{} definition {noun} skipped or only partly used; run `coda agents lint`",
+            files.len()
+        ))
     }
 
     /// The held-back project agent file that would override the agent `name`,

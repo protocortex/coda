@@ -44,6 +44,8 @@ pub struct Context {
     pub wait: Wait,
     /// Whether standard input and output are both a terminal.
     pub is_tty: bool,
+    /// Whether standard input is a terminal, whatever standard output is.
+    pub stdin_is_tty: bool,
     /// Runs the terminal UI.
     pub launch_tui: TuiLauncher,
 }
@@ -59,6 +61,7 @@ impl Context {
             timing: Timing::default(),
             wait: Wait::default(),
             is_tty: false,
+            stdin_is_tty: false,
             launch_tui: real_tui,
         }
     }
@@ -75,7 +78,8 @@ impl Context {
             std::env::current_exe().map_err(CliError::Environment)?,
             std::env::current_dir().map_err(CliError::Environment)?,
         );
-        ctx.is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        ctx.stdin_is_tty = std::io::stdin().is_terminal();
+        ctx.is_tty = ctx.stdin_is_tty && std::io::stdout().is_terminal();
         Ok(ctx)
     }
 }
