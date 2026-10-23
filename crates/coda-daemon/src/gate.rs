@@ -312,6 +312,7 @@ impl Announce {
             tool: notice.tool,
             repo_path: self.repo.clone(),
             command: notice.command,
+            agent: notice.agent,
         };
         if let Err(e) = self.hub.announce_pending(&turn, &notice.id, pending).await {
             warn!(session = %self.session, request = %notice.id, error = %e, "could not announce a permission request; denying it");
@@ -354,7 +355,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use coda_core::broker::Broker;
+    use coda_core::broker::{Broker, RunGrants};
+    use coda_protocol::codec::decode_message;
+    use coda_protocol::jsonrpc::Message;
     use coda_protocol::methods::PermissionRespondParams;
     use coda_protocol::paths::{Target, classify_target};
     use coda_protocol::types::{BackendKind, Mode, PermissionDecision, RequestId, TurnId};
@@ -368,7 +371,10 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::{BrokerGate, Brokers};
-    use crate::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub, Outbox};
+    use crate::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub, Outbox, PERMISSION_REQUEST_NOTIFICATION};
+
+    /// Length of the frame header in front of each queued payload.
+    const HEADER_LEN: usize = 4;
 
     const SHORT_TIMEOUT: Duration = Duration::from_millis(100);
     const ANSWER_WAIT: Duration = Duration::from_secs(10);
@@ -708,6 +714,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sub_agents_prompt_reaches_subscribers_with_its_agent_apart_from_the_command() {
+        // Arrange
+        let fixture = Fixture::new();
+        let (record, broker) = fixture
+            .broker_waiting("/ws/x", Mode::Default, ANSWER_WAIT)
+            .await;
+        let gate = fixture.gate(&record, &broker);
+        let (conn, mut outbox) = fixture.hub.connect();
+        conn.subscribe(&record.id, Some(0), None).await.unwrap();
+        let mut notices = broker.subscribe();
+        let asking = tokio::spawn({
+            let request = edit(&fixture, "src/a.rs", "/ws");
+            async move {
+                gate.request_for_agent(&request, "explore", &RunGrants::default())
+                    .await
+            }
+        });
+        let notice = tokio::time::timeout(ANSWER_WAIT, notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Act
+        let announced = tokio::time::timeout(ANSWER_WAIT, async {
+            loop {
+                let frame = outbox.events.recv().await.unwrap();
+                if let Ok(Message::Notification(n)) = decode_message(&frame[HEADER_LEN..])
+                    && n.method == PERMISSION_REQUEST_NOTIFICATION
+                {
+                    return n.params.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        fixture
+            .answer(&record, &notice.id, PermissionDecision::Deny)
+            .await;
+        asking.await.unwrap();
+
+        // Assert
+        assert_eq!(announced["agent"], "explore");
+        assert_eq!(announced["command"], "edit src/a.rs");
+    }
+
+    #[tokio::test]
     async fn an_answer_naming_another_sessions_request_is_refused() {
         // Arrange
         let fixture = Fixture::new();
@@ -770,6 +822,7 @@ mod tests {
                     tool: "bash".to_owned(),
                     repo_path: "/r".to_owned(),
                     command: "ls".to_owned(),
+                    agent: None,
                 })
             })
             .await

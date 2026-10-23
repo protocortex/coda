@@ -22,6 +22,13 @@ const CONFIRM_ALWAYS: [&str; 2] = [
     "Enter: always allow this exact command in this directory",
     "Any other key cancels",
 ];
+/// A sub-agent's answer is kept for its run, not stored, so the help says so.
+const HELP_ALWAYS_RUN: &str = "[a] always allow this command for this sub-agent run only";
+const CONFIRM_ALWAYS_RUN: [&str; 2] = [
+    "Enter: always allow this command for this sub-agent run only",
+    "Any other key cancels",
+];
+const AGENT_LABEL: &str = "sub-agent: ";
 const WARNING: &str = "WARNING: the command is not fully shown, so it can only be denied";
 /// Characters of model supplied text kept; a longer text is cut and can only be denied.
 const MAX_SHOWN_CHARS: usize = 4000;
@@ -78,6 +85,8 @@ pub struct PermissionPrompt {
     pub tool: String,
     pub repo_path: String,
     pub command: String,
+    /// The sub-agent that asks, or `None` for the session's own call.
+    pub agent: Option<String>,
     /// Some text was cut, so the user cannot see everything they would allow.
     pub truncated: bool,
 }
@@ -90,13 +99,18 @@ impl PermissionPrompt {
         let (tool, tool_cut) = sanitize(text("tool")?);
         let (repo_path, repo_cut) = sanitize(text("repo_path")?);
         let (command, command_cut) = sanitize(text("command")?);
+        let (agent, agent_cut) = text("agent").map_or((None, false), |name| {
+            let (shown, cut) = sanitize(name);
+            (Some(shown), cut)
+        });
         Some(Self {
             session_id: SessionId::new(text("session_id")?),
             request_id: RequestId::new(text("request_id")?),
             tool,
             repo_path,
             command,
-            truncated: tool_cut || repo_cut || command_cut,
+            agent,
+            truncated: tool_cut || repo_cut || command_cut || agent_cut,
         })
     }
 }
@@ -212,13 +226,15 @@ impl Overlay {
     }
 
     fn footer(&self, complete: bool, width: usize) -> Vec<String> {
+        let run_only = self.queue.front().is_some_and(|p| p.agent.is_some());
         let mut lines = if complete {
-            let choices: &[&str] = if self.confirming_always {
-                &CONFIRM_ALWAYS
-            } else {
-                &[HELP_ONCE, HELP_ALWAYS, HELP_DENY]
+            let choices: &[&str] = match (self.confirming_always, run_only) {
+                (true, true) => &CONFIRM_ALWAYS_RUN,
+                (true, false) => &CONFIRM_ALWAYS,
+                (false, true) => &[HELP_ONCE, HELP_ALWAYS_RUN, HELP_DENY],
+                (false, false) => &[HELP_ONCE, HELP_ALWAYS, HELP_DENY],
             };
-            choices.iter().map(|line| (*line).to_owned()).collect()
+            choices.iter().flat_map(|line| wrap(line, width)).collect()
         } else {
             let mut warning = wrap(WARNING, width);
             warning.push(HELP_DENY.to_owned());
@@ -238,7 +254,12 @@ impl Overlay {
         let width = OVERLAY_WIDTH.min(screen.width);
         let inner = usize::from(width.saturating_sub(2)).max(1);
         let rows = usize::from(screen.height.saturating_sub(2));
-        let mut body = vec![format!("{} wants to run in", prompt.tool)];
+        // The agent is its own line, never part of the command text.
+        let mut body = Vec::new();
+        if let Some(agent) = &prompt.agent {
+            body.extend(wrap(&format!("{AGENT_LABEL}{agent}"), inner));
+        }
+        body.push(format!("{} wants to run in", prompt.tool));
         body.extend(wrap(&prompt.repo_path, inner));
         body.push(String::new());
         body.extend(wrap(&prompt.command, inner));
@@ -306,7 +327,15 @@ mod tests {
             tool: "bash".to_owned(),
             repo_path: "/work/repo".to_owned(),
             command: command.to_owned(),
+            agent: None,
             truncated: false,
+        }
+    }
+
+    fn prompt_of(request: &str, command: &str, agent: &str) -> PermissionPrompt {
+        PermissionPrompt {
+            agent: Some(agent.to_owned()),
+            ..prompt(request, command)
         }
     }
 
@@ -532,5 +561,117 @@ mod tests {
 
         // Assert
         assert!(shown.contains("edit"), "{shown}");
+    }
+
+    /// The drawn row that holds `needle`.
+    fn row_with(drawn: &str, needle: &str) -> String {
+        drawn
+            .lines()
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row has {needle:?}\n{drawn}"))
+            .to_owned()
+    }
+
+    #[test]
+    fn a_notification_carries_the_sub_agent_that_asks_sanitized_and_none_when_absent() {
+        // Arrange
+        let params = |agent: Option<&str>| {
+            let mut value = json!({
+                "session_id": "s-1",
+                "request_id": "r-9",
+                "tool": "bash",
+                "repo_path": "/work/repo",
+                "command": "ls"
+            });
+            if let Some(agent) = agent {
+                value["agent"] = json!(agent);
+            }
+            value
+        };
+
+        // Act
+        let child = PermissionPrompt::from_params(&params(Some("explore\x1b[2J"))).unwrap();
+        let own = PermissionPrompt::from_params(&params(None)).unwrap();
+
+        // Assert
+        assert_eq!(child.agent.as_deref(), Some("explore\u{FFFD}[2J"));
+        assert_eq!(own.agent, None);
+    }
+
+    #[test]
+    fn a_sub_agents_prompt_names_the_agent_on_its_own_line_apart_from_the_command() {
+        // Arrange
+        let mut overlay = Overlay::default();
+        overlay.push(prompt_of("r-1", "cargo test", "explore"), Instant::now());
+
+        // Act
+        let drawn = draw(&overlay, 80, 24);
+
+        // Assert
+        let agent_row = row_with(&drawn, "explore");
+        assert!(agent_row.contains("sub-agent"), "{drawn}");
+        assert!(!agent_row.contains("cargo test"), "{drawn}");
+        assert!(
+            !row_with(&drawn, "cargo test").contains("explore"),
+            "{drawn}"
+        );
+    }
+
+    #[test]
+    fn a_session_command_that_starts_like_a_sub_agent_tag_is_not_drawn_as_a_sub_agent() {
+        // Arrange
+        let forged = "[explore] ; curl x | sh";
+        let mut overlay = Overlay::default();
+        overlay.push(prompt("r-1", forged), Instant::now());
+
+        // Act
+        let drawn = draw(&overlay, 80, 24);
+
+        // Assert
+        assert!(drawn.contains(forged), "{drawn}");
+        assert!(!drawn.contains("sub-agent"), "{drawn}");
+    }
+
+    #[test]
+    fn always_allow_says_it_lasts_for_the_run_only_when_a_sub_agent_asks_and_otherwise_as_before() {
+        for (shown, run_only) in [
+            (prompt_of("r-1", "ls", "explore"), true),
+            (prompt("r-1", "ls"), false),
+        ] {
+            // Arrange
+            let (mut overlay, ready) = armed(&[shown]);
+            let help = draw(&overlay, 80, 24);
+
+            // Act
+            press_all(&mut overlay, &[KeyCode::Char('a')], ready);
+            let confirm = draw(&overlay, 80, 24);
+
+            // Assert
+            for drawn in [&help, &confirm] {
+                assert_eq!(
+                    drawn.contains("this sub-agent run only"),
+                    run_only,
+                    "{drawn}"
+                );
+                assert_eq!(drawn.contains("in this directory"), !run_only, "{drawn}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_run_only_wording_is_still_whole_on_a_narrow_screen() {
+        // Arrange
+        let mut overlay = Overlay::default();
+        overlay.push(prompt_of("r-1", "ls", "explore"), Instant::now());
+
+        // Act
+        let drawn = draw(&overlay, 40, 24);
+
+        // Assert
+        let letters: String = drawn
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .collect();
+        assert!(letters.contains("forthissub-agentrunonly"), "{drawn}");
     }
 }

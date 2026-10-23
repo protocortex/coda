@@ -721,6 +721,7 @@ fn leftover_prompts_are_denied_even_when_a_client_answered_one_after_the_listing
             tool: "bash".to_owned(),
             repo_path: "/ws".to_owned(),
             command: command.to_owned(),
+            agent: None,
         };
         store.add_pending(&pending).unwrap();
     }

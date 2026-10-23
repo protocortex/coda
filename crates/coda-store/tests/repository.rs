@@ -568,6 +568,7 @@ fn new_pending(session: &SessionId, command: &str) -> NewPending {
         tool: "bash".to_owned(),
         repo_path: "/repo".to_owned(),
         command: command.to_owned(),
+        agent: None,
     }
 }
 
@@ -679,6 +680,7 @@ fn decisions_are_recorded_and_listed_for_a_session() {
         session: session.clone(),
         repo_path: "/repo".to_owned(),
         command: command.to_owned(),
+        agent: None,
         decision,
     };
 
@@ -698,6 +700,56 @@ fn decisions_are_recorded_and_listed_for_a_session() {
         .collect();
     assert_eq!(got, vec![("ls", true), ("rm -rf x", false)]);
     assert_eq!(decisions[0].decided_at, T0);
+}
+
+#[test]
+fn a_pending_request_and_its_decision_keep_the_sub_agent_that_asked() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = store.create_session(&new_session("/a")).unwrap();
+    let asked = |command: &str, agent: Option<&str>| NewPending {
+        agent: agent.map(str::to_owned),
+        ..new_pending(&session, command)
+    };
+    let child = store
+        .add_pending(&asked("cargo test", Some("explore")))
+        .unwrap();
+    let own = store.add_pending(&asked("cargo test", None)).unwrap();
+
+    // Act
+    let listed = store.list_pending(&session).unwrap();
+    store
+        .resolve_pending(&child, PermissionDecision::AllowOnce)
+        .unwrap();
+    store
+        .resolve_pending(&own, PermissionDecision::Deny)
+        .unwrap();
+    store
+        .record_decision(&NewDecision {
+            session: session.clone(),
+            repo_path: "/repo".to_owned(),
+            command: "ls".to_owned(),
+            agent: Some("reviewer".to_owned()),
+            decision: PermissionDecision::AllowOnce,
+        })
+        .unwrap();
+    let decisions = store.list_decisions(&session).unwrap();
+
+    // Assert
+    let asking: Vec<_> = listed.iter().map(|p| p.agent.as_deref()).collect();
+    assert_eq!(asking, [Some("explore"), None]);
+    let recorded: Vec<_> = decisions
+        .iter()
+        .map(|d| (d.command.as_str(), d.agent.as_deref()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            ("cargo test", Some("explore")),
+            ("cargo test", None),
+            ("ls", Some("reviewer")),
+        ]
+    );
 }
 
 #[test]

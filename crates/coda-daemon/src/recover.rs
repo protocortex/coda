@@ -238,6 +238,7 @@ mod tests {
             tool: "bash".to_owned(),
             repo_path: "/work".to_owned(),
             command: "ls".to_owned(),
+            agent: None,
         };
         let turn = rig
             .hub

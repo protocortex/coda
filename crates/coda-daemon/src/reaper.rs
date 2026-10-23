@@ -460,6 +460,7 @@ mod tests {
             tool: "bash".to_owned(),
             repo_path: "/work".to_owned(),
             command: "ls".to_owned(),
+            agent: None,
         };
         rig.hub
             .with_store_mut(move |store| store.add_pending(&pending))
@@ -564,6 +565,7 @@ mod tests {
                 tool: "bash".to_owned(),
                 repo_path: "/work".to_owned(),
                 command: command.to_owned(),
+                agent: None,
             };
             rig.hub
                 .with_store_mut(move |store| store.add_pending(&pending))

@@ -28,11 +28,11 @@ use crate::turn::Turns;
 const BODY: &str = "You are a scout. Report what you find.\n";
 const PROMPT: &str = "find the needle";
 const TOUCH: &str = "touch ran.txt";
-const LABELLED: &str = "[scout] touch ran.txt";
+const AGENT: &str = "scout";
 const DENY_TIMEOUT: Duration = Duration::from_millis(100);
 /// A file that a build or hook runs, so an edit to it prompts even in accept-edits mode.
 const SCRIPT: &str = "scripts/x.sh";
-const LABELLED_EDIT: &str = "[scout] edit scripts/x.sh";
+const EDIT_TEXT: &str = "edit scripts/x.sh";
 const MODEL_DOWN: &str =
     r#"{"events": [], "error": {"class": "fatal", "message": "the model is down"}}"#;
 
@@ -64,6 +64,17 @@ fn scout_rig(script: &[Value], tools: &str, tune: impl FnOnce(&mut Config)) -> R
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("scout.md"), agent_file("scout", tools, BODY)).unwrap();
     rig
+}
+
+/// The text and asking agent of the first waiting prompt.
+async fn waiting(rig: &Rig) -> (String, Option<String>) {
+    let pending = rig.pending().await;
+    (pending[0].command.clone(), pending[0].agent.clone())
+}
+
+/// What a prompt of the agent `scout` for `text` looks like.
+fn scouts(text: &str) -> (String, Option<String>) {
+    (text.to_owned(), Some(AGENT.to_owned()))
 }
 
 /// Waits for the `results`th turn to end.
@@ -204,23 +215,35 @@ async fn an_always_allow_for_a_child_covers_its_run_only_and_never_widens_the_pa
     let mut rig = scout_rig(&script, "\"bash\"", |_| {});
     rig.send("go").await;
     let first = rig.wait_for_pending().await;
-    let labelled = rig.pending().await[0].command.clone();
+    let labelled = waiting(&rig).await;
 
     // Act
     rig.respond(&first, "allow_always").await;
     let second = rig.wait_for_pending().await;
-    let asked = rig.pending().await[0].command.clone();
+    let asked = waiting(&rig).await;
     let grants = dump(&rig.db(), "permission_grants");
     let decisions = dump(&rig.db(), "permission_decisions");
     rig.respond(&second, "deny").await;
     finish(&rig, 1).await;
 
     // Assert
-    assert_eq!(labelled, LABELLED, "the child's prompt names the agent");
-    assert_eq!(asked, TOUCH, "the second prompt is the parent's own");
-    assert_eq!(grants, "", "nothing is stored for the session");
     assert_eq!(
-        decisions.matches(LABELLED).count(),
+        labelled,
+        scouts(TOUCH),
+        "the child's prompt names the agent"
+    );
+    assert_eq!(
+        asked,
+        (TOUCH.to_owned(), None),
+        "the second prompt is the parent's own"
+    );
+    assert_eq!(grants, "", "nothing is stored for the session");
+    let by_child = format!("|{TOUCH}|allow|");
+    assert_eq!(
+        decisions
+            .lines()
+            .filter(|row| row.contains(&by_child) && row.ends_with(&format!("|{AGENT}|")))
+            .count(),
         2,
         "the answered prompt and the call it covered are both recorded: {decisions}"
     );
@@ -266,7 +289,7 @@ async fn cancelling_the_parent_stops_the_child_and_takes_back_its_prompt() {
     let mut rig = scout_rig(&script, "\"bash\"", |_| {});
     rig.send("go").await;
     rig.wait_for_pending().await;
-    let waiting_on = rig.pending().await[0].command.clone();
+    let waiting_on = waiting(&rig).await;
 
     // Act
     rig.call("session.cancel", json!({"session_id": rig.session}))
@@ -274,7 +297,7 @@ async fn cancelling_the_parent_stops_the_child_and_takes_back_its_prompt() {
     finish(&rig, 1).await;
 
     // Assert
-    assert_eq!(waiting_on, LABELLED, "the child was the one waiting");
+    assert_eq!(waiting_on, scouts(TOUCH), "the child was the one waiting");
     let stopped = rig.bodies("turn_stopped").await;
     assert_eq!(stopped.len(), 1, "one terminal event: {stopped:?}");
     assert_eq!(stopped[0]["condition"], "cancelled");
@@ -311,22 +334,24 @@ async fn an_always_allow_does_not_stop_the_prompt_for_an_edit_that_changes_what_
     std::fs::write(rig.cwd.join(SCRIPT), "one\n").unwrap();
     rig.send("go").await;
     let first = rig.wait_for_pending().await;
-    let asked = rig.pending().await[0].command.clone();
+    let asked = waiting(&rig).await;
 
     // Act
     rig.respond(&first, "allow_always").await;
     let second = rig.wait_for_pending().await;
-    let asked_again = rig.pending().await[0].command.clone();
+    let asked_again = waiting(&rig).await;
     rig.respond(&second, "deny").await;
     finish(&rig, 1).await;
 
     // Assert
     assert_eq!(
-        asked, LABELLED_EDIT,
+        asked,
+        scouts(EDIT_TEXT),
         "the prompt names the agent and the path"
     );
     assert_eq!(
-        asked_again, LABELLED_EDIT,
+        asked_again,
+        scouts(EDIT_TEXT),
         "an always-allow cannot cover this path"
     );
     let on_disk = std::fs::read_to_string(rig.cwd.join(SCRIPT)).unwrap();

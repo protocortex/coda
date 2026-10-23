@@ -687,6 +687,7 @@ mod tests {
             tool: "bash".to_owned(),
             repo_path: "/work/repo".to_owned(),
             command: "cargo test".to_owned(),
+            agent: None,
             truncated: false,
         })
     }
