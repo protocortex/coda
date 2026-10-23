@@ -88,3 +88,56 @@ fn expansion_is_plain_text_and_runs_nothing_and_includes_nothing() {
     // Assert
     assert_eq!(prompt, "Cat @/etc/hosts and !`echo hi` and $(echo hi): x");
 }
+
+#[test]
+fn a_prompt_that_is_blank_after_expansion_is_an_error() {
+    // Arrange
+    let cases = [
+        ("$ARGUMENTS", ""),
+        ("$ARGUMENTS", "   \n"),
+        ("  $ARGUMENTS  \n", "\t"),
+        ("", ""),
+        ("   \n\n", ""),
+    ];
+
+    for (body, args) in cases {
+        // Act
+        let result = command(body).expand(args);
+
+        // Assert
+        assert_eq!(result, Err(ExpandError::Blank), "{body:?} with {args:?}");
+    }
+}
+
+#[test]
+fn a_template_that_is_only_the_placeholder_is_a_prompt_once_it_has_arguments() {
+    // Arrange
+    let def = command("$ARGUMENTS");
+
+    // Act
+    let prompt = def.expand(" fix the build ").unwrap();
+
+    // Assert
+    assert_eq!(prompt, "fix the build");
+}
+
+#[test]
+fn a_command_takes_arguments_only_when_its_prompt_has_the_placeholder() {
+    // Act
+    let with = command("Review $ARGUMENTS.").takes_arguments();
+    let without = command("Review the repository.").takes_arguments();
+
+    // Assert
+    assert!(with);
+    assert!(!without);
+}
+
+#[test]
+fn the_blank_error_says_how_to_fix_it() {
+    // Act
+    let message = ExpandError::Blank.to_string();
+
+    // Assert
+    assert!(message.contains("blank"), "{message}");
+    assert!(message.contains("arguments"), "{message}");
+}

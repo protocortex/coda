@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::Path;
 
-use coda_agents::{Catalog, PROJECT_DIR, Source, trust_project};
+use coda_agents::{Catalog, CommandLookupError, PROJECT_DIR, PendingReason, Source, trust_project};
 use coda_store::Store;
 use tempfile::TempDir;
 
@@ -378,4 +378,163 @@ fn a_symlinked_subfolder_is_refused() {
             .iter()
             .any(|p| p.message.contains("symlink"))
     );
+}
+
+fn command(name: &str) -> String {
+    format!("+++\nname = \"{name}\"\ndescription = \"d\"\n+++\nDo $ARGUMENTS\n")
+}
+
+#[test]
+fn a_user_command_and_a_trusted_project_command_are_runnable() {
+    // Arrange
+    let f = fixture();
+    write(f.user.path(), "commands/review.md", &command("review"));
+    write(
+        f.repo.path(),
+        ".coda/commands/deploy.md",
+        &command("deploy"),
+    );
+
+    // Act
+    let catalog = f.trusted();
+
+    // Assert
+    let review = catalog.runnable_command("review").unwrap();
+    assert_eq!(review.def.name, "review");
+    assert_eq!(review.source, Source::User);
+    let deploy = catalog.runnable_command("deploy").unwrap();
+    assert_eq!(deploy.source, Source::Project);
+}
+
+#[test]
+fn a_project_command_waiting_for_trust_is_refused_with_the_reason_and_the_way_forward() {
+    // Arrange
+    let f = fixture();
+    write(
+        f.repo.path(),
+        ".coda/commands/deploy.md",
+        &command("deploy"),
+    );
+
+    // Act
+    let refused = f.untrusted().runnable_command("deploy").unwrap_err();
+
+    // Assert
+    assert_eq!(
+        refused,
+        CommandLookupError::Pending {
+            name: "deploy".to_owned(),
+            reason: PendingReason::NotTrusted
+        }
+    );
+    assert_eq!(
+        refused.to_string(),
+        "deploy is a project command that is not in use: the repository is not trusted; \
+         review the files, then run `coda agents trust`"
+    );
+}
+
+#[test]
+fn a_command_file_edited_after_trust_is_refused_as_changed() {
+    // Arrange
+    let f = fixture();
+    write(
+        f.repo.path(),
+        ".coda/commands/deploy.md",
+        &command("deploy"),
+    );
+    let mut store = Store::open(&f.data.path().join("data")).unwrap();
+    trust_project(&mut store, f.repo.path()).unwrap();
+    let edited = command("deploy").replace("Do", "Undo");
+    write(f.repo.path(), ".coda/commands/deploy.md", &edited);
+
+    // Act
+    let catalog = Catalog::load_trusted(&store, f.user.path(), Some(f.repo.path())).unwrap();
+
+    // Assert
+    let refused = catalog.runnable_command("deploy").unwrap_err();
+    assert!(matches!(
+        refused,
+        CommandLookupError::Pending {
+            reason: PendingReason::ChangedSinceTrust,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_name_no_file_defines_is_unknown_and_a_pending_agent_file_is_not_a_command() {
+    // Arrange
+    let f = fixture();
+    write(
+        f.repo.path(),
+        ".coda/agents/deploy.md",
+        &agent("deploy", "p", "\"read\""),
+    );
+
+    // Act
+    let catalog = f.untrusted();
+
+    // Assert
+    for name in ["nope", "deploy", "Deploy", ""] {
+        assert_eq!(
+            catalog.runnable_command(name).unwrap_err(),
+            CommandLookupError::Unknown {
+                name: name.to_owned()
+            },
+            "{name:?}"
+        );
+    }
+}
+
+#[test]
+fn a_user_command_runs_even_when_a_project_file_of_the_same_name_waits_for_trust() {
+    // Arrange
+    let f = fixture();
+    write(f.user.path(), "commands/deploy.md", &command("deploy"));
+    write(
+        f.repo.path(),
+        ".coda/commands/deploy.md",
+        &command("deploy"),
+    );
+
+    // Act
+    let catalog = f.untrusted();
+
+    // Assert
+    let deploy = catalog.runnable_command("deploy").unwrap();
+    assert_eq!(deploy.source, Source::User);
+}
+
+#[test]
+fn problems_are_summed_up_in_a_line_that_names_the_lint_command() {
+    // Arrange
+    let f = fixture();
+    write(f.user.path(), "agents/bad.md", "no frontmatter");
+    write(f.user.path(), "commands/worse.md", "no frontmatter either");
+
+    // Act
+    let hint = f.untrusted().problems_hint();
+
+    // Assert
+    let hint = hint.unwrap();
+    assert!(hint.starts_with("2 definition files"), "{hint}");
+    assert!(hint.contains("`coda agents lint`"), "{hint}");
+}
+
+#[test]
+fn several_problems_in_one_file_count_as_one_file_and_a_clean_catalog_has_no_hint() {
+    // Arrange
+    let f = fixture();
+    let two_problems = agent("bad", "p", "\"teleport\"").replace("\"fast\"", "\"turbo\"");
+    write(f.user.path(), "agents/bad.md", &two_problems);
+
+    // Act
+    let catalog = f.untrusted();
+
+    // Assert
+    assert!(catalog.problems().len() > 1, "{:?}", catalog.problems());
+    let hint = catalog.problems_hint().unwrap();
+    assert!(hint.starts_with("1 definition file "), "{hint}");
+    assert_eq!(fixture().untrusted().problems_hint(), None);
 }

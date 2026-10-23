@@ -6,10 +6,12 @@
 //! The run is headless: nobody can answer a permission prompt, so every
 //! prompt is denied and the model carries on without that tool call.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use coda_agents::CommandDef;
 use coda_client::{Client, ClientError, Subscription};
 use coda_config::config::Config;
 use coda_core::turn::StopCondition;
@@ -27,13 +29,17 @@ use serde_json::Value;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing::{debug, info, warn};
 
-use crate::agents::command_prompt;
+use crate::agents::{command_def, command_prompt};
 use crate::autostart::{connect_unchecked, ensure_daemon};
 use crate::cli::RunArgs;
 use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
 use crate::error::CliError;
 use crate::exit;
+
+/// The most bytes of standard input that `coda run --command` takes as the
+/// arguments of the command. A longer input is refused, not cut.
+pub const MAX_COMMAND_INPUT_BYTES: usize = 256 * 1024;
 
 const FAUX_KEY: &str = "faux";
 const CLAUDE_CODE_KEY: &str = "claude_code";
@@ -73,8 +79,10 @@ struct Finish {
     hook_reason: Option<String>,
 }
 
-/// Runs the prompt, from `--prompt` or else standard input, in a new session
-/// and returns the exit code for how it stopped.
+/// Runs the prompt, from `--prompt` or else standard input, or the prompt of
+/// the command file `--command` names, in a new session and returns the exit
+/// code for how it stopped. A command takes its arguments from `--args` or else
+/// from standard input when that is not a terminal.
 ///
 /// # Errors
 /// Returns [`CliError::EmptyPrompt`] when there is nothing to send,
@@ -95,12 +103,13 @@ pub async fn run(
     info!(step = "read_prompt", "reading the prompt");
     let cwd = session_cwd(&ctx.cwd, args.cwd)?;
     let prompt = match args.command {
-        Some(name) => command_prompt(
-            ctx,
-            Path::new(&cwd),
-            &name,
-            args.args.as_deref().unwrap_or_default(),
-        )?,
+        Some(name) => {
+            // The command is found first, so a name that cannot run fails
+            // before standard input is touched.
+            let def = command_def(ctx, Path::new(&cwd), &name)?;
+            let command_args = command_args(ctx, io, &def, args.args)?;
+            command_prompt(&def, &name, &command_args)?
+        }
         None => read_prompt(io, args.prompt)?,
     };
     info!(step = "connect", "reaching the daemon");
@@ -207,6 +216,40 @@ async fn cancel_during_send(
         done = cancel => done,
         _ = interrupts.recv() => Err(CliError::RunInterrupted),
     }
+}
+
+/// The arguments of the command `def`: the `--args` flag, or else standard
+/// input when it is piped and the command has a place for arguments, or else
+/// none. A terminal is never read, so the command does not wait for a user who
+/// was not asked to type, and a command without a place for arguments never
+/// touches input that has nothing to do with it.
+///
+/// # Errors
+/// Returns [`CliError::CommandInputTooLarge`] when standard input is longer
+/// than [`MAX_COMMAND_INPUT_BYTES`], or [`CliError::Output`] when it cannot be
+/// read as text.
+fn command_args(
+    ctx: &Context,
+    io: &mut Io<'_>,
+    def: &CommandDef,
+    flag: Option<String>,
+) -> Result<String, CliError> {
+    if let Some(args) = flag {
+        return Ok(args);
+    }
+    if ctx.stdin_is_tty || !def.takes_arguments() {
+        return Ok(String::new());
+    }
+    let mut text = String::new();
+    // One byte past the cap tells an input that fits from one that does not.
+    let past_the_cap = MAX_COMMAND_INPUT_BYTES as u64 + 1;
+    Read::take(&mut *io.input, past_the_cap).read_to_string(&mut text)?;
+    if text.len() > MAX_COMMAND_INPUT_BYTES {
+        return Err(CliError::CommandInputTooLarge {
+            limit: MAX_COMMAND_INPUT_BYTES,
+        });
+    }
+    Ok(text)
 }
 
 /// The prompt flag, or else all of the input.

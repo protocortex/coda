@@ -106,8 +106,9 @@ impl App {
         }
     }
 
-    /// Offers the commands from command files; a failure to read them and a
-    /// name a built-in already has are reported in the transcript.
+    /// Offers the commands from command files; a failure to read them, files
+    /// that were skipped and a name a built-in already has are reported in the
+    /// transcript.
     pub fn set_user_commands(&mut self, commands: UserCommands) {
         for notice in commands.startup_notices() {
             self.chat.push_notice(notice);

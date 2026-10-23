@@ -40,6 +40,7 @@ const REVIEW: &str = "+++\nname = \"review\"\ndescription = \"Reviews a change.\
     argument_hint = \"<change>\"\n+++\nReview $ARGUMENTS and report problems only.\n";
 const STATUS: &str = "+++\nname = \"status\"\ndescription = \"Summarizes the repo.\"\n+++\n\
     Summarize the repository.\n";
+const ASK: &str = "+++\nname = \"ask\"\ndescription = \"Asks.\"\n+++\n$ARGUMENTS\n";
 const SHADOW: &str =
     "+++\nname = \"new\"\ndescription = \"Starts something.\"\n+++\nDo $ARGUMENTS\n";
 const DEPLOY: &str =
@@ -188,6 +189,128 @@ fn arguments_for_a_command_without_a_placeholder_send_nothing_and_say_why() {
 }
 
 #[test]
+fn a_command_that_expands_to_a_blank_prompt_sends_nothing_and_says_why() {
+    // Arrange
+    let f = files();
+    f.user_command("ask", ASK);
+    let (mut app, mut link) = app_with(f.untrusted());
+
+    // Act
+    type_line(&mut app, "/ask");
+    type_line(&mut app, "/ask    ");
+
+    // Assert
+    assert_eq!(sent(&mut link), []);
+    let shown = screen(&app);
+    assert!(
+        shown.contains("/ask: the command's prompt is blank"),
+        "{shown}"
+    );
+    let (mut app, mut link) = app_with(f.untrusted());
+    type_line(&mut app, "/ask what is a lock");
+    assert_eq!(
+        sent(&mut link),
+        [LinkCommand::Send("what is a lock".to_owned())]
+    );
+}
+
+#[test]
+fn a_skipped_definition_file_is_announced_when_the_ui_opens_and_in_help() {
+    // Arrange
+    let f = files();
+    f.user_command("review", REVIEW);
+    f.user_command("broken", "no frontmatter at all");
+
+    // Act
+    let (mut app, _link) = app_with(f.untrusted());
+    let opening = screen(&app);
+    type_line(&mut app, "/help");
+    let after_help = screen(&app);
+
+    // Assert
+    let notice = "1 definition file was skipped or only partly used; run `coda agents lint`";
+    assert!(opening.contains(notice), "{opening}");
+    assert_eq!(after_help.matches(notice).count(), 2, "{after_help}");
+}
+
+#[test]
+fn a_project_file_waiting_to_replace_a_user_command_is_announced_and_the_user_command_runs() {
+    // Arrange
+    let f = files();
+    f.user_command(
+        "deploy",
+        "+++\nname = \"deploy\"\ndescription = \"Your deploy.\"\n+++\nUser deploy $ARGUMENTS\n",
+    );
+    f.project_command("deploy", DEPLOY);
+    let (mut app, mut link) = app_with(f.untrusted());
+
+    // Act
+    let opening = screen(&app);
+    type_line(&mut app, "/deploy staging");
+    type_line(&mut app, "/help");
+
+    // Assert
+    let notice = "a project file for /deploy waits for trust; \
+                  after `coda agents trust` and a restart it replaces your user command /deploy";
+    assert!(opening.contains(notice), "{opening}");
+    assert_eq!(
+        sent(&mut link),
+        [LinkCommand::Send("User deploy staging".to_owned())]
+    );
+    let shown = screen(&app);
+    assert_eq!(shown.matches(notice).count(), 2, "{shown}");
+}
+
+#[test]
+fn once_the_project_is_trusted_its_command_replaces_the_user_one_without_a_notice() {
+    // Arrange
+    let f = files();
+    f.user_command(
+        "deploy",
+        "+++\nname = \"deploy\"\ndescription = \"Your deploy.\"\n+++\nUser deploy $ARGUMENTS\n",
+    );
+    f.project_command("deploy", DEPLOY);
+    let (mut app, mut link) = app_with(f.trusted());
+
+    // Act
+    type_line(&mut app, "/deploy staging");
+
+    // Assert
+    assert_eq!(
+        sent(&mut link),
+        [LinkCommand::Send("Deploy staging".to_owned())]
+    );
+    assert!(!screen(&app).contains("waits for trust"));
+}
+
+#[test]
+fn a_pending_project_file_with_no_user_command_of_that_name_adds_no_replacement_notice() {
+    // Arrange
+    let f = files();
+    f.project_command("deploy", DEPLOY);
+
+    // Act
+    let (app, _link) = app_with(f.untrusted());
+
+    // Assert
+    assert!(!screen(&app).contains("replaces your user command"));
+}
+
+#[test]
+fn no_notice_is_shown_when_every_definition_file_loads() {
+    // Arrange
+    let f = files();
+    f.user_command("review", REVIEW);
+
+    // Act
+    let (app, _link) = app_with(f.untrusted());
+
+    // Assert
+    let shown = screen(&app);
+    assert!(!shown.contains("coda agents lint"), "{shown}");
+}
+
+#[test]
 fn a_built_in_wins_a_name_clash_and_the_clash_is_reported() {
     // Arrange
     let f = files();
@@ -229,6 +352,11 @@ fn a_pending_project_command_is_listed_as_pending_and_does_not_run() {
         "{shown}"
     );
     assert!(shown.contains("coda agents trust"), "{shown}");
+    assert_eq!(
+        shown.matches("then restart the UI").count(),
+        2,
+        "the refusal and the help line both say a restart is needed: {shown}"
+    );
 }
 
 #[test]

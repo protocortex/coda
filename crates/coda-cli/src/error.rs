@@ -47,12 +47,19 @@ pub enum CliError {
     NoGitRoot,
     #[error("no prompt: pass --prompt or --command, or write the prompt to standard input")]
     EmptyPrompt,
-    #[error("no command named {0}; list the command files with `coda agents list`")]
-    UnknownCommand(String),
+    #[error("no command named {name}; list the command files with `coda agents list`{}", lint_suffix(.lint_hint.as_deref()))]
+    UnknownCommand {
+        name: String,
+        /// Says that definition files were skipped, when some were, since one
+        /// of them may be the command that was asked for.
+        lint_hint: Option<String>,
+    },
+    #[error(transparent)]
+    CommandRefused(#[from] coda_agents::CommandLookupError),
     #[error(
-        "{name} is a project command that is not in use: {reason}; review the files, then run `coda agents trust`"
+        "standard input is more than {limit} bytes; it is the arguments of the command, so pass less, or use --args"
     )]
-    CommandPending { name: String, reason: &'static str },
+    CommandInputTooLarge { limit: usize },
     #[error("{name}: {source}")]
     CommandArguments {
         name: String,
@@ -76,4 +83,9 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("could not write output: {0}")]
     Output(#[from] io::Error),
+}
+
+/// What follows an unknown-command message: the lint hint, if there is one.
+fn lint_suffix(hint: Option<&str>) -> String {
+    hint.map(|hint| format!("; {hint}")).unwrap_or_default()
 }

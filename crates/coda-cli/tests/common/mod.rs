@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use std::io::{Cursor, Read};
+use std::io::{BufRead, Cursor, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -58,13 +58,19 @@ pub struct Outcome {
 
 /// Runs the CLI in-process with `input` as the answer to any prompt.
 pub async fn cli(ctx: &Context, args: &[&str], input: &str) -> Outcome {
-    let (mut out, mut err) = (Vec::new(), Vec::new());
     let mut input = Cursor::new(input.as_bytes().to_vec());
+    cli_reading(ctx, args, &mut input).await
+}
+
+/// Like [`cli`], with the answers read from `input`, so a test can watch
+/// whether the command reads them.
+pub async fn cli_reading(ctx: &Context, args: &[&str], input: &mut dyn BufRead) -> Outcome {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = {
         let mut io = Io {
             out: &mut out,
             err: &mut err,
-            input: &mut input,
+            input,
         };
         tokio::time::timeout(WAIT, run(args.iter().copied(), ctx, &mut io))
             .await

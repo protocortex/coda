@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use coda_agents::{Catalog, CommandDef, Kind, PendingReason, Source};
+use coda_agents::{Catalog, CommandDef, CommandLookupError, Kind, Source};
 use coda_protocol::types::SessionId;
 
 use crate::permission::sanitize;
@@ -116,18 +116,29 @@ pub enum Resolved {
     Unknown,
 }
 
+/// Ends the advice on a pending command, since the UI reads the command files
+/// and the trust decision once, when it starts.
+const RESTART_NOTE: &str = "then restart the UI";
+
 /// The commands from command files, as the UI offers them.
 ///
 /// Only user commands and project commands the user trusted can run. A project
 /// command that waits for trust is listed as pending and never runs. A command
-/// whose name is a built-in is ignored, because the built-in wins.
+/// whose name is a built-in is ignored, because the built-in wins. What a name
+/// comes to is decided once, by [`Catalog::runnable_command`], when the UI
+/// starts, so a later `coda agents trust` or `--revoke` reaches the UI only
+/// after a restart.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserCommands {
-    runnable: BTreeMap<String, UserCommand>,
+    /// Each command file name that is not a built-in: the command, or why it
+    /// cannot run.
+    named: BTreeMap<String, Result<UserCommand, CommandLookupError>>,
     /// Commands hidden by a built-in of the same name.
     shadowed: Vec<(String, Source)>,
-    /// Project commands that wait for trust, with the reason.
-    pending: Vec<(String, PendingReason)>,
+    /// Says that definition files were skipped, when some were.
+    skipped: Option<String>,
+    /// Names of user commands that a project file waiting for trust would replace.
+    replaceable: Vec<String>,
     /// Why the command files could not be read, when they could not.
     warning: Option<String>,
 }
@@ -146,34 +157,47 @@ impl UserCommands {
     /// Takes the commands out of `catalog`.
     #[must_use]
     pub fn from_catalog(catalog: &Catalog) -> Self {
-        let mut commands = Self::default();
-        for entry in catalog.commands() {
-            let name = entry.def.name.clone();
-            if COMMANDS.contains(&name.as_str()) {
-                commands.shadowed.push((name, entry.source));
-            } else {
-                commands.runnable.insert(
-                    name,
-                    UserCommand {
-                        def: entry.def.clone(),
-                        source: entry.source,
-                    },
-                );
-            }
-        }
-        let waiting = catalog
+        let mut commands = Self {
+            skipped: catalog.problems_hint(),
+            ..Self::default()
+        };
+        let loaded = catalog
+            .commands()
+            .map(|entry| (entry.def.name.clone(), entry.source));
+        let waiting: Vec<&str> = catalog
             .pending()
             .iter()
-            .filter(|pending| pending.kind == Kind::Command);
-        for pending in waiting {
-            let Some(name) = pending.name().map(str::to_owned) else {
-                continue;
-            };
-            // Trusting the file would not make it run, so it is a clash, not a wait.
+            .filter(|pending| pending.kind == Kind::Command)
+            .filter_map(|pending| pending.name())
+            .collect();
+        // A trusted project file replaces a user command of its name, so the
+        // user command runs only until the user trusts the project.
+        commands.replaceable = waiting
+            .iter()
+            .filter(|name| !COMMANDS.contains(name) && catalog.command(name).is_some())
+            .map(|name| (*name).to_owned())
+            .collect();
+        let waiting = waiting
+            .into_iter()
+            .map(|name| (name.to_owned(), Source::Project));
+        for (name, source) in loaded.chain(waiting) {
+            // Trusting a waiting file would not make it run, so it is a clash, not a wait.
             if COMMANDS.contains(&name.as_str()) {
-                commands.shadowed.push((name, Source::Project));
-            } else {
-                commands.pending.push((name, pending.reason));
+                commands.shadowed.push((name, source));
+                continue;
+            }
+            match catalog.runnable_command(&name) {
+                Ok(entry) => {
+                    let command = UserCommand {
+                        def: entry.def.clone(),
+                        source: entry.source,
+                    };
+                    commands.named.insert(name, Ok(command));
+                }
+                Err(refused @ CommandLookupError::Pending { .. }) => {
+                    commands.named.insert(name, Err(refused));
+                }
+                Err(CommandLookupError::Unknown { .. }) => {}
             }
         }
         commands
@@ -187,8 +211,7 @@ impl UserCommands {
     pub fn mistyped(&self, line: &str) -> Option<String> {
         let word = line.split_whitespace().next()?;
         let (name, tail) = word.strip_prefix(SLASH)?.split_once(SLASH)?;
-        let known = self.runnable.contains_key(name)
-            || self.pending.iter().any(|(pending, _)| pending == name);
+        let known = self.named.contains_key(name);
         (known && tail.chars().all(|c| c == SLASH)).then(|| word.to_owned())
     }
 
@@ -207,18 +230,34 @@ impl UserCommands {
     }
 
     /// What to tell the user when the UI opens: a warning that the command
-    /// files could not be read, and each file a built-in hides.
+    /// files could not be read, that some definition files were skipped, each
+    /// project file that waits to replace a user command, and each file a
+    /// built-in hides.
     #[must_use]
     pub fn startup_notices(&self) -> Vec<String> {
         let warning = self.warning.iter().map(|text| sanitize(text).0);
-        warning.chain(self.clash_notices()).collect()
+        let replaceable = self.replaceable.iter().map(|name| {
+            let name = sanitize(name).0;
+            format!(
+                "a project file for {SLASH}{name} waits for trust; after `coda agents trust` and a restart it replaces your user command {SLASH}{name}"
+            )
+        });
+        warning
+            .chain(self.skipped.clone())
+            .chain(replaceable)
+            .chain(self.clash_notices())
+            .collect()
     }
 
     /// The lines `/help` shows.
     #[must_use]
     pub fn help_lines(&self) -> Vec<String> {
         let mut lines = vec![BUILT_IN_HELP.to_owned()];
-        for (name, command) in &self.runnable {
+        let runnable = self
+            .named
+            .iter()
+            .filter_map(|(name, lookup)| lookup.as_ref().ok().map(|command| (name, command)));
+        for (name, command) in runnable {
             let hint = command
                 .def
                 .argument_hint
@@ -231,9 +270,13 @@ impl UserCommands {
                 command.source.as_str()
             ));
         }
-        for (name, reason) in &self.pending {
+        let waiting = self.named.iter().filter_map(|(name, lookup)| match lookup {
+            Err(CommandLookupError::Pending { reason, .. }) => Some((name, reason)),
+            _ => None,
+        });
+        for (name, reason) in waiting {
             lines.push(format!(
-                "{SLASH}{}: project command, pending ({}); review the files, then run `coda agents trust`",
+                "{SLASH}{}: project command, pending ({}); review the files, then run `coda agents trust`, {RESTART_NOTE}",
                 sanitize(name).0,
                 reason.as_str()
             ));
@@ -248,17 +291,14 @@ impl UserCommands {
         let Some(name) = word.strip_prefix(SLASH) else {
             return Resolved::Unknown;
         };
-        if let Some(command) = self.runnable.get(name) {
-            return match command.def.expand(args) {
+        match self.named.get(name) {
+            Some(Ok(command)) => match command.def.expand(args) {
                 Ok(prompt) => Resolved::Prompt(prompt),
                 Err(error) => Resolved::Refused(format!("{word}: {error}")),
-            };
-        }
-        match self.pending.iter().find(|(pending, _)| pending == name) {
-            Some((_, reason)) => Resolved::Refused(format!(
-                "{word} is a project command that is not in use: {}; review the files, then run `coda agents trust`",
-                reason.as_str()
-            )),
+            },
+            Some(Err(refused)) => {
+                Resolved::Refused(sanitize(&format!("{SLASH}{refused}, {RESTART_NOTE}")).0)
+            }
             None => Resolved::Unknown,
         }
     }

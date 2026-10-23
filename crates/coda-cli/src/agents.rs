@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use coda_agents::{Catalog, Kind, revoke_project, trust_project};
+use coda_agents::{Catalog, CommandDef, CommandLookupError, revoke_project, trust_project};
 use coda_protocol::paths::repo_identity;
 use coda_store::{DB_FILE_NAME, Store};
 use coda_tui::permission::sanitize;
@@ -135,36 +135,33 @@ pub(crate) fn catalog_at(ctx: &Context, cwd: &Path) -> Result<Catalog, CliError>
 ///
 /// # Errors
 /// Returns [`CliError::UnknownCommand`] when no command has that name,
-/// [`CliError::CommandPending`] when only a project file waiting for trust has
-/// it, [`CliError::CommandArguments`] when `args` do not fit the template, or
-/// the errors of loading the definitions.
-pub(crate) fn command_prompt(
-    ctx: &Context,
-    cwd: &Path,
-    name: &str,
-    args: &str,
-) -> Result<String, CliError> {
+/// [`CliError::CommandRefused`] when only a project file waiting for trust has
+/// it, or the errors of loading the definitions.
+pub(crate) fn command_def(ctx: &Context, cwd: &Path, name: &str) -> Result<CommandDef, CliError> {
     let catalog = catalog_at(ctx, cwd)?;
-    if let Some(entry) = catalog.command(name) {
-        return entry
-            .def
-            .expand(args)
-            .map_err(|source| CliError::CommandArguments {
-                name: name.to_owned(),
-                source,
-            });
-    }
-    let pending = catalog
-        .pending()
-        .iter()
-        .find(|pending| pending.kind == Kind::Command && pending.name() == Some(name));
-    Err(match pending {
-        Some(pending) => CliError::CommandPending {
+    let entry = catalog
+        .runnable_command(name)
+        .map_err(|refusal| match refusal {
+            CommandLookupError::Unknown { name } => CliError::UnknownCommand {
+                name,
+                lint_hint: catalog.problems_hint(),
+            },
+            pending @ CommandLookupError::Pending { .. } => CliError::CommandRefused(pending),
+        })?;
+    Ok(entry.def.clone())
+}
+
+/// The prompt of the command `def` named `name`, with `args` in place.
+///
+/// # Errors
+/// Returns [`CliError::CommandArguments`] when `args` do not fit the template
+/// or leave the prompt blank.
+pub(crate) fn command_prompt(def: &CommandDef, name: &str, args: &str) -> Result<String, CliError> {
+    def.expand(args)
+        .map_err(|source| CliError::CommandArguments {
             name: name.to_owned(),
-            reason: pending.reason.as_str(),
-        },
-        None => CliError::UnknownCommand(name.to_owned()),
-    })
+            source,
+        })
 }
 
 /// Loads the definitions with the stored trust decision for `repo`. No

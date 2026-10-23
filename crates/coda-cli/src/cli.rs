@@ -112,6 +112,7 @@ pub struct RunArgs {
     #[arg(long, conflicts_with = "prompt")]
     pub command: Option<String>,
     /// The arguments of --command, placed where its template has `$ARGUMENTS`.
+    /// Without this, piped standard input is the arguments.
     #[arg(long, requires = "command", allow_hyphen_values = true)]
     pub args: Option<String>,
     /// Working directory of the run.
