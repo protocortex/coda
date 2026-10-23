@@ -25,6 +25,14 @@ const BULK_FILES: usize = 400;
 const LINE: &str = "a line of instructions\n";
 /// How long a thread is given to run into a lock held for it.
 const HOLD: Duration = Duration::from_millis(100);
+/// A read shorter than this cannot tell a held store from a free one.
+const MEASURABLE: Duration = Duration::from_millis(100);
+/// How many times a fast machine gets twice the files before the test gives up.
+const MAX_GROWTH: u32 = 4;
+/// The window inside the read, as fifths of it, where a store call must finish.
+const WINDOW_START_FIFTHS: u32 = 1;
+const WINDOW_END_FIFTHS: u32 = 4;
+const FIFTHS: u32 = 5;
 
 /// `count` large skill files under `root/dir`.
 fn write_bulk_skills(root: &Path, dir: &str, count: usize) {
@@ -37,6 +45,16 @@ fn write_bulk_skills(root: &Path, dir: &str, count: usize) {
             &skill_file(&name, "Bulk.", &body),
         );
     }
+}
+
+/// Trusts the repository as its files are now, then times one read.
+async fn trust_and_time(rig: &Rig) -> Duration {
+    let repo = rig.cwd.clone();
+    rig.hub
+        .with_store_mut(move |store| trust_project(store, &repo))
+        .await
+        .unwrap();
+    time_a_load(rig).await
 }
 
 /// The time one read of the definitions takes on this machine.
@@ -61,16 +79,18 @@ async fn a_store_user_is_not_blocked_while_the_definitions_are_read() {
     let mut rig = Rig::new(Mode::Default, &[text_turn("hi")]);
     write_bulk_skills(&rig.home(), "skills", BULK_FILES);
     write_bulk_skills(&rig.cwd, ".coda/skills", BULK_FILES);
-    let repo = rig.cwd.clone();
-    rig.hub
-        .with_store_mut(move |store| trust_project(store, &repo))
-        .await
-        .unwrap();
-    let load = time_a_load(&rig).await;
-    assert!(
-        load > Duration::from_millis(100),
-        "{load:?} is too short to measure"
-    );
+    let mut files = BULK_FILES;
+    let mut load = trust_and_time(&rig).await;
+    for _ in 0..MAX_GROWTH {
+        if load > MEASURABLE {
+            break;
+        }
+        files *= 2;
+        write_bulk_skills(&rig.home(), "skills", files);
+        write_bulk_skills(&rig.cwd, ".coda/skills", files);
+        load = trust_and_time(&rig).await;
+    }
+    assert!(load > MEASURABLE, "{load:?} is too short to measure");
     let user = StoreProbe::start(&rig);
 
     // Act
@@ -85,7 +105,10 @@ async fn a_store_user_is_not_blocked_while_the_definitions_are_read() {
     // the files were being read. Were the store held for the read, the first
     // one would finish only at its end. One call in a window of most of the
     // read is enough, so a pause of the runner cannot fail the test.
-    let (from, to) = (started + load / 5, started + load * 4 / 5);
+    let (from, to) = (
+        started + load * WINDOW_START_FIFTHS / FIFTHS,
+        started + load * WINDOW_END_FIFTHS / FIFTHS,
+    );
     let served = probed.finished.iter().any(|at| (from..=to).contains(at));
     assert!(
         served,
