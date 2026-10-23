@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
+use coda_agents::Catalog;
 use common::{cli, context, short_dir};
 
 const GOOD_AGENT: &str = "+++\nname = \"scout\"\n\
@@ -56,16 +57,19 @@ async fn list_names_the_built_in_agents_and_a_user_file_of_the_same_name_replace
     let outcome = cli(&ctx, &["coda", "agents", "list"], "").await;
 
     // Assert
+    let expected: Vec<String> = Catalog::builtin()
+        .agents()
+        .map(|entry| {
+            let source = if entry.def.name == "reviewer" {
+                "user"
+            } else {
+                "built-in"
+            };
+            format!("agent {} ({source})", entry.def.name)
+        })
+        .collect();
     let lines: Vec<&str> = outcome.out.lines().collect();
-    assert_eq!(
-        lines,
-        [
-            "agent explore (built-in)",
-            "agent implementer (built-in)",
-            "agent reviewer (user)",
-            "agent tester (built-in)",
-        ]
-    );
+    assert_eq!(lines, expected);
 }
 
 #[tokio::test]

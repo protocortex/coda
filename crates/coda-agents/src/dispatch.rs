@@ -2,11 +2,13 @@
 
 //! Which named agent a `task` call runs, and with which tools.
 //!
-//! Only definitions the catalog already holds can run: the user's, and the
-//! project's once the repository is trusted. A project file that is still
-//! pending is named in the refusal so the model can tell the user why.
+//! Only definitions the catalog already holds can run: the built-in and the
+//! user's, and the project's once the repository is trusted. A project file
+//! that is still pending and defines no agent otherwise is named in the refusal
+//! so the model can tell the user why; [`Catalog::pending_override`] tells a
+//! caller when such a file shadows an agent that does run.
 
-use crate::catalog::{Catalog, Entry, Kind, PendingReason};
+use crate::catalog::{Catalog, Entry, PendingReason};
 use crate::definition::AgentDef;
 
 /// Why a `task` call cannot run its agent.
@@ -37,11 +39,7 @@ impl Catalog {
         if let Some(entry) = self.agent(name) {
             return Ok(entry);
         }
-        let held_back = self
-            .pending()
-            .iter()
-            .find(|p| p.kind == Kind::Agent && p.path.file_stem().is_some_and(|stem| stem == name));
-        match held_back {
+        match self.pending_agent(name) {
             Some(pending) => Err(DispatchError::NotTrusted {
                 name: name.to_owned(),
                 reason: pending.reason,

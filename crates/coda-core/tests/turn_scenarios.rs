@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use coda_core::prompt::{Conversation, Message, Prefix, ToolSchema};
+use coda_core::task::{TaskFuture, TaskOutcome, TaskRequest, TaskRunner};
 use coda_core::turn::{StopCondition, ToolSet, TurnConfig, TurnError, TurnEvent, TurnLoop};
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId};
 use coda_providers::faux::{FauxProvider, Turn};
@@ -442,5 +443,57 @@ async fn context_overflow_is_a_terminal_stop_with_a_user_visible_event() {
     assert_eq!(stop, StopCondition::ContextOverflow);
     assert_eq!(events.try_recv().unwrap(), TurnEvent::ContextOverflow);
     assert_eq!(fixture.calls(), 1, "the loop does not retry or compact");
+    assert_valid_history(lp.conversation().messages());
+}
+
+/// A sub-agent seam that records the prompts it is asked to run.
+#[derive(Default)]
+struct RecordingRunner {
+    prompts: Mutex<Vec<String>>,
+}
+
+impl TaskRunner for RecordingRunner {
+    fn run(&self, request: TaskRequest) -> TaskFuture<'_> {
+        self.prompts.lock().unwrap().push(request.prompt);
+        Box::pin(std::future::ready(TaskOutcome {
+            text: "child done".to_owned(),
+            is_error: false,
+            usage: usage(0, 0),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn a_task_call_with_a_blank_prompt_is_refused_by_the_loop_and_starts_no_child() {
+    // Arrange: one call with a blank prompt, then one with a real prompt.
+    let fixture = Fixture::new();
+    let runner = Arc::new(RecordingRunner::default());
+    let blank = r#"{"agent": "explore", "prompt": "  \n "}"#;
+    let real = r#"{"agent": "explore", "prompt": "find the parser"}"#;
+    let turns = vec![
+        tool_turn(&[("c1", "task", blank), ("c2", "task", real)], usage(1, 1)),
+        end_turn(usage(1, 1)),
+    ];
+    let (lp, _events) = fixture.turn_loop(turns, ToolSet::new(), 1_000_000);
+    let mut lp = lp.with_tasks(Arc::clone(&runner) as Arc<dyn TaskRunner>);
+
+    // Act
+    lp.send("go").await.unwrap();
+
+    // Assert
+    assert_eq!(*runner.prompts.lock().unwrap(), ["find the parser"]);
+    let results: Vec<(String, bool)> = fixture
+        .request(1)
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            RequestMessage::ToolResult { text, is_error, .. } => Some((text.clone(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results[0].1, "the blank prompt is an error result");
+    assert!(results[0].0.contains("prompt"), "{}", results[0].0);
+    assert_eq!(results[1], ("child done".to_owned(), false));
     assert_valid_history(lp.conversation().messages());
 }

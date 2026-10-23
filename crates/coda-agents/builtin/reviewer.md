@@ -24,6 +24,6 @@ Reply with one JSON object and nothing else. It has a `summary` string and a `fi
 
 For example, on one line:
 
-{"summary": "One real bug and one idea.", "findings": [{"severity": "blocking", "message": "The lock is held across an await.", "location": "src/a.rs:10"}, {"severity": "suggestion", "message": "Rename `x` to say what it counts."}]}
+{"summary": "One real bug, one smell and one idea.", "findings": [{"severity": "blocking", "message": "The lock is held across an await.", "location": "src/a.rs:10"}, {"severity": "non_blocking", "message": "This function is long enough to split.", "location": "src/a.rs:40"}, {"severity": "suggestion", "message": "Rename `x` to say what it counts."}]}
 
 If you find nothing, reply with a summary that says what you checked and an empty `findings` list.

@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use coda_agents::{Status, Tier, trust_project};
+use coda_agents::{Catalog, NO_REPLY_SUMMARY, Status, Tier, trust_project};
 use coda_config::config::Config;
 use coda_core::prompt::{Conversation, Prefix};
 use coda_core::turn::{StopCondition, ToolSet, TurnConfig, TurnError, TurnEvent};
@@ -518,6 +518,39 @@ async fn a_review_agent_returns_classified_findings_and_a_malformed_report_is_re
     assert!(rejected.contains("missing field `summary`"), "{rejected}");
 }
 
+#[tokio::test]
+async fn a_completed_child_with_a_blank_answer_says_it_ended_without_a_reply() {
+    // Arrange: one child answers with empty text, the other with no text at all.
+    let no_text = json!({"events": [
+        {"type": "usage", "input_tokens": 3, "output_tokens": 0},
+        {"type": "stop", "reason": "end_turn"},
+    ]});
+    let script = [
+        task_call("t1", "scout"),
+        text_turn(""),
+        task_call("t2", "scout"),
+        no_text,
+        text_turn("parent done"),
+    ];
+    let mut rig = scout_rig(&script, "\"read\"", |_| {});
+
+    // Act
+    rig.send("go").await;
+    finish(&rig, 1).await;
+
+    // Assert
+    let lines = rig.request_lines();
+    for result in tool_results(&lines[4]) {
+        assert_eq!(result["is_error"], false, "{result}");
+        let text = text_of(&result);
+        assert!(text.starts_with("status: completed\n"), "{text}");
+        assert!(
+            text.contains(&format!("summary: {NO_REPLY_SUMMARY}\n")),
+            "{text}"
+        );
+    }
+}
+
 #[test]
 fn how_a_run_ended_becomes_a_status() {
     // Arrange
@@ -700,7 +733,12 @@ async fn a_daemon_that_cannot_find_the_users_directory_still_offers_the_built_in
 
     // Assert
     let names: Vec<&str> = agents.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["explore", "implementer", "reviewer", "tester"]);
+    let built_in = Catalog::builtin();
+    let expected: Vec<&str> = built_in
+        .agents()
+        .map(|entry| entry.def.name.as_str())
+        .collect();
+    assert_eq!(names, expected);
 }
 
 #[test]

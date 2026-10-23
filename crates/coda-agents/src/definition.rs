@@ -93,8 +93,9 @@ pub struct AgentDef {
     pub description: String,
     pub tier: Tier,
     pub effort: Effort,
-    /// The only tools the agent can call. An agent is read-only because this
-    /// list holds no write tool.
+    /// The only tools the agent can call. An agent without `edit` and `bash`
+    /// cannot change files, because this list holds no such tool; one with
+    /// `bash` can, and each command it runs goes through the permission broker.
     pub tools: Vec<String>,
     /// The agent's system prompt.
     pub body: String,

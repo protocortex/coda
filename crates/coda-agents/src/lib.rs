@@ -25,7 +25,8 @@ pub use definition::{
 pub use dispatch::{DispatchError, child_tools};
 pub use expand::{ARGUMENTS_PLACEHOLDER, ExpandError};
 pub use result::{
-    Finding, MAX_REPORT_BYTES, MalformedReport, Report, Severity, Status, TaskResult, parse_report,
+    Finding, MAX_FINDING_MESSAGE_BYTES, MAX_REPORT_BYTES, MalformedReport, NO_REPLY_SUMMARY,
+    Report, Severity, Status, TaskResult, parse_report,
 };
 pub use skills::{
     MAX_INDEX_BYTES, MAX_INDEX_DESCRIPTION_CHARS, MAX_SKILL_BODY_BYTES, SKILL_TOOL_NAME, SkillTool,
