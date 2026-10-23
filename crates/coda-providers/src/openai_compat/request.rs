@@ -2,6 +2,7 @@
 
 //! The chat completions request body.
 
+use coda_config::config::MaxTokensField;
 use serde_json::{Value, json};
 
 use crate::anthropic::request::RequestSettings;
@@ -11,14 +12,33 @@ use crate::model::{ModelRequest, RequestMessage, RequestToolCall, ToolSchema};
 /// marked in its text.
 const TOOL_ERROR_MARKER: &str = "[tool error] ";
 
+/// The parts of the request body that servers disagree on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireOptions {
+    /// The key that carries the output token limit.
+    pub max_tokens_field: MaxTokensField,
+    /// Whether the request asks the server to report usage at the end of the
+    /// stream.
+    pub stream_usage: bool,
+}
+
+impl Default for WireOptions {
+    fn default() -> Self {
+        Self {
+            max_tokens_field: MaxTokensField::default(),
+            stream_usage: true,
+        }
+    }
+}
+
 /// Builds the JSON body of a streaming chat completions request.
 ///
 /// A non-empty system prompt or tool list on the request replaces the one in
 /// `settings`. Tools are sorted by name so the prompt prefix is byte-stable.
 /// Usage is requested explicitly because servers omit it from a stream
-/// otherwise.
+/// otherwise; a server that rejects the option needs `wire.stream_usage` off.
 #[must_use]
-pub fn build_body(settings: &RequestSettings, request: &ModelRequest) -> Value {
+pub fn build_body(settings: &RequestSettings, wire: WireOptions, request: &ModelRequest) -> Value {
     let system = if request.system.is_empty() {
         &settings.system
     } else {
@@ -36,11 +56,13 @@ pub fn build_body(settings: &RequestSettings, request: &ModelRequest) -> Value {
     messages.extend(request.messages.iter().map(encode_message));
     let mut body = json!({
         "model": settings.model,
-        "max_tokens": settings.max_tokens,
         "stream": true,
-        "stream_options": {"include_usage": true},
         "messages": messages,
     });
+    body[wire.max_tokens_field.as_str()] = json!(settings.max_tokens);
+    if wire.stream_usage {
+        body["stream_options"] = json!({"include_usage": true});
+    }
     if !tools.is_empty() {
         let mut sorted: Vec<&ToolSchema> = tools.iter().collect();
         sorted.sort_by(|a, b| a.name.cmp(&b.name));
@@ -83,4 +105,72 @@ fn encode_tool_call(call: &RequestToolCall) -> Value {
         "name": call.name,
         "arguments": call.arguments,
     }})
+}
+
+#[cfg(test)]
+mod tests {
+    use coda_config::config::MaxTokensField;
+    use serde_json::{Value, json};
+
+    use super::{WireOptions, build_body};
+    use crate::anthropic::request::RequestSettings;
+    use crate::model::ModelRequest;
+
+    const LIMIT: u32 = 512;
+
+    fn body(wire: WireOptions) -> Value {
+        let settings = RequestSettings {
+            model: "m".to_owned(),
+            max_tokens: LIMIT,
+            system: String::new(),
+            tools: Vec::new(),
+        };
+        build_body(&settings, wire, &ModelRequest::user_prompt("hi"))
+    }
+
+    #[test]
+    fn the_default_body_has_max_tokens_and_asks_for_stream_usage() {
+        // Arrange
+        let wire = WireOptions::default();
+
+        // Act
+        let body = body(wire);
+
+        // Assert
+        assert_eq!(body["max_tokens"], LIMIT);
+        assert_eq!(body["stream_options"], json!({"include_usage": true}));
+        assert_eq!(body.get("max_completion_tokens"), None);
+    }
+
+    #[test]
+    fn max_completion_tokens_replaces_max_tokens() {
+        // Arrange
+        let wire = WireOptions {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            ..WireOptions::default()
+        };
+
+        // Act
+        let body = body(wire);
+
+        // Assert
+        assert_eq!(body["max_completion_tokens"], LIMIT);
+        assert_eq!(body.get("max_tokens"), None);
+    }
+
+    #[test]
+    fn stream_usage_off_leaves_out_stream_options() {
+        // Arrange
+        let wire = WireOptions {
+            stream_usage: false,
+            ..WireOptions::default()
+        };
+
+        // Act
+        let body = body(wire);
+
+        // Assert
+        assert_eq!(body.get("stream_options"), None);
+        assert_eq!(body["stream"], true);
+    }
 }

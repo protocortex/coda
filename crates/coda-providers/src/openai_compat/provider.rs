@@ -16,7 +16,7 @@ use tracing::{Instrument, debug, info_span, warn};
 
 use super::classify_status;
 use super::events::EventMapper;
-use super::request::build_body;
+use super::request::{WireOptions, build_body};
 use crate::anthropic::request::RequestSettings;
 use crate::http::sse::SseParser;
 use crate::http::{
@@ -64,6 +64,8 @@ pub struct OpenAiCompatOptions {
     pub base_url: String,
     /// The parts of the request that stay the same across calls.
     pub settings: RequestSettings,
+    /// The request fields the server may reject.
+    pub wire: WireOptions,
     /// Retry and idle bounds.
     pub timing: Timing,
 }
@@ -80,6 +82,7 @@ struct Inner<S, C> {
     url: String,
     key: Option<KeySource>,
     settings: RequestSettings,
+    wire: WireOptions,
     timing: Timing,
     watch: IdleWatch<S, C>,
 }
@@ -111,6 +114,7 @@ impl<S: Sleeper + 'static, C: Clock + 'static> OpenAiCompatProvider<S, C> {
                 url,
                 key: key_env.map(|name| KeySource::new(name, env)),
                 settings: options.settings,
+                wire: options.wire,
                 timing: options.timing,
                 watch: IdleWatch::new(sleeper, clock, options.timing.idle_timeout),
             }),
@@ -162,7 +166,7 @@ impl<S: Sleeper, C: Clock> Inner<S, C> {
         request: &ModelRequest,
         sender: &mpsc::Sender<StreamItem>,
     ) -> Result<(), ProviderError> {
-        let body = serde_json::to_vec(&build_body(&self.settings, request))
+        let body = serde_json::to_vec(&build_body(&self.settings, self.wire, request))
             .map_err(|_| fatal("the request could not be encoded"))?;
         let mut attempt = 1;
         loop {
