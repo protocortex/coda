@@ -51,6 +51,8 @@ pub struct HookConfig {
     /// When the hook runs.
     pub event: HookEvent,
     /// The program and its arguments. There is no shell: a string here is an error.
+    /// The program is an absolute path or a bare name found in the absolute
+    /// entries of the hook's `PATH`; a relative path is an error.
     pub command: Vec<String>,
     /// Whether a failure stops the action. A hook that is not blocking only logs.
     #[serde(default)]

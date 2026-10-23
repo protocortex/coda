@@ -54,6 +54,39 @@ fn an_empty_command_or_program_is_rejected_with_the_hook_named() {
 }
 
 #[test]
+fn a_relative_program_path_is_rejected_with_the_hook_named() {
+    // A relative path resolves inside the session directory, which the model can edit.
+    for program in [
+        "./guard.sh",
+        "scripts/guard.sh",
+        "../guard.sh",
+        "~/guard.sh",
+    ] {
+        // Arrange
+        let text = format!(
+            "[[hooks]]\nevent = \"session_start\"\ncommand = [\"ok\"]\n\
+             [[hooks]]\nevent = \"pre_tool\"\ncommand = [{program:?}]\n"
+        );
+
+        // Act and Assert
+        assert_eq!(invalid_path(&text), "hooks[1].command", "{program}");
+    }
+}
+
+#[test]
+fn an_absolute_path_or_a_bare_name_is_a_program() {
+    // A bare name is looked up on the PATH the hook is given, not in the session directory.
+    let text = "[[hooks]]\nevent = \"pre_tool\"\ncommand = [\"/usr/local/bin/guard\"]\n\
+                [[hooks]]\nevent = \"pre_tool\"\ncommand = [\"guard\", \"./relative-argument\"]\n";
+
+    // Act
+    let parsed = Config::from_toml_str(text);
+
+    // Assert
+    assert!(parsed.is_ok(), "{parsed:?}");
+}
+
+#[test]
 fn a_timeout_of_zero_or_past_the_cap_is_rejected() {
     for timeout in [0, MAX_TIMEOUT_MS + 1] {
         // Arrange
