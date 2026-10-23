@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use coda_client::{Client, ClientError, Subscription};
 use coda_config::timing::Timing;
-use coda_protocol::events::{EVENT_NOTIFICATION, Event};
+use coda_protocol::events::{EVENT_NOTIFICATION, Event, HOOK_BLOCKED_KIND, HookBlockedBody};
 use coda_protocol::jsonrpc::Notification;
 use coda_protocol::methods::{
     DAEMON_BACKENDS, DAEMON_PING, DAEMON_STATUS, DaemonBackendsParams, DaemonBackendsResult,
@@ -32,8 +32,6 @@ use crate::status::backend_name;
 const PERMISSION_REQUEST_NOTIFICATION: &str = "permission.request";
 /// Stored kind of the user's own message, which the event stream carries as well.
 const USER_MESSAGE_KIND: &str = "user_message";
-/// Stored kind of the reason a blocking hook stopped a turn; shown as a notice.
-const HOOK_BLOCKED_KIND: &str = "hook_blocked";
 /// How often a live link is probed, since the client reports a lost link only on use.
 const LINK_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 /// How long a switch waits for the old session to close before leaving it for the quit.
@@ -50,6 +48,11 @@ const REPLAY_FROM_START: u64 = 0;
 
 /// Said after a backend switch: the new backend starts with an empty history.
 pub const TRANSCRIPT_NOT_CARRIED: &str = "the transcript is not carried over to the new session";
+
+/// Said when the config has hooks and the session's backend runs its own tools,
+/// where coda runs no hook.
+pub const HOOKS_NOT_RUN: &str =
+    "the hooks in config.toml do not run for this backend: it runs its own tools";
 
 /// A request from the UI to the task that holds the daemon connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,8 +103,8 @@ pub fn hook_blocked_from_params(params: &Value) -> Option<String> {
     if params.get("kind")?.as_str()? != HOOK_BLOCKED_KIND {
         return None;
     }
-    let body: Value = serde_json::from_str(params.get("body")?.as_str()?).ok()?;
-    let reason = sanitize_line(body.get("reason")?.as_str()?);
+    let blocked: HookBlockedBody = serde_json::from_str(params.get("body")?.as_str()?).ok()?;
+    let reason = sanitize_line(&blocked.reason);
     Some(format!("The turn did not start. {reason}"))
 }
 
@@ -163,6 +166,9 @@ async fn open_session(
 pub struct LinkConfig {
     pub backend: BackendKind,
     pub cwd: String,
+    /// Whether the user's config has hooks, so that a session on a backend
+    /// that runs none says so.
+    pub hooks_configured: bool,
 }
 
 impl Default for LinkConfig {
@@ -173,6 +179,7 @@ impl Default for LinkConfig {
                 .ok()
                 .and_then(|dir| dir.to_str().map(str::to_owned))
                 .unwrap_or_else(|| FALLBACK_CWD.to_owned()),
+            hooks_configured: false,
         }
     }
 }
@@ -430,6 +437,7 @@ impl Link {
         created_here: bool,
     ) -> Result<(), ClientError> {
         let id = info.id.clone();
+        let backend = info.backend;
         follow_session(
             &self.client,
             &mut self.subscription,
@@ -441,6 +449,9 @@ impl Link {
         let previous = std::mem::replace(&mut self.owned, created_here.then_some(id));
         if let Some(previous) = previous {
             self.release(previous, SWITCH_CLOSE_WAIT).await;
+        }
+        if self.config.hooks_configured && !backend.is_model_backend() {
+            self.notice(HOOKS_NOT_RUN.to_owned());
         }
         Ok(())
     }
@@ -607,6 +618,7 @@ impl Link {
 
 #[cfg(test)]
 mod tests {
+    use coda_protocol::events::HookBlockedBody;
     use coda_protocol::methods::SessionStatus;
     use serde_json::json;
 
@@ -774,9 +786,13 @@ mod tests {
     fn a_hook_blocked_notification_becomes_a_one_line_notice_safe_to_draw() {
         // Arrange
         let reason = "blocked by the session_start hook `gate`: not on\nthis network\u{1b}[31m";
-        let body = json!({ "reason": reason });
-        let blocked = json!({"kind": "hook_blocked", "body": body.to_string()});
+        // The body and kind the daemon writes, from the type it writes them with.
+        let body = json!(HookBlockedBody {
+            reason: reason.to_owned()
+        });
+        let blocked = json!({"kind": HOOK_BLOCKED_KIND, "body": body.to_string()});
         let other = json!({"kind": "result", "body": body.to_string()});
+        let no_reason = json!({"kind": HOOK_BLOCKED_KIND, "body": "{}"});
 
         // Act
         let notice = hook_blocked_from_params(&blocked).unwrap();
@@ -786,6 +802,7 @@ mod tests {
         assert!(notice.contains("not on this network"), "{notice}");
         assert!(!notice.chars().any(char::is_control), "{notice:?}");
         assert_eq!(hook_blocked_from_params(&other), None);
+        assert_eq!(hook_blocked_from_params(&no_reason), None);
     }
 
     #[test]

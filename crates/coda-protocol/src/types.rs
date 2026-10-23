@@ -132,10 +132,40 @@ pub struct SessionInfo {
     pub mode: Mode,
 }
 
+impl BackendKind {
+    /// Whether coda runs the model loop and its tools itself, so that the
+    /// user's hooks apply. Claude Code and Codex run their own tools.
+    #[must_use]
+    pub const fn is_model_backend(self) -> bool {
+        match self {
+            Self::Anthropic | Self::OpenaiCompat | Self::Faux => true,
+            Self::ClaudeCode | Self::CodexAppServer | Self::CodexExec => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_the_backends_coda_drives_itself_are_model_backends() {
+        // Arrange
+        let cases = [
+            (BackendKind::Anthropic, true),
+            (BackendKind::OpenaiCompat, true),
+            (BackendKind::Faux, true),
+            (BackendKind::ClaudeCode, false),
+            (BackendKind::CodexAppServer, false),
+            (BackendKind::CodexExec, false),
+        ];
+
+        // Act and Assert
+        for (kind, model) in cases {
+            assert_eq!(kind.is_model_backend(), model, "{kind:?}");
+        }
+    }
 
     #[test]
     fn ids_serialize_as_bare_strings() {

@@ -6,12 +6,14 @@
 use std::path::Path;
 
 use coda_config::hooks::{HookConfig, HookEvent};
-use coda_protocol::types::Mode;
+use coda_protocol::events::{HOOK_BLOCKED_KIND, HookBlockedBody};
+use coda_protocol::types::{Mode, OriginalId};
 use serde_json::{Value, json};
 
 use coda_core::hooks::MAX_RESULT_BYTES;
 
-use super::{API_KEY_CANARY, Rig, text_turn, tool_turn};
+use super::switch::faux_alias;
+use super::{API_KEY_CANARY, POLL, Rig, WAIT, text_turn, tool_turn};
 use crate::model_session::COMPACT_THRESHOLD_BYTES;
 
 /// Far longer than a hook needs: the first run of a program can be slow on a busy machine.
@@ -75,9 +77,9 @@ async fn a_blocking_session_start_hook_stops_the_turn_and_its_reason_is_not_mode
     rig.wait_until_idle().await;
 
     // Assert
-    let blocked = rig.bodies("hook_blocked").await;
-    let reason = blocked[0]["reason"].as_str().unwrap();
-    assert!(reason.contains("not on this network"), "{reason}");
+    let blocked = rig.bodies(HOOK_BLOCKED_KIND).await;
+    let body: HookBlockedBody = serde_json::from_value(blocked[0].clone()).unwrap();
+    assert!(body.reason.contains("not on this network"), "{body:?}");
     let stopped = rig.bodies("turn_stopped").await;
     assert_eq!(stopped[0]["condition"], "hook_blocked");
     assert_eq!(rig.bodies("stream_delta").await.len(), 0);
@@ -215,6 +217,82 @@ fn payloads(file: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// Logs the payload to `$1`, one line each, then fails unless `$1.allow` exists.
+const GATE: &str =
+    r#"cat >> "$1"; echo >> "$1"; test -e "$1.allow" || { echo "not yet" >&2; exit 9; }"#;
+
+/// Sends `text` and waits for the `ended`th turn to end.
+async fn send_and_finish(rig: &mut Rig, text: &str, ended: usize) {
+    rig.send(text).await;
+    rig.wait_for_results(ended).await;
+    rig.wait_until_idle().await;
+}
+
+async fn switch_model(rig: &mut Rig) {
+    let params = json!({"session_id": rig.session, "model": "scripted"});
+    let response = rig.call("session.set_model", params).await;
+    assert!(response["error"].is_null(), "{response}");
+}
+
+fn resumed_flags(log: &Path) -> Vec<Value> {
+    payloads(log).iter().map(|p| p["resumed"].clone()).collect()
+}
+
+#[tokio::test]
+async fn a_session_start_hook_is_told_the_session_is_resumed_once_it_passed_in_an_earlier_loop() {
+    // Arrange
+    let out = tempfile::tempdir().unwrap();
+    let log = out.path().join("starts.jsonl");
+    std::fs::write(out.path().join("starts.jsonl.allow"), "").unwrap();
+    let hook = shell_hook(HookEvent::SessionStart, GATE, &log, true);
+    let script = [text_turn("one"), text_turn("two")];
+    let mut rig = Rig::custom(Mode::Default, &script, true, None, |config| {
+        faux_alias(config);
+        config.hooks.push(hook);
+    });
+
+    // Act
+    send_and_finish(&mut rig, "first", 1).await;
+    switch_model(&mut rig).await;
+    send_and_finish(&mut rig, "second", 2).await;
+
+    // Assert
+    assert_eq!(resumed_flags(&log), [json!(false), json!(true)]);
+    assert_eq!(rig.bodies("session_started").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_blocked_first_send_is_still_a_first_start_after_the_loop_is_rebuilt() {
+    // Arrange
+    let out = tempfile::tempdir().unwrap();
+    let log = out.path().join("starts.jsonl");
+    let hook = shell_hook(HookEvent::SessionStart, GATE, &log, true);
+    let script = [text_turn("one"), text_turn("two")];
+    let mut rig = Rig::custom(Mode::Default, &script, true, None, |config| {
+        faux_alias(config);
+        config.hooks.push(hook);
+    });
+
+    // Act
+    send_and_finish(&mut rig, "blocked", 1).await;
+    let started_when_blocked = rig.bodies("session_started").await.len();
+    switch_model(&mut rig).await;
+    std::fs::write(out.path().join("starts.jsonl.allow"), "").unwrap();
+    send_and_finish(&mut rig, "retry", 2).await;
+    switch_model(&mut rig).await;
+    send_and_finish(&mut rig, "again", 3).await;
+
+    // Assert
+    // The history held the blocked send's messages when the retry's loop was
+    // built, and the retry was still the session's first start.
+    assert_eq!(
+        resumed_flags(&log),
+        [json!(false), json!(false), json!(true)]
+    );
+    assert_eq!(started_when_blocked, 0);
+    assert_eq!(rig.bodies("session_started").await.len(), 1);
+}
+
 /// The compaction footer names the original's size and id.
 const FOOTER_ROOM_BYTES: usize = 256;
 
@@ -291,4 +369,68 @@ async fn a_blocking_post_tool_hook_guards_a_sub_agents_tool_output_too() {
     let logged = std::fs::read_to_string(&seen).unwrap();
     assert_eq!(logged.matches("\"event\":\"post_tool\"").count(), 1);
     assert!(logged.contains("\"tool\":\"read\""), "{logged}");
+}
+
+/// Waits for the file a hook writes when it starts.
+async fn wait_for_file(file: &Path) {
+    tokio::time::timeout(WAIT, async {
+        while !file.exists() {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} was not written in time", file.display()));
+}
+
+/// The text stored under the original `id` of the rig's session.
+async fn stored_text(rig: &Rig, id: &str) -> String {
+    let (session, id) = (rig.session.clone(), OriginalId::new(id));
+    let loaded = rig
+        .hub
+        .with_store(move |store| store.load_original(&session, &id))
+        .await;
+    loaded.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn cancelling_a_sub_agents_post_tool_hook_withholds_the_childs_result() {
+    // Arrange
+    let out = tempfile::tempdir().unwrap();
+    let started = out.path().join("started");
+    let hook = shell_hook(
+        HookEvent::PostTool,
+        r#"echo up > "$1"; sleep 30"#,
+        &started,
+        true,
+    );
+    let mut rig = Rig::custom(Mode::Default, &scout_script(), true, None, |config| {
+        config.hooks.push(hook);
+    });
+    install_scout(&rig);
+    rig.send("go").await;
+    wait_for_file(&started).await;
+
+    // Act
+    rig.call("session.cancel", json!({"session_id": rig.session}))
+        .await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let children = rig.bodies("child_event").await;
+    let finished = |e: &&Value| e["kind"] == "tool_finished" && e["body"]["call_id"] == "r1";
+    let read = children
+        .iter()
+        .find(finished)
+        .expect("the scout's read ended");
+    assert_eq!(read["body"]["is_error"], true);
+    let original = read["body"]["original"].as_str().unwrap();
+    let told = stored_text(&rig, original).await;
+    assert!(told.contains("withheld"), "{told}");
+    assert!(!told.contains("one needle here"), "{told}");
+    assert_eq!(
+        rig.request_lines().len(),
+        2,
+        "no model call after the cancel"
+    );
 }

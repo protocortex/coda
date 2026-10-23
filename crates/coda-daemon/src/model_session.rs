@@ -17,18 +17,16 @@ use coda_agents::{SKILL_TOOL_NAME, SkillTool};
 use coda_config::config::{Config, Dirs, ProviderConfig};
 use coda_core::broker::BrokerError;
 use coda_core::history::{
-    ASSISTANT_MESSAGE_KIND, Rebuild, TOOL_FINISHED_KIND, assistant_body, empty_text_id,
-    tool_finished_body,
+    ASSISTANT_MESSAGE_KIND, Rebuild, SESSION_STARTED_KIND, TOOL_FINISHED_KIND, assistant_body,
+    empty_text_id, tool_finished_body,
 };
-pub use coda_core::history::{
-    CONTEXT_OVERFLOW_KIND, HOOK_BLOCKED_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND,
-};
+pub use coda_core::history::{CONTEXT_OVERFLOW_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND};
 use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
 use coda_core::tools::{
     BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index, task_schema,
 };
 use coda_core::turn::{CancelToken, TurnConfig, TurnEvent, TurnLoop};
-use coda_protocol::events::{Event, TIMEOUT_KIND};
+use coda_protocol::events::{Event, HOOK_BLOCKED_KIND, HookBlockedBody, TIMEOUT_KIND};
 use coda_protocol::types::{
     BackendKind, OriginalId, PermissionDecision, SessionId, TokenUsage, TurnId,
 };
@@ -567,12 +565,13 @@ impl ModelSessions {
     }
 
     /// Rebuilds the conversation one page of events at a time, so the store is
-    /// free for other users between pages.
+    /// free for other users between pages. Also says whether a `session_start`
+    /// hook already passed for the session.
     async fn stored_conversation(
         &self,
         session: &SessionId,
         prefix: Prefix,
-    ) -> Result<Conversation, HubError> {
+    ) -> Result<(Conversation, bool), HubError> {
         let mut rebuild = Rebuild::new(prefix);
         let mut after = 0;
         loop {
@@ -585,10 +584,11 @@ impl ModelSessions {
                 })
                 .await?;
             rebuild = back;
-            match next {
-                Some(last) => after = last,
-                None => return Ok(rebuild.finish()),
-            }
+            let Some(last) = next else {
+                let started = rebuild.session_started();
+                return Ok((rebuild.finish(), started));
+            };
+            after = last;
         }
     }
 
@@ -626,7 +626,7 @@ impl ModelSessions {
         let mut schemas = tools.schemas;
         schemas.push(task_schema(&self.children.agents(&record.cwd).await));
         let prefix = Prefix::new(SYSTEM_PROMPT, schemas, "")?;
-        let conversation = self.stored_conversation(&record.id, prefix).await?;
+        let (conversation, session_started) = self.stored_conversation(&record.id, prefix).await?;
         let turn = Arc::new(Mutex::new(TurnId::new(NO_TURN)));
         let broker = self
             .brokers
@@ -666,7 +666,8 @@ impl ModelSessions {
                     cancel: None,
                 },
             )
-            .with_used_tokens(used);
+            .with_used_tokens(used)
+            .with_resumed(session_started);
         Ok(ModelLoop {
             turn_loop,
             events,
@@ -855,15 +856,12 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
             task::publish_child_event(hub, session, turn, &agent, *event).await;
             return;
         }
+        TurnEvent::SessionStarted => {
+            publish_kind(hub, session, turn, SESSION_STARTED_KIND, &json!({})).await
+        }
         TurnEvent::HookBlocked { reason } => {
-            publish_kind(
-                hub,
-                session,
-                turn,
-                HOOK_BLOCKED_KIND,
-                &json!({ "reason": reason }),
-            )
-            .await
+            let body = json!(HookBlockedBody { reason });
+            publish_kind(hub, session, turn, HOOK_BLOCKED_KIND, &body).await
         }
         TurnEvent::Compaction {
             summary,

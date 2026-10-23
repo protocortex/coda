@@ -14,7 +14,7 @@ use coda_daemon::state::DaemonState;
 use coda_tui::app::{ConnectionState, SETUP_GUIDANCE};
 use coda_tui::commands::UserCommands;
 use coda_tui::logs::LogBuffer;
-use coda_tui::{KeySource, UserInput, drive, run_session};
+use coda_tui::{KeySource, Startup, UserInput, drive, run_session};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -142,7 +142,7 @@ async fn it_connects_to_a_running_daemon_and_exits_on_quit() {
             idle_timeout: REQUEST_TIMEOUT,
             ..Timing::for_tests()
         },
-        false,
+        Startup::default(),
         UserCommands::default(),
         QuitAfter::new(Duration::from_millis(500)),
         never(),
@@ -171,7 +171,7 @@ async fn it_shows_a_failed_connection_and_still_exits_on_quit() {
             terminal(),
             Path::new(&missing),
             Timing::for_tests(),
-            false,
+            Startup::default(),
             UserCommands::default(),
             QuitAfter::new(Duration::from_millis(300)),
             never(),
@@ -209,7 +209,7 @@ async fn quitting_works_while_a_daemon_that_never_answers_is_still_connecting() 
         terminal(),
         &socket,
         timing,
-        false,
+        Startup::default(),
         UserCommands::default(),
         QuitAfter::new(Duration::from_millis(100)),
         never(),
@@ -241,7 +241,7 @@ async fn it_shows_a_disconnect_when_the_daemon_dies_after_connecting() {
                 idle_timeout: REQUEST_TIMEOUT,
                 ..Timing::for_tests()
             },
-            false,
+            Startup::default(),
             UserCommands::default(),
             QuitAfter::new(Duration::from_secs(3)),
             never(),
@@ -274,7 +274,7 @@ async fn a_shutdown_signal_ends_the_session_without_a_key() {
         terminal(),
         &missing,
         Timing::for_tests(),
-        false,
+        Startup::default(),
         UserCommands::default(),
         QuitAfter::new(Duration::from_secs(60)),
         signal,
@@ -300,7 +300,10 @@ async fn the_setup_guidance_is_on_screen_when_setup_is_needed() {
         terminal(),
         &missing,
         Timing::for_tests(),
-        true,
+        Startup {
+            needs_setup: true,
+            ..Startup::default()
+        },
         UserCommands::default(),
         QuitAfter::new(Duration::from_millis(200)),
         never(),
@@ -345,7 +348,7 @@ async fn the_setup_guidance_is_on_screen_when_the_daemon_reports_no_provider() {
             idle_timeout: REQUEST_TIMEOUT,
             ..Timing::for_tests()
         },
-        false,
+        Startup::default(),
         UserCommands::default(),
         QuitAfter::new(Duration::from_millis(500)),
         never(),

@@ -449,6 +449,7 @@ pub(super) async fn publish_child_event(
         | TurnEvent::Usage(_)
         | TurnEvent::Compaction { .. }
         | TurnEvent::Child { .. }
+        | TurnEvent::SessionStarted
         | TurnEvent::HookBlocked { .. } => return,
     };
     let wrapped = json!({ "agent": agent, "kind": kind, "body": body });

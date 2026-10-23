@@ -312,6 +312,66 @@ fn unknown_original_id_loads_as_none() {
 }
 
 #[test]
+fn a_deleted_original_is_gone_and_the_others_stay() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = new_session(&mut store);
+    let doomed = store.store_original(&session, "withheld output").unwrap();
+    let kept = store.store_original(&session, "other output").unwrap();
+
+    // Act
+    store.delete_original(&session, &doomed).unwrap();
+
+    // Assert
+    let loaded = store.load_original(&session, &doomed).unwrap();
+    assert_eq!(loaded, None);
+    let still = store.load_original(&session, &kept).unwrap();
+    assert_eq!(still.as_deref(), Some("other output"));
+}
+
+#[test]
+fn another_session_cannot_delete_an_original() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let owner = new_session(&mut store);
+    let other = new_session(&mut store);
+    let id = store.store_original(&owner, "private output").unwrap();
+
+    // Act
+    store.delete_original(&other, &id).unwrap();
+
+    // Assert
+    let loaded = store.load_original(&owner, &id).unwrap();
+    assert_eq!(loaded.as_deref(), Some("private output"));
+}
+
+#[test]
+fn deleting_an_unknown_original_is_not_an_error() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = new_session(&mut store);
+
+    // Act
+    let by_number = store.delete_original(&session, &OriginalId::new("999"));
+    let by_garbage = store.delete_original(&session, &OriginalId::new("nope"));
+
+    // Assert
+    assert!(by_number.is_ok() && by_garbage.is_ok());
+}
+
+#[test]
+fn deleting_an_original_of_a_missing_session_is_rejected() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+
+    // Act
+    let result = store.delete_original(&SessionId::new("42"), &OriginalId::new("1"));
+
+    // Assert
+    assert!(matches!(result, Err(StoreError::SessionNotFound { .. })));
+}
+
+#[test]
 fn oversize_original_is_rejected_and_the_cap_is_accepted() {
     // Arrange
     let (_dir, mut store) = open_store();

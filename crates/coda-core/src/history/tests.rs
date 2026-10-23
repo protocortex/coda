@@ -406,6 +406,36 @@ fn bookkeeping_events_are_not_worth_a_warning() {
 }
 
 #[test]
+fn a_started_session_is_known_from_its_stored_event_and_not_from_its_messages() {
+    // Arrange
+    let blocked = [user("go"), (HOOK_BLOCKED_KIND, json!({"reason": "no"}))];
+    let started = [
+        user("go"),
+        (SESSION_STARTED_KIND, json!({})),
+        assistant("hi", &[]),
+    ];
+    let known = |events: &[(&str, Value)]| {
+        let mut replay = Rebuild::new(prefix());
+        for event in numbered(events) {
+            replay.apply(&event, &lookup);
+        }
+        replay.session_started()
+    };
+
+    // Act and Assert
+    assert!(!known(&[]));
+    assert!(
+        !known(&blocked),
+        "a blocked start did not start the session"
+    );
+    assert!(known(&started));
+    // The marker is bookkeeping: the model never saw it.
+    let (messages, logs) = replay_logged(&started);
+    assert_eq!(logs, "");
+    assert_eq!(messages, replay(&[user("go"), assistant("hi", &[])]));
+}
+
+#[test]
 fn a_childs_events_leave_the_parents_history_alone_and_cost_no_warning() {
     // Arrange
     let child = (

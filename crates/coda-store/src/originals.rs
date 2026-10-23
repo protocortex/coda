@@ -61,6 +61,29 @@ impl Store {
         ))
     }
 
+    /// Deletes the original `id` of `session`, for output that must not be
+    /// retrievable after all. An unknown id, or one of another session, is left alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SessionNotFound`] when the session does not exist
+    /// and [`StoreError::Sqlite`] when the delete fails.
+    pub fn delete_original(
+        &mut self,
+        session: &SessionId,
+        id: &OriginalId,
+    ) -> Result<(), StoreError> {
+        let session_row = self.existing_session_row(session)?;
+        let Some(original_row) = row_id(id) else {
+            return Ok(());
+        };
+        self.connection().execute(
+            "DELETE FROM originals WHERE id = ?1 AND session_id = ?2",
+            [original_row, session_row],
+        )?;
+        Ok(())
+    }
+
     fn evict_for(&self, session_row: i64, incoming: usize) -> Result<(), StoreError> {
         let room = MAX_SESSION_ORIGINAL_BYTES - incoming;
         let mut stmt = self.connection().prepare(

@@ -642,6 +642,7 @@ async fn a_command_file_typed_in_the_ui_reaches_the_model_as_its_expanded_prompt
         LinkConfig {
             backend: BackendKind::Faux,
             cwd: rig.cwd.clone(),
+            hooks_configured: false,
         },
         command_rx,
         event_tx,

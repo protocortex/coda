@@ -7,8 +7,8 @@ use std::path::Path;
 use std::pin::Pin;
 
 use coda_config::timing::Timing;
-use coda_tui::TuiError;
 use coda_tui::commands::UserCommands;
+use coda_tui::{Startup, TuiError};
 use tracing::{info, warn};
 
 use crate::agents::catalog_at;
@@ -20,18 +20,18 @@ use crate::error::CliError;
 /// The boxed future of a TUI run.
 pub type TuiFuture<'a> = Pin<Box<dyn Future<Output = Result<(), TuiError>> + 'a>>;
 
-/// Runs the TUI on the daemon socket. The boolean asks it to show the setup
-/// guidance; the commands are the slash commands from command files.
-pub type TuiLauncher = for<'a> fn(&'a Path, Timing, bool, UserCommands) -> TuiFuture<'a>;
+/// Runs the TUI on the daemon socket. `Startup` says what the config needs the
+/// UI to show; the commands are the slash commands from command files.
+pub type TuiLauncher = for<'a> fn(&'a Path, Timing, Startup, UserCommands) -> TuiFuture<'a>;
 
 /// Launches the real terminal UI.
 pub fn real_tui(
     socket: &Path,
     timing: Timing,
-    needs_setup: bool,
+    startup: Startup,
     commands: UserCommands,
 ) -> TuiFuture<'_> {
-    Box::pin(coda_tui::run(socket, timing, needs_setup, commands))
+    Box::pin(coda_tui::run(socket, timing, startup, commands))
 }
 
 /// Starts the daemon when absent and runs the TUI against it.
@@ -42,10 +42,15 @@ pub fn real_tui(
 pub async fn open(ctx: &Context, io: &mut Io<'_>, force: bool) -> Result<(), CliError> {
     // The TUI opens its own link; keeping this one would count as an extra client.
     drop(ensure_daemon(ctx, io, force).await?);
-    let needs_setup = !any_provider_enabled(ctx)?;
-    info!(needs_setup, "opening the terminal UI");
+    let config = load_config(&ctx.dirs)?;
+    let startup = Startup {
+        needs_setup: !config.providers.values().any(|p| p.enabled),
+        hooks_configured: !config.hooks.is_empty(),
+    };
+    info!(?startup, "opening the terminal UI");
     let commands = file_commands(ctx);
-    (ctx.launch_tui)(&ctx.dirs.socket_path(), ctx.timing, needs_setup, commands).await?;
+    let socket = ctx.dirs.socket_path();
+    (ctx.launch_tui)(&socket, ctx.timing, startup, commands).await?;
     Ok(())
 }
 
@@ -78,9 +83,4 @@ pub async fn tui(ctx: &Context, io: &mut Io<'_>, force: bool) -> Result<(), CliE
         return Err(CliError::NoTerminal);
     }
     open(ctx, io, force).await
-}
-
-fn any_provider_enabled(ctx: &Context) -> Result<bool, CliError> {
-    let config = load_config(&ctx.dirs)?;
-    Ok(config.providers.values().any(|p| p.enabled))
 }

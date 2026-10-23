@@ -7,6 +7,7 @@ mod common;
 
 use std::process::ExitCode;
 
+use coda_tui::sessions::HOOKS_NOT_RUN;
 use common::{Outcome, StopDaemon, cli, context, short_dir};
 use tempfile::TempDir;
 
@@ -54,6 +55,22 @@ async fn a_delegated_turn_that_completes_exits_zero() {
 
     // Assert
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert!(!outcome.err.contains("hooks"), "{}", outcome.err);
+}
+
+#[tokio::test]
+async fn hooks_in_the_config_are_said_not_to_run_for_a_delegated_backend() {
+    // Arrange
+    let hooks = "[[hooks]]\nevent = \"pre_tool\"\ncommand = [\"/bin/true\"]\nblocking = true\n";
+    let rig = rig(hooks);
+
+    // Act
+    let outcome = run(&rig, "hello").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let line = format!("coda: {HOOKS_NOT_RUN}\n");
+    assert_eq!(outcome.err.matches(&line).count(), 1, "{}", outcome.err);
 }
 
 #[tokio::test]

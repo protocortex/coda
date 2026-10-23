@@ -39,7 +39,7 @@ provider = "anthropic"
 model = "claude-fast"
 "#;
 
-fn faux_alias(config: &mut Config) {
+pub(super) fn faux_alias(config: &mut Config) {
     config.models.insert(
         "scripted".to_owned(),
         ModelAlias {

@@ -15,15 +15,18 @@ use coda_agents::CommandDef;
 use coda_client::{Client, ClientError, Subscription};
 use coda_config::config::Config;
 use coda_core::turn::StopCondition;
-use coda_daemon::model_session::{HOOK_BLOCKED_KIND, TURN_STOPPED_KIND};
+use coda_daemon::model_session::TURN_STOPPED_KIND;
 use coda_daemon::subscribe::PERMISSION_REQUEST_NOTIFICATION;
-use coda_protocol::events::{EVENT_NOTIFICATION, InterruptCause};
+use coda_protocol::events::{
+    EVENT_NOTIFICATION, HOOK_BLOCKED_KIND, HookBlockedBody, InterruptCause,
+};
 use coda_protocol::methods::{
     PERMISSION_RESPOND, PermissionRequestParams, PermissionRespondParams, PermissionRespondResult,
     SESSION_CANCEL, SESSION_CREATE, SESSION_SEND, SessionCancelParams, SessionCancelResult,
     SessionCreateParams, SessionCreateResult, SessionSendParams, SessionSendResult,
 };
 use coda_protocol::types::{BackendKind, PermissionDecision, SessionId};
+use coda_tui::sessions::HOOKS_NOT_RUN;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -115,11 +118,12 @@ pub async fn run(
     info!(step = "connect", "reaching the daemon");
     let client = ensure_daemon(ctx, io, force).await?;
     info!(step = "create_session", "creating the session");
+    let backend = backend(ctx, io)?;
     let created: SessionCreateResult = client
         .request(
             SESSION_CREATE,
             &SessionCreateParams {
-                backend: backend(ctx)?,
+                backend,
                 cwd,
                 model: None,
                 mode: args.mode.into(),
@@ -269,8 +273,14 @@ fn read_prompt(io: &mut Io<'_>, flag: Option<String>) -> Result<String, CliError
 
 /// The scripted provider when the config enables it, else the delegated
 /// Claude Code agent, else the delegated Codex agent, else the Anthropic API.
-fn backend(ctx: &Context) -> Result<BackendKind, CliError> {
-    Ok(pick_backend(&load_config(&ctx.dirs)?))
+/// Says on standard error when the config has hooks that the backend will not run.
+fn backend(ctx: &Context, io: &mut Io<'_>) -> Result<BackendKind, CliError> {
+    let config = load_config(&ctx.dirs)?;
+    let backend = pick_backend(&config);
+    if !config.hooks.is_empty() && !backend.is_model_backend() {
+        writeln!(io.err, "coda: {HOOKS_NOT_RUN}")?;
+    }
+    Ok(backend)
 }
 
 fn pick_backend(config: &Config) -> BackendKind {
@@ -334,7 +344,9 @@ async fn follow(
                         condition = body["condition"].as_str().map(str::to_owned);
                     }
                     HOOK_BLOCKED_KIND => {
-                        hook_reason = body["reason"].as_str().map(str::to_owned);
+                        hook_reason = HookBlockedBody::deserialize(&body)
+                            .ok()
+                            .map(|blocked| blocked.reason);
                     }
                     RESULT_KIND => {
                         if printed {
@@ -511,11 +523,49 @@ mod tests {
             ("context_overflow", 3),
             ("cancelled", 4),
             ("refused", 5),
+            ("hook_blocked", 5),
             ("something_new", 5),
         ] {
             // Act and Assert
             assert_eq!(exit_code(condition), code, "{condition}");
         }
+    }
+
+    fn stopped_by_a_hook(reason: Option<&str>) -> Finish {
+        Finish {
+            condition: Some(HOOK_BLOCKED.to_owned()),
+            failed: false,
+            cut_short: false,
+            cause: None,
+            hook_reason: reason.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_hook_stop_with_no_reason_still_says_a_hook_stopped_the_run() {
+        // Act
+        let message = hook_blocked_message(&stopped_by_a_hook(None));
+
+        // Assert
+        assert_eq!(
+            message,
+            "a hook stopped the run before the model was called"
+        );
+    }
+
+    #[test]
+    fn a_hook_reason_is_folded_onto_one_line_and_safe_to_draw() {
+        // Arrange
+        let reason = "blocked by the session_start hook `gate`: not on\nthis network\u{1b}[31m";
+
+        // Act
+        let message = hook_blocked_message(&stopped_by_a_hook(Some(reason)));
+
+        // Assert
+        let expected = "the run was stopped before the model was called: \
+                        blocked by the session_start hook `gate`: not on this network";
+        assert!(message.starts_with(expected), "{message}");
+        assert!(!message.chars().any(char::is_control), "{message:?}");
     }
 
     #[test]

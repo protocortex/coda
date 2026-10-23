@@ -176,13 +176,20 @@ impl HookRunner {
         self
     }
 
-    /// Whether any hook is set for `event`, so a payload is built only for one.
-    fn has(&self, event: HookEvent) -> bool {
+    /// Whether any hook is set for `event`.
+    #[must_use]
+    pub fn has(&self, event: HookEvent) -> bool {
         self.hooks.iter().any(|entry| entry.config.event == event)
     }
 
-    /// Runs the `session_start` hooks. `resumed` tells them the conversation
-    /// had earlier messages.
+    /// Whether a hook set for `event` can stop the action it guards.
+    #[must_use]
+    pub fn has_blocking(&self, event: HookEvent) -> bool {
+        (self.hooks.iter()).any(|entry| entry.config.event == event && entry.config.blocking)
+    }
+
+    /// Runs the `session_start` hooks. `resumed` tells them a `session_start`
+    /// hook already passed for this session.
     ///
     /// # Errors
     /// Returns [`Blocked`] when a blocking hook fails.

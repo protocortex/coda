@@ -34,6 +34,16 @@ pub const BACKEND_CRASHED_KIND: &str = "backend_crashed";
 pub const TURN_INTERRUPTED_KIND: &str = "turn_interrupted";
 /// Stored event kind of older messages replaced by a summary.
 pub const COMPACTION_KIND: &str = "compaction";
+/// Stored event kind of the reason a blocking `session_start` hook stopped a turn.
+/// The body is a [`HookBlockedBody`]; clients show it to the user and never to the model.
+pub const HOOK_BLOCKED_KIND: &str = "hook_blocked";
+
+/// The body of a stored `hook_blocked` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookBlockedBody {
+    /// Which hook failed and why.
+    pub reason: String,
+}
 
 /// Why a turn was cut short.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -223,6 +233,26 @@ mod tests {
             // Assert
             assert_eq!(serde_json::to_value(&event).unwrap()["type"], kind);
         }
+    }
+
+    #[test]
+    fn a_hook_blocked_body_is_written_as_a_reason_and_read_back() {
+        // Arrange
+        let body = HookBlockedBody {
+            reason: "blocked by the session_start hook `gate`".to_owned(),
+        };
+
+        // Act
+        let written = serde_json::to_value(&body).unwrap();
+        let read: HookBlockedBody = serde_json::from_value(written.clone()).unwrap();
+
+        // Assert
+        assert_eq!(
+            written,
+            json!({"reason": "blocked by the session_start hook `gate`"})
+        );
+        assert_eq!(read, body);
+        assert_eq!(HOOK_BLOCKED_KIND, "hook_blocked");
     }
 
     #[test]
