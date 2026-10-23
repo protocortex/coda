@@ -23,6 +23,7 @@ use crate::model::{
 };
 use crate::models;
 use crate::openai_compat::provider::{OpenAiCompatOptions, OpenAiCompatProvider};
+use crate::openai_compat::request::WireOptions;
 
 /// Config key of the Anthropic provider section.
 pub const ANTHROPIC_KEY: &str = "anthropic";
@@ -33,7 +34,7 @@ pub const FAUX_KEY: &str = "faux";
 
 const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-5-5";
-const MAX_OUTPUT_TOKENS: u32 = 8192;
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
 
 /// Why a model could not be selected or its client could not be built.
 #[derive(Debug, thiserror::Error)]
@@ -236,7 +237,9 @@ impl ModelRegistry {
             .ok_or(RegistryError::Disabled(key))?;
         let settings = RequestSettings {
             model: target.model.clone(),
-            max_tokens: MAX_OUTPUT_TOKENS,
+            max_tokens: section
+                .max_output_tokens
+                .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
             system: String::new(),
             tools: Vec::new(),
         };
@@ -260,6 +263,10 @@ impl ModelRegistry {
         let options = OpenAiCompatOptions {
             base_url,
             settings,
+            wire: WireOptions {
+                max_tokens_field: section.max_tokens_field,
+                stream_usage: section.stream_usage,
+            },
             timing: self.timing,
         };
         let provider = OpenAiCompatProvider::new(

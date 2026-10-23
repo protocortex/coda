@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use coda_config::config::Config;
+use coda_protocol::types::BackendKind;
 use coda_providers::anthropic::Timing;
 use coda_providers::anthropic::provider::IDLE_CHECK_INTERVAL;
 use coda_providers::anthropic::request::{RequestSettings, ToolSchema};
@@ -17,6 +19,8 @@ use coda_providers::model::{
 };
 use coda_providers::openai_compat::classify_status;
 use coda_providers::openai_compat::provider::{OpenAiCompatOptions, OpenAiCompatProvider};
+use coda_providers::openai_compat::request::WireOptions;
+use coda_providers::registry::ModelRegistry;
 use coda_providers::testing::contract::{Collected, Scenario, collect, run_contract};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -304,6 +308,7 @@ fn options(base_url: String) -> OpenAiCompatOptions {
                 input_schema: json!({"type": "object"}),
             }],
         },
+        wire: WireOptions::default(),
         timing: Timing {
             idle_timeout: IDLE,
             ..Timing::default()
@@ -641,6 +646,49 @@ async fn the_request_is_a_streaming_chat_completion_with_bearer_auth_under_the_b
     assert_eq!(sent.body["messages"][1]["content"], "hello");
     assert_eq!(sent.body["tools"][0]["type"], "function");
     assert_eq!(sent.body["tools"][0]["function"]["name"], "read");
+}
+
+#[tokio::test]
+async fn the_section_keys_reach_the_body_the_registry_sends() {
+    // Arrange: an empty section keeps the built-in shape, a configured one changes it.
+    let cases = [
+        ("", "max_tokens", 8192, true),
+        (
+            "max_output_tokens = 2048\nmax_tokens_field = \"max_completion_tokens\"\n\
+             stream_usage = false\n",
+            "max_completion_tokens",
+            2048,
+            false,
+        ),
+    ];
+    for (keys, field, limit, usage) in cases {
+        let mock = start(vec![sse(&text_stream(&["ok"]))]);
+        let text = format!(
+            "[providers.openai_compat]\nenabled = true\nbase_url = \"{}\"\n{keys}",
+            mock.url
+        );
+        let registry = ModelRegistry::from_config(&Config::from_toml_str(&text).unwrap().config);
+        let target = registry
+            .select(BackendKind::OpenaiCompat, Some("local-model"))
+            .unwrap();
+        let client = registry.build(&target, |_| None).unwrap();
+
+        // Act
+        let collected = collect(&client, request(), WAIT).await;
+
+        // Assert
+        assert_eq!(collected.error, None);
+        let requests = mock.requests.lock().expect("lock");
+        let body = &requests[0].body;
+        assert_eq!(body[field], limit, "{keys}");
+        assert_eq!(body.get("stream_options").is_some(), usage, "{keys}");
+        let other = if field == "max_tokens" {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        assert_eq!(body.get(other), None, "{keys}");
+    }
 }
 
 #[tokio::test]

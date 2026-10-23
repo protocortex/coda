@@ -119,8 +119,30 @@ pub struct Permissions {
     pub grants: Vec<String>,
 }
 
+/// The request field that caps the reply length on an `openai_compat` server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    /// `max_tokens`, which most servers accept.
+    #[default]
+    MaxTokens,
+    /// `max_completion_tokens`, which reasoning models such as the o-series require.
+    MaxCompletionTokens,
+}
+
+impl MaxTokensField {
+    /// The key as it appears in `config.toml` and in the request body.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+}
+
 /// One `[providers.<backend>]` section.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ProviderConfig {
     /// Whether the backend may be used.
@@ -145,6 +167,34 @@ pub struct ProviderConfig {
     pub sandbox: Option<String>,
     /// Allows a `sandbox` wider than read-only.
     pub allow_wider_sandbox: bool,
+    /// Output token limit of a model request; the built-in limit when unset.
+    pub max_output_tokens: Option<u32>,
+    /// Request field that carries the output limit; `openai_compat` only.
+    pub max_tokens_field: MaxTokensField,
+    /// Whether the request asks for token usage in the stream; `openai_compat` only.
+    pub stream_usage: bool,
+}
+
+// Written by hand because `stream_usage` is on unless the file turns it off.
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            binary: None,
+            api_key_env: None,
+            env_passthrough: Vec::new(),
+            verified_versions: Vec::new(),
+            script: None,
+            request_log: None,
+            base_url: None,
+            model: None,
+            sandbox: None,
+            allow_wider_sandbox: false,
+            max_output_tokens: None,
+            max_tokens_field: MaxTokensField::default(),
+            stream_usage: true,
+        }
+    }
 }
 
 /// One `[models.<alias>]` section: a name that selects a provider and model.
@@ -226,7 +276,7 @@ impl Config {
     /// Returns [`ConfigError::Syntax`] if the text is not valid for the schema, or
     /// [`ConfigError::PlaintextSecret`] if a provider section holds a literal secret, or
     /// [`ConfigError::InvalidValue`] if a provider `sandbox` is not a Codex sandbox or a
-    /// `context_window` or `timing.delegated_tool_ms` is zero, or [`ConfigError::ConflictingContextWindow`] if two
+    /// `context_window`, `max_output_tokens` or `timing.delegated_tool_ms` is zero, or [`ConfigError::ConflictingContextWindow`] if two
     /// aliases of one model disagree on it.
     pub fn from_toml_str(text: &str) -> Result<Parsed, ConfigError> {
         let value: toml::Value = toml::from_str(text)?;
@@ -237,6 +287,7 @@ impl Config {
         let config: Self =
             serde_ignored::deserialize(value, |path| unknown_keys.push(path.to_string()))?;
         config.check_sandboxes()?;
+        config.check_output_limits()?;
         config.check_context_windows()?;
         config.check_timing()?;
         config.check_routing()?;
@@ -304,6 +355,18 @@ impl Config {
                 return Err(ConfigError::InvalidValue {
                     path: format!("{PROVIDERS_KEY}.{name}.sandbox"),
                     allowed: SANDBOX_MODES.join(", "),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_output_limits(&self) -> Result<(), ConfigError> {
+        for (name, section) in &self.providers {
+            if section.max_output_tokens == Some(0) {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{PROVIDERS_KEY}.{name}.max_output_tokens"),
+                    allowed: "a whole number of tokens above 0".to_owned(),
                 });
             }
         }

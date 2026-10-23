@@ -57,6 +57,9 @@ One section per backend. The names Coda uses are `claude_code`, `codex`, `anthro
 | `model` | string | unset | Model a session uses when it names none. |
 | `sandbox` | string | unset (read-only) | Sandbox for a Codex session: `"read-only"`, `"workspace-write"` or `"danger-full-access"`. Any other value is an error that names `providers.<name>.sandbox`. |
 | `allow_wider_sandbox` | boolean | `false` | Must be `true` before a `sandbox` wider than read-only takes effect. |
+| `max_output_tokens` | integer | unset (8192) | Most tokens the model may write in one reply. Used by `anthropic` and `openai_compat`. Must be above 0; zero is an error that names `providers.<name>.max_output_tokens`. Lower it for a local model whose context is near 8192 tokens, because some servers refuse a request when the prompt plus this limit does not fit. |
+| `max_tokens_field` | string | `"max_tokens"` | Request field that carries `max_output_tokens`: `"max_tokens"` or `"max_completion_tokens"`. OpenAI's o-series models accept only the second. Used by `openai_compat`. Any other value is an error that names `providers.<name>.max_tokens_field`. |
+| `stream_usage` | boolean | `true` | Whether the request asks the server to report token counts at the end of the stream (`stream_options.include_usage`). Set it to `false` for a server that rejects that option. The server may then send no token counts, and the session's token budget does not count that provider's use. Used by `openai_compat`. |
 
 `claude_code` and `codex` start the programs you installed, which may run under a subscription. Read the account risk notice in the README before you enable them.
 

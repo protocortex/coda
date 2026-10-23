@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use coda_config::config::ProviderConfig;
+use coda_config::config::{Config, ProviderConfig};
+use coda_protocol::types::BackendKind;
 use coda_providers::anthropic::Timing;
 use coda_providers::anthropic::provider::{
     AnthropicOptions, AnthropicProvider, BaseUrlError, IDLE_CHECK_INTERVAL, validate_base_url,
@@ -17,6 +18,7 @@ use coda_providers::anthropic::request::{RequestSettings, ToolSchema};
 use coda_providers::model::{
     Clock, ModelEvent, ModelProvider, ModelRequest, ProviderError, Sleeper, StopReason, Usage,
 };
+use coda_providers::registry::ModelRegistry;
 use coda_providers::testing::contract::{Collected, Scenario, collect, run_contract};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -702,6 +704,31 @@ async fn a_slow_but_alive_stream_is_not_aborted() {
 }
 
 // ---- request, key, contract ----------------------------------------------
+
+#[tokio::test]
+async fn max_output_tokens_reaches_the_body_the_registry_sends() {
+    // Arrange: an empty section keeps the built-in limit.
+    let cases = [("", 8192), ("max_output_tokens = 2048\n", 2048)];
+    for (keys, limit) in cases {
+        let mock = start(vec![sse(&text_stream(&["ok"]))]);
+        let text = format!(
+            "[providers.anthropic]\nenabled = true\napi_key_env = \"{KEY_ENV}\"\n\
+             base_url = \"{}\"\n{keys}",
+            mock.url
+        );
+        let registry = ModelRegistry::from_config(&Config::from_toml_str(&text).unwrap().config);
+        let target = registry.select(BackendKind::Anthropic, None).unwrap();
+        let client = registry.build(&target, secret_env).unwrap();
+
+        // Act
+        let collected = collect(&client, ModelRequest::user_prompt("hello"), WAIT).await;
+
+        // Assert
+        assert_eq!(collected.error, None);
+        let requests = mock.requests.lock().expect("lock");
+        assert_eq!(requests[0].body["max_tokens"], limit, "{keys}");
+    }
+}
 
 #[tokio::test]
 async fn the_request_carries_cache_breakpoints_and_the_key_header() {

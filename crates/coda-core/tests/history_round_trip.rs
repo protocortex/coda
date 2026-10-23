@@ -20,7 +20,7 @@ use coda_providers::gate::PermissionGate;
 use coda_providers::model::{
     ModelEvent, ModelProvider, ModelRequest, ModelStream, ProviderError, StopReason,
 };
-use coda_providers::openai_compat::request::build_body as openai_body;
+use coda_providers::openai_compat::request::{WireOptions, build_body as openai_body};
 use coda_providers::tool_request::ToolRequest;
 use coda_store::{NewSession, Store, StoredEvent};
 use coda_tools::{Tool, ToolError, ToolOutput};
@@ -401,7 +401,7 @@ async fn a_replayed_history_is_valid_for_both_wire_formats() {
         tools: Vec::new(),
     };
     let anthropic = anthropic_body(&settings, &request);
-    let openai = openai_body(&settings, &request);
+    let openai = openai_body(&settings, WireOptions::default(), &request);
     assert_eq!(
         anthropic["messages"][2]["content"][0]["type"],
         "tool_result"
