@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use coda_config::config::{Config, ModelAlias, ProviderConfig};
 use coda_protocol::jsonrpc::Response;
-use coda_protocol::types::{BackendKind, Mode, SessionId, TurnId};
+use coda_protocol::types::{BackendKind, Mode, OriginalId, SessionId, TurnId};
 use coda_providers::model::{ModelProvider, ModelRequest};
 use coda_store::{NewSession, SessionRecord, Store, StoredEvent};
 use rusqlite::types::ValueRef;
@@ -61,6 +61,15 @@ fn tool_turn(calls: &[(&str, &str, Value)]) -> Value {
     events.push(json!({"type": "usage", "input_tokens": 5, "output_tokens": 3}));
     events.push(json!({"type": "stop", "reason": "tool_use"}));
     json!({ "events": events })
+}
+
+/// The token cap of the budget tests. A tool turn spends 8 tokens and a text
+/// turn 18, so a read turn and a reply leave 4 of it.
+const TOKEN_CAP: u64 = 30;
+
+/// A model turn that reads a file, which needs no permission.
+fn read_turn() -> Value {
+    tool_turn(&[("c1", "read", json!({"path": "a.txt"}))])
 }
 
 struct Rig {
@@ -216,6 +225,16 @@ impl Rig {
         })
         .await
         .unwrap_or_else(|_| panic!("no {kind} event was stored in time"))
+    }
+
+    /// The text kept under the original `id` of the session, if any.
+    async fn original(&self, id: &str) -> Option<String> {
+        let (session, id) = (self.session.clone(), OriginalId::new(id));
+        let loaded = self
+            .hub
+            .with_store(move |store| store.load_original(&session, &id))
+            .await;
+        loaded.unwrap()
     }
 
     async fn bodies(&self, kind: &str) -> Vec<Value> {
@@ -968,6 +987,54 @@ async fn a_failed_index_refresh_does_not_fail_the_session_start() {
     assert_eq!(rig.bodies("stream_delta").await[0]["text"], "hi");
 }
 
+/// Another user of the store: it reads a few events again and again and notes
+/// when each read finished and which took longest.
+struct StoreProbe {
+    done: Arc<std::sync::atomic::AtomicBool>,
+    user: tokio::task::JoinHandle<Probed>,
+}
+
+/// What a [`StoreProbe`] saw.
+struct Probed {
+    /// The longest time one read took, which is how long the store was held.
+    longest: Duration,
+    /// When each read finished.
+    finished: Vec<std::time::Instant>,
+}
+
+impl StoreProbe {
+    fn start(rig: &Rig) -> Self {
+        let session = rig.session.clone();
+        let hub = Arc::clone(&rig.hub);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::clone(&done);
+        let user = tokio::spawn(async move {
+            let mut seen = Probed {
+                longest: Duration::ZERO,
+                finished: Vec::new(),
+            };
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let started = std::time::Instant::now();
+                let session = session.clone();
+                hub.with_store(move |store| store.load_events(&session, 0, 10))
+                    .await
+                    .unwrap();
+                seen.longest = seen.longest.max(started.elapsed());
+                seen.finished.push(std::time::Instant::now());
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            seen
+        });
+        Self { done, user }
+    }
+
+    /// Stops reading and returns what was seen.
+    async fn stop(self) -> Probed {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.user.await.unwrap()
+    }
+}
+
 /// Files that are costly to parse yet hold few symbols, so the walk dominates
 /// the time and the writes that follow stay short.
 fn write_large_workspace(cwd: &std::path::Path) {
@@ -997,30 +1064,13 @@ async fn a_store_user_is_not_blocked_while_the_index_walk_runs() {
         walk > Duration::from_millis(100),
         "{walk:?} is too short to measure"
     );
-    let session = rig.session.clone();
-    let hub = Arc::clone(&rig.hub);
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop = Arc::clone(&done);
-    let user = tokio::spawn(async move {
-        let mut longest = Duration::ZERO;
-        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-            let started = std::time::Instant::now();
-            let session = session.clone();
-            hub.with_store(move |store| store.load_events(&session, 0, 10))
-                .await
-                .unwrap();
-            longest = longest.max(started.elapsed());
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        longest
-    });
+    let user = StoreProbe::start(&rig);
 
     // Act
     rig.send("go").await;
     rig.wait_for("result").await;
     rig.wait_until_idle().await;
-    done.store(true, std::sync::atomic::Ordering::SeqCst);
-    let longest = user.await.unwrap();
+    let longest = user.stop().await.longest;
 
     // Assert
     assert!(
@@ -1030,6 +1080,7 @@ async fn a_store_user_is_not_blocked_while_the_index_walk_runs() {
     assert_eq!(indexed_symbols(&rig, "f5"), 1);
 }
 
+mod catalog;
 mod hooks;
 mod skills;
 mod switch;

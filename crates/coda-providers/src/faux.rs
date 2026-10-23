@@ -157,6 +157,7 @@ impl FauxProvider {
         let line = json!({
             "system": request.system,
             "tools": request.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            "tool_schemas": request.tools,
             "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
         });
         std::fs::OpenOptions::new()
@@ -222,7 +223,7 @@ mod tests {
     use crate::model::ToolSchema;
 
     #[tokio::test]
-    async fn the_request_log_records_the_system_prompt_and_the_tool_names() {
+    async fn the_request_log_records_the_system_prompt_and_the_tools() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("requests.jsonl");
@@ -233,8 +234,8 @@ mod tests {
         .with_request_log(log.clone());
         let tool = ToolSchema {
             name: "grep".to_owned(),
-            description: String::new(),
-            input_schema: json!({}),
+            description: "Search files.".to_owned(),
+            input_schema: json!({"type": "object"}),
         };
         let request = ModelRequest {
             system: "You are a scout.".to_owned(),
@@ -249,6 +250,8 @@ mod tests {
         let line: Value = serde_json::from_str(&std::fs::read_to_string(log).unwrap()).unwrap();
         assert_eq!(line["system"], "You are a scout.");
         assert_eq!(line["tools"], json!(["grep"]));
+        let schema = json!({"name": "grep", "description": "Search files.", "input_schema": {"type": "object"}});
+        assert_eq!(line["tool_schemas"], json!([schema]));
     }
 
     #[tokio::test]

@@ -49,7 +49,7 @@ pub(crate) mod capture {
     use tracing::field::{Field, Visit};
     use tracing::span::Attributes;
     use tracing::subscriber::DefaultGuard;
-    use tracing::{Id, Subscriber};
+    use tracing::{Event, Id, Level, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::{Layer, Registry};
 
@@ -60,16 +60,38 @@ pub(crate) mod capture {
         pub fields: BTreeMap<String, String>,
     }
 
-    /// Spans created while the guard returned by [`install`] lives on this thread.
+    /// A log event as it was emitted: its level and recorded fields, the
+    /// message among them.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct EventRecord {
+        pub level: Level,
+        pub fields: BTreeMap<String, String>,
+    }
+
+    /// Spans and log events created while the guard returned by [`install`]
+    /// lives on this thread.
     #[derive(Clone, Default)]
-    pub(crate) struct Spans(Arc<Mutex<Vec<SpanRecord>>>);
+    pub(crate) struct Spans {
+        spans: Arc<Mutex<Vec<SpanRecord>>>,
+        events: Arc<Mutex<Vec<EventRecord>>>,
+    }
 
     impl Spans {
         pub(crate) fn all(&self) -> Vec<SpanRecord> {
-            self.0
+            self.spans
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()
+        }
+
+        /// The log events of `level`, oldest first.
+        pub(crate) fn events_at(&self, level: Level) -> Vec<EventRecord> {
+            let events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+            events
+                .iter()
+                .filter(|e| e.level == level)
+                .cloned()
+                .collect()
         }
 
         pub(crate) fn named(&self, name: &str) -> Vec<SpanRecord> {
@@ -94,11 +116,23 @@ pub(crate) mod capture {
         fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
             let mut fields = Fields::default();
             attrs.record(&mut fields);
-            self.0
+            self.spans
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(SpanRecord {
                     name: attrs.metadata().name().to_owned(),
+                    fields: fields.0,
+                });
+        }
+
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(EventRecord {
+                    level: *event.metadata().level(),
                     fields: fields.0,
                 });
         }

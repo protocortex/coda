@@ -7,13 +7,13 @@
 //! A session keeps its loop across sends; a send runs on its own task, with
 //! the loop out of the table until the send ends.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use coda_agents::SkillTool;
+use coda_agents::{Catalog, SkillTool};
 use coda_config::config::{Config, Dirs, ProviderConfig};
 use coda_core::broker::BrokerError;
 use coda_core::history::{
@@ -125,15 +125,40 @@ pub struct Limits {
     pub token_cap: Option<u64>,
 }
 
+/// What one snapshot of the definitions offers the model: the skills of the
+/// `skill` tool and the agents the `task` tool lists. Both sit in the cached
+/// prefix of a request, so a loop is rebuilt when either changes.
+#[derive(Debug, PartialEq, Eq)]
+struct Offer {
+    skills: Option<Arc<SkillTool>>,
+    /// Each agent's name and description.
+    agents: Vec<(String, String)>,
+}
+
+impl Offer {
+    fn of(catalog: &Catalog) -> Self {
+        Self {
+            skills: SkillTool::from_catalog(catalog).map(Arc::new),
+            agents: catalog
+                .agents()
+                .map(|entry| (entry.def.name.clone(), entry.def.description.clone()))
+                .collect(),
+        }
+    }
+}
+
 /// One session's loop with the channel its events arrive on.
 struct ModelLoop {
     turn_loop: TurnLoop<Provider, Arc<BrokerGate>>,
     events: UnboundedReceiver<TurnEvent>,
     turn: Arc<Mutex<TurnId>>,
     limits: Limits,
-    /// The skills this loop offers, to tell at the next send whether the files
-    /// or the trust decision changed.
-    skills: Option<Arc<SkillTool>>,
+    /// What this loop offers the model, to tell at the next send whether the
+    /// files or the trust decision changed.
+    offer: Offer,
+    /// How many definition files had problems when this loop last said so, so
+    /// the daemon log repeats the warning only when that number changes.
+    problems: usize,
 }
 
 /// What a loop takes over from the idle one it replaces: the send limits and
@@ -142,6 +167,42 @@ struct ModelLoop {
 struct Carried {
     limits: Limits,
     used: u64,
+}
+
+/// Most dropped conversations whose [`Carried`] state is kept: as many as the
+/// idle pool holds.
+const MAX_CARRIED: usize = MAX_IDLE_LOOPS;
+
+/// The [`Carried`] state of conversations that were dropped, oldest first, until
+/// the next send of their session builds the replacement. A session that is
+/// never used again would leave its entry for good, so the oldest entry is
+/// forgotten at [`MAX_CARRIED`]; that session then restarts from the limits of
+/// its next send and its stored usage.
+#[derive(Debug, Default)]
+struct Dropped(VecDeque<(SessionId, Carried)>);
+
+impl Dropped {
+    fn insert(&mut self, session: SessionId, carried: Carried) {
+        self.remove(&session);
+        self.0.push_back((session, carried));
+        if self.0.len() > MAX_CARRIED {
+            self.0.pop_front();
+        }
+    }
+
+    fn get(&self, session: &SessionId) -> Option<Carried> {
+        let found = self.0.iter().find(|(id, _)| id == session);
+        found.map(|(_, carried)| *carried)
+    }
+
+    fn remove(&mut self, session: &SessionId) {
+        self.0.retain(|(id, _)| id != session);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 impl ModelLoop {
@@ -193,7 +254,7 @@ pub struct ModelSessions {
     loops: IdlePool<ModelLoop>,
     /// Limits and spent tokens of conversations a rebuild dropped, until the
     /// next send builds the replacement.
-    carried: Mutex<HashMap<SessionId, Carried>>,
+    carried: Mutex<Dropped>,
     /// What the runners of the sessions' `task` calls share.
     children: Arc<task::ChildEnv>,
 }
@@ -438,8 +499,13 @@ impl ModelSessions {
     }
 
     fn keep_loop(&self, session: SessionId, model_loop: ModelLoop) {
-        if let Some((evicted, _)) = self.loops.keep(session, model_loop) {
+        // Held across the eviction, so a send for the evicted session that finds
+        // it gone from the pool finds its state in the table too.
+        let mut carried = lock(&self.carried);
+        if let Some((evicted, dropped)) = self.loops.keep(session, model_loop) {
             info!(session = %evicted, "dropped the least recently used idle conversation");
+            // The next send rebuilds it, and must not hand it a fresh budget.
+            carried.insert(evicted, dropped.carried());
         }
     }
 
@@ -509,50 +575,65 @@ impl ModelSessions {
     }
 
     /// The idle loop of the session, or a new one that continues from the
-    /// history the session stored. An idle loop whose skills no longer match
-    /// the files and the trust decision is dropped, so a revoked or edited
-    /// project skill is gone by this send; the limits and spent tokens carry over.
+    /// history the session stored. The definitions are read once for the send.
+    /// An idle loop whose offer (skills and agents) no longer matches them is
+    /// dropped, so a revoked or edited project skill or agent is gone by this
+    /// send; the limits and spent tokens carry over. When the trust decision
+    /// cannot be read, an idle loop is kept as it is for this send, since the
+    /// failure says nothing about the files, and only a session with no idle
+    /// loop is built on the built-in agents.
     async fn loop_for_send(
         &self,
         record: &SessionRecord,
         limits: Limits,
     ) -> Result<ModelLoop, ModelError> {
-        let skills = self.skill_tool(record).await.map(Arc::new);
-        if let Some(model_loop) = self.take_loop(&record.id) {
-            if model_loop.skills == skills {
+        let catalog = match self.children.read_catalog(&record.cwd).await {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                if let Some(model_loop) = self.take_loop(&record.id) {
+                    warn!(session = %record.id, %error, "the definitions could not be read; keeping the conversation as it is");
+                    return Ok(model_loop);
+                }
+                warn!(session = %record.id, %error, "the definitions could not be read; only the built-in agents are offered");
+                Catalog::builtin()
+            }
+        };
+        let offer = Offer::of(&catalog);
+        let problems = catalog.problems().len();
+        if let Some(mut model_loop) = self.take_loop(&record.id) {
+            if model_loop.offer == offer {
+                if model_loop.problems != problems {
+                    warn_skipped(&record.id, problems);
+                    model_loop.problems = problems;
+                }
                 return Ok(model_loop);
             }
-            info!(session = %record.id, "the skills changed; rebuilding the conversation");
+            info!(session = %record.id, "the skills or agents changed; rebuilding the conversation");
             lock(&self.carried).insert(record.id.clone(), model_loop.carried());
         }
-        let carried = lock(&self.carried)
-            .get(&record.id)
-            .copied()
-            .unwrap_or(Carried { limits, used: 0 });
-        let built = self.build(record, carried, skills).await?;
+        let kept = lock(&self.carried).get(&record.id);
+        let carried = match kept {
+            Some(carried) => carried,
+            None => Carried {
+                limits,
+                used: self.stored_tokens(&record.id).await?,
+            },
+        };
+        warn_skipped(&record.id, problems);
+        let built = self.build(record, carried, offer, problems).await?;
         lock(&self.carried).remove(&record.id);
         Ok(built)
     }
 
-    /// The skill tool for the user's skills and, once trusted, the project's.
-    /// Skills that cannot be loaded cost the session its skills, not the session.
-    async fn skill_tool(&self, record: &SessionRecord) -> Option<SkillTool> {
-        match self.children.catalog(&record.cwd).await {
-            Ok(catalog) => {
-                if !catalog.problems().is_empty() {
-                    warn!(
-                        session = %record.id,
-                        problems = catalog.problems().len(),
-                        "some definition files were skipped; run `coda agents lint` to see why"
-                    );
-                }
-                SkillTool::from_catalog(&catalog)
-            }
-            Err(error) => {
-                warn!(session = %record.id, %error, "could not load the skills; the session has none");
-                None
-            }
-        }
+    /// The tokens the session's stored usage events add up to, which is what a
+    /// loop built after a restart or an eviction has already spent.
+    async fn stored_tokens(&self, session: &SessionId) -> Result<u64, HubError> {
+        let id = session.clone();
+        let usage = self
+            .hub
+            .with_store(move |store| store.usage_summary(Some(&id)))
+            .await?;
+        Ok(usage.input_tokens.saturating_add(usage.output_tokens))
     }
 
     /// The context window of the model the session runs, when it is known.
@@ -596,7 +677,8 @@ impl ModelSessions {
         &self,
         record: &SessionRecord,
         Carried { limits, used }: Carried,
-        skills: Option<Arc<SkillTool>>,
+        offer: Offer,
+        problems: usize,
     ) -> Result<ModelLoop, ModelError> {
         let provider = self.provider(record)?;
         let faux = if let Provider::Faux(faux) = &provider {
@@ -619,12 +701,12 @@ impl ModelSessions {
             self.hub.store_handle(),
             StoreOriginals::new(self.hub.store_handle(), record.id.clone()),
         )?;
-        if let Some(skills) = &skills {
+        if let Some(skills) = &offer.skills {
             tools.schemas.push(skill_schema(skills));
             tools.tools = tools.tools.with(Arc::clone(skills) as Arc<dyn Tool>);
         }
         let mut schemas = tools.schemas;
-        schemas.push(task_schema(&self.children.agents(&record.cwd).await));
+        schemas.push(task_schema(&offer.agents));
         let prefix = Prefix::new(SYSTEM_PROMPT, schemas, "")?;
         let (conversation, session_started) = self.stored_conversation(&record.id, prefix).await?;
         let turn = Arc::new(Mutex::new(TurnId::new(NO_TURN)));
@@ -639,14 +721,14 @@ impl ModelSessions {
             Arc::clone(&turn),
         ));
         let (sender, events) = unbounded_channel();
-        let runner = task::ChildRunner::new(
+        let factory = task::LoopFactory::new(
             Arc::clone(&self.children),
             record.clone(),
             Arc::clone(&gate),
             faux,
             sender.clone(),
         );
-        let turn_loop = runner
+        let turn_loop = factory
             .build_loop(
                 0,
                 task::LoopParts {
@@ -673,7 +755,8 @@ impl ModelSessions {
             events,
             turn,
             limits,
-            skills,
+            offer,
+            problems,
         })
     }
 
@@ -681,18 +764,14 @@ impl ModelSessions {
     /// events, expire orphaned prompts, record the end.
     async fn run(
         self: Arc<Self>,
-        model_loop: ModelLoop,
+        mut model_loop: ModelLoop,
         session: SessionId,
         turn: TurnId,
         text: String,
     ) {
         let ModelLoop {
-            mut turn_loop,
-            mut events,
-            turn: shared_turn,
-            limits,
-            skills,
-        } = model_loop;
+            turn_loop, events, ..
+        } = &mut model_loop;
         info!(session = %session, turn = %turn, step = "drive", "driving the turn loop");
         let outcome = {
             let send = turn_loop.send(&text);
@@ -723,13 +802,6 @@ impl ModelSessions {
             reservation.wind_down();
         }
         close_turn(&self.hub, &session, &turn, failed).await;
-        let model_loop = ModelLoop {
-            turn_loop,
-            events,
-            turn: shared_turn,
-            limits,
-            skills,
-        };
         self.keep_loop(session, model_loop);
     }
 }
@@ -776,6 +848,16 @@ fn skill_schema(skills: &SkillTool) -> ToolSchema {
     }
 }
 
+fn warn_skipped(session: &SessionId, problems: usize) {
+    if problems > 0 {
+        warn!(
+            session = %session,
+            problems,
+            "some definition files were skipped; run `coda agents lint` to see why"
+        );
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // Plain data, so a panic elsewhere cannot leave it invalid.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -809,7 +891,61 @@ async fn publish_kind(
     hub.publish(session, turn, record).await.map(|_| ())
 }
 
+/// What a turn event is stored as in the session's log.
+#[derive(Debug, PartialEq)]
+enum Row {
+    /// One plain row of this kind and body, in the session's own log and
+    /// wrapped in a child's alike.
+    Stored { kind: &'static str, body: Value },
+    /// No plain row. [`publish_turn_event`] stores some of these in a form of
+    /// their own; a child's run stores none of them.
+    NotStored,
+}
+
+/// The row of `event`. Long texts are kept apart in `originals`. Every kind of
+/// event is named, so a new one has to be placed here before the daemon builds.
+async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Row {
+    match event {
+        TurnEvent::Assistant { text, tool_calls } => {
+            let mut kept = Vec::with_capacity(tool_calls.len());
+            for call in tool_calls {
+                kept.push((call, keep_original(hub, session, &call.arguments).await));
+            }
+            Row::Stored {
+                kind: ASSISTANT_MESSAGE_KIND,
+                body: assistant_body(text, &kept),
+            }
+        }
+        TurnEvent::ToolFinished {
+            tool,
+            call_id,
+            text,
+            is_error,
+        } => {
+            let original = keep_original(hub, session, text).await;
+            Row::Stored {
+                kind: TOOL_FINISHED_KIND,
+                body: tool_finished_body(tool, call_id, original.as_ref(), *is_error),
+            }
+        }
+        TurnEvent::ContextOverflow => Row::Stored {
+            kind: CONTEXT_OVERFLOW_KIND,
+            body: json!({}),
+        },
+        TurnEvent::Text(_)
+        | TurnEvent::Usage(_)
+        | TurnEvent::SessionStarted
+        | TurnEvent::HookBlocked { .. }
+        | TurnEvent::Compaction { .. }
+        | TurnEvent::Child { .. } => Row::NotStored,
+    }
+}
+
 async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, event: TurnEvent) {
+    if let Row::Stored { kind, body } = event_row(hub, session, &event).await {
+        log_failure(publish_kind(hub, session, turn, kind, &body).await);
+        return;
+    }
     let stored = match event {
         TurnEvent::Text(text) => {
             let delta = Event::StreamDelta {
@@ -830,27 +966,6 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
                 },
             };
             store_event(hub, session, turn, &usage).await
-        }
-        TurnEvent::Assistant { text, tool_calls } => {
-            let mut kept = Vec::with_capacity(tool_calls.len());
-            for call in &tool_calls {
-                kept.push((call, keep_original(hub, session, &call.arguments).await));
-            }
-            let body = assistant_body(&text, &kept);
-            publish_kind(hub, session, turn, ASSISTANT_MESSAGE_KIND, &body).await
-        }
-        TurnEvent::ToolFinished {
-            tool,
-            call_id,
-            text,
-            is_error,
-        } => {
-            let original = keep_original(hub, session, &text).await;
-            let body = tool_finished_body(&tool, &call_id, original.as_ref(), is_error);
-            publish_kind(hub, session, turn, TOOL_FINISHED_KIND, &body).await
-        }
-        TurnEvent::ContextOverflow => {
-            publish_kind(hub, session, turn, CONTEXT_OVERFLOW_KIND, &json!({})).await
         }
         TurnEvent::Child { agent, event } => {
             task::publish_child_event(hub, session, turn, &agent, *event).await;
@@ -884,6 +999,10 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
             ack.confirm(stored.is_ok());
             stored
         }
+        // Stored above, as plain rows.
+        TurnEvent::Assistant { .. }
+        | TurnEvent::ToolFinished { .. }
+        | TurnEvent::ContextOverflow => return,
     };
     log_failure(stored);
 }

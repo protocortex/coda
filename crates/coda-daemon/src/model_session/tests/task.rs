@@ -9,20 +9,21 @@ use std::time::Duration;
 
 use coda_agents::{Catalog, NO_REPLY_SUMMARY, Status, Tier, trust_project};
 use coda_config::config::Config;
-use coda_core::prompt::{Conversation, Prefix};
+use coda_core::prompt::{Conversation, Message, Prefix};
 use coda_core::turn::{StopCondition, ToolSet, TurnConfig, TurnError, TurnEvent};
 use coda_protocol::paths::repo_identity;
 use coda_protocol::types::{BackendKind, Mode};
 use coda_providers::faux::{FauxProvider, Turn};
+use coda_providers::model::Usage;
 use coda_providers::registry::{ModelRegistry, RegistryError};
 use coda_tools::task::MAX_DEPTH;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-use super::{HOME_DIR, Rig, dump, text_turn, tool_turn, user_message};
+use super::{HOME_DIR, Rig, dump, overflow_turn, read_turn, text_turn, tool_turn, user_message};
 use crate::gate::BrokerGate;
-use crate::model_session::task::{ChildEnv, ChildRunner, LoopParts, child_target, status_of};
-use crate::model_session::{COMPACT_THRESHOLD_BYTES, Provider};
+use crate::model_session::task::{ChildEnv, LoopFactory, LoopParts, child_target, status_of};
+use crate::model_session::{COMPACT_THRESHOLD_BYTES, Offer, Provider, Row, event_row};
 use crate::turn::Turns;
 
 const BODY: &str = "You are a scout. Report what you find.\n";
@@ -36,7 +37,7 @@ const EDIT_TEXT: &str = "edit scripts/x.sh";
 const MODEL_DOWN: &str =
     r#"{"events": [], "error": {"class": "fatal", "message": "the model is down"}}"#;
 
-fn agent_file(name: &str, tools: &str, body: &str) -> String {
+pub(super) fn agent_file(name: &str, tools: &str, body: &str) -> String {
     format!(
         "+++\nname = \"{name}\"\n\
          description = \"Does {name}. Use when asked. Do not use otherwise.\"\n\
@@ -44,7 +45,7 @@ fn agent_file(name: &str, tools: &str, body: &str) -> String {
     )
 }
 
-fn task_call(id: &str, agent: &str) -> Value {
+pub(super) fn task_call(id: &str, agent: &str) -> Value {
     tool_turn(&[(id, "task", json!({"agent": agent, "prompt": PROMPT}))])
 }
 
@@ -78,13 +79,13 @@ fn scouts(text: &str) -> (String, Option<String>) {
 }
 
 /// Waits for the `results`th turn to end.
-async fn finish(rig: &Rig, results: usize) {
+pub(super) async fn finish(rig: &Rig, results: usize) {
     rig.wait_for_results(results).await;
     rig.wait_until_idle().await;
 }
 
 /// The tool results among the messages of the faux request `request`.
-fn tool_results(request: &Value) -> Vec<Value> {
+pub(super) fn tool_results(request: &Value) -> Vec<Value> {
     let messages = request["messages"].as_array().unwrap();
     let results = messages.iter().filter(|m| m["role"] == "tool");
     results.cloned().collect()
@@ -98,7 +99,7 @@ fn spent(usage: &[Value]) -> u64 {
     usage.iter().map(tokens).sum()
 }
 
-fn text_of(result: &Value) -> &str {
+pub(super) fn text_of(result: &Value) -> &str {
     result["text"].as_str().unwrap()
 }
 
@@ -642,10 +643,10 @@ async fn a_rebuilt_parent_shows_the_task_call_and_its_result_and_nothing_of_the_
 #[tokio::test]
 async fn a_project_agent_runs_only_after_its_repository_is_trusted() {
     // Arrange
+    // Trusting the project adds `local` to the agents the model is offered, so
+    // the second send runs in a rebuilt loop, which reads the script again.
     let script = [
         task_call("t1", "local"),
-        text_turn("refused"),
-        task_call("t2", "local"),
         text_turn("child answer"),
         text_turn("parent done"),
     ];
@@ -712,6 +713,7 @@ async fn a_built_in_agent_runs_with_no_definition_files_and_only_its_read_tools(
         answer.contains("summary: the needle is in a.txt:1"),
         "{answer}"
     );
+    assert!(!answer.contains("note:"), "no project file waits: {answer}");
 }
 
 #[tokio::test]
@@ -729,10 +731,10 @@ async fn a_daemon_that_cannot_find_the_users_directory_still_offers_the_built_in
     };
 
     // Act
-    let agents = env.agents(rig.cwd.to_str().unwrap()).await;
+    let offer = Offer::of(&env.catalog(rig.cwd.to_str().unwrap()).await);
 
     // Assert
-    let names: Vec<&str> = agents.iter().map(|(name, _)| name.as_str()).collect();
+    let names: Vec<&str> = offer.agents.iter().map(|(name, _)| name.as_str()).collect();
     let built_in = Catalog::builtin();
     let expected: Vec<&str> = built_in
         .agents()
@@ -766,22 +768,227 @@ fn the_tier_routes_to_its_alias_and_an_unrouted_tier_keeps_the_sessions_model() 
     assert!(matches!(deep, Err(RegistryError::WrongBackend { .. })));
 }
 
+const KEYLESS: &str = "[providers.anthropic]\nenabled = true\nmodel = \"claude-default\"\n\
+                       api_key_env = \"SCOUT_KEY\"\n\
+                       [models.far]\nprovider = \"openai_compat\"\nmodel = \"other\"\n";
+
+/// The scout (a `fast` agent) is asked for by a session on the Anthropic
+/// backend whose daemon has no key, under `routing`. Returns what the
+/// parent was told and whether it was an error.
+async fn scout_on_a_keyless_provider(routing: &str) -> (String, bool) {
+    let rig = scout_rig(&[], "\"read\"", |_| {});
+    let config = Config::from_toml_str(&format!("{KEYLESS}{routing}"))
+        .unwrap()
+        .config;
+    let shared = &rig.turns.models.children;
+    let env = Arc::new(ChildEnv {
+        hub: Arc::clone(&shared.hub),
+        registry: ModelRegistry::from_config(&config),
+        config,
+        env: shared.env.clone(),
+        key_reader: Arc::new(|_| None),
+        home: shared.home.clone(),
+    });
+    let script = [task_call("t1", "scout"), text_turn("parent done")];
+    let (runner, parts, _events) = parent_on(&rig, &script, env, BackendKind::Anthropic).await;
+    let mut session = runner.build_loop(0, parts);
+    session.send("go").await.unwrap();
+    let messages = session.conversation().messages();
+    let mut results = messages.iter().filter_map(|message| match message {
+        Message::ToolResult { text, is_error, .. } => Some((text.clone(), *is_error)),
+        _ => None,
+    });
+    let first = results.next().expect("the parent got a tool result");
+    assert!(results.next().is_none(), "one task call, one result");
+    first
+}
+
+const CANNOT_USE_THE_MODEL: &str =
+    "the task could not run: the model for the agent's tier cannot be used";
+
+#[tokio::test]
+async fn a_child_on_a_provider_with_no_key_says_which_variable_is_missing() {
+    // Act
+    let (text, is_error) = scout_on_a_keyless_provider("").await;
+
+    // Assert
+    assert!(is_error, "{text}");
+    assert!(text.starts_with(CANNOT_USE_THE_MODEL), "{text}");
+    assert!(text.contains("SCOUT_KEY"), "{text}");
+}
+
+#[tokio::test]
+async fn a_child_whose_tier_is_routed_to_another_backend_says_so() {
+    // Act
+    let (text, is_error) = scout_on_a_keyless_provider("[routing]\nfast = \"far\"\n").await;
+
+    // Assert
+    assert!(is_error, "{text}");
+    assert!(text.starts_with(CANNOT_USE_THE_MODEL), "{text}");
+    let wrong = "model alias `far` belongs to provider `openai_compat`";
+    assert!(text.contains(wrong), "{text}");
+}
+
+#[tokio::test]
+async fn a_child_that_compacts_its_conversation_goes_on_and_reports_to_the_parent() {
+    // Arrange
+    // Four reads, then the model's window is exceeded: the child summarises its
+    // early messages, which its parent never stores, and asks again.
+    let read = |n: u8| tool_turn(&[(&format!("r{n}"), "read", json!({"path": "a.txt"}))]);
+    let mut script = vec![task_call("t1", "scout")];
+    script.extend((1..=4).map(read));
+    script.extend([
+        overflow_turn(),
+        text_turn("a summary of the reads"),
+        text_turn("child done"),
+        text_turn("parent done"),
+    ]);
+    let mut rig = scout_rig(&script, "\"read\"", |_| {});
+
+    // Act
+    rig.send("go").await;
+    finish(&rig, 1).await;
+
+    // Assert
+    let lines = rig.request_lines();
+    assert_eq!(lines.len(), 9, "the child asks again after its summary");
+    let answer = &tool_results(&lines[8])[0];
+    assert_eq!(answer["is_error"], false);
+    assert!(text_of(answer).contains("summary: child done"), "{answer}");
+    let retry = lines[7]["messages"].as_array().unwrap();
+    assert!(
+        retry[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("a summary of the reads")
+    );
+    assert_eq!(rig.bodies("compaction").await, Vec::<Value>::new());
+}
+
+#[tokio::test]
+async fn a_child_that_runs_out_of_budget_tells_the_parent_which_agent_and_why() {
+    // Arrange
+    // The parent's call spends 8 of its 20 tokens, so the child has 12, and
+    // two reads of 8 tokens each pass that.
+    let script = [
+        task_call("t1", "scout"),
+        read_turn(),
+        read_turn(),
+        text_turn("never"),
+    ];
+    let mut rig = scout_rig(&script, "\"read\"", |config| config.token_cap = 20);
+
+    // Act
+    rig.send("go").await;
+    finish(&rig, 1).await;
+
+    // Assert
+    let finished = rig.bodies("tool_finished").await;
+    let task = finished.iter().find(|body| body["tool"] == "task").unwrap();
+    assert_eq!(task["is_error"], true);
+    let text = rig.original(task["original"].as_str().unwrap()).await;
+    let text = text.unwrap();
+    assert!(text.starts_with("status: failed\n"), "{text}");
+    assert!(text.contains("scout"), "{text}");
+    assert!(text.contains("stopped early (budget_exhausted)"), "{text}");
+    assert_eq!(
+        rig.request_lines().len(),
+        3,
+        "the parent made no further call"
+    );
+}
+
+#[tokio::test]
+async fn a_reply_a_tool_result_and_a_context_overflow_are_the_events_that_become_plain_rows() {
+    // Arrange
+    let rig = Rig::new(Mode::Default, &[]);
+    let used = Usage {
+        input_tokens: 1,
+        output_tokens: 1,
+    };
+    let aside = || Box::new(TurnEvent::ContextOverflow);
+    let events = [
+        TurnEvent::Assistant {
+            text: "hi".to_owned(),
+            tool_calls: Vec::new(),
+        },
+        TurnEvent::ToolFinished {
+            tool: "read".to_owned(),
+            call_id: "c1".to_owned(),
+            text: "text".to_owned(),
+            is_error: false,
+        },
+        TurnEvent::ContextOverflow,
+        TurnEvent::Text("text".to_owned()),
+        TurnEvent::Usage(used),
+        TurnEvent::SessionStarted,
+        TurnEvent::HookBlocked {
+            reason: "no".to_owned(),
+        },
+        TurnEvent::Child {
+            agent: AGENT.to_owned(),
+            event: aside(),
+        },
+    ];
+
+    // Act
+    let mut kinds = Vec::new();
+    for event in &events {
+        kinds.push(match event_row(&rig.hub, &rig.session, event).await {
+            Row::Stored { kind, .. } => kind,
+            Row::NotStored => "not stored",
+        });
+    }
+
+    // Assert
+    let none = "not stored";
+    let expected = [
+        "assistant_message",
+        "tool_finished",
+        "context_overflow",
+        none,
+        none,
+        none,
+        none,
+        none,
+    ];
+    assert_eq!(kinds, expected);
+}
+
 /// A top-level loop's runner and parts, and the channel its events go up, with
 /// one scripted provider for the loop and its children.
 async fn parent(
     rig: &Rig,
     script: &[Value],
 ) -> (
-    ChildRunner,
+    Arc<LoopFactory>,
+    LoopParts<Arc<BrokerGate>>,
+    UnboundedReceiver<TurnEvent>,
+) {
+    let env = Arc::clone(&rig.turns.models.children);
+    parent_on(rig, script, env, BackendKind::Faux).await
+}
+
+/// Like [`parent`], for a session on `backend` whose children run in `env`.
+/// Children draw from the script only on the faux backend; on any other they
+/// get the provider `env` builds.
+async fn parent_on(
+    rig: &Rig,
+    script: &[Value],
+    env: Arc<ChildEnv>,
+    backend: BackendKind,
+) -> (
+    Arc<LoopFactory>,
     LoopParts<Arc<BrokerGate>>,
     UnboundedReceiver<TurnEvent>,
 ) {
     let id = rig.session.clone();
-    let record = rig
+    let mut record = rig
         .hub
         .with_store(move |s| s.load_session(&id))
         .await
         .unwrap();
+    record.backend = backend;
     let models = &rig.turns.models;
     let broker = models.brokers.broker(&record, DENY_TIMEOUT).await.unwrap();
     let turn = Turns::begin(&rig.hub, &record.id, "go").await.unwrap();
@@ -797,11 +1004,12 @@ async fn parent(
         .collect();
     let faux = Arc::new(FauxProvider::new(turns));
     let (sender, events) = unbounded_channel();
-    let runner = ChildRunner::new(
-        Arc::clone(&models.children),
+    let children_draw_from_the_script = (backend == BackendKind::Faux).then(|| Arc::clone(&faux));
+    let runner = LoopFactory::new(
+        env,
         record.clone(),
         Arc::clone(&gate),
-        Some(Arc::clone(&faux)),
+        children_draw_from_the_script,
         sender.clone(),
     );
     let parts = LoopParts {
