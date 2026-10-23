@@ -48,7 +48,7 @@ use crate::gate::{BrokerGate, Brokers};
 use crate::idle_pool::IdlePool;
 use crate::subscribe::{Hub, HubError};
 use crate::trace::backend_span;
-use crate::turn::{Reservation, TurnError, Turns, store_event};
+use crate::turn::{Reservation, TurnError, TurnState, Turns, store_event};
 
 mod task;
 
@@ -314,7 +314,8 @@ impl ModelSessions {
     /// with a fresh prefix and the history rebuilt from the stored events, and
     /// keeps the send limits and spent tokens of the dropped loop. The alias name lives only in
     /// the switch event, so a later change to the aliases cannot reinterpret the
-    /// stored model. Only `session` is touched.
+    /// stored model. Only `session` is touched. It refuses a cancelled send that
+    /// has not ended; the `session.set_model` handler waits for that first.
     ///
     /// # Errors
     /// Returns [`SwitchError::Busy`] while a send runs,
@@ -386,11 +387,9 @@ impl ModelSessions {
         self.take_loop(session).is_some()
     }
 
-    /// Whether the send of `session` has emitted its terminal event and only cleans up.
-    pub(crate) fn is_winding_down(&self, session: &SessionId) -> bool {
-        self.running()
-            .get(session)
-            .is_some_and(Reservation::is_winding_down)
+    /// The state of the send of `session`, or `None` when it has none.
+    pub(crate) fn turn_state(&self, session: &SessionId) -> Option<TurnState> {
+        self.running().get(session).map(Reservation::state)
     }
 
     /// Whether `session` has a send starting or running.

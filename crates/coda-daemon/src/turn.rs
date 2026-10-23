@@ -71,8 +71,9 @@ const CODEX_BACKEND_NAME: &str = "codex";
 /// emit callback is synchronous and must not block, so when the store falls
 /// this far behind, further events are dropped with a warning.
 const EVENT_QUEUE_CAPACITY: usize = 1024;
-/// How long a request waits for a session whose turn already emitted its terminal
-/// event. Cleanup after that event stops a backend, which can take a few seconds.
+/// How long a request waits for a session whose turn is ending: its terminal
+/// event is out, or it was cancelled and has not ended yet. Stopping a backend
+/// after the cancel or the event can take a few seconds.
 const WIND_DOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const WIND_DOWN_POLL: Duration = Duration::from_millis(10);
 /// Bytes of earlier conversation given to a Codex thread that replaces a lost one.
@@ -100,6 +101,8 @@ pub enum TurnError {
     SessionNotFound(SessionId),
     #[error("session {0} already has a turn running")]
     Busy(SessionId),
+    #[error("session {0} is still ending a cancelled turn")]
+    Ending(SessionId),
     #[error("session {0} does not use a backend this daemon can run")]
     Unsupported(SessionId),
     #[error(transparent)]
@@ -115,6 +118,10 @@ impl TurnError {
         match self {
             Self::SessionNotFound(_) => error(SESSION_NOT_FOUND, "Session not found"),
             Self::Busy(_) => error(TURN_RUNNING, "A turn is already running"),
+            Self::Ending(_) => error(
+                TURN_RUNNING,
+                "The cancelled turn is still ending. Try again.",
+            ),
             Self::Unsupported(_)
             | Self::Model(
                 ModelError::Disabled(_) | ModelError::Registry(RegistryError::Disabled(_)),
@@ -140,6 +147,18 @@ pub(crate) struct Reservation<T> {
     cancellable: bool,
     /// The turn has emitted its terminal event and only cleans up now.
     winding_down: bool,
+}
+
+/// What a session's reservation says about its turn, read under one lock per table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnState {
+    /// No turn holds the session.
+    Free,
+    /// The turn is running, or starting, and nobody cancelled it.
+    Live,
+    /// The turn is ending: its terminal event is out, or it was cancelled and
+    /// the turn task has not yet said so.
+    WindingDown { cancelled: bool },
 }
 
 /// How far a cancel of a reservation has got.
@@ -212,10 +231,15 @@ impl<T> Reservation<T> {
         self.winding_down = true;
     }
 
-    /// Whether the turn is ending: it emitted its terminal event, or it was
-    /// cancelled and the turn task has not yet said so.
-    pub(crate) fn is_winding_down(&self) -> bool {
-        self.winding_down || self.cancel != CancelState::None
+    /// How the turn stands: live, or ending because it emitted its terminal
+    /// event or was cancelled.
+    pub(crate) fn state(&self) -> TurnState {
+        let cancelled = self.cancel != CancelState::None;
+        if self.winding_down || cancelled {
+            TurnState::WindingDown { cancelled }
+        } else {
+            TurnState::Live
+        }
     }
 
     pub(crate) fn armed(&self) -> Option<&T> {
@@ -312,8 +336,9 @@ impl Turns {
     ///
     /// # Errors
     /// Returns [`TurnError::SessionNotFound`], [`TurnError::Unsupported`],
-    /// [`TurnError::Busy`], [`TurnError::Start`] when the backend cannot
-    /// start, and [`TurnError::Hub`] when the store refuses.
+    /// [`TurnError::Busy`], [`TurnError::Ending`] when a cancelled turn does
+    /// not end in time, [`TurnError::Start`] when the backend cannot start,
+    /// and [`TurnError::Hub`] when the store refuses.
     pub async fn send(self: &Arc<Self>, params: SessionSendParams) -> Result<TurnId, TurnError> {
         let SessionSendParams {
             session_id,
@@ -512,7 +537,8 @@ impl Turns {
     /// cancels it first; the close then waits for that turn to end.
     ///
     /// # Errors
-    /// Returns [`TurnError::Busy`] while a turn is starting or running.
+    /// Returns [`TurnError::Busy`] while a turn is starting or running, and
+    /// [`TurnError::Ending`] when a cancelled turn does not end in time.
     pub async fn close(&self, session: &SessionId) -> Result<bool, TurnError> {
         self.await_wind_down(session).await?;
         let server = self.idle.take(session);
@@ -553,26 +579,38 @@ impl Turns {
     /// session is free, and so is a cancelled one, since a client that cancels
     /// and then closes does not wait for the turn to notice; a live turn is
     /// refused at once.
-    async fn await_wind_down(&self, session: &SessionId) -> Result<(), TurnError> {
-        let wait = async {
-            while self.is_running(session) {
-                if !self.is_winding_down(session) {
-                    return Err(TurnError::Busy(session.clone()));
+    ///
+    /// # Errors
+    /// Returns [`TurnError::Busy`] for a live turn, or one that outlasts
+    /// [`WIND_DOWN_TIMEOUT`], and [`TurnError::Ending`] when the one that
+    /// outlasts it was cancelled.
+    pub(crate) async fn await_wind_down(&self, session: &SessionId) -> Result<(), TurnError> {
+        let deadline = tokio::time::Instant::now() + WIND_DOWN_TIMEOUT;
+        loop {
+            match self.turn_state(session) {
+                TurnState::Free => return Ok(()),
+                TurnState::Live => return Err(TurnError::Busy(session.clone())),
+                TurnState::WindingDown { cancelled } => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(if cancelled {
+                            TurnError::Ending(session.clone())
+                        } else {
+                            TurnError::Busy(session.clone())
+                        });
+                    }
+                    tokio::time::sleep(WIND_DOWN_POLL).await;
                 }
-                tokio::time::sleep(WIND_DOWN_POLL).await;
             }
-            Ok(())
-        };
-        tokio::time::timeout(WIND_DOWN_TIMEOUT, wait)
-            .await
-            .unwrap_or_else(|_| Err(TurnError::Busy(session.clone())))
+        }
     }
 
-    fn is_winding_down(&self, session: &SessionId) -> bool {
-        self.running()
-            .get(session)
-            .is_some_and(Reservation::is_winding_down)
-            || self.models.is_winding_down(session)
+    /// The state of `session`'s turn, with one read of each table so a turn
+    /// that ends meanwhile is never taken for a live one.
+    fn turn_state(&self, session: &SessionId) -> TurnState {
+        let agent = self.running().get(session).map(Reservation::state);
+        agent
+            .or_else(|| self.models.turn_state(session))
+            .unwrap_or(TurnState::Free)
     }
 
     /// Whether `session` has a turn starting or running.

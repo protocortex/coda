@@ -21,7 +21,7 @@ use crate::gate::Brokers;
 use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
 use crate::trace::capture::{Spans, install};
-use crate::turn::{BACKEND_UNSUPPORTED, TurnConfig, Turns};
+use crate::turn::{BACKEND_UNSUPPORTED, TurnConfig, TurnState, Turns};
 use crate::watchdog::Timing;
 use coda_core::history::CONVERSATION_RESET_KIND;
 use coda_core::turn::{CancelToken, PROVIDER_CALL_SPAN, TOOL_CALL_SPAN};
@@ -423,6 +423,55 @@ async fn cancel_stops_the_loop_and_expires_the_open_permission_request() {
     let timeouts = rig.bodies("timeout").await;
     assert_eq!(timeouts[0]["request_id"], request);
     assert!(!rig.cwd.join("ran.txt").exists());
+}
+
+#[tokio::test]
+async fn a_close_right_after_a_cancel_waits_for_the_model_turn_to_end() {
+    // Arrange
+    let calls = tool_turn(&[("c1", "bash", json!({"command": "touch ran.txt"}))]);
+    let mut rig = Rig::new(Mode::Default, &[calls]);
+    rig.send("go").await;
+    rig.wait_for_pending().await;
+
+    // Act
+    // The turn task has not run since the cancel, so it has not yet said it is ending.
+    let cancelled = rig
+        .call("session.cancel", json!({"session_id": rig.session}))
+        .await;
+    let closed = rig
+        .call("session.close", json!({"session_id": rig.session}))
+        .await;
+
+    // Assert
+    assert_eq!(cancelled["result"]["cancelled"], true);
+    assert!(closed["error"].is_null(), "{closed}");
+    assert!(!rig.turns.is_running(&rig.session));
+}
+
+#[tokio::test]
+async fn a_model_session_reports_no_turn_a_live_one_and_a_cancelled_one() {
+    // Arrange
+    let rig = Rig::new(Mode::Default, &[]);
+    let models = &rig.turns.models;
+    let none = models.turn_state(&rig.session);
+
+    // Act
+    let slot = models.reserve(&rig.session).unwrap();
+    let live = models.turn_state(&rig.session);
+    models.cancel(&rig.session);
+    let cancelled = models.turn_state(&rig.session);
+    drop(slot);
+
+    // Assert
+    assert_eq!(
+        [none, live, cancelled],
+        [
+            None,
+            Some(TurnState::Live),
+            Some(TurnState::WindingDown { cancelled: true }),
+        ]
+    );
+    assert_eq!(models.turn_state(&rig.session), None);
 }
 
 #[tokio::test]
