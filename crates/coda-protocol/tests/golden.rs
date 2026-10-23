@@ -102,6 +102,7 @@ golden_tests! {
     session_resume_params: "session.resume.params" => SessionResumeParams,
     session_resume_result: "session.resume.result" => SessionResumeResult,
     permission_request_params: "permission.request.params" => PermissionRequestParams,
+    permission_request_params_minimal: "permission.request.params.minimal" => PermissionRequestParams,
     permission_respond_params: "permission.respond.params" => PermissionRespondParams,
     permission_respond_result: "permission.respond.result" => PermissionRespondResult,
     grant_add_params: "grant.add.params" => GrantAddParams,

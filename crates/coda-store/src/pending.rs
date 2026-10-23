@@ -17,6 +17,8 @@ pub struct NewPending {
     pub tool: String,
     pub repo_path: String,
     pub command: String,
+    /// Name of the sub-agent that asks; `None` for the session's own call.
+    pub agent: Option<String>,
 }
 
 /// A queued permission request.
@@ -28,9 +30,14 @@ pub struct PendingPermission {
     pub tool: String,
     pub repo_path: String,
     pub command: String,
+    /// Name of the sub-agent that asks; `None` for the session's own call.
+    pub agent: Option<String>,
     /// Request time in milliseconds since the Unix epoch.
     pub requested_at: i64,
 }
+
+/// Session row, repo, command, asking agent and answer time of a queued request.
+type PendingRow = (i64, String, String, Option<String>, Option<i64>);
 
 /// Parses a request id, accepting only the canonical decimal form this store
 /// issues, so "03" or "+3" never alias request 3.
@@ -48,13 +55,15 @@ impl Store {
     pub fn add_pending(&mut self, new: &NewPending) -> Result<RequestId, StoreError> {
         let session_row = self.existing_session_row(&new.session)?;
         self.connection().execute(
-            "INSERT INTO pending_permissions (session_id, tool, repo_path, command, requested_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO pending_permissions \
+             (session_id, tool, repo_path, command, agent, requested_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 session_row,
                 new.tool,
                 new.repo_path,
                 new.command,
+                new.agent,
                 self.clock.now_ms()
             ],
         )?;
@@ -82,12 +91,20 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (session_row, repo_path, command, resolved_at): (i64, String, String, Option<i64>) = tx
+        let (session_row, repo_path, command, agent, resolved_at): PendingRow = tx
             .query_row(
-                "SELECT session_id, repo_path, command, resolved_at \
+                "SELECT session_id, repo_path, command, agent, resolved_at \
                  FROM pending_permissions WHERE id = ?1",
                 [request_row],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or_else(not_found)?;
@@ -100,7 +117,15 @@ impl Store {
             "UPDATE pending_permissions SET resolved_at = ?1 WHERE id = ?2",
             params![now, request_row],
         )?;
-        insert_decision(&tx, session_row, &repo_path, &command, decision, now)?;
+        insert_decision(
+            &tx,
+            session_row,
+            &repo_path,
+            &command,
+            agent.as_deref(),
+            decision,
+            now,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -113,7 +138,7 @@ impl Store {
     pub fn list_pending(&self, session: &SessionId) -> Result<Vec<PendingPermission>, StoreError> {
         let session_row = self.existing_session_row(session)?;
         let mut stmt = self.connection().prepare(
-            "SELECT id, tool, repo_path, command, requested_at FROM pending_permissions \
+            "SELECT id, tool, repo_path, command, agent, requested_at FROM pending_permissions \
              WHERE session_id = ?1 AND resolved_at IS NULL ORDER BY id",
         )?;
         let rows = stmt.query_map([session_row], |row| {
@@ -123,7 +148,8 @@ impl Store {
                 tool: row.get(1)?,
                 repo_path: row.get(2)?,
                 command: row.get(3)?,
-                requested_at: row.get(4)?,
+                agent: row.get(4)?,
+                requested_at: row.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

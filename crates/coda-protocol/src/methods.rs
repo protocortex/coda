@@ -250,8 +250,13 @@ pub struct PermissionRequestParams {
     pub tool: String,
     /// Canonical root of the git repository the call runs in.
     pub repo_path: String,
-    /// The command line, or the tool name when the call has none.
+    /// The command line, or the tool name followed by the paths it acts on
+    /// when the call has no command line.
     pub command: String,
+    /// Name of the sub-agent that asks, absent when the session's own call
+    /// asks. A client shows it apart from `command`, which is the model's text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// Parameters of [`PERMISSION_RESPOND`].

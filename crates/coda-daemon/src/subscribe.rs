@@ -112,6 +112,7 @@ fn pending_frame(pending: &PendingPermission) -> Result<Vec<u8>, HubError> {
         tool: pending.tool.clone(),
         repo_path: pending.repo_path.clone(),
         command: pending.command.clone(),
+        agent: pending.agent.clone(),
     })
 }
 
@@ -237,6 +238,7 @@ impl Hub {
                 tool: pending.tool.clone(),
                 repo_path: pending.repo_path.clone(),
                 command: pending.command.clone(),
+                agent: pending.agent.clone(),
             })
             .inspect_err(
                 |e| warn!(request = %request, error = %e, "request stored but not announced"),
@@ -716,7 +718,20 @@ mod tests {
 
         /// Stores a request and announces it, as the broker's announcer does.
         async fn register(&self, turn: &TurnId, command: &str) -> Result<RequestId, HubError> {
-            let pending = self.pending(command);
+            self.register_for(turn, command, None).await
+        }
+
+        /// [`Fixture::register`] for a call made by the sub-agent `agent`.
+        async fn register_for(
+            &self,
+            turn: &TurnId,
+            command: &str,
+            agent: Option<&str>,
+        ) -> Result<RequestId, HubError> {
+            let pending = NewPending {
+                agent: agent.map(str::to_owned),
+                ..self.pending(command)
+            };
             let request = self.hub.store().add_pending(&pending)?;
             self.hub.announce_pending(turn, &request, pending).await?;
             Ok(request)
@@ -728,6 +743,7 @@ mod tests {
                 tool: "bash".to_owned(),
                 repo_path: "/work".to_owned(),
                 command: command.to_owned(),
+                agent: None,
             }
         }
 
@@ -765,6 +781,19 @@ mod tests {
             Message::Notification(n) => (n.method, n.params.unwrap()),
             other => panic!("expected a notification, got {other:?}"),
         }
+    }
+
+    /// The command and agent of the next `count` permission requests, skipping events.
+    async fn next_requests(outbox: &mut Outbox, count: usize) -> Vec<(String, Option<String>)> {
+        let mut seen = Vec::new();
+        while seen.len() < count {
+            let (method, params) = next_params(outbox).await;
+            if method == PERMISSION_REQUEST_NOTIFICATION {
+                let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_owned);
+                seen.push((text("command").unwrap(), text("agent")));
+            }
+        }
+        seen
     }
 
     async fn next_seq(outbox: &mut Outbox) -> u64 {
@@ -1150,6 +1179,31 @@ mod tests {
         assert_eq!(method, PERMISSION_REQUEST_NOTIFICATION);
         assert_eq!(params["request_id"], request.as_str());
         assert_eq!(params["command"], "rm -rf build");
+    }
+
+    #[tokio::test]
+    async fn a_sub_agents_request_names_its_agent_live_and_on_resume_and_a_session_call_names_none()
+    {
+        // Arrange
+        let f = fixture(8);
+        let (live, mut live_outbox) = f.hub.connect();
+        live.subscribe(&f.session, None, None).await.unwrap();
+
+        // Act
+        f.register_for(&f.turn, "cargo test", Some("explore"))
+            .await
+            .unwrap();
+        f.register_for(&f.turn, "[explore] ls", None).await.unwrap();
+        let (resumed, mut resumed_outbox) = f.hub.connect();
+        resumed.subscribe(&f.session, Some(0), None).await.unwrap();
+
+        // Assert
+        let expected = [
+            ("cargo test".to_owned(), Some("explore".to_owned())),
+            ("[explore] ls".to_owned(), None),
+        ];
+        assert_eq!(next_requests(&mut live_outbox, 2).await, expected);
+        assert_eq!(next_requests(&mut resumed_outbox, 2).await, expected);
     }
 
     #[tokio::test]

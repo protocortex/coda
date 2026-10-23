@@ -81,7 +81,7 @@ fn open_records_the_schema_version() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn newer_schema_version_is_refused() {
         err,
         StoreError::SchemaTooNew {
             found: 99,
-            supported: 9
+            supported: 10
         }
     ));
 }
@@ -278,6 +278,7 @@ fn v3_snapshot_migrates_forward_keeping_unresolved_pending_requests() {
             "index_files",
             "meta",
             "pending_permissions",
+            "permission_decisions",
             "project_trust",
             "savings",
             "symbols"
@@ -578,6 +579,48 @@ fn v6_snapshot_migrates_forward_ending_every_open_turn() {
         .map(Result::unwrap)
         .collect();
     assert_eq!(ends, [(1, Some(100)), (2, Some(275)), (3, Some(310))]);
+    assert_eq!(master_listing(&old), master_listing(&fresh));
+}
+
+/// The last schema version before permission rows gained the asking agent.
+const BEFORE_AGENT_COLUMN: u32 = 9;
+
+#[test]
+fn permission_rows_from_before_the_agent_column_migrate_forward_with_no_agent() {
+    // Arrange
+    let mut old = Connection::open_in_memory().unwrap();
+    for step in migrate::STEPS
+        .iter()
+        .filter(|s| s.seq <= BEFORE_AGENT_COLUMN)
+    {
+        old.execute_batch(step.sql).unwrap();
+    }
+    old.pragma_update(None, "user_version", BEFORE_AGENT_COLUMN)
+        .unwrap();
+    old.execute_batch(
+        "INSERT INTO sessions (id, created_at) VALUES (1, 0);
+         INSERT INTO pending_permissions (session_id, tool, repo_path, command, requested_at)
+             VALUES (1, 'bash', '/r', 'ls', 5);
+         INSERT INTO permission_decisions (session_id, repo_path, command, decision, decided_at)
+             VALUES (1, '/r', 'ls', 'allow', 6);",
+    )
+    .unwrap();
+    let mut fresh = Connection::open_in_memory().unwrap();
+    migrate::migrate(&mut fresh).unwrap();
+
+    // Act
+    migrate::migrate(&mut old).unwrap();
+
+    // Assert
+    let agents: (Option<String>, Option<String>) = old
+        .query_row(
+            "SELECT (SELECT agent FROM pending_permissions), \
+                    (SELECT agent FROM permission_decisions)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(agents, (None, None));
     assert_eq!(master_listing(&old), master_listing(&fresh));
 }
 

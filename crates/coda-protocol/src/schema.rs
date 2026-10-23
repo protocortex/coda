@@ -110,6 +110,7 @@ pub fn protocol_schema() -> Value {
     // Types no method or event reaches still belong to the contract.
     generator.subschema_for::<Request>();
     generator.subschema_for::<Notification>();
+    generator.subschema_for::<m::PermissionRequestParams>();
     generator.subschema_for::<ErrorObject>();
     generator.subschema_for::<Id>();
     generator.subschema_for::<OriginalId>();

@@ -187,3 +187,23 @@ fn golden_payloads_validate_against_the_schema() {
         }
     }
 }
+
+#[test]
+fn the_permission_request_schema_documents_the_command_and_names_the_agent() {
+    // Arrange
+    let schema = protocol_schema();
+
+    // Act
+    let properties = &schema["$defs"]["PermissionRequestParams"]["properties"];
+
+    // Assert
+    let command = properties["command"]["description"].as_str().unwrap_or("");
+    assert!(
+        command.contains("followed by the paths"),
+        "the command doc is {command:?}"
+    );
+    assert!(
+        properties["agent"]["description"].is_string(),
+        "the schema has no documented agent field"
+    );
+}
