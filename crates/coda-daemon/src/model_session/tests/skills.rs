@@ -9,36 +9,26 @@ use coda_agents::{revoke_project, trust_project};
 use coda_protocol::types::Mode;
 use serde_json::{Value, json};
 
-use super::{Rig, assistant_message, text_turn, tool_turn, user_message};
+use super::task::agent_file;
+use super::{Rig, TOKEN_CAP, assistant_message, read_turn, text_turn, tool_turn, user_message};
 use crate::model_session::COMPACT_THRESHOLD_BYTES;
 
-const TOKEN_CAP: u64 = 30;
 const PROJECT_BODY: &str = "PROJECT-BODY-MARKER lint before you ship";
 const EDITED_BODY: &str = "EDITED-BODY-MARKER skip the lint";
 const USER_BODY: &str = "USER-BODY-MARKER fill every field";
 
-fn skill_file(name: &str, description: &str, body: &str) -> String {
+pub(super) fn skill_file(name: &str, description: &str, body: &str) -> String {
     format!("+++\nname = \"{name}\"\ndescription = {description:?}\n+++\n{body}\n")
 }
 
-fn write(root: &Path, rel: &str, text: &str) {
+pub(super) fn write(root: &Path, rel: &str, text: &str) {
     let path = root.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
 }
 
 fn skill_call(name: &str) -> Value {
-    json!({"events": [
-        {"type": "tool_call_start", "call_id": "c1", "name": "skill"},
-        {"type": "tool_call_arguments_delta", "call_id": "c1",
-         "fragment": json!({"name": name}).to_string()},
-        {"type": "stop", "reason": "tool_use"},
-    ]})
-}
-
-/// A model turn that reads a file, which needs no permission.
-fn read_turn() -> Value {
-    tool_turn(&[("c1", "read", json!({"path": "a.txt"}))])
+    tool_turn(&[("c1", "skill", json!({"name": name}))])
 }
 
 /// Whether the model was offered the `skill` tool in `request`.
@@ -47,6 +37,15 @@ fn offers_skill(request: &Value) -> bool {
         .as_array()
         .unwrap()
         .contains(&json!("skill"))
+}
+
+/// The schema named `name` among the tools of a logged request.
+pub(super) fn schema_of(request: &Value, name: &str) -> Value {
+    let schemas = request["tool_schemas"].as_array().unwrap();
+    let found = schemas.iter().find(|schema| schema["name"] == name);
+    found
+        .unwrap_or_else(|| panic!("no {name} tool in {schemas:?}"))
+        .clone()
 }
 
 /// A rig with a user skill and a project skill the user has trusted.
@@ -105,6 +104,9 @@ async fn a_revoked_or_edited_project_skill_leaves_a_running_session_at_the_next_
         assert!(requests.iter().all(offers_skill), "{change:?}");
         let before = requests[1]["messages"][2]["text"].as_str().unwrap();
         assert!(before.contains(PROJECT_BODY), "{change:?}: {before}");
+        // What the model already loaded stays in its history after the change.
+        let replayed = requests[2]["messages"][2]["text"].as_str().unwrap();
+        assert!(replayed.contains(PROJECT_BODY), "{change:?}: {replayed}");
         let refused = requests[3]["messages"]
             .as_array()
             .unwrap()
@@ -267,4 +269,88 @@ async fn a_sub_agent_is_not_offered_the_skill_tool() {
     assert!(offers_skill(&lines[0]), "the session itself has the tool");
     assert_eq!(lines[1]["system"], "You are a scout.\n");
     assert_eq!(lines[1]["tools"], json!(["grep", "read"]));
+}
+
+#[tokio::test]
+async fn the_model_is_sent_the_skill_index_and_only_the_names_it_may_load() {
+    // Arrange
+    // A rebuilt loop starts the script again, so both sends use its first turn.
+    let script = [text_turn("done")];
+    let mut rig = trusted_project_skill(&script).await;
+    rig.send("first").await;
+    rig.wait_until_idle().await;
+    let repo = rig.cwd.clone();
+    rig.hub
+        .with_store_mut(move |store| revoke_project(store, &repo))
+        .await
+        .unwrap();
+
+    // Act
+    rig.send("second").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let lines = rig.request_lines();
+    let trusted = schema_of(&lines[0], "skill");
+    let index = trusted["description"].as_str().unwrap();
+    assert!(index.contains("- local: Lints the project.\n"), "{index}");
+    assert!(index.contains("- pdf: Fills in PDF forms.\n"), "{index}");
+    assert_eq!(
+        trusted["input_schema"]["properties"]["name"]["enum"],
+        json!(["local", "pdf"])
+    );
+    let revoked = schema_of(&lines[1], "skill");
+    let index = revoked["description"].as_str().unwrap();
+    assert!(!index.contains("local"), "{index}");
+    assert!(index.contains("- pdf: Fills in PDF forms.\n"), "{index}");
+    assert_eq!(
+        revoked["input_schema"]["properties"]["name"]["enum"],
+        json!(["pdf"])
+    );
+}
+
+#[tokio::test]
+async fn a_revoke_in_a_repository_with_agents_and_no_skills_rebuilds_the_loop_and_keeps_the_tokens()
+{
+    // Arrange
+    // The project holds an agent and no skill, so a revoke changes only the
+    // agents the `task` tool lists. A read turn and a reply leave 4 of the 30
+    // tokens, and a rebuilt loop starts the script again with a read turn.
+    let script = [read_turn(), text_turn("done")];
+    let mut rig = Rig::custom(Mode::Default, &script, true, None, |config| {
+        config.token_cap = TOKEN_CAP;
+    });
+    let agent = agent_file("local", "\"read\"", "Local.\n");
+    write(&rig.cwd, ".coda/agents/local.md", &agent);
+    let repo = rig.cwd.clone();
+    rig.hub
+        .with_store_mut(move |store| trust_project(store, &repo))
+        .await
+        .unwrap();
+    rig.send("first").await;
+    rig.wait_until_idle().await;
+    let repo = rig.cwd.clone();
+    rig.hub
+        .with_store_mut(move |store| revoke_project(store, &repo))
+        .await
+        .unwrap();
+
+    // Act
+    rig.send("second").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let lines = rig.request_lines();
+    assert_eq!(lines.len(), 3, "the second send makes one call");
+    let listed = |request: &Value| {
+        let task = schema_of(request, "task");
+        task["description"].as_str().unwrap().to_owned()
+    };
+    assert!(listed(&lines[0]).contains("- local: "), "trusted");
+    let after = listed(&lines[2]);
+    assert!(!after.contains("- local: "), "{after}");
+    assert!(after.contains("- explore: "), "the built-ins stay: {after}");
+    let stops = rig.bodies("turn_stopped").await;
+    let conditions: Vec<_> = stops.iter().map(|stop| &stop["condition"]).collect();
+    assert_eq!(conditions, ["end_turn", "budget_exhausted"]);
 }

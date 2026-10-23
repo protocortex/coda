@@ -7,7 +7,7 @@ use std::path::Path;
 
 use coda_config::hooks::{HookConfig, HookEvent};
 use coda_protocol::events::{HOOK_BLOCKED_KIND, HookBlockedBody};
-use coda_protocol::types::{Mode, OriginalId};
+use coda_protocol::types::Mode;
 use serde_json::{Value, json};
 
 use coda_core::hooks::MAX_RESULT_BYTES;
@@ -382,28 +382,8 @@ async fn wait_for_file(file: &Path) {
     .unwrap_or_else(|_| panic!("{} was not written in time", file.display()));
 }
 
-/// The text stored under the original `id` of the rig's session.
-async fn stored_text(rig: &Rig, id: &str) -> String {
-    let (session, id) = (rig.session.clone(), OriginalId::new(id));
-    let loaded = rig
-        .hub
-        .with_store(move |store| store.load_original(&session, &id))
-        .await;
-    loaded.unwrap().unwrap()
-}
-
 /// A line of the big file the model-visible result drops.
 const SECRET_LINE: &str = "line 500 of the big file";
-
-/// The text stored under the original `id` of the rig's session, if any.
-async fn original(rig: &Rig, id: &str) -> Option<String> {
-    let (session, id) = (rig.session.clone(), OriginalId::new(id));
-    let loaded = rig
-        .hub
-        .with_store(move |store| store.load_original(&session, &id))
-        .await;
-    loaded.unwrap()
-}
 
 #[tokio::test]
 async fn cancelling_a_sub_agents_post_tool_hook_leaves_nothing_to_retrieve_of_a_compacted_result() {
@@ -431,7 +411,7 @@ async fn cancelling_a_sub_agents_post_tool_hook_leaves_nothing_to_retrieve_of_a_
     let told = std::fs::read_to_string(out.path().join("seen")).unwrap();
     let (_, tail) = told.rsplit_once("retrieve id ").expect(&told);
     let id: String = tail.chars().take_while(char::is_ascii_digit).collect();
-    let before = original(&rig, &id).await;
+    let before = rig.original(&id).await;
 
     // Act
     rig.call("session.cancel", json!({"session_id": rig.session}))
@@ -446,7 +426,7 @@ async fn cancelling_a_sub_agents_post_tool_hook_leaves_nothing_to_retrieve_of_a_
         "control: original {id} held the file"
     );
     // A deleted id is handed out again, so it may now hold the withheld note.
-    let after = original(&rig, &id).await.unwrap_or_default();
+    let after = rig.original(&id).await.unwrap_or_default();
     assert!(
         !after.contains(SECRET_LINE),
         "retrieve {id} returns the file: {after}"
@@ -491,7 +471,7 @@ async fn cancelling_a_sub_agents_post_tool_hook_withholds_the_childs_result() {
         .expect("the scout's read ended");
     assert_eq!(read["body"]["is_error"], true);
     let original = read["body"]["original"].as_str().unwrap();
-    let told = stored_text(&rig, original).await;
+    let told = rig.original(original).await.unwrap();
     assert!(told.contains("withheld"), "{told}");
     assert!(!told.contains("one needle here"), "{told}");
     assert_eq!(

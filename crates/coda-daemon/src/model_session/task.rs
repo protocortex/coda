@@ -22,15 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use coda_agents::{
-    Catalog, DispatchError, Report, Status, TaskResult, Tier, child_tools, parse_report,
+    Catalog, DispatchError, Report, Status, StoredTrust, TaskResult, Tier, child_tools,
+    parse_report,
 };
 use coda_config::config::Config;
 use coda_config::hooks::HookEvent;
 use coda_core::broker::RunGrants;
-use coda_core::history::{
-    ASSISTANT_MESSAGE_KIND, CHILD_EVENT_KIND, CONTEXT_OVERFLOW_KIND, TOOL_FINISHED_KIND,
-    assistant_body, tool_finished_body,
-};
+use coda_core::history::CHILD_EVENT_KIND;
 use coda_core::hooks::HookRunner;
 use coda_core::prompt::{Conversation, Message, Prefix, PromptError};
 use coda_core::task::{TaskFuture, TaskOutcome, TaskRequest, TaskRunner};
@@ -52,7 +50,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::warn;
 
 use super::{
-    COMPACT_THRESHOLD_BYTES, EnvReader, Provider, keep_original, log_failure, publish_kind,
+    COMPACT_THRESHOLD_BYTES, EnvReader, Provider, Row, event_row, log_failure, publish_kind,
 };
 use crate::gate::BrokerGate;
 use crate::subscribe::{Hub, HubError};
@@ -71,31 +69,40 @@ pub(super) struct ChildEnv {
 }
 
 impl ChildEnv {
-    /// The agents a session in `cwd` may dispatch: the built-in ones, the
+    /// The definitions a session in `cwd` may use: the built-in ones, the
     /// user's, and the project's once its repository is trusted. Read afresh on
     /// every call, so an edited file is checked against the trusted digest again.
-    pub(super) async fn catalog(&self, cwd: &str) -> Result<Catalog, HubError> {
+    /// When the trust decision cannot be read, the built-in agents are all there is.
+    pub(super) async fn catalog(&self, cwd: &str) -> Catalog {
+        match self.read_catalog(cwd).await {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                warn!(%error, "the definitions could not be read; only the built-in agents are offered");
+                Catalog::builtin()
+            }
+        }
+    }
+
+    /// Like [`ChildEnv::catalog`], but a failed read is the caller's to handle.
+    ///
+    /// The store is held only to read the trust decision. The files are read
+    /// after, so a large or slow definitions folder never keeps the other
+    /// users of the store waiting.
+    pub(super) async fn read_catalog(&self, cwd: &str) -> Result<Catalog, HubError> {
         let Some(home) = self.home.clone() else {
             return Ok(Catalog::builtin());
         };
         let root = repo_identity(Path::new(cwd));
-        self.hub
-            .with_store(move |store| Catalog::load_trusted(store, &home, root.as_deref()))
-            .await
-    }
-
-    /// Name and description of each agent, for the `task` schema.
-    pub(super) async fn agents(&self, cwd: &str) -> Vec<(String, String)> {
-        match self.catalog(cwd).await {
-            Ok(catalog) => catalog
-                .agents()
-                .map(|entry| (entry.def.name.clone(), entry.def.description.clone()))
-                .collect(),
-            Err(error) => {
-                warn!(%error, "the agent definitions could not be read; offering no agents");
-                Vec::new()
-            }
-        }
+        let trusted_root = root.clone();
+        let trust = self
+            .hub
+            .with_store(move |store| StoredTrust::read(store, trusted_root.as_deref()))
+            .await?;
+        let catalog = tokio::task::spawn_blocking(move || {
+            Catalog::load_with_trust(&home, root.as_deref(), &trust)
+        })
+        .await?;
+        Ok(catalog)
     }
 }
 
@@ -106,8 +113,6 @@ enum ChildError {
     Depth(#[from] DepthExceeded),
     #[error(transparent)]
     Dispatch(#[from] DispatchError),
-    #[error("the agent definitions could not be read: {0}")]
-    Catalog(#[from] HubError),
     #[error("the model for the agent's tier cannot be used: {0}")]
     Model(#[from] RegistryError),
     #[error(transparent)]
@@ -147,24 +152,6 @@ fn summary_only(summary: String) -> Report {
     }
 }
 
-/// Runs the `task` calls of one session.
-pub(super) struct ChildRunner {
-    env: Arc<ChildEnv>,
-    record: SessionRecord,
-    /// The session's own gate, which carries the child's prompts to its client.
-    gate: Arc<BrokerGate>,
-    /// The session's scripted provider, which its children draw turns from in
-    /// call order; `None` for a real provider, which each child builds anew.
-    faux: Option<Arc<FauxProvider>>,
-    /// The session's event channel. A child's events are sent here, so they are
-    /// stored in order with the session's own.
-    events: UnboundedSender<TurnEvent>,
-    /// The tools of the loop this runner serves, which bound what a child may be given.
-    parent_tools: Vec<&'static str>,
-    /// How deep the loop this runner serves is: 0 for a top-level session.
-    depth: u8,
-}
-
 /// What a loop is made of, apart from how deep it runs.
 pub(super) struct LoopParts<G> {
     pub(super) provider: Provider,
@@ -179,43 +166,50 @@ pub(super) struct LoopParts<G> {
     pub(super) cancel: Option<CancelToken>,
 }
 
-impl ChildRunner {
-    /// A runner for the session `record`, which sends its children's events up
-    /// `events`. It serves no loop until [`ChildRunner::build_loop`] builds one.
+/// Builds the loops of one session: its own and each child's. Every loop is
+/// built here, so none can start a sub-agent past the depth cap, and only a
+/// loop built here is given a [`ChildRunner`].
+pub(super) struct LoopFactory {
+    env: Arc<ChildEnv>,
+    record: SessionRecord,
+    /// The session's own gate, which carries the child's prompts to its client.
+    gate: Arc<BrokerGate>,
+    /// The session's scripted provider, which its children draw turns from in
+    /// call order; `None` for a real provider, which each child builds anew.
+    faux: Option<Arc<FauxProvider>>,
+    /// The session's event channel. A child's events are sent here, so they are
+    /// stored in order with the session's own.
+    events: UnboundedSender<TurnEvent>,
+}
+
+impl LoopFactory {
+    /// The factory for the session `record`, whose children's events go up `events`.
     pub(super) fn new(
         env: Arc<ChildEnv>,
         record: SessionRecord,
         gate: Arc<BrokerGate>,
         faux: Option<Arc<FauxProvider>>,
         events: UnboundedSender<TurnEvent>,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        Arc::new(Self {
             env,
             record,
             gate,
             faux,
             events,
-            parent_tools: Vec::new(),
-            depth: 0,
-        }
+        })
     }
 
     /// Builds the loop of a session `depth` levels down. It is given a runner
-    /// for its own children only when a child of it would be within the depth
-    /// cap. Every loop, the session's and each child's, is built here, so none
-    /// can start a sub-agent past the cap.
+    /// for its own children only when a child of it would be within the depth cap.
     pub(super) fn build_loop<G: PermissionGate>(
-        &self,
+        self: &Arc<Self>,
         depth: u8,
         parts: LoopParts<G>,
     ) -> TurnLoop<Provider, G> {
         let below = child_depth(depth).is_ok().then(|| {
-            Arc::new(Self {
-                env: Arc::clone(&self.env),
-                record: self.record.clone(),
-                gate: Arc::clone(&self.gate),
-                faux: self.faux.clone(),
-                events: self.events.clone(),
+            Arc::new(ChildRunner {
+                factory: Arc::clone(self),
                 parent_tools: parts.tools.names(),
                 depth,
             })
@@ -253,30 +247,44 @@ impl ChildRunner {
             runner.without(HookEvent::SessionStart)
         }
     }
+}
 
+/// Runs the `task` calls of one loop: how deep it is, and the tools that bound
+/// what a child of it may be given.
+struct ChildRunner {
+    factory: Arc<LoopFactory>,
+    /// The tools of the loop this runner serves.
+    parent_tools: Vec<&'static str>,
+    /// How deep the loop this runner serves is: 0 for a top-level session.
+    depth: u8,
+}
+
+impl ChildRunner {
     async fn run_child(&self, request: TaskRequest) -> Result<TaskOutcome, ChildError> {
+        let LoopFactory { env, record, .. } = &*self.factory;
         let depth = child_depth(self.depth)?;
-        let catalog = self.env.catalog(&self.record.cwd).await?;
-        let def = &catalog.dispatchable(&request.agent)?.def;
+        let catalog = env.catalog(&record.cwd).await;
+        let entry = catalog.dispatchable(&request.agent)?;
+        let def = &entry.def;
         let (provider, window) = self.provider(def.tier)?;
         let tools = base_tools(
             &BaseToolsConfig {
-                workdir: PathBuf::from(&self.record.cwd),
-                bash_timeout: self.env.config.timing.tool_execution,
-                env: self.env.env.clone(),
+                workdir: PathBuf::from(&record.cwd),
+                bash_timeout: env.config.timing.tool_execution,
+                env: env.env.clone(),
             },
-            self.env.hub.store_handle(),
-            StoreOriginals::new(self.env.hub.store_handle(), self.record.id.clone()),
+            env.hub.store_handle(),
+            StoreOriginals::new(env.hub.store_handle(), record.id.clone()),
         )?
         .narrowed(&child_tools(def, &self.parent_tools));
         let prefix = Prefix::new(&def.body, tools.schemas, "")?;
         let (sender, events) = unbounded_channel();
         let gate = ChildGate {
-            parent: Arc::clone(&self.gate),
+            parent: Arc::clone(&self.factory.gate),
             agent: def.name.clone(),
             grants: RunGrants::default(),
         };
-        let mut child = self.build_loop(
+        let mut child = self.factory.build_loop(
             depth,
             LoopParts {
                 provider,
@@ -285,8 +293,8 @@ impl ChildRunner {
                 tools: tools.tools,
                 conversation: Conversation::new(prefix),
                 config: TurnConfig {
-                    session: self.record.id.clone(),
-                    cwd: PathBuf::from(&self.record.cwd),
+                    session: record.id.clone(),
+                    cwd: PathBuf::from(&record.cwd),
                     max_turns: request.max_turns,
                     token_limit: request.budget,
                     compact_threshold_bytes: COMPACT_THRESHOLD_BYTES,
@@ -295,29 +303,41 @@ impl ChildRunner {
                 cancel: Some(request.cancel),
             },
         );
-        Ok(self
+        let mut outcome = self
             .drive(&mut child, events, &def.name, &request.prompt)
-            .await)
+            .await;
+        if let Some(held_back) = catalog.pending_override(&def.name) {
+            let waiting = DispatchError::NotTrusted {
+                name: def.name.clone(),
+                reason: held_back.reason,
+            };
+            let ran = entry.source.as_str();
+            outcome.text = format!(
+                "{}\nnote: {waiting}. The {ran} agent ran instead.",
+                outcome.text
+            );
+        }
+        Ok(outcome)
     }
 
     /// The provider for a child of `tier` and its model's context window.
     fn provider(&self, tier: Tier) -> Result<(Provider, Option<u32>), ChildError> {
-        if let Some(faux) = &self.faux {
+        let LoopFactory {
+            env, record, faux, ..
+        } = &*self.factory;
+        if let Some(faux) = faux {
             return Ok((Provider::Faux(Arc::clone(faux)), None));
         }
         let target = child_target(
-            &self.env.config,
-            &self.env.registry,
-            self.record.backend,
-            self.record.model.as_deref(),
+            &env.config,
+            &env.registry,
+            record.backend,
+            record.model.as_deref(),
             tier,
         )?;
-        let reader = Arc::clone(&self.env.key_reader);
-        let client = self.env.registry.build(&target, move |name| reader(name))?;
-        Ok((
-            Provider::Api(client),
-            self.env.registry.context_window(&target),
-        ))
+        let reader = Arc::clone(&env.key_reader);
+        let client = env.registry.build(&target, move |name| reader(name))?;
+        Ok((Provider::Api(client), env.registry.context_window(&target)))
     }
 
     /// Runs the child to the end, storing its events as it goes.
@@ -388,7 +408,7 @@ impl ChildRunner {
             TurnEvent::Text(_) => {}
             other => {
                 // A closed channel means nobody is watching the session.
-                let _ = self.events.send(TurnEvent::Child {
+                let _ = self.factory.events.send(TurnEvent::Child {
                     agent: agent.to_owned(),
                     event: Box::new(other),
                 });
@@ -423,34 +443,11 @@ pub(super) async fn publish_child_event(
     agent: &str,
     event: TurnEvent,
 ) {
-    let (kind, body) = match event {
-        TurnEvent::Assistant { text, tool_calls } => {
-            let mut kept = Vec::with_capacity(tool_calls.len());
-            for call in &tool_calls {
-                kept.push((call, keep_original(hub, session, &call.arguments).await));
-            }
-            (ASSISTANT_MESSAGE_KIND, assistant_body(&text, &kept))
-        }
-        TurnEvent::ToolFinished {
-            tool,
-            call_id,
-            text,
-            is_error,
-        } => {
-            let original = keep_original(hub, session, &text).await;
-            let body = tool_finished_body(&tool, &call_id, original.as_ref(), is_error);
-            (TOOL_FINISHED_KIND, body)
-        }
-        TurnEvent::ContextOverflow => (CONTEXT_OVERFLOW_KIND, json!({})),
-        // Not stored: the parent counts the usage, and a child's own children
-        // send their events up the session's channel, not through this one. A
-        // child runs no `session_start` hook, so it never reports one blocked.
-        TurnEvent::Text(_)
-        | TurnEvent::Usage(_)
-        | TurnEvent::Compaction { .. }
-        | TurnEvent::Child { .. }
-        | TurnEvent::SessionStarted
-        | TurnEvent::HookBlocked { .. } => return,
+    // The rest are not stored: the parent counts the usage, and a child's own
+    // children send their events up the session's channel, not through this
+    // one. A child runs no `session_start` hook, so it never reports one blocked.
+    let Row::Stored { kind, body } = event_row(hub, session, &event).await else {
+        return;
     };
     let wrapped = json!({ "agent": agent, "kind": kind, "body": body });
     log_failure(publish_kind(hub, session, turn, CHILD_EVENT_KIND, &wrapped).await);

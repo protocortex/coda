@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use coda_core::history::CONVERSATION_RESET_KIND;
 use coda_providers::registry::RegistryError;
 
-use super::{EnvReader, QUEUE, Rig, text_turn, tool_turn};
+use super::{EnvReader, QUEUE, Rig, TOKEN_CAP, read_turn, text_turn, tool_turn};
 use crate::gate::Brokers;
 use crate::model_session::{
     Limits, MODEL_SWITCHED_KIND, ModelError, ModelSessions, Provider, SwitchError, lock,
@@ -22,7 +22,6 @@ use crate::registry::{MODEL_UNAVAILABLE, UNKNOWN_MODEL};
 use crate::subscribe::Hub;
 use crate::turn::{TURN_RUNNING, TurnError};
 
-const TOKEN_CAP: u64 = 30;
 const SECRET: &str = "sk-live-SECRET-VALUE-91c";
 const API_CONFIG: &str = r#"
 [providers.anthropic]
@@ -111,8 +110,7 @@ async fn a_switch_keeps_the_tokens_the_session_spent() {
     // Arrange
     // A read turn (8 tokens) and a reply (18) leave 4 of the 30 tokens; the
     // rebuilt loop starts the script again, so its read turn must hit the cap.
-    let read = tool_turn(&[("c1", "read", json!({"path": "a.txt"}))]);
-    let script = [read, text_turn("done")];
+    let script = [read_turn(), text_turn("done")];
     let mut rig = Rig::custom(Mode::Default, &script, true, None, |config| {
         faux_alias(config);
         config.token_cap = TOKEN_CAP;

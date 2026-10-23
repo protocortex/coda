@@ -27,6 +27,12 @@ All notable changes to Coda are recorded here. The format follows
 - A skill body between 16 and 32 KiB reaches the model whole. It was shortened like any long tool result.
 - A `task` call for an agent whose definition file was skipped is refused with the problem. It used to run the built-in or user agent of that name without a word.
 - A result that a hook withheld no longer leaves its original in the store when saving its size failed, and deleting it no longer waits for the store on the async threads.
+- The daemon holds the store only to read the trust decision when it reads definition files, instead of for the whole read, and reads them once per send, so the skill index and the `task` agent list come from the same files.
+- A model-API session that is revoked, or whose project agents change, rebuilds its conversation at the next send even when it has no skills, so the `task` tool no longer lists an agent the repository stopped trusting.
+- A session keeps the tokens it spent, and its send limits, when the daemon drops its idle conversation to make room, and keeps the tokens after a daemon restart. It used to start again with a full budget.
+- The warning about skipped definition files is logged once per built conversation and again only when the number of skipped files changes, not at every send.
+- A `task` call that runs a built-in or user agent while a held-back project file has the same name ends its result with a note saying so.
+- A store error while reading the trust decision leaves the built-in agents in the `task` list and in dispatch, and is logged, instead of failing the send. A session that already has a conversation keeps it for as long as the read keeps failing.
 
 ## [0.1.0] - Unreleased
 
