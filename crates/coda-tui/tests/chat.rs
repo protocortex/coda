@@ -27,12 +27,21 @@ impl Keys {
 }
 
 fn key(code: KeyCode) -> UserInput {
+    key_with(code, KeyModifiers::NONE)
+}
+
+fn key_with(code: KeyCode, modifiers: KeyModifiers) -> UserInput {
     UserInput::Key(KeyEvent {
         code,
-        modifiers: KeyModifiers::NONE,
+        modifiers,
         kind: KeyEventKind::Press,
         state: KeyEventState::NONE,
     })
+}
+
+/// Ctrl+C twice, the quit that works whatever is typed.
+fn quit_keys() -> [UserInput; 2] {
+    [(); 2].map(|()| key_with(KeyCode::Char('c'), KeyModifiers::CONTROL))
 }
 
 impl KeySource for Keys {
@@ -84,7 +93,8 @@ fn streamed_deltas_and_usage_reach_the_screen_through_the_event_channel() {
             },
         }))
         .unwrap();
-    let mut keys = Keys::codes([KeyCode::Char('h'), KeyCode::Esc]);
+    let mut keys = Keys::codes([KeyCode::Char('h')]);
+    keys.0.extend(quit_keys());
 
     // Act
     coda_tui::drive(&mut terminal, &mut app, &mut keys, &mut events).unwrap();
@@ -115,7 +125,8 @@ fn a_one_cell_screen_survives_a_busy_session() {
             text: "wide \u{4e2d}\u{6587} text ".repeat(50),
         }))
         .unwrap();
-    let mut keys = Keys::codes([KeyCode::Char('\u{4e2d}'), KeyCode::PageUp, KeyCode::Esc]);
+    let mut keys = Keys::codes([KeyCode::Char('\u{4e2d}'), KeyCode::PageUp]);
+    keys.0.extend(quit_keys());
 
     // Act
     let result = coda_tui::drive(&mut terminal, &mut app, &mut keys, &mut events);
@@ -132,13 +143,8 @@ fn a_paste_with_newlines_fills_the_prompt_and_only_enter_submits_it() {
     let (link, mut commands) = mpsc::unbounded_channel();
     let mut app = App::with_link(link);
     let (_sender, mut events) = mpsc::unbounded_channel();
-    let mut keys = Keys(
-        [
-            UserInput::Paste("first\nsecond\n".to_owned()),
-            key(KeyCode::Esc),
-        ]
-        .into(),
-    );
+    let mut keys = Keys([UserInput::Paste("first\nsecond\n".to_owned())].into());
+    keys.0.extend(quit_keys());
 
     // Act
     coda_tui::drive(&mut terminal, &mut app, &mut keys, &mut events).unwrap();
