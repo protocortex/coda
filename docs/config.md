@@ -123,6 +123,7 @@ Each value is an integer number of milliseconds. A key left out keeps its defaul
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `max_findings` | integer | `5` | Most findings one review run reports. When the model returns more, the most severe are kept and the rest are counted in the run details. Must not be zero. |
+| `diff_budget_chars` | integer | `120000` | Most characters of diff text one review sends to the model. The diff is packed to fit: binary, vendored and ignored files and deletion-only hunks are dropped, files of the repository's main language go first and smaller files before larger ones, and each hunk carries three lines of context and its new-side line numbers. A file that does not fit whole is clipped to the hunks that do, and the files after it are left out. The review's coverage list names every file as reviewed, clipped or left out. Must not be zero. |
 
 ## `[review.ignore]`
 
@@ -249,6 +250,7 @@ delegated_tool_ms = 900000
 
 [review]
 max_findings = 5
+diff_budget_chars = 120000
 
 [review.ignore]
 globs = ["docs/generated/**"]
