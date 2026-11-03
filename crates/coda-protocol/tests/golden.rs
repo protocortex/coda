@@ -8,14 +8,14 @@ use std::path::PathBuf;
 
 use coda_protocol::events::{Event, InterruptCause};
 use coda_protocol::methods::{
-    DaemonBackendsParams, DaemonBackendsResult, DaemonShutdownParams, DaemonShutdownResult,
-    DaemonStatusParams, DaemonStatusResult, GrantAddParams, GrantAddResult, InitializeParams,
-    InitializeResult, PermissionRequestParams, PermissionRespondParams, PermissionRespondResult,
-    PingParams, PingResult, SessionCancelParams, SessionCancelResult, SessionCloseParams,
-    SessionCloseResult, SessionCreateParams, SessionCreateResult, SessionListParams,
-    SessionListResult, SessionResumeParams, SessionResumeResult, SessionSendParams,
-    SessionSendResult, SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams,
-    SessionSubscribeResult, UsageSummaryParams, UsageSummaryResult,
+    Capabilities, DaemonBackendsParams, DaemonBackendsResult, DaemonShutdownParams,
+    DaemonShutdownResult, DaemonStatusParams, DaemonStatusResult, GrantAddParams, GrantAddResult,
+    InitializeParams, InitializeResult, PermissionRequestParams, PermissionRespondParams,
+    PermissionRespondResult, PingParams, PingResult, SessionCancelParams, SessionCancelResult,
+    SessionCloseParams, SessionCloseResult, SessionCreateParams, SessionCreateResult,
+    SessionListParams, SessionListResult, SessionResumeParams, SessionResumeResult,
+    SessionSendParams, SessionSendResult, SessionSetModelParams, SessionSetModelResult,
+    SessionSubscribeParams, SessionSubscribeResult, UsageSummaryParams, UsageSummaryResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -164,6 +164,31 @@ fn absent_optional_fields_stay_absent_when_serialized() {
         crashed_json,
         json!({"type": "backend_crashed", "session_id": "s-1"})
     );
+}
+
+#[test]
+fn an_initialize_result_without_capabilities_reads_as_no_capabilities() {
+    // Arrange
+    let legacy = golden("initialize.result.legacy");
+
+    // Act
+    let result: InitializeResult = serde_json::from_value(legacy).unwrap();
+
+    // Assert
+    assert_eq!(result.capabilities, Capabilities::default());
+    assert!(!result.capabilities.usage_details);
+}
+
+#[test]
+fn an_event_type_from_a_newer_peer_reads_as_unknown() {
+    // Arrange
+    let raw = json!({"type": "event_added_later", "session_id": "s-1", "extra": {"n": 1}});
+
+    // Act
+    let event: Event = serde_json::from_value(raw).unwrap();
+
+    // Assert
+    assert_eq!(event, Event::Unknown);
 }
 
 #[test]
