@@ -82,8 +82,9 @@ impl InterruptCause {
 
 /// One event of a session.
 ///
-/// Adding a variant requires a `PROTOCOL_VERSION` bump: older peers reject
-/// unknown variants rather than ignoring them.
+/// A variant added later reads as [`Event::Unknown`] on an older peer, so
+/// adding one does not need a `PROTOCOL_VERSION` bump. The daemon announces
+/// the matching `Capabilities` flag at `initialize`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -195,6 +196,9 @@ pub enum Event {
         /// How many recent messages were kept as they were.
         kept_messages: u32,
     },
+    /// An event of a type this peer does not know, sent by a newer one.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -354,17 +358,5 @@ mod tests {
                 detail: None,
             }
         );
-    }
-
-    #[test]
-    fn unknown_event_type_is_rejected() {
-        // Arrange
-        let raw = json!({"type":"from_the_future","session_id":"s-1"});
-
-        // Act
-        let parsed = serde_json::from_value::<Event>(raw);
-
-        // Assert
-        assert!(parsed.is_err());
     }
 }

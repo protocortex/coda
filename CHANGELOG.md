@@ -8,6 +8,7 @@ All notable changes to Coda are recorded here. The format follows
 
 ### Added
 
+- `initialize` returns `capabilities`, optional flags such as `usage_details` and `rate_limit_events` that default to false when absent, and an event type a peer does not know reads as `unknown` instead of failing. A new event no longer needs a `PROTOCOL_VERSION` bump; only a breaking change does.
 - A release workflow that builds, checksums and attests the `coda` archives for Linux and macOS, and an `install.sh` that verifies the checksum before installing.
 - A `session.close` request that stops a session's idle Codex server or model conversation and keeps its stored events. `coda run` calls it when the turn ends, and the terminal UI calls it for a session it created when the user quits or switches away.
 - A `cause` on `turn_interrupted` events (`cancelled`, `idle_timeout`, `backend_lost`, `daemon_restarted`, `daemon_stopping`). `coda run` exits 4 for a turn cancelled from another client and 5 for the other causes, naming the cause.

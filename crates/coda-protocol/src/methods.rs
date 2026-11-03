@@ -77,6 +77,21 @@ pub struct InitializeParams {
     pub client_name: String,
 }
 
+/// Optional features a daemon offers. A flag the peer does not send reads as
+/// false, so a client can tell an older daemon from one that has the feature.
+///
+/// Add a flag when a change adds events or fields and is not breaking. Bump
+/// [`PROTOCOL_VERSION`] only for a breaking change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Capabilities {
+    /// The daemon reports the full usage of a turn, including cache tokens.
+    #[serde(default)]
+    pub usage_details: bool,
+    /// The daemon sends rate-limit events.
+    #[serde(default)]
+    pub rate_limit_events: bool,
+}
+
 /// Result of [`INITIALIZE`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InitializeResult {
@@ -84,6 +99,9 @@ pub struct InitializeResult {
     pub protocol_version: u32,
     /// Version of the daemon build.
     pub daemon_version: String,
+    /// Optional features the daemon offers; absent from daemons that predate them.
+    #[serde(default)]
+    pub capabilities: Capabilities,
 }
 
 /// Parameters of [`SESSION_CREATE`].
