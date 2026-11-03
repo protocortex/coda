@@ -7,13 +7,26 @@ use std::sync::atomic::Ordering;
 use coda_protocol::events::{Event, InterruptCause};
 use coda_protocol::types::TurnId;
 use coda_providers::claude_session::TurnOutcome;
+use coda_providers::codex::{Carried, seeded_prompt};
 use coda_store::SessionRecord;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
-use super::{CancelHandle, Turns, WatchedGate, remove_pidfile, stop};
+use super::{CancelHandle, HISTORY_UNREAD_REASON, Turns, WatchedGate, remove_pidfile, stop};
 use crate::backends::{AgentError, AgentSession};
 use crate::supervisor::{Attempt, Step};
 use crate::watchdog::Watchdog;
+
+/// Waits for the backend to report a new conversation id. Never ends when it cannot.
+async fn reported(updates: &mut Option<watch::Receiver<Option<String>>>) -> String {
+    if let Some(receiver) = updates
+        && receiver.changed().await.is_ok()
+        && let Some(id) = receiver.borrow_and_update().clone()
+    {
+        return id;
+    }
+    std::future::pending().await
+}
 
 /// How the last run of the backend ended. `None` means it crashed and could not be started again.
 pub(super) type Outcome = Option<Result<TurnOutcome, AgentError>>;
@@ -29,6 +42,8 @@ pub(super) struct Drive<'a, E> {
     pub child: AgentSession,
     pub outcome: Outcome,
     pub timed_out: bool,
+    /// The earlier conversation, sent before the prompt once a resume was refused.
+    seed: Option<String>,
     /// The cancel handle of the run that crashed, so a cancel that raced the crash is not lost.
     crashed_cancel: Option<CancelHandle>,
 }
@@ -53,6 +68,7 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
             child,
             outcome: None,
             timed_out: false,
+            seed: None,
             crashed_cancel: None,
         }
     }
@@ -112,6 +128,18 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
         true
     }
 
+    /// Reads the stored conversation, so the fresh start can be told it with the prompt.
+    async fn seed_fresh_start(&mut self) {
+        match self.turns.carried(&self.record.id, Some(self.turn)).await {
+            Carried::Seed(history) => self.seed = Some(history),
+            Carried::Lost => (self.emit)(Event::HistoryNotRestored {
+                session_id: self.record.id.clone(),
+                reason: HISTORY_UNREAD_REASON.to_owned(),
+            }),
+            Carried::Nothing => {}
+        }
+    }
+
     async fn run_once(&mut self, may_restart: bool) -> Step {
         let session = &self.record.id;
         let cancel = self.child.cancel_handle();
@@ -124,12 +152,29 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
                 (self.emit)(event);
             }
         };
-        let result = tokio::select! {
-            result = self.child.run_turn(self.turn, self.text, self.watched, &mut forward) => result,
-            phase = self.watchdog.expired() => {
-                warn!(session = %session, turn = %self.turn, ?phase, "backend silent for too long; aborting");
-                self.timed_out = true;
-                Ok(TurnOutcome::Cancelled)
+        let prompt = match &self.seed {
+            Some(history) => seeded_prompt(history, self.text),
+            None => self.text.to_owned(),
+        };
+        let (turns, record, turn) = (self.turns, self.record, self.turn);
+        let mut ids = self.child.backend_id_updates();
+        let result = {
+            let run = self
+                .child
+                .run_turn(turn, &prompt, self.watched, &mut forward);
+            tokio::pin!(run);
+            // The id is stored as soon as the backend names its conversation, so a
+            // daemon killed mid-turn can still resume it.
+            loop {
+                tokio::select! {
+                    result = &mut run => break result,
+                    phase = self.watchdog.expired() => {
+                        warn!(session = %session, turn = %turn, ?phase, "backend silent for too long; aborting");
+                        self.timed_out = true;
+                        break Ok(TurnOutcome::Cancelled);
+                    }
+                    id = reported(&mut ids) => turns.remember_backend_id(record, turn, &id).await,
+                }
             }
         };
         if self.timed_out {
@@ -174,6 +219,7 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
         } else if self.turns.forget_backend_id(self.record).await {
             // A backend that dies before it names its conversation was refused its resume.
             warn!(session = %session, turn = %self.turn, "the backend did not accept the stored conversation id; starting it fresh");
+            self.seed_fresh_start().await;
         }
         stop(&mut self.child, session).await;
         remove_pidfile(&self.turns.config.pidfile_dir, session);

@@ -107,6 +107,13 @@ pub enum Carried {
     Lost,
 }
 
+/// `text` with the earlier conversation put before it, for a backend that starts
+/// a thread without its history.
+#[must_use]
+pub fn seeded_prompt(history: &str, text: &str) -> String {
+    format!("{SEED_HEADER}\n\n{history}\n\n{SEED_FOOTER}\n\n{text}")
+}
+
 /// What it takes to start a Codex session.
 #[derive(Debug, Clone)]
 pub struct CodexLaunch {
@@ -311,7 +318,7 @@ impl CodexSession {
                 text
             }
             Carried::Seed(history) => {
-                seeded = format!("{SEED_HEADER}\n\n{history}\n\n{SEED_FOOTER}\n\n{text}");
+                seeded = seeded_prompt(history, text);
                 &seeded
             }
         };

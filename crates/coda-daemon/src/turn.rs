@@ -78,6 +78,8 @@ const WIND_DOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const WIND_DOWN_POLL: Duration = Duration::from_millis(10);
 /// Bytes of earlier conversation given to a Codex thread that replaces a lost one.
 const MAX_SEED_BYTES: usize = 32 * 1024;
+/// Why a fresh Claude Code conversation has none of the earlier turns.
+const HISTORY_UNREAD_REASON: &str = "the stored conversation could not be read";
 
 /// How turns start their backend.
 #[derive(Debug, Clone)]
@@ -451,7 +453,7 @@ impl Turns {
         )
         .await?;
         let carried = if record.backend == BackendKind::CodexAppServer {
-            self.carried(&session_id).await
+            self.carried(&session_id, None).await
         } else {
             Carried::Nothing
         };
@@ -482,8 +484,12 @@ impl Turns {
     }
 
     /// The stored conversation, for a new thread to pick up where the lost one stopped.
-    async fn carried(&self, session: &SessionId) -> Carried {
+    /// `skip` leaves out a turn that is being sent again.
+    async fn carried(&self, session: &SessionId, skip: Option<&TurnId>) -> Carried {
         let mut transcript = Transcript::new(MAX_SEED_BYTES);
+        if let Some(turn) = skip {
+            transcript = transcript.without_turn(turn.clone());
+        }
         let mut after = 0;
         loop {
             let id = session.clone();
