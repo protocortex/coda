@@ -36,6 +36,8 @@ pub const TURN_INTERRUPTED_KIND: &str = "turn_interrupted";
 pub const COMPACTION_KIND: &str = "compaction";
 /// Stored event kind of a provider's rate-limit report.
 pub const RATE_LIMIT_KIND: &str = "rate_limit";
+/// Stored event kind of a turn that ended because the plan limit was hit.
+pub const USAGE_LIMIT_KIND: &str = "usage_limit";
 /// Stored event kind of the reason a blocking `session_start` hook stopped a turn.
 /// The body is a [`HookBlockedBody`]; clients show it to the user and never to the model.
 pub const HOOK_BLOCKED_KIND: &str = "hook_blocked";
@@ -88,6 +90,41 @@ pub struct RateLimit {
     /// Why overage is unavailable, when the provider says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overage_disabled_reason: Option<String>,
+}
+
+/// Which plan window a usage limit belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum UsageWindowKind {
+    /// The rolling five-hour window.
+    FiveHour,
+    /// The rolling seven-day window.
+    SevenDay,
+    /// A window that counts one model only, such as the seven-day Opus window.
+    ModelScoped,
+    /// A monthly window.
+    Monthly,
+    /// A window this peer does not know, sent by a newer one.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Prefix of the provider's names for seven-day windows that count one model.
+const MODEL_SCOPED_PREFIX: &str = "seven_day_";
+
+impl UsageWindowKind {
+    /// The kind a provider's window name stands for.
+    #[must_use]
+    pub fn from_window_name(name: &str) -> Self {
+        match name {
+            "five_hour" => Self::FiveHour,
+            "seven_day" => Self::SevenDay,
+            "monthly" => Self::Monthly,
+            _ if name.starts_with(MODEL_SCOPED_PREFIX) => Self::ModelScoped,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// Why a turn was cut short.
@@ -248,6 +285,19 @@ pub enum Event {
         /// What the provider reported.
         limit: RateLimit,
     },
+    /// The turn ended in error because the provider's plan limit was hit.
+    /// Sent just before that turn's `result`.
+    UsageLimit {
+        /// Affected session.
+        session_id: SessionId,
+        /// The turn the limit ended.
+        turn_id: TurnId,
+        /// The window that ran out.
+        window: UsageWindowKind,
+        /// When the window resets, in seconds since the Unix epoch, when the provider says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reset_at: Option<u64>,
+    },
     /// An event of a type this peer does not know, sent by a newer one.
     #[serde(other)]
     Unknown,
@@ -275,6 +325,7 @@ mod tests {
             TURN_INTERRUPTED_KIND,
             COMPACTION_KIND,
             RATE_LIMIT_KIND,
+            USAGE_LIMIT_KIND,
         ];
 
         for kind in kinds {
@@ -284,7 +335,7 @@ mod tests {
                 "turn_id": "t", "is_error": false, "reason": "x", "text": "",
                 "usage": {"input_tokens": 0, "output_tokens": 0},
                 "summary": "1", "replaced_messages": 0, "kept_messages": 0,
-                "limit": {"status": "allowed"},
+                "limit": {"status": "allowed"}, "window": "five_hour",
             });
             let event: Event = serde_json::from_value(fields).unwrap();
 
@@ -332,6 +383,33 @@ mod tests {
             // Assert
             assert_eq!(written, json!(cause.as_str()));
         }
+    }
+
+    #[test]
+    fn a_window_name_maps_to_its_kind() {
+        let cases = [
+            ("five_hour", UsageWindowKind::FiveHour),
+            ("seven_day", UsageWindowKind::SevenDay),
+            ("seven_day_opus", UsageWindowKind::ModelScoped),
+            ("seven_day_sonnet", UsageWindowKind::ModelScoped),
+            ("monthly", UsageWindowKind::Monthly),
+            ("overage", UsageWindowKind::Unknown),
+        ];
+
+        for (name, kind) in cases {
+            assert_eq!(UsageWindowKind::from_window_name(name), kind, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_window_kind_from_a_newer_peer_reads_as_unknown() {
+        let read: UsageWindowKind = serde_json::from_value(json!("yearly")).unwrap();
+
+        assert_eq!(read, UsageWindowKind::Unknown);
+        assert_eq!(
+            serde_json::to_value(UsageWindowKind::ModelScoped).unwrap(),
+            json!("model_scoped")
+        );
     }
 
     #[test]

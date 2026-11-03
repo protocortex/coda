@@ -90,6 +90,9 @@ pub struct Capabilities {
     /// The daemon sends rate-limit events.
     #[serde(default)]
     pub rate_limit_events: bool,
+    /// The daemon sends a `usage_limit` event when a turn ends at the plan limit.
+    #[serde(default)]
+    pub usage_limit_events: bool,
 }
 
 /// Result of [`INITIALIZE`].

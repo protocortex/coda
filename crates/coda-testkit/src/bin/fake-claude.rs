@@ -21,6 +21,7 @@
 //! and `tool-hang` announces one and never reports it. `tool-flaky` announces a tool and
 //! crashes the first time (the control file's `crash_marker` remembers it), then stalls.
 //! `report-usage` reports a rate limit, then finishes with token usage on the result.
+//! `hit-limit` reports a rejected seven-day limit, then ends the turn with an error.
 //! `stream-long` streams `input_json_delta` and `thinking_delta` lines for longer than
 //! the idle limits the tests use, then finishes.
 //! `flaky` crashes like `crash` the first time and works afterwards, using
@@ -73,6 +74,7 @@ const TOOL_HANG_TRIGGER: &str = "tool-hang";
 const TOOL_FLAKY_TRIGGER: &str = "tool-flaky";
 const STREAM_LONG_TRIGGER: &str = "stream-long";
 const REPORT_USAGE_TRIGGER: &str = "report-usage";
+const HIT_LIMIT_TRIGGER: &str = "hit-limit";
 const STREAM_STEP: Duration = Duration::from_millis(100);
 const STREAM_STEPS: u32 = 15;
 const TOOL_USE_ID: &str = "toolu-1";
@@ -220,6 +222,9 @@ fn run_turn(
     if user_line.contains(REPORT_USAGE_TRIGGER) {
         return report_usage(out);
     }
+    if user_line.contains(HIT_LIMIT_TRIGGER) {
+        return hit_limit(out);
+    }
     if user_line.contains(VANISH_TRIGGER) {
         std::fs::remove_file(std::env::current_exe()?)?;
         std::process::exit(CRASH_EXIT_CODE);
@@ -272,6 +277,17 @@ fn report_usage(out: &mut impl Write) -> io::Result<()> {
             "input_tokens":3,"output_tokens":11,
             "cache_read_input_tokens":7,"cache_creation_input_tokens":5}}),
     )
+}
+
+/// Reports a rejected rate limit and ends the turn in error, as claude does at the plan limit.
+fn hit_limit(out: &mut impl Write) -> io::Result<()> {
+    emit(
+        out,
+        &serde_json::json!({"type":"rate_limit_event","rate_limit_info":{
+            "status":"rejected","rateLimitType":"seven_day_opus","resetsAt":1_794_193_200_u64,
+            "unifiedWindows":{"seven_day_opus":{"utilization":1.0,"resetsAt":1_794_193_200_u64}}}}),
+    )?;
+    emit(out, &serde_json::json!({"type":"result","is_error":true}))
 }
 
 /// Announces a tool and crashes once; after the restart nothing is in flight and it stalls.
