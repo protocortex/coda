@@ -41,7 +41,7 @@ impl Sleeper for GatedSleeper {
 }
 
 impl Rig {
-    async fn count(&self, kind: &str) -> usize {
+    pub(super) async fn count(&self, kind: &str) -> usize {
         self.kinds().await.iter().filter(|k| *k == kind).count()
     }
 
@@ -59,7 +59,7 @@ impl Rig {
     }
 
     /// Turns over the rig's store that run `binary` and wait at `sleeper` before every restart.
-    fn turns_with(&self, binary: PathBuf, sleeper: Arc<dyn Sleeper>) -> Arc<Turns> {
+    pub(super) fn turns_with(&self, binary: PathBuf, sleeper: Arc<dyn Sleeper>) -> Arc<Turns> {
         let supervisor = Supervisor::new(RestartPolicy::new(RESTART_BASE), sleeper);
         let config = TurnConfig {
             binary: Some(binary),
@@ -76,7 +76,7 @@ impl Rig {
         self.turns_with(binary, Arc::clone(gate) as Arc<_>)
     }
 
-    async fn send_to(&self, turns: &Arc<Turns>, text: &str) {
+    pub(super) async fn send_to(&self, turns: &Arc<Turns>, text: &str) {
         let params = SessionSendParams {
             session_id: self.session.clone(),
             text: text.to_owned(),
@@ -86,7 +86,7 @@ impl Rig {
         turns.send(params).await.unwrap();
     }
 
-    async fn wait_until_stopped(&self, turns: &Turns) {
+    pub(super) async fn wait_until_stopped(&self, turns: &Turns) {
         let path = self.pidfile();
         tokio::time::timeout(WAIT, async {
             while path.exists() || turns.is_running(&self.session) {

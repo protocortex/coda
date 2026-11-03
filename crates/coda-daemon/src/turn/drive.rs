@@ -169,8 +169,11 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
         let session = &self.record.id;
         if let Some(backend_id) = self.child.session_id_from_backend() {
             self.turns
-                .backend_ids()
-                .insert(session.clone(), backend_id.to_owned());
+                .remember_backend_id(self.record, self.turn, backend_id)
+                .await;
+        } else if self.turns.forget_backend_id(self.record).await {
+            // A backend that dies before it names its conversation was refused its resume.
+            warn!(session = %session, turn = %self.turn, "the backend did not accept the stored conversation id; starting it fresh");
         }
         stop(&mut self.child, session).await;
         remove_pidfile(&self.turns.config.pidfile_dir, session);
