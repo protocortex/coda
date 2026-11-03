@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coda_config::config::Config;
-use coda_protocol::events::Event;
 use coda_protocol::types::{BackendKind, SessionId, TurnId};
 use coda_providers::backend::{
     AgentBackend, BackendError, VERIFIED_CLAUDE_CODE_VERSIONS, VERIFIED_CODEX_VERSIONS, locate,
@@ -23,6 +22,7 @@ use coda_providers::codex::{
     resolve_sandbox,
 };
 use coda_providers::detect::DetectedBinary;
+use coda_providers::emit::Emit;
 use coda_providers::gate::PermissionGate;
 
 use crate::pidfile::{self, PidfileError};
@@ -346,7 +346,7 @@ impl AgentSession {
         turn_id: &TurnId,
         text: &str,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<TurnOutcome, AgentError> {
         Ok(match self {
             Self::Claude(session) => session.run_turn(turn_id, text, gate, emit).await?,

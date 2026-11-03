@@ -8,6 +8,7 @@ use coda_protocol::events::{Event, InterruptCause};
 use coda_protocol::types::TurnId;
 use coda_providers::claude_session::TurnOutcome;
 use coda_providers::codex::{Carried, seeded_prompt};
+use coda_providers::emit::Emit;
 use coda_store::SessionRecord;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -26,6 +27,22 @@ async fn reported(updates: &mut Option<watch::Receiver<Option<String>>>) -> Stri
         return id;
     }
     std::future::pending().await
+}
+
+/// Passes the adapter's events on, keeping the crash back until it is known whether a restart follows.
+struct Forward<'a, E> {
+    crash: &'a mut Option<Event>,
+    emit: &'a mut E,
+}
+
+impl<E: Emit> Emit for Forward<'_, E> {
+    async fn emit(&mut self, event: Event) {
+        if matches!(event, Event::BackendCrashed { .. }) {
+            *self.crash = Some(event);
+        } else {
+            self.emit.emit(event).await;
+        }
+    }
 }
 
 /// How the last run of the backend ended. `None` means it crashed and could not be started again.
@@ -48,7 +65,7 @@ pub(super) struct Drive<'a, E> {
     crashed_cancel: Option<CancelHandle>,
 }
 
-impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
+impl<'a, E: Emit> Drive<'a, E> {
     pub fn new(
         turns: &'a Turns,
         record: &'a SessionRecord,
@@ -74,20 +91,24 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
     }
 
     /// Ends the turn as failed. The cause goes to the log: a result event carries none.
-    fn fail_turn(&mut self) {
-        (self.emit)(Event::Result {
-            session_id: self.record.id.clone(),
-            turn_id: self.turn.clone(),
-            is_error: true,
-        });
+    async fn fail_turn(&mut self) {
+        self.emit
+            .emit(Event::Result {
+                session_id: self.record.id.clone(),
+                turn_id: self.turn.clone(),
+                is_error: true,
+            })
+            .await;
     }
 
-    fn interrupted(&mut self, cause: InterruptCause) {
-        (self.emit)(Event::TurnInterrupted {
-            session_id: self.record.id.clone(),
-            turn_id: self.turn.clone(),
-            cause: Some(cause),
-        });
+    async fn interrupted(&mut self, cause: InterruptCause) {
+        self.emit
+            .emit(Event::TurnInterrupted {
+                session_id: self.record.id.clone(),
+                turn_id: self.turn.clone(),
+                cause: Some(cause),
+            })
+            .await;
     }
 
     /// Starts the crashed session's backend again, unless the user cancelled or
@@ -104,7 +125,7 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
             } else {
                 InterruptCause::DaemonStopping
             };
-            self.interrupted(cause);
+            self.interrupted(cause).await;
             self.outcome = Some(Ok(TurnOutcome::Cancelled));
             return false;
         }
@@ -113,7 +134,7 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
             Err(e) => {
                 warn!(session = %self.record.id, turn = %self.turn, error = %e, "could not restart the backend; failing the turn");
                 self.outcome = None;
-                self.fail_turn();
+                self.fail_turn().await;
                 return false;
             }
         }
@@ -132,10 +153,14 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
     async fn seed_fresh_start(&mut self) {
         match self.turns.carried(&self.record.id, Some(self.turn)).await {
             Carried::Seed(history) => self.seed = Some(history),
-            Carried::Lost => (self.emit)(Event::HistoryNotRestored {
-                session_id: self.record.id.clone(),
-                reason: HISTORY_UNREAD_REASON.to_owned(),
-            }),
+            Carried::Lost => {
+                self.emit
+                    .emit(Event::HistoryNotRestored {
+                        session_id: self.record.id.clone(),
+                        reason: HISTORY_UNREAD_REASON.to_owned(),
+                    })
+                    .await;
+            }
             Carried::Nothing => {}
         }
     }
@@ -145,12 +170,9 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
         let cancel = self.child.cancel_handle();
         // The crash event waits until it is known whether a restart follows.
         let mut crash = None;
-        let mut forward = |event: Event| {
-            if matches!(event, Event::BackendCrashed { .. }) {
-                crash = Some(event);
-            } else {
-                (self.emit)(event);
-            }
+        let mut forward = Forward {
+            crash: &mut crash,
+            emit: &mut self.emit,
         };
         let prompt = match &self.seed {
             Some(history) => seeded_prompt(history, self.text),
@@ -178,7 +200,7 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
             }
         };
         if self.timed_out {
-            self.interrupted(InterruptCause::IdleTimeout);
+            self.interrupted(InterruptCause::IdleTimeout).await;
         }
         // A crash that raced the user's cancel is the user's choice, not a failure to retry.
         let crashed = matches!(result, Ok(TurnOutcome::Crashed { .. }))
@@ -195,17 +217,19 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
             ..
         }) = crash
         {
-            (self.emit)(Event::BackendCrashed {
-                session_id,
-                exit_code,
-                will_restart,
-                detail,
-            });
+            self.emit
+                .emit(Event::BackendCrashed {
+                    session_id,
+                    exit_code,
+                    will_restart,
+                    detail,
+                })
+                .await;
         }
         self.outcome = Some(result);
         if crashed && !replayable {
             warn!(session = %self.record.id, turn = %self.turn, "the backend crashed and the prompt cannot be replayed; failing the turn");
-            self.fail_turn();
+            self.fail_turn().await;
         }
         if !crashed || !replayable {
             return Step::Finished;
@@ -228,7 +252,7 @@ impl<'a, E: FnMut(Event) + Send> Drive<'a, E> {
     }
 }
 
-impl<E: FnMut(Event) + Send> Attempt for Drive<'_, E> {
+impl<E: Emit> Attempt for Drive<'_, E> {
     async fn attempt(&mut self, restarts: u32, may_restart: bool) -> Step {
         if restarts > 0 {
             info!(session = %self.record.id, turn = %self.turn, restarts, step = "restart", "restarting the crashed backend");

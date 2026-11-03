@@ -21,6 +21,7 @@ use tokio::time::timeout;
 use crate::claude_code::{
     Diagnostic, Message, PermissionAsk, StreamParser, control_response, map_tool,
 };
+use crate::emit::Emit;
 use crate::gate::PermissionGate;
 
 /// Only flags proven against a live binary; `--permission-mode` is left out on purpose.
@@ -246,7 +247,7 @@ impl ClaudeSession {
         turn_id: &TurnId,
         text: &str,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<TurnOutcome, AdapterError> {
         if self.closed {
             return Err(AdapterError::Closed);
@@ -332,24 +333,30 @@ impl ClaudeSession {
         message: Message,
         turn_id: &TurnId,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<Option<TurnOutcome>, AdapterError> {
         match message {
             Message::Init { session_id } => {
                 self.backend_id_tx.send_replace(Some(session_id.clone()));
                 self.backend_session_id = Some(session_id);
             }
-            Message::TextDelta(text) => emit(Event::StreamDelta {
-                session_id: self.session_id.clone(),
-                turn_id: turn_id.clone(),
-                text,
-            }),
+            Message::TextDelta(text) => {
+                emit.emit(Event::StreamDelta {
+                    session_id: self.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    text,
+                })
+                .await;
+            }
             Message::Assistant { .. } => {}
-            Message::Usage(usage) => emit(Event::Usage {
-                session_id: self.session_id.clone(),
-                turn_id: turn_id.clone(),
-                usage,
-            }),
+            Message::Usage(usage) => {
+                emit.emit(Event::Usage {
+                    session_id: self.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    usage,
+                })
+                .await;
+            }
             Message::RateLimit(limit) => {
                 if limit.status == REJECTED_STATUS {
                     let window = limit
@@ -358,27 +365,30 @@ impl ClaudeSession {
                         .map_or(UsageWindowKind::Unknown, UsageWindowKind::from_window_name);
                     self.limit_hit = Some((window, limit.resets_at));
                 }
-                emit(Event::RateLimit {
+                emit.emit(Event::RateLimit {
                     session_id: self.session_id.clone(),
                     limit,
-                });
+                })
+                .await;
             }
             Message::ToolStarted { id } => gate.tool_started(&id),
             Message::ToolFinished { id } => gate.tool_finished(&id),
             Message::Result { is_error } => {
                 if let Some((window, reset_at)) = self.limit_hit.take().filter(|_| is_error) {
-                    emit(Event::UsageLimit {
+                    emit.emit(Event::UsageLimit {
                         session_id: self.session_id.clone(),
                         turn_id: turn_id.clone(),
                         window,
                         reset_at,
-                    });
+                    })
+                    .await;
                 }
-                emit(Event::Result {
+                emit.emit(Event::Result {
                     session_id: self.session_id.clone(),
                     turn_id: turn_id.clone(),
                     is_error,
-                });
+                })
+                .await;
                 return Ok(Some(TurnOutcome::Completed { is_error }));
             }
             Message::PermissionRequest(ask) => return self.ask(ask, turn_id, gate, emit).await,
@@ -400,7 +410,7 @@ impl ClaudeSession {
         ask: PermissionAsk,
         turn_id: &TurnId,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<Option<TurnOutcome>, AdapterError> {
         let request = map_tool(&ask.tool_name, &ask.input, &self.cwd);
         self.pending.insert(ask.request_id.clone(), ask.input);
@@ -419,7 +429,7 @@ impl ClaudeSession {
             RequestId::new(ask.request_id.as_str()),
             request.tool.name().to_owned(),
         );
-        emit(if allowed {
+        emit.emit(if allowed {
             Event::Approve {
                 session_id,
                 request_id,
@@ -431,7 +441,8 @@ impl ClaudeSession {
                 request_id,
                 tool,
             }
-        });
+        })
+        .await;
         let input = self.pending.remove(&ask.request_id).unwrap_or(Value::Null);
         let line = control_response(&ask.request_id, decision, &input);
         if !self.write_line(&line).await? {
@@ -447,18 +458,19 @@ impl ClaudeSession {
         &mut self,
         turn_id: &TurnId,
         cause: InterruptCause,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<TurnOutcome, AdapterError> {
-        emit(Event::TurnInterrupted {
+        emit.emit(Event::TurnInterrupted {
             session_id: self.session_id.clone(),
             turn_id: turn_id.clone(),
             cause: Some(cause),
-        });
+        })
+        .await;
         self.shutdown().await?;
         Ok(TurnOutcome::Cancelled)
     }
 
-    async fn crashed(&mut self, emit: &mut impl FnMut(Event)) -> Result<TurnOutcome, AdapterError> {
+    async fn crashed(&mut self, emit: &mut impl Emit) -> Result<TurnOutcome, AdapterError> {
         self.closed = true;
         self.stdin = None;
         let pid = self.child.id();
@@ -473,12 +485,13 @@ impl ClaudeSession {
             Err(_) => self.kill_and_reap().await?,
         };
         let exit_code = status.and_then(|status| status.code());
-        emit(Event::BackendCrashed {
+        emit.emit(Event::BackendCrashed {
             session_id: self.session_id.clone(),
             exit_code,
             will_restart: false,
             detail: None,
-        });
+        })
+        .await;
         Ok(TurnOutcome::Crashed { exit_code })
     }
 

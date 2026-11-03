@@ -43,6 +43,7 @@ use crate::claude_session::{
     kill_group,
 };
 use crate::codex_exec::{SandboxMode, SpawnHook};
+use crate::emit::Emit;
 use crate::gate::PermissionGate;
 use crate::tool_request::{Tool, ToolRequest};
 use crate::websocket::{
@@ -443,7 +444,7 @@ impl CodexAppServerSession {
         turn_id: &TurnId,
         text: &str,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<TurnOutcome, AppServerError> {
         if self.closed {
             return Err(AppServerError::Closed);
@@ -455,7 +456,7 @@ impl CodexAppServerSession {
         if *self.cancel.borrow() {
             // Nothing is running yet, so there is nothing to interrupt.
             self.cancel.send_replace(false);
-            emit(self.interrupted_event(turn_id));
+            emit.emit(self.interrupted_event(turn_id)).await;
             return Ok(TurnOutcome::Cancelled);
         }
         let cancel = self.cancel.subscribe();
@@ -503,7 +504,7 @@ impl CodexAppServerSession {
         turn_id: &TurnId,
         text: &str,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<Option<TurnOutcome>, AppServerError> {
         let params = json!({"threadId": self.thread_id, "input": [{"type": "text", "text": text}]});
         let turn_request = self.send_request("turn/start", params).await?;
@@ -520,7 +521,7 @@ impl CodexAppServerSession {
                     } else {
                         warn!("the Codex app-server did not end the cancelled turn; killing it");
                         self.stop().await?;
-                        emit(self.result(turn_id, true));
+                        emit.emit(self.result(turn_id, true)).await;
                         return Ok(Some(TurnOutcome::Completed { is_error: true }));
                     }
                 }
@@ -531,8 +532,9 @@ impl CodexAppServerSession {
             gate.progress();
             match message {
                 Message::Notification { method, params } => {
-                    if let Some(is_error) =
-                        self.notify(&method, &params, gate, turn_id, &mut usage, emit)
+                    if let Some(is_error) = self
+                        .notify(&method, &params, gate, turn_id, &mut usage, emit)
+                        .await
                     {
                         return Ok(Some(TurnOutcome::Completed { is_error }));
                     }
@@ -543,7 +545,7 @@ impl CodexAppServerSession {
                         Flow::Cancelled => deadline = Some(Instant::now() + INTERRUPT_TIMEOUT),
                         Flow::Lost => return Ok(None),
                         Flow::Ended => {
-                            emit(self.result(turn_id, true));
+                            emit.emit(self.result(turn_id, true)).await;
                             return Ok(Some(TurnOutcome::Completed { is_error: true }));
                         }
                     }
@@ -559,7 +561,7 @@ impl CodexAppServerSession {
                 Message::Response {
                     id, failed: true, ..
                 } if id == turn_request => {
-                    emit(self.result(turn_id, true));
+                    emit.emit(self.result(turn_id, true)).await;
                     return Ok(Some(TurnOutcome::Completed { is_error: true }));
                 }
                 Message::Response { .. } => {}
@@ -568,23 +570,24 @@ impl CodexAppServerSession {
     }
 
     /// Handles one notification; returns the turn's error flag once the turn ended.
-    fn notify<G: PermissionGate>(
+    async fn notify<G: PermissionGate>(
         &mut self,
         method: &str,
         params: &Value,
         gate: &G,
         turn_id: &TurnId,
         usage: &mut Option<TokenUsage>,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Option<bool> {
         match method {
             "item/agentMessage/delta" => {
                 if let Some(text) = params["delta"].as_str() {
-                    emit(Event::StreamDelta {
+                    emit.emit(Event::StreamDelta {
                         session_id: self.session_id.clone(),
                         turn_id: turn_id.clone(),
                         text: text.to_owned(),
-                    });
+                    })
+                    .await;
                 }
             }
             "item/started" => {
@@ -610,13 +613,14 @@ impl CodexAppServerSession {
             "turn/completed" => {
                 let is_error = params["turn"]["status"] != "completed";
                 if let Some(usage) = usage.take() {
-                    emit(Event::Usage {
+                    emit.emit(Event::Usage {
                         session_id: self.session_id.clone(),
                         turn_id: turn_id.clone(),
                         usage,
-                    });
+                    })
+                    .await;
                 }
-                emit(self.result(turn_id, is_error));
+                emit.emit(self.result(turn_id, is_error)).await;
                 return Some(is_error);
             }
             other => debug!(method = other, "ignored Codex app-server notification"),
@@ -639,7 +643,7 @@ impl CodexAppServerSession {
         method: &str,
         params: &Value,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<Flow, AppServerError> {
         let Some(request) = self.tool_request(method, params) else {
             let error = json!({"code": METHOD_NOT_FOUND, "message": "method not supported"});
@@ -668,7 +672,7 @@ impl CodexAppServerSession {
             Value::String(text) => text.clone(),
             other => other.to_string(),
         });
-        emit(if allowed {
+        emit.emit(if allowed {
             Event::Approve {
                 session_id,
                 request_id,
@@ -680,7 +684,8 @@ impl CodexAppServerSession {
                 request_id,
                 tool,
             }
-        });
+        })
+        .await;
         match reply_for(allowed, params) {
             Reply::Decision(decision) => {
                 self.send(&json!({"id": id, "result": {"decision": decision}}))
@@ -852,28 +857,26 @@ impl CodexAppServerSession {
     async fn interrupted(
         &mut self,
         turn_id: &TurnId,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<TurnOutcome, AppServerError> {
-        emit(self.interrupted_event(turn_id));
+        emit.emit(self.interrupted_event(turn_id)).await;
         self.interrupt(None).await?;
         self.cancel.send_replace(false);
         Ok(TurnOutcome::Cancelled)
     }
 
-    async fn crashed(
-        &mut self,
-        emit: &mut impl FnMut(Event),
-    ) -> Result<TurnOutcome, AppServerError> {
+    async fn crashed(&mut self, emit: &mut impl Emit) -> Result<TurnOutcome, AppServerError> {
         let exit_code = self
             .stop_after(EXIT_GRACE)
             .await?
             .and_then(|status| status.code());
-        emit(Event::BackendCrashed {
+        emit.emit(Event::BackendCrashed {
             session_id: self.session_id.clone(),
             exit_code,
             will_restart: false,
             detail: Some(SERVER_DIED_DETAIL.to_owned()),
-        });
+        })
+        .await;
         Ok(TurnOutcome::Crashed { exit_code })
     }
 

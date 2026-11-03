@@ -28,6 +28,7 @@ use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, Tur
 use coda_providers::claude_session::TurnOutcome;
 use coda_providers::codex::Carried;
 use coda_providers::detect::DEFAULT_PROBE_TIMEOUT;
+use coda_providers::emit::Emit;
 use coda_providers::gate::PermissionGate;
 use coda_providers::registry::RegistryError;
 use coda_providers::tool_request::ToolRequest;
@@ -76,6 +77,9 @@ const MAX_DELTA_CHUNK_BYTES: usize = 16 * 1024;
 /// after the cancel or the event can take a few seconds.
 const WIND_DOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const WIND_DOWN_POLL: Duration = Duration::from_millis(10);
+/// Events a turn may have emitted that the publisher has not stored yet. The
+/// backend waits when the queue holds this many.
+const EVENT_QUEUE_BOUND: usize = 1024;
 /// Bytes of earlier conversation given to a Codex thread that replaces a lost one.
 const MAX_SEED_BYTES: usize = 32 * 1024;
 /// Why a fresh Claude Code conversation has none of the earlier turns.
@@ -285,6 +289,8 @@ pub struct Turns {
     running: Mutex<HashMap<SessionId, Reservation<CancelHandle>>>,
     /// The backends' own session ids, so the next turn resumes the conversation.
     backend_ids: Mutex<HashMap<SessionId, String>>,
+    /// The event queue of each running turn, to count what is waiting.
+    queues: Mutex<HashMap<SessionId, mpsc::WeakSender<Event>>>,
     /// Codex app-servers between turns, one per session. A turn takes its
     /// session's server out, so turns of one session never share it at once.
     idle: IdlePool<AgentSession>,
@@ -328,6 +334,7 @@ impl Turns {
             models,
             running: Mutex::default(),
             backend_ids: Mutex::default(),
+            queues: Mutex::default(),
             idle: IdlePool::new(MAX_IDLE_SERVERS),
             supervisor,
             stopping: AtomicBool::new(false),
@@ -715,6 +722,20 @@ impl Turns {
             })
     }
 
+    fn queues(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, mpsc::WeakSender<Event>>> {
+        self.queues.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How many events of `session`'s running turn wait to be stored.
+    #[must_use]
+    pub fn queued_events(&self, session: &SessionId) -> usize {
+        let queue = self
+            .queues()
+            .get(session)
+            .and_then(mpsc::WeakSender::upgrade);
+        queue.map_or(0, |tx| tx.max_capacity() - tx.capacity())
+    }
+
     fn backend_ids(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, String>> {
         self.backend_ids
             .lock()
@@ -759,7 +780,8 @@ impl Turns {
             child,
             gate,
         } = job;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(EVENT_QUEUE_BOUND);
+        self.queues().insert(session.clone(), tx.downgrade());
         let publisher = tokio::spawn(publish_events(
             Arc::clone(&self.hub),
             session.clone(),
@@ -772,21 +794,11 @@ impl Turns {
             watchdog: Arc::clone(&watchdog),
             tool_requested: AtomicBool::new(false),
         };
-        let observer = Arc::clone(&watchdog);
-        let emit_session = session.clone();
-        let turns = Arc::clone(&self);
-        let emit = move |event: Event| {
-            observer.observe(&event);
-            if matches!(event, Event::Result { .. } | Event::TurnInterrupted { .. })
-                && let Some(reservation) = turns.running().get_mut(&emit_session)
-            {
-                reservation.wind_down();
-            }
-            // The adapter's callback cannot wait, so the queue never refuses an
-            // event; the publisher coalesces text to keep up with a burst.
-            if tx.send(event).is_err() {
-                warn!(session = %emit_session, "the event publisher is gone; dropping an event");
-            }
+        let emit = EventSink {
+            tx,
+            watchdog: Arc::clone(&watchdog),
+            turns: Arc::clone(&self),
+            session: session.clone(),
         };
         info!(session = %session, turn = %turn, step = "drive", "driving the backend");
         let mut drive = Drive::new(
@@ -800,11 +812,14 @@ impl Turns {
         let verdict = self.supervisor.run(&mut drive).await;
         if let Verdict::Exhausted { restarts } = verdict {
             warn!(session = %session, turn = %turn, restarts, "restart cap reached; failing the turn");
-            (drive.emit)(Event::Result {
-                session_id: session.clone(),
-                turn_id: turn.clone(),
-                is_error: true,
-            });
+            drive
+                .emit
+                .emit(Event::Result {
+                    session_id: session.clone(),
+                    turn_id: turn.clone(),
+                    is_error: true,
+                })
+                .await;
         }
         let Drive {
             emit,
@@ -835,6 +850,7 @@ impl Turns {
         if publisher.await.is_err() {
             warn!(session = %session, "the event publisher stopped early");
         }
+        self.queues().remove(&session);
         if !keep {
             remove_pidfile(&self.config.pidfile_dir, &session);
         }
@@ -954,11 +970,34 @@ impl PermissionGate for WatchedGate {
     }
 }
 
+/// Where a running turn's adapter puts its events. A full queue makes the adapter
+/// wait, so a slow store slows the backend instead of growing memory.
+struct EventSink {
+    tx: mpsc::Sender<Event>,
+    watchdog: Arc<Watchdog>,
+    turns: Arc<Turns>,
+    session: SessionId,
+}
+
+impl Emit for EventSink {
+    async fn emit(&mut self, event: Event) {
+        self.watchdog.observe(&event);
+        if matches!(event, Event::Result { .. } | Event::TurnInterrupted { .. })
+            && let Some(reservation) = self.turns.running().get_mut(&self.session)
+        {
+            reservation.wind_down();
+        }
+        if self.tx.send(event).await.is_err() {
+            warn!(session = %self.session, "the event publisher is gone; dropping an event");
+        }
+    }
+}
+
 async fn publish_events(
     hub: Arc<Hub>,
     session: SessionId,
     turn: TurnId,
-    mut events: mpsc::UnboundedReceiver<Event>,
+    mut events: mpsc::Receiver<Event>,
 ) {
     let mut held = None;
     loop {
@@ -981,7 +1020,7 @@ async fn publish_events(
 /// is kept and no event is skipped.
 async fn coalesce_text(
     first: Event,
-    events: &mut mpsc::UnboundedReceiver<Event>,
+    events: &mut mpsc::Receiver<Event>,
     held: &mut Option<Event>,
 ) -> Event {
     let Event::StreamDelta {

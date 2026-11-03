@@ -28,6 +28,7 @@ use crate::claude_session::{
     CancelHandle, EXIT_GRACE, READ_CHUNK_BYTES, REAP_TIMEOUT, TurnOutcome, allowlisted, cancelled,
     kill_group,
 };
+use crate::emit::Emit;
 use crate::gate::PermissionGate;
 use crate::jsonl::{DiagnosticLog, Framed, LineFramer, bounded};
 
@@ -373,7 +374,7 @@ impl CodexExecSession {
         turn_id: &TurnId,
         text: &str,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<TurnOutcome, CodexError> {
         if self.closed {
             return Err(CodexError::Closed);
@@ -406,7 +407,7 @@ impl CodexExecSession {
         turn_id: &TurnId,
         text: &str,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
         spawned: (ChildStdin, R),
     ) -> Result<TurnOutcome, CodexError> {
         let result = self.exchange(turn_id, text, gate, emit, spawned).await;
@@ -421,7 +422,7 @@ impl CodexExecSession {
         turn_id: &TurnId,
         text: &str,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
         (stdin, mut stdout): (ChildStdin, R),
     ) -> Result<TurnOutcome, CodexError> {
         if !self.send_prompt(stdin, text).await? {
@@ -442,7 +443,7 @@ impl CodexExecSession {
             }
             gate.progress();
             for message in self.parser.feed(&buffer[..read]) {
-                if let Some(is_error) = self.handle(message, turn_id, gate, emit) {
+                if let Some(is_error) = self.handle(message, turn_id, gate, emit).await {
                     self.reap(EXIT_GRACE).await?;
                     return Ok(TurnOutcome::Completed { is_error });
                 }
@@ -512,12 +513,12 @@ impl CodexExecSession {
     }
 
     /// Emits the events of one message; returns the turn's error flag once it ended.
-    fn handle<G: PermissionGate>(
+    async fn handle<G: PermissionGate>(
         &mut self,
         message: CodexMessage,
         turn_id: &TurnId,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Option<bool> {
         let session_id = self.spec.session_id.clone();
         let turn_id = turn_id.clone();
@@ -525,30 +526,36 @@ impl CodexExecSession {
             CodexMessage::ThreadStarted { thread_id } => self.backend_session_id = Some(thread_id),
             CodexMessage::ToolStarted { id } => gate.tool_started(&id),
             CodexMessage::ToolFinished { id } => gate.tool_finished(&id),
-            CodexMessage::AgentMessage(text) => emit(Event::StreamDelta {
-                session_id,
-                turn_id,
-                text,
-            }),
+            CodexMessage::AgentMessage(text) => {
+                emit.emit(Event::StreamDelta {
+                    session_id,
+                    turn_id,
+                    text,
+                })
+                .await;
+            }
             CodexMessage::TurnCompleted(usage) => {
-                emit(Event::Usage {
+                emit.emit(Event::Usage {
                     session_id: session_id.clone(),
                     turn_id: turn_id.clone(),
                     usage,
-                });
-                emit(Event::Result {
+                })
+                .await;
+                emit.emit(Event::Result {
                     session_id,
                     turn_id,
                     is_error: false,
-                });
+                })
+                .await;
                 return Some(false);
             }
             CodexMessage::TurnFailed => {
-                emit(Event::Result {
+                emit.emit(Event::Result {
                     session_id,
                     turn_id,
                     is_error: true,
-                });
+                })
+                .await;
                 return Some(true);
             }
         }
@@ -559,18 +566,19 @@ impl CodexExecSession {
         &mut self,
         turn_id: &TurnId,
         cause: InterruptCause,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<TurnOutcome, CodexError> {
-        emit(Event::TurnInterrupted {
+        emit.emit(Event::TurnInterrupted {
             session_id: self.spec.session_id.clone(),
             turn_id: turn_id.clone(),
             cause: Some(cause),
-        });
+        })
+        .await;
         self.reap(Duration::ZERO).await?;
         Ok(TurnOutcome::Cancelled)
     }
 
-    async fn crashed(&mut self, emit: &mut impl FnMut(Event)) -> Result<TurnOutcome, CodexError> {
+    async fn crashed(&mut self, emit: &mut impl Emit) -> Result<TurnOutcome, CodexError> {
         let exit_code = self
             .reap(EXIT_GRACE)
             .await?
@@ -579,12 +587,13 @@ impl CodexExecSession {
             Some(tail) => tail.finish().await,
             None => None,
         };
-        emit(Event::BackendCrashed {
+        emit.emit(Event::BackendCrashed {
             session_id: self.spec.session_id.clone(),
             exit_code,
             will_restart: false,
             detail,
-        });
+        })
+        .await;
         Ok(TurnOutcome::Crashed { exit_code })
     }
 
