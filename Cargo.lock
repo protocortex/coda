@@ -432,9 +432,14 @@ dependencies = [
 name = "coda-review"
 version = "0.1.0"
 dependencies = [
+ "coda-config",
+ "globset",
+ "regex",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
