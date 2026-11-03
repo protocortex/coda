@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::hooks::{HookConfig, MAX_TIMEOUT_MS};
+use crate::review::{MAX_FINDINGS_KEY, REVIEW_KEY, ReviewConfig};
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
 
@@ -242,6 +243,8 @@ pub struct Config {
     pub routing: Routing,
     /// Hooks run at session start and around tool calls; only this file can add them.
     pub hooks: Vec<HookConfig>,
+    /// Limits for `coda review`.
+    pub review: ReviewConfig,
 }
 
 impl Default for Config {
@@ -256,6 +259,7 @@ impl Default for Config {
             timing: Timing::default(),
             routing: Routing::default(),
             hooks: Vec::new(),
+            review: ReviewConfig::default(),
         }
     }
 }
@@ -292,6 +296,7 @@ impl Config {
         config.check_timing()?;
         config.check_routing()?;
         config.check_hooks()?;
+        config.check_review()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -369,6 +374,16 @@ impl Config {
                     allowed: "a whole number of tokens above 0".to_owned(),
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn check_review(&self) -> Result<(), ConfigError> {
+        if self.review.max_findings == 0 {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{REVIEW_KEY}.{MAX_FINDINGS_KEY}"),
+                allowed: "a whole number of findings above 0".to_owned(),
+            });
         }
         Ok(())
     }
@@ -779,6 +794,35 @@ idle_timeout_ms = 1500
         // Assert
         assert!(
             matches!(&err, ConfigError::InvalidValue { path, .. } if path == "timing.delegated_tool_ms"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn review_max_findings_defaults_to_five_and_can_be_set() {
+        // Arrange
+        let set = "[review]\nmax_findings = 8\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config;
+        let custom = Config::from_toml_str(set).unwrap().config;
+
+        // Assert
+        assert_eq!(default.review.max_findings, 5);
+        assert_eq!(custom.review.max_findings, 8);
+    }
+
+    #[test]
+    fn a_zero_review_finding_cap_is_rejected_naming_the_key() {
+        // Arrange
+        let input = "[review]\nmax_findings = 0\n";
+
+        // Act
+        let err = Config::from_toml_str(input).unwrap_err();
+
+        // Assert
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { path, .. } if path == "review.max_findings"),
             "{err}"
         );
     }

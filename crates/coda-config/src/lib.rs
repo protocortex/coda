@@ -4,5 +4,6 @@
 
 pub mod config;
 pub mod hooks;
+pub mod review;
 pub mod routing;
 pub mod timing;
