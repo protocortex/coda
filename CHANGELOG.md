@@ -22,6 +22,7 @@ All notable changes to Coda are recorded here. The format follows
 - Skills for model-API sessions. The model is offered the skills by name and description in the description of a new `skill` tool, and a skill's body enters the conversation only when the model calls the tool for it. Only your own skills and those of a trusted project are offered.
 - `coda doctor` warns when a `[routing]` alias uses another provider than the default session provider, since a `task` call in a session on that provider cannot use it.
 - Provider keys `max_output_tokens` (for `anthropic` and `openai_compat`), `max_tokens_field` (`"max_tokens"` or `"max_completion_tokens"`) and `stream_usage` (for `openai_compat`), so a server that rejects `max_tokens` or `stream_options`, or a small local model that cannot fit an 8192-token reply, can be used. The defaults keep the request as it was. See [docs/config.md](docs/config.md).
+- A licensing page, [docs/licensing.md](docs/licensing.md), covering the Apache-2.0 license, the source header check and the dependency license policy.
 
 ### Changed
 
