@@ -118,6 +118,12 @@ Each value is an integer number of milliseconds. A key left out keeps its defaul
 | `tool_execution_ms` | `300000` | Longest run time of one of coda's own tool calls (the tools coda runs itself, not a delegated backend's). |
 | `delegated_tool_ms` | `900000` | How long a delegated backend (Claude Code, Codex) may stay silent while a tool runs, before the turn is aborted. It covers tools the backend started on its own and tool calls coda approved for it. Above Claude Code's 10 minute Bash maximum; must not be zero. |
 
+## `[review]`
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `max_findings` | integer | `5` | Most findings one review run reports. When the model returns more, the most severe are kept and the rest are counted in the run details. Must not be zero. |
+
 ## `[[hooks]]`
 
 A hook is a program coda runs at a point in a model-API session (`anthropic`, `openai_compat`, `faux`). Hooks run in coda's own tool path. Claude Code and Codex run their own tools and coda only sees the calls it is asked to approve through its permission broker, so no coda hook runs for those sessions. When the config has hooks and a session runs on one of those backends, the terminal UI shows a notice when the session starts and `coda run` prints one line on standard error, so a guard is never assumed to be active. Hooks come from this file only. A project file or a definition file cannot add one.
@@ -213,6 +219,9 @@ restart_backoff_ms = 1000
 permission_default_deny_ms = 120000
 tool_execution_ms = 300000
 delegated_tool_ms = 900000
+
+[review]
+max_findings = 5
 
 [[hooks]]
 event = "pre_tool"
