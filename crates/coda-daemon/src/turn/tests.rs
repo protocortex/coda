@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use coda_core::history::PERMISSION_REQUEST_KIND;
 use coda_protocol::events::Event;
 use coda_protocol::jsonrpc::Response;
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TokenUsage, TurnId};
@@ -196,18 +197,32 @@ impl Rig {
             .unwrap()
     }
 
-    /// Polls until a permission request is waiting and returns its id.
+    /// Polls until a permission request is waiting and its announcement is
+    /// stored, then returns its id. The request row is written before the
+    /// announcement, and an answer that lands in between suppresses the
+    /// announcement, so a test that asserts on the event must wait for both.
     async fn wait_for_pending(&self) -> String {
         tokio::time::timeout(WAIT, async {
             loop {
                 if let Some(first) = self.pending().await.first() {
-                    return first.id.as_str().to_owned();
+                    let id = first.id.as_str().to_owned();
+                    if self.announced(&id).await {
+                        return id;
+                    }
                 }
                 tokio::time::sleep(POLL).await;
             }
         })
         .await
-        .expect("no permission request was queued in time")
+        .expect("no permission request was queued and announced in time")
+    }
+
+    async fn announced(&self, request_id: &str) -> bool {
+        self.events().await.iter().any(|event| {
+            event.kind == PERMISSION_REQUEST_KIND
+                && serde_json::from_str::<Value>(&event.body)
+                    .is_ok_and(|body| body["request_id"] == request_id)
+        })
     }
 
     async fn respond(&mut self, request_id: &str, decision: &str) -> Value {
