@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use coda_protocol::events::{Event, InterruptCause};
+use coda_protocol::events::{Event, InterruptCause, UsageWindowKind};
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
 use coda_providers::claude_code::Diagnostic;
 use coda_providers::claude_session::{
@@ -196,6 +196,48 @@ async fn usage_and_rate_limit_reports_become_events() {
     let limit = limit.expect("no rate_limit event");
     assert_eq!(limit.status, "allowed");
     assert_eq!(limit.windows[0].utilization_bps, 900);
+}
+
+#[tokio::test]
+async fn a_rejected_rate_limit_ends_the_turn_with_a_usage_limit_event() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    let (outcome, events) = turn(&mut session, &gate, "hit-limit").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Completed { is_error: true });
+    let limit = Event::UsageLimit {
+        session_id: SessionId::new("s-1"),
+        turn_id: TurnId::new("t-1"),
+        window: UsageWindowKind::ModelScoped,
+        reset_at: Some(1_794_193_200),
+    };
+    let at = events
+        .iter()
+        .position(|e| *e == limit)
+        .expect("no usage_limit event");
+    assert!(matches!(
+        events[at + 1],
+        Event::Result { is_error: true, .. }
+    ));
+}
+
+#[tokio::test]
+async fn an_allowed_rate_limit_raises_no_usage_limit_event() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    let (_, events) = turn(&mut session, &gate, "report-usage").await;
+
+    // Assert
+    assert!(!events.iter().any(|e| matches!(e, Event::UsageLimit { .. })));
 }
 
 #[tokio::test]

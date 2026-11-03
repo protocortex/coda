@@ -9,7 +9,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use coda_protocol::events::{Event, InterruptCause};
+use coda_protocol::events::{Event, InterruptCause, UsageWindowKind};
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
 use rustix::process::{Pid, Signal, kill_process_group};
 use serde_json::{Value, json};
@@ -36,6 +36,8 @@ const CLAUDE_FLAGS: &[&str] = &[
     "stdio",
 ];
 const RESUME_FLAG: &str = "--resume";
+/// Status Claude Code gives a rate-limit report when the plan limit blocks the turn.
+const REJECTED_STATUS: &str = "rejected";
 /// Parent variables a delegated agent may inherit. Credentials such as
 /// `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, and `CLAUDECODE`, are absent by design.
 pub const ENV_ALLOWLIST: &[&str] = &[
@@ -144,6 +146,8 @@ pub struct ClaudeSession {
     session_id: SessionId,
     cwd: PathBuf,
     backend_session_id: Option<String>,
+    /// The window a rejected rate-limit report named, until the turn's result.
+    limit_hit: Option<(UsageWindowKind, Option<u64>)>,
     closed: bool,
 }
 
@@ -192,6 +196,7 @@ impl ClaudeSession {
             session_id: spec.session_id,
             cwd: spec.cwd,
             backend_session_id: None,
+            limit_hit: None,
             closed: false,
         })
     }
@@ -333,13 +338,30 @@ impl ClaudeSession {
                 turn_id: turn_id.clone(),
                 usage,
             }),
-            Message::RateLimit(limit) => emit(Event::RateLimit {
-                session_id: self.session_id.clone(),
-                limit,
-            }),
+            Message::RateLimit(limit) => {
+                if limit.status == REJECTED_STATUS {
+                    let window = limit
+                        .window_type
+                        .as_deref()
+                        .map_or(UsageWindowKind::Unknown, UsageWindowKind::from_window_name);
+                    self.limit_hit = Some((window, limit.resets_at));
+                }
+                emit(Event::RateLimit {
+                    session_id: self.session_id.clone(),
+                    limit,
+                });
+            }
             Message::ToolStarted { id } => gate.tool_started(&id),
             Message::ToolFinished { id } => gate.tool_finished(&id),
             Message::Result { is_error } => {
+                if let Some((window, reset_at)) = self.limit_hit.take().filter(|_| is_error) {
+                    emit(Event::UsageLimit {
+                        session_id: self.session_id.clone(),
+                        turn_id: turn_id.clone(),
+                        window,
+                        reset_at,
+                    });
+                }
                 emit(Event::Result {
                     session_id: self.session_id.clone(),
                     turn_id: turn_id.clone(),

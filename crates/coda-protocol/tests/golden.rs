@@ -135,6 +135,8 @@ golden_tests! {
     event_compaction: "event.compaction" => Event,
     event_rate_limit: "event.rate_limit" => Event,
     event_rate_limit_minimal: "event.rate_limit.minimal" => Event,
+    event_usage_limit: "event.usage_limit" => Event,
+    event_usage_limit_minimal: "event.usage_limit.minimal" => Event,
 }
 
 #[test]
