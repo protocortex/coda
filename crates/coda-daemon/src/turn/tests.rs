@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use super::{
-    BACKEND_UNSUPPORTED, CancelHandle, Reservation, SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig,
-    TurnState, Turns, WIND_DOWN_TIMEOUT,
+    BACKEND_UNSUPPORTED, CancelHandle, EVENT_QUEUE_BOUND, Reservation, SESSION_NOT_FOUND,
+    TURN_RUNNING, TurnConfig, TurnState, Turns, WIND_DOWN_TIMEOUT,
 };
 use crate::dispatch::Dispatcher;
 use crate::idle_pool::MAX_IDLE_SERVERS;
@@ -1860,4 +1860,79 @@ async fn a_burst_larger_than_the_event_queue_loses_no_text_and_no_durable_event(
             "{durable}"
         );
     }
+}
+
+/// More one-byte deltas than the publisher joins into its first chunk, so the rest queue up.
+const STALL_BURST: usize = 40_000;
+const STALL_SAMPLES: usize = 10;
+const STALL_SAMPLE_GAP: Duration = Duration::from_millis(50);
+
+#[tokio::test]
+async fn a_stalled_publisher_holds_the_queue_at_its_bound_and_nothing_is_lost_after() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.control(&json!({ "delta_burst": STALL_BURST }));
+    rig.send("hello").await;
+    // The backend's id is stored as it reports it, which needs the store the test is about to stall.
+    let named = rig.session.clone();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let named = named.clone();
+            let found = rig
+                .hub
+                .with_store(move |store| store.active_backend_ref(&named, BackendKind::ClaudeCode))
+                .await
+                .unwrap();
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("the backend never named its conversation");
+    let store = rig.hub.store_handle();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let stall = std::thread::spawn(move || {
+        let _held = store.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    // Act
+    let session = rig.session.clone();
+    let reached = tokio::time::timeout(WAIT, async {
+        while rig.turns.queued_events(&session) < EVENT_QUEUE_BOUND {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await;
+    let mut deepest = 0;
+    for _ in 0..STALL_SAMPLES {
+        tokio::time::sleep(STALL_SAMPLE_GAP).await;
+        deepest = deepest.max(rig.turns.queued_events(&session));
+    }
+    release_tx.send(()).unwrap();
+    stall.join().unwrap();
+    let request = rig.wait_for_pending().await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert!(reached.is_ok(), "the queue never filled");
+    assert!(deepest <= EVENT_QUEUE_BOUND, "the queue grew to {deepest}");
+    let text: String = rig
+        .events()
+        .await
+        .iter()
+        .filter(|e| e.kind == STREAM_DELTA_KIND)
+        .map(|e| {
+            let body: Value = serde_json::from_str(&e.body).unwrap();
+            body["text"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(text.len(), "working".len() + STALL_BURST);
 }

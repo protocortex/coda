@@ -19,6 +19,7 @@ use tracing::{info, warn};
 use crate::claude_session::{CancelHandle, TurnOutcome};
 use crate::codex_app_server::{AppServerError, AppServerSpec, CodexAppServerSession};
 use crate::codex_exec::{CodexError, CodexExecSession, CodexSpec};
+use crate::emit::Emit;
 use crate::gate::PermissionGate;
 
 pub use crate::codex_exec::{SandboxMode, SpawnHook};
@@ -299,22 +300,24 @@ impl CodexSession {
         turn_id: &TurnId,
         text: &str,
         gate: &G,
-        emit: &mut impl FnMut(Event),
+        emit: &mut impl Emit,
     ) -> Result<TurnOutcome, CodexSessionError> {
         if let Some(reason) = self.notice.take() {
-            emit(Event::ApprovalsUnavailable {
+            emit.emit(Event::ApprovalsUnavailable {
                 session_id: self.session_id.clone(),
                 reason,
-            });
+            })
+            .await;
         }
         let seeded;
         let text = match &self.carried {
             Carried::Nothing => text,
             Carried::Lost => {
-                emit(Event::HistoryNotRestored {
+                emit.emit(Event::HistoryNotRestored {
                     session_id: self.session_id.clone(),
                     reason: NOT_RESTORED_REASON.to_owned(),
-                });
+                })
+                .await;
                 text
             }
             Carried::Seed(history) => {

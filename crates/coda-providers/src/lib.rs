@@ -10,6 +10,7 @@ pub mod codex;
 pub mod codex_app_server;
 pub mod codex_exec;
 pub mod detect;
+pub mod emit;
 pub mod faux;
 pub mod gate;
 mod http;
