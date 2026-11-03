@@ -8,6 +8,7 @@ All notable changes to Coda are recorded here. The format follows
 
 ### Added
 
+- A Claude Code session keeps what the CLI reports about usage and limits. The `result` line's token counts (input, output, cache read and cache write) become a `usage` event, and each `rate_limit_event` becomes a `rate_limit` event with the status, the window and its reset time, per-window utilization in basis points, and the overage fields. `initialize` reports the `usage_details` and `rate_limit_events` capabilities. The field names come from a live recording on claude 2.1.296.
 - `initialize` returns `capabilities`, optional flags such as `usage_details` and `rate_limit_events` that default to false when absent, and an event type a peer does not know reads as `unknown` instead of failing. A new event no longer needs a `PROTOCOL_VERSION` bump; only a breaking change does.
 - A release workflow that builds, checksums and attests the `coda` archives for Linux and macOS, and an `install.sh` that verifies the checksum before installing.
 - A `session.close` request that stops a session's idle Codex server or model conversation and keeps its stored events. `coda run` calls it when the turn ends, and the terminal UI calls it for a session it created when the user quits or switches away.

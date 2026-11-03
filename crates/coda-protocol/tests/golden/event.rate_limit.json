@@ -1,0 +1,1 @@
+{"type":"rate_limit","session_id":"s-1","limit":{"status":"allowed","window_type":"seven_day","resets_at":1794193200,"windows":[{"name":"seven_day","utilization_bps":900,"resets_at":1794193200}],"is_using_overage":true,"overage_status":"allowed","overage_resets_at":1796083200,"overage_disabled_reason":"out_of_credits"}}

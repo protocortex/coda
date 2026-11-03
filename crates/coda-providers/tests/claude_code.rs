@@ -2,7 +2,7 @@
 
 //! Recorded and synthetic transcripts replayed through the stream parser.
 
-use coda_protocol::types::PermissionDecision;
+use coda_protocol::types::{PermissionDecision, TokenUsage};
 use coda_providers::claude_code::{Diagnostic, Message, StreamParser, control_response};
 use coda_testkit::fixtures::{self, FixtureError, Label, Transcript};
 use serde_json::json;
@@ -26,6 +26,8 @@ fn kinds(messages: &[Message]) -> Vec<&'static str> {
             Message::ToolStarted { .. } => "tool-start",
             Message::ToolFinished { .. } => "tool-end",
             Message::Result { .. } => "result",
+            Message::Usage(_) => "usage",
+            Message::RateLimit(_) => "rate-limit",
             Message::PermissionRequest(_) => "ask",
             Message::InvalidPermissionRequest { .. } => "invalid",
         })
@@ -176,4 +178,50 @@ fn live_permission_transcripts_replay_the_bash_request() {
         assert_eq!(asks[0].tool_name, "Bash", "{name}");
         assert_eq!(asks[0].input["command"], "touch hello.txt", "{name}");
     }
+}
+
+#[test]
+fn the_live_text_transcript_keeps_its_usage_before_the_result() {
+    // Arrange
+    let transcript = fixtures::load("live-text.jsonl").unwrap();
+
+    // Act
+    let (messages, diagnostics) = parse(&transcript);
+
+    // Assert
+    let usage = TokenUsage {
+        input_tokens: 2,
+        output_tokens: 4,
+        cache_read_tokens: 17990,
+        cache_write_tokens: 4092,
+    };
+    assert_eq!(diagnostics, vec![]);
+    let [.., before_result, last] = messages.as_slice() else {
+        panic!("too few messages");
+    };
+    assert_eq!(before_result, &Message::Usage(usage));
+    assert_eq!(last, &Message::Result { is_error: false });
+}
+
+#[test]
+fn the_live_text_transcript_keeps_its_rate_limit_report() {
+    // Arrange
+    let transcript = fixtures::load("live-text.jsonl").unwrap();
+
+    // Act
+    let (messages, _) = parse(&transcript);
+
+    // Assert
+    let limits: Vec<_> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::RateLimit(limit) => Some(limit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(limits.len(), 1);
+    assert_eq!(limits[0].status, "allowed");
+    assert_eq!(limits[0].window_type.as_deref(), Some("five_hour"));
+    let names: Vec<_> = limits[0].windows.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, ["five_hour", "seven_day"]);
 }
