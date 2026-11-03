@@ -813,6 +813,52 @@ idle_timeout_ms = 1500
     }
 
     #[test]
+    fn review_ignore_and_skip_default_to_builtin_ignores_and_no_skips() {
+        // Arrange and Act
+        let review = Config::from_toml_str("").unwrap().config.review;
+
+        // Assert
+        assert!(review.ignore.builtin);
+        assert_eq!(review.ignore.globs.len(), 0);
+        assert_eq!(review.skip, crate::review::ReviewSkip::default());
+        assert!(!review.skip.draft && !review.skip.bots);
+    }
+
+    #[test]
+    fn review_ignore_and_skip_keys_are_read() {
+        // Arrange
+        let input = r#"
+[review.ignore]
+globs = ["docs/**"]
+builtin = false
+
+[review.skip]
+draft = true
+labels = ["wip"]
+title_regex = ["^chore"]
+source_branch_regex = ["^bot/"]
+target_branch_regex = ["^release/"]
+authors = ["alice"]
+bots = true
+"#;
+
+        // Act
+        let parsed = Config::from_toml_str(input).unwrap();
+
+        // Assert
+        let review = parsed.config.review;
+        assert_eq!(review.ignore.globs, ["docs/**"]);
+        assert!(!review.ignore.builtin);
+        assert!(review.skip.draft && review.skip.bots);
+        assert_eq!(review.skip.labels, ["wip"]);
+        assert_eq!(review.skip.title_regex, ["^chore"]);
+        assert_eq!(review.skip.source_branch_regex, ["^bot/"]);
+        assert_eq!(review.skip.target_branch_regex, ["^release/"]);
+        assert_eq!(review.skip.authors, ["alice"]);
+        assert_eq!(parsed.unknown_keys.len(), 0);
+    }
+
+    #[test]
     fn a_zero_review_finding_cap_is_rejected_naming_the_key() {
         // Arrange
         let input = "[review]\nmax_findings = 0\n";

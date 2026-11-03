@@ -124,6 +124,33 @@ Each value is an integer number of milliseconds. A key left out keeps its defaul
 | --- | --- | --- | --- |
 | `max_findings` | integer | `5` | Most findings one review run reports. When the model returns more, the most severe are kept and the rest are counted in the run details. Must not be zero. |
 
+## `[review.ignore]`
+
+Files a review leaves out.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `globs` | array of strings | `[]` | Globs matched against the path from the repository root. `*` stays inside one directory, `**/` and `/**` cross directories, `?` is one character. A glob with no `/` matches the file name at any depth, so `*.snap` ignores `a/b/c.snap`. |
+| `builtin` | boolean | `true` | Also leave out generated files: lockfiles (`Cargo.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lock`, `poetry.lock`, `Pipfile.lock`, `Gemfile.lock`, `composer.lock`, `go.sum`), minified files (`*.min.js`, `*.min.css`), source maps (`*.map`) and generated protobuf code (`*.pb.go`, `*_pb2.py`, `*_pb2_grpc.py`). |
+
+## `[review.skip]`
+
+Pull requests a review does not run on. Every rule is off until you set it, and one match skips the pull request. A skipped pull request exits 0 and prints one line with the reason. `--force` reviews it anyway.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `draft` | boolean | `false` | Skip a draft. |
+| `labels` | array of strings | `[]` | Skip a pull request with one of these labels. Case-insensitive. |
+| `title_regex` | array of strings | `[]` | Skip when the title matches one of these regular expressions. |
+| `source_branch_regex` | array of strings | `[]` | Skip when the branch the change comes from matches. |
+| `target_branch_regex` | array of strings | `[]` | Skip when the branch it goes to matches. |
+| `authors` | array of strings | `[]` | Skip when the author login is listed. Case-insensitive. |
+| `bots` | boolean | `false` | Skip when the author is a bot account (a login ending in `[bot]`, or one the host marks as a bot). |
+
+Regular expressions use the `regex` crate syntax and match anywhere in the text, so anchor them with `^` and `$` when you mean the whole value.
+
+Review rules are read from the global `config.toml` and from `.coda/review.toml` on the repository's default branch, with the same `[review.ignore]` and `[review.skip]` tables. Lists from both add up, `draft` and `bots` are on when either turns them on, and the built-in ignore list stays on only if both keep it. A `.coda/review.toml` on the pull request's own branch is never read, so a pull request cannot switch off its own review.
+
 ## `[[hooks]]`
 
 A hook is a program coda runs at a point in a model-API session (`anthropic`, `openai_compat`, `faux`). Hooks run in coda's own tool path. Claude Code and Codex run their own tools and coda only sees the calls it is asked to approve through its permission broker, so no coda hook runs for those sessions. When the config has hooks and a session runs on one of those backends, the terminal UI shows a notice when the session starts and `coda run` prints one line on standard error, so a guard is never assumed to be active. Hooks come from this file only. A project file or a definition file cannot add one.
@@ -222,6 +249,19 @@ delegated_tool_ms = 900000
 
 [review]
 max_findings = 5
+
+[review.ignore]
+globs = ["docs/generated/**"]
+builtin = true
+
+[review.skip]
+draft = true
+labels = ["skip-review"]
+title_regex = ["^chore\\(deps\\)"]
+source_branch_regex = ["^dependabot/"]
+target_branch_regex = ["^experimental/"]
+authors = ["release-bot"]
+bots = true
 
 [[hooks]]
 event = "pre_tool"
