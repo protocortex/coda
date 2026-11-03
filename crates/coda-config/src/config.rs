@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::hooks::{HookConfig, MAX_TIMEOUT_MS};
-use crate::review::{MAX_FINDINGS_KEY, REVIEW_KEY, ReviewConfig};
+use crate::review::{DIFF_BUDGET_CHARS_KEY, MAX_FINDINGS_KEY, REVIEW_KEY, ReviewConfig};
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
 
@@ -383,6 +383,12 @@ impl Config {
             return Err(ConfigError::InvalidValue {
                 path: format!("{REVIEW_KEY}.{MAX_FINDINGS_KEY}"),
                 allowed: "a whole number of findings above 0".to_owned(),
+            });
+        }
+        if self.review.diff_budget_chars == 0 {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{REVIEW_KEY}.{DIFF_BUDGET_CHARS_KEY}"),
+                allowed: "a whole number of characters above 0".to_owned(),
             });
         }
         Ok(())
@@ -810,6 +816,26 @@ idle_timeout_ms = 1500
         // Assert
         assert_eq!(default.review.max_findings, 5);
         assert_eq!(custom.review.max_findings, 8);
+    }
+
+    #[test]
+    fn review_diff_budget_defaults_to_120000_and_zero_is_rejected() {
+        // Arrange
+        let set = "[review]\ndiff_budget_chars = 5000\n";
+        let zero = "[review]\ndiff_budget_chars = 0\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config;
+        let custom = Config::from_toml_str(set).unwrap().config;
+        let err = Config::from_toml_str(zero).unwrap_err();
+
+        // Assert
+        assert_eq!(default.review.diff_budget_chars, 120_000);
+        assert_eq!(custom.review.diff_budget_chars, 5000);
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { path, .. } if path == "review.diff_budget_chars"),
+            "{err}"
+        );
     }
 
     #[test]

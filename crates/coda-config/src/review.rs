@@ -11,12 +11,19 @@ pub const MAX_FINDINGS_KEY: &str = "max_findings";
 /// Findings kept per run when the file does not say.
 pub const DEFAULT_MAX_FINDINGS: usize = 5;
 
+/// Key of the diff size budget inside `[review]`.
+pub const DIFF_BUDGET_CHARS_KEY: &str = "diff_budget_chars";
+/// Characters of diff text sent to the model when the file does not say.
+pub const DEFAULT_DIFF_BUDGET_CHARS: usize = 120_000;
+
 /// The `[review]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ReviewConfig {
     /// Most findings one review run reports. Must not be zero.
     pub max_findings: usize,
+    /// Most characters of diff text one review sends to the model. Must not be zero.
+    pub diff_budget_chars: usize,
     /// Files left out of a review.
     pub ignore: ReviewIgnore,
     /// Pull requests that are not reviewed.
@@ -27,6 +34,7 @@ impl Default for ReviewConfig {
     fn default() -> Self {
         Self {
             max_findings: DEFAULT_MAX_FINDINGS,
+            diff_budget_chars: DEFAULT_DIFF_BUDGET_CHARS,
             ignore: ReviewIgnore::default(),
             skip: ReviewSkip::default(),
         }

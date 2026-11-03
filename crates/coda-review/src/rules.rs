@@ -101,7 +101,7 @@ pub fn parse_repo_rules(text: &str) -> Result<ReviewConfig, RulesError> {
 
 /// Combines the global config with the repository rules. Lists add up, a switch that
 /// skips is on when either side turns it on, and the built-in ignore list stays on only
-/// when both sides keep it. The finding cap comes from the global config alone.
+/// when both sides keep it. The finding cap and the diff budget come from the global config alone.
 #[must_use]
 pub fn merge(global: &ReviewConfig, repo: Option<&ReviewConfig>) -> ReviewConfig {
     let Some(repo) = repo else {
@@ -110,6 +110,7 @@ pub fn merge(global: &ReviewConfig, repo: Option<&ReviewConfig>) -> ReviewConfig
     let join = |a: &[String], b: &[String]| [a, b].concat();
     ReviewConfig {
         max_findings: global.max_findings,
+        diff_budget_chars: global.diff_budget_chars,
         ignore: ReviewIgnore {
             globs: join(&global.ignore.globs, &repo.ignore.globs),
             builtin: global.ignore.builtin && repo.ignore.builtin,
