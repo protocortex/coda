@@ -4,7 +4,7 @@ A coding agent, harness and chat interface, written in Rust.
 
 Status: early development. The previous TypeScript implementation lives in `protocortex/coda-ts`.
 
-License: Apache-2.0. See `LICENSE`.
+License: Apache-2.0. See `LICENSE` and [docs/licensing.md](docs/licensing.md).
 
 ## Account risk notice
 
