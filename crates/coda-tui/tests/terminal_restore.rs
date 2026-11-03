@@ -101,18 +101,24 @@ fn ctrl_c() -> UserInput {
     })
 }
 
-/// Sends Ctrl-C on the first poll and runs `during` just before it.
+/// Idle, one Ctrl-C only asks for confirmation, so a quit takes two.
+const CTRL_C_PRESSES_TO_QUIT: usize = 2;
+
+/// Sends Ctrl-C on each poll until it has quit, and runs `during` just before the first.
 struct CtrlC<F: FnMut()> {
-    pending: bool,
+    pending: usize,
     during: F,
 }
 
 impl<F: FnMut()> KeySource for CtrlC<F> {
     fn next_input(&mut self) -> io::Result<Option<UserInput>> {
-        if !std::mem::take(&mut self.pending) {
+        if self.pending == 0 {
             return Ok(None);
         }
-        (self.during)();
+        if self.pending == CTRL_C_PRESSES_TO_QUIT {
+            (self.during)();
+        }
+        self.pending -= 1;
         Ok(Some(ctrl_c()))
     }
 }
@@ -150,7 +156,7 @@ fn a_ctrl_c_exit_leaves_the_terminal_as_it_was_found() {
     let mut app = App::new();
     let (_sender, mut events) = tokio_mpsc::unbounded_channel();
     let mut keys = CtrlC {
-        pending: true,
+        pending: CTRL_C_PRESSES_TO_QUIT,
         during: || {},
     };
 
@@ -208,7 +214,7 @@ fn a_pty_is_raw_while_the_ui_runs_and_back_to_its_modes_afterwards() {
     let (_sender, mut events) = tokio_mpsc::unbounded_channel();
     let running = Arc::new(Mutex::new(None));
     let mut keys = CtrlC {
-        pending: true,
+        pending: CTRL_C_PRESSES_TO_QUIT,
         during: {
             let (probe, running) = (probe.try_clone().unwrap(), Arc::clone(&running));
             move || *running.lock().unwrap() = Some(tcgetattr(&probe).unwrap())

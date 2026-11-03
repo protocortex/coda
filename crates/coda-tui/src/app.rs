@@ -2,7 +2,7 @@
 
 //! UI state, key handling and rendering.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use coda_protocol::events::Event;
 use coda_protocol::methods::{SessionStatus, SessionSummary};
@@ -20,13 +20,16 @@ use crate::permission::{Overlay, PermissionPrompt};
 use crate::sessions::LinkCommand;
 use crate::status::Status;
 
-const TITLE: &str = " coda (Esc quits) ";
+const TITLE: &str = " coda (/quit, Ctrl+D or Ctrl+C twice quits) ";
+/// How long after an idle Ctrl+C a second one still quits.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
+const QUIT_CONFIRM_NOTICE: &str = "Press Ctrl+C again to quit.";
 /// Rows a page key moves the transcript.
 const PAGE_ROWS: usize = 5;
 /// Shown in the transcript when no provider is enabled in the config.
 pub const SETUP_GUIDANCE: &str = "No provider is enabled. Run `coda init`, enable one in config.toml, then run `coda daemon restart`.";
 /// Closes the connection line after the daemon went away.
-pub const LOST_DAEMON_HINT: &str = "Press Esc, then run `coda` to start it again.";
+pub const LOST_DAEMON_HINT: &str = "Type /quit, then run `coda` to start it again.";
 const NO_SESSIONS: &str = "the daemon has no sessions";
 const BACKEND_SWITCH_BUSY: &str = "wait for the running turn to finish before switching backend";
 
@@ -78,6 +81,7 @@ pub struct App {
     setup_shown: bool,
     user_commands: UserCommands,
     quit: bool,
+    idle_ctrl_c_at: Option<Instant>,
 }
 
 impl App {
@@ -94,6 +98,7 @@ impl App {
             setup_shown: false,
             user_commands: UserCommands::default(),
             quit: false,
+            idle_ctrl_c_at: None,
         }
     }
 
@@ -207,27 +212,38 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.handle_key_at(key, Instant::now());
+    }
+
+    fn handle_key_at(&mut self, key: KeyEvent, now: Instant) {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        let ctrl_c =
-            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl_c {
-            self.interrupt();
-        } else if self.overlay.is_active() {
-            if let Some(answer) = self.overlay.handle_key(key, Instant::now()) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
+            self.interrupt(now);
+            return;
+        }
+        self.idle_ctrl_c_at = None;
+        if self.overlay.is_active() {
+            if let Some(answer) = self.overlay.handle_key(key, now) {
                 self.send(LinkCommand::Respond(answer));
             }
+        } else if ctrl && key.code == KeyCode::Char('d') {
+            if self.input.text().is_empty() {
+                self.quit = true;
+            }
         } else if key.code == KeyCode::Esc {
-            self.quit = true;
+            self.input.clear();
         } else {
             self.handle_prompt_key(key);
         }
     }
 
-    /// Denies pending prompts and cancels the running turn; idle, quits. The
-    /// turn counts as over only when the daemon says so.
-    fn interrupt(&mut self) {
+    /// Denies pending prompts and cancels the running turn. Idle, the first
+    /// press asks for confirmation and a second one inside the window quits.
+    /// The turn counts as over only when the daemon says so.
+    fn interrupt(&mut self, now: Instant) {
         let denials = self.overlay.deny_all();
         let busy = self.turn_running || !denials.is_empty();
         for answer in denials {
@@ -236,8 +252,18 @@ impl App {
         if self.turn_running {
             self.send(LinkCommand::Cancel);
         }
-        if !busy {
+        if busy {
+            self.idle_ctrl_c_at = None;
+            return;
+        }
+        let confirmed = self
+            .idle_ctrl_c_at
+            .is_some_and(|first| now.duration_since(first) <= QUIT_CONFIRM_WINDOW);
+        if confirmed {
             self.quit = true;
+        } else {
+            self.idle_ctrl_c_at = Some(now);
+            self.chat.push_notice(QUIT_CONFIRM_NOTICE);
         }
     }
 
@@ -563,21 +589,132 @@ mod tests {
         assert!(app.should_quit());
     }
 
+    fn ctrl_d() -> KeyEvent {
+        key(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )
+    }
+
     #[test]
-    fn the_quit_keys_end_the_app() {
-        for (code, modifiers) in [
-            (KeyCode::Esc, KeyModifiers::NONE),
-            (KeyCode::Char('c'), KeyModifiers::CONTROL),
-        ] {
-            // Arrange
-            let mut app = App::new();
+    fn esc_never_quits() {
+        // Arrange
+        let mut app = App::new();
 
-            // Act
-            app.handle_key(key(code, modifiers, KeyEventKind::Press));
+        // Act
+        app.handle_key(press(KeyCode::Esc));
 
-            // Assert
-            assert!(app.should_quit(), "{code:?} {modifiers:?}");
-        }
+        // Assert
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn esc_clears_the_input() {
+        // Arrange
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+
+        // Act
+        app.handle_key(press(KeyCode::Esc));
+
+        // Assert
+        assert_eq!(app.input.text(), "");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn esc_closes_an_overlay_and_does_not_quit() {
+        // Arrange
+        let (mut app, mut commands) = armed();
+        app.handle_event(prompt("r-1"));
+
+        // Act
+        app.handle_key(press(KeyCode::Esc));
+
+        // Assert
+        assert!(!app.should_quit());
+        assert!(!app.overlay.is_active());
+        assert_eq!(sent(&mut commands).len(), 1);
+    }
+
+    #[test]
+    fn slash_quit_ends_the_app() {
+        // Arrange
+        let mut app = App::new();
+
+        // Act
+        type_line(&mut app, "/quit");
+
+        // Assert
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn ctrl_d_quits_only_on_an_empty_input() {
+        // Arrange
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('x')));
+
+        // Act
+        app.handle_key(ctrl_d());
+        let with_text = app.should_quit();
+        app.handle_key(press(KeyCode::Backspace));
+        app.handle_key(ctrl_d());
+
+        // Assert
+        assert!(!with_text);
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn a_double_ctrl_c_when_idle_quits() {
+        // Arrange
+        let mut app = App::new();
+        let start = Instant::now();
+
+        // Act
+        app.handle_key_at(ctrl_c(), start);
+        let after_first = app.should_quit();
+        app.handle_key_at(ctrl_c(), start + QUIT_CONFIRM_WINDOW);
+
+        // Assert
+        assert!(!after_first);
+        assert!(screen(&app).contains(QUIT_CONFIRM_NOTICE));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn a_second_ctrl_c_after_the_window_only_asks_again() {
+        // Arrange
+        let mut app = App::new();
+        let start = Instant::now();
+
+        // Act
+        app.handle_key_at(ctrl_c(), start);
+        app.handle_key_at(
+            ctrl_c(),
+            start + QUIT_CONFIRM_WINDOW + Duration::from_millis(1),
+        );
+
+        // Assert
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn another_key_between_two_ctrl_c_presses_resets_the_confirmation() {
+        // Arrange
+        let mut app = App::new();
+        let start = Instant::now();
+
+        // Act
+        app.handle_key_at(ctrl_c(), start);
+        app.handle_key_at(press(KeyCode::Char('x')), start);
+        app.handle_key_at(ctrl_c(), start);
+
+        // Assert
+        assert!(!app.should_quit());
     }
 
     #[test]
@@ -736,8 +873,11 @@ mod tests {
         let before_end = (app.should_quit(), sent(&mut commands));
         app.handle_event(turn_ended());
         app.handle_key(ctrl_c());
+        let after_first_idle = app.should_quit();
+        app.handle_key(ctrl_c());
 
         // Assert
+        assert!(!after_first_idle);
         assert_eq!(
             before_end,
             (false, vec![LinkCommand::Cancel, LinkCommand::Cancel])

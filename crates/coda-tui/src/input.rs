@@ -26,6 +26,10 @@ impl Input {
         &self.text
     }
 
+    pub fn clear(&mut self) {
+        self.text.clear();
+    }
+
     /// Returns the finished line when Enter submits a non-blank one.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
         if key.kind == KeyEventKind::Release {

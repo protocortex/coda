@@ -34,8 +34,8 @@ impl Script {
     fn quit_after_ticks(ticks: usize) -> Self {
         let mut polls: VecDeque<_> = std::iter::repeat_n(None, ticks).collect();
         polls.push_back(Some(KeyEvent {
-            code: KeyCode::Esc,
-            modifiers: KeyModifiers::NONE,
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }));
@@ -63,8 +63,8 @@ impl KeySource for QuitAfter {
         std::thread::sleep(Duration::from_millis(10));
         Ok(
             (Instant::now() >= self.0).then_some(UserInput::Key(KeyEvent {
-                code: KeyCode::Esc,
-                modifiers: KeyModifiers::NONE,
+                code: KeyCode::Char('d'),
+                modifiers: KeyModifiers::CONTROL,
                 kind: KeyEventKind::Press,
                 state: KeyEventState::NONE,
             })),
