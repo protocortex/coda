@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The chat view driven by an injected event stream and scripted keys.
 //! The events are synthetic, not recorded from a live backend.

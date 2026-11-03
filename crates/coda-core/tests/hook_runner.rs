@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The hook runner on its own: what a hook is given, what stops it, what it
 //! cannot see and what it leaves behind. Every hook is a small script in a

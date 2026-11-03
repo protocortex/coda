@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Self-hosting acceptance: runs `coda run` on a pinned task in a temporary
 //! copy of the repository, verifies the result and scrubs the transcript.

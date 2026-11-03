@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The behaviour every [`ModelProvider`] must show, as a suite any provider
 //! crate can run against its own implementation.

@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: AGPL-3.0-only
+-- SPDX-License-Identifier: Apache-2.0
 -- Schema version 7: close the turns that began before turns were ended.
 --
 -- Nothing set `turns.ended_at` before this version, so every old turn looks

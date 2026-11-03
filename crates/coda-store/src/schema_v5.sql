@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: AGPL-3.0-only
+-- SPDX-License-Identifier: Apache-2.0
 -- Schema version 5: bytes the token economy kept out of the context, per session.
 --
 -- Content-free like `usage`: integer sizes and a timestamp only.

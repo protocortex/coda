@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Rebuilds a provider-neutral [`Conversation`] from the events a session
 //! stored, so a new loop continues where the last one stopped.

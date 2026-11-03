@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: AGPL-3.0-only
+-- SPDX-License-Identifier: Apache-2.0
 -- Schema version 10: a permission request and its decision name the sub-agent
 -- that asked. Null is the session's own call, and what rows from before this
 -- step are read as.

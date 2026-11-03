@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `session.set_model` request: switch an idle model-API session to a
 //! model alias defined in the configuration.

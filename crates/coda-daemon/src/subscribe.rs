@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-session event fan-out: stored events are replayed from a cursor and then
 //! followed live, with no gap and no duplicate between the two.

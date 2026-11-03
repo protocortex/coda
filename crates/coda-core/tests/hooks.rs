@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Hooks in the turn loop: what they can stop and what the model and the user
 //! are told. The runner itself is tested in `hook_runner.rs`.

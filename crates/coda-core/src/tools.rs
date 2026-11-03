@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The base tools every model-API session offers: read, grep, edit, bash,
 //! retrieve and the code index tools, with the schemas the model sees.

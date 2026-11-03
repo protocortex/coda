@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! `coda doctor`: reports the health of the daemon's files, the database, the
 //! backends and the config, and with `--repair` clears what a dead daemon left.

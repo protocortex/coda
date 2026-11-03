@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Read-only inspection of the database file, for `coda doctor`. Unlike
 //! [`crate::Store::open`] it never creates, migrates or switches the journal

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Skills in a running session: what the model is offered follows the user's
 //! trust decision and the files at every send, not only at the first one.

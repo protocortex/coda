@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Hooks in a model session: the environment they get and a blocking hook that
 //! stops a tool call.

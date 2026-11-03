@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Wires sessions to the permission broker: one broker per session, and a gate
 //! that announces its prompts to subscribers.

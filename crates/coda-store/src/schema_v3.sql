@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: AGPL-3.0-only
+-- SPDX-License-Identifier: Apache-2.0
 -- Schema version 3: a grant is keyed by repo, tool, cwd and exact pattern.
 
 -- The grants API shipped in this same release, so the table holds no production data to keep.

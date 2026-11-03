@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Model-API sessions: a `coda_core` turn loop driven by a configured
 //! provider, with its events stored through the hub and its permission

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The openai-compat provider against a local mock server bound to port 0.
 //! All streams are synthetic: hand-written, never recorded from a live server.

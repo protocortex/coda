@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use coda_protocol::events::EVENT_NOTIFICATION;
 use coda_protocol::jsonrpc::Notification;

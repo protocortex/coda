@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The Codex app-server adapter driven against the scripted `fake-codex` WebSocket mode.
 //! The wire shapes are SYNTHETIC: written from the documented method names, not recorded.

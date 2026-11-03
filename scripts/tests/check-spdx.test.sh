@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 set -u
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/check-spdx.sh"
-HEADER="SPDX-License-Identifier: AGPL-3.0-only"
+HEADER="SPDX-License-Identifier: Apache-2.0"
+PREVIOUS_LICENSE="A""GPL-3.0-only"
 WORK_ROOT="$(mktemp -d)"
 failures=0
 
@@ -67,6 +68,16 @@ output="$(cd "$repo" && bash "$SCRIPT" 2>&1)"
 status=$?
 # Assert
 [ "$status" -eq 0 ] || fail "untracked file: expected exit 0, got $status"
+
+# Scenario: the previous license header no longer counts.
+repo="$(new_repo)"
+echo "// SPDX-License-Identifier: ${PREVIOUS_LICENSE}" >"$repo/old.rs"
+git -C "$repo" add .
+# Act
+output="$(cd "$repo" && bash "$SCRIPT" 2>&1)"
+status=$?
+# Assert
+[ "$status" -eq 1 ] || fail "old header: expected exit 1, got $status"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed"

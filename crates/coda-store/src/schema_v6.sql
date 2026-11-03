@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: AGPL-3.0-only
+-- SPDX-License-Identifier: Apache-2.0
 -- Schema version 6: incremental indexing state and fuller symbol spans.
 --
 -- `index_files` remembers the content hash and time each file was indexed, so

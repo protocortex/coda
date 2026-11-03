@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `skill` tool: skills are offered by name and description, and a body
 //! enters the conversation only when the model asks for it.

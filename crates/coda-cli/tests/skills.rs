@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Skills through the real daemon: offered by name and description, a body
 //! only when the model asks for it. The faux provider logs every request.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! A session's earlier turns as plain text, for an agent backend that keeps the
 //! conversation itself and has to be told it again after a restart.

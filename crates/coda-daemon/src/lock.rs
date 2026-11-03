@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Single-instance guard: an exclusive advisory lock on a file held for the daemon lifetime.
 

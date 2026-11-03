@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `bash` tool: one shell command with a timeout, an output cap and a
 //! cleared environment.

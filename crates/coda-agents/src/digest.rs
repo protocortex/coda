@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! A digest of the project's definition files, recorded with the trust
 //! decision so a later change to any of them withdraws the trust.
