@@ -148,6 +148,8 @@ pub struct ClaudeSession {
     backend_session_id: Option<String>,
     /// The window a rejected rate-limit report named, until the turn's result.
     limit_hit: Option<(UsageWindowKind, Option<u64>)>,
+    /// Carries the backend id to watchers the moment it is reported.
+    backend_id_tx: watch::Sender<Option<String>>,
     closed: bool,
 }
 
@@ -197,6 +199,7 @@ impl ClaudeSession {
             cwd: spec.cwd,
             backend_session_id: None,
             limit_hit: None,
+            backend_id_tx: watch::channel(None).0,
             closed: false,
         })
     }
@@ -217,6 +220,12 @@ impl ClaudeSession {
     #[must_use]
     pub fn session_id_from_backend(&self) -> Option<&str> {
         self.backend_session_id.as_deref()
+    }
+
+    /// Wakes when the backend reports its conversation id, even while a turn runs.
+    #[must_use]
+    pub fn backend_id_updates(&self) -> watch::Receiver<Option<String>> {
+        self.backend_id_tx.subscribe()
     }
 
     /// What the parser skipped so far; never carries message content.
@@ -326,7 +335,10 @@ impl ClaudeSession {
         emit: &mut impl FnMut(Event),
     ) -> Result<Option<TurnOutcome>, AdapterError> {
         match message {
-            Message::Init { session_id } => self.backend_session_id = Some(session_id),
+            Message::Init { session_id } => {
+                self.backend_id_tx.send_replace(Some(session_id.clone()));
+                self.backend_session_id = Some(session_id);
+            }
             Message::TextDelta(text) => emit(Event::StreamDelta {
                 session_id: self.session_id.clone(),
                 turn_id: turn_id.clone(),

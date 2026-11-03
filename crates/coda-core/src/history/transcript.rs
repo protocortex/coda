@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 
 use coda_protocol::events::STREAM_DELTA_KIND;
-use coda_protocol::types::SessionId;
+use coda_protocol::types::{SessionId, TurnId};
 use coda_store::{Store, StoreError, StoredEvent};
 use serde::Deserialize;
 use serde_json::json;
@@ -41,6 +41,7 @@ pub struct Transcript {
     bytes: usize,
     budget: usize,
     trimmed: bool,
+    skipped_turn: Option<TurnId>,
 }
 
 impl Transcript {
@@ -52,7 +53,15 @@ impl Transcript {
             bytes: 0,
             budget,
             trimmed: false,
+            skipped_turn: None,
         }
+    }
+
+    /// Leaves out the events of `turn`, such as the one the transcript is built for.
+    #[must_use]
+    pub fn without_turn(mut self, turn: TurnId) -> Self {
+        self.skipped_turn = Some(turn);
+        self
     }
 
     /// Applies the next page of `session`'s events after `after` and returns the
@@ -76,6 +85,9 @@ impl Transcript {
 
     /// Applies one event; kinds that are not part of the conversation are skipped.
     pub fn apply(&mut self, event: &StoredEvent) {
+        if self.skipped_turn.as_ref() == Some(&event.turn) {
+            return;
+        }
         let speaker = match event.kind.as_str() {
             USER_MESSAGE_KIND => Speaker::User,
             STREAM_DELTA_KIND => Speaker::Assistant,
@@ -140,7 +152,6 @@ impl Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coda_protocol::types::TurnId;
 
     fn said(seq: u64, kind: &str, text: &str) -> StoredEvent {
         StoredEvent {
@@ -170,6 +181,24 @@ mod tests {
 
         // Assert
         assert_eq!(text, None);
+    }
+
+    #[test]
+    fn the_skipped_turn_is_left_out() {
+        // Arrange
+        let mut transcript = Transcript::new(100).without_turn(TurnId::new("1"));
+        let mut later = said(2, USER_MESSAGE_KIND, "now");
+        later.turn = TurnId::new("2");
+
+        // Act
+        transcript.apply(&said(1, USER_MESSAGE_KIND, "before"));
+        transcript.apply(&later);
+
+        // Assert
+        assert_eq!(
+            transcript.render(),
+            Some(r#"{"role":"user","text":"now"}"#.to_owned())
+        );
     }
 
     #[test]

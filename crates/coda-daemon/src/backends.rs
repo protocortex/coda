@@ -328,6 +328,15 @@ impl AgentSession {
         }
     }
 
+    /// Updates of the backend id while a turn runs. Only Claude Code reports its id early.
+    #[must_use]
+    pub fn backend_id_updates(&self) -> Option<tokio::sync::watch::Receiver<Option<String>>> {
+        match self {
+            Self::Claude(session) => Some(session.backend_id_updates()),
+            Self::Codex(_) => None,
+        }
+    }
+
     /// Runs one prompt to the end of the turn.
     ///
     /// # Errors

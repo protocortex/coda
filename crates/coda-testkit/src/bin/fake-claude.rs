@@ -35,7 +35,8 @@
 //! `flood` makes it fill stdout before it reads any input, and `start_gate`
 //! holds the start-up, before any output, until a file exists at that path, and
 //! exits non-zero if none appears within two minutes. `reject_resume` makes it exit
-//! at once, before any output, when it is started with `--resume`.
+//! at once, before any output, when it is started with `--resume`. `prompt_path`
+//! appends every user line it reads to that file.
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -182,6 +183,13 @@ fn run_turn(
     out: &mut impl Write,
     control: &Control,
 ) -> io::Result<()> {
+    if let Some(path) = control.path("prompt_path") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(file, "{user_line}")?;
+    }
     if user_line.contains(GRANDCHILD_TRIGGER) || user_line.contains(ORPHAN_TRIGGER) {
         start_grandchild(control)?;
     }
