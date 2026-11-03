@@ -62,6 +62,7 @@ fn relaxed() -> Timing {
 }
 
 mod restarts;
+mod resume;
 
 struct Rig {
     sleeper: Arc<RecordingSleeper>,

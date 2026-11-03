@@ -81,7 +81,7 @@ fn open_records_the_schema_version() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn newer_schema_version_is_refused() {
         err,
         StoreError::SchemaTooNew {
             found: 99,
-            supported: 10
+            supported: 11
         }
     ));
 }
@@ -275,6 +275,7 @@ fn v3_snapshot_migrates_forward_keeping_unresolved_pending_requests() {
         [
             "events_by_turn_and_time",
             "savings_by_session",
+            "backend_threads",
             "index_files",
             "meta",
             "pending_permissions",

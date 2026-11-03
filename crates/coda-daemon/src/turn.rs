@@ -425,7 +425,7 @@ impl Turns {
     async fn start_child(&self, record: &SessionRecord) -> Result<AgentSession, StartError> {
         let session_id = record.id.clone();
         let cwd = PathBuf::from(&record.cwd);
-        let resume = self.resume_id(&session_id);
+        let resume = self.resume_id(record).await;
         let parent_env = self.config.parent_env.clone();
         let pidfile_dir = self.config.pidfile_dir.clone();
         if let (BackendKind::ClaudeCode, Some(binary)) = (record.backend, &self.config.binary) {
@@ -641,8 +641,72 @@ impl Turns {
         })
     }
 
-    fn resume_id(&self, session: &SessionId) -> Option<String> {
-        self.backend_ids().get(session).cloned()
+    /// The id to resume: the one this daemon saw, else the one stored before it restarted.
+    async fn resume_id(&self, record: &SessionRecord) -> Option<String> {
+        if let Some(id) = self.backend_ids().get(&record.id).cloned() {
+            return Some(id);
+        }
+        if record.backend != BackendKind::ClaudeCode {
+            return None;
+        }
+        let session = record.id.clone();
+        let stored = self
+            .hub
+            .with_store(move |store| store.active_backend_ref(&session, BackendKind::ClaudeCode))
+            .await;
+        stored.unwrap_or_else(|error| {
+            warn!(session = %record.id, %error, "could not read the stored backend id");
+            None
+        })
+    }
+
+    /// Keeps the id the backend reported, in memory and, for Claude, in the store.
+    pub(super) async fn remember_backend_id(
+        &self,
+        record: &SessionRecord,
+        turn: &TurnId,
+        backend_id: &str,
+    ) {
+        self.backend_ids()
+            .insert(record.id.clone(), backend_id.to_owned());
+        if record.backend != BackendKind::ClaudeCode {
+            return;
+        }
+        let (session, turn, backend_id) = (record.id.clone(), turn.clone(), backend_id.to_owned());
+        let stored = self
+            .hub
+            .with_store_mut(move |store| {
+                store.record_backend_thread(&session, BackendKind::ClaudeCode, &backend_id, &turn)
+            })
+            .await;
+        if let Err(error) = stored {
+            warn!(session = %record.id, %error, "could not store the backend id");
+        }
+    }
+
+    /// Drops the id a start with `--resume` just failed on and marks its stored
+    /// row `error`. Returns whether there was an id to drop.
+    pub(super) async fn forget_backend_id(&self, record: &SessionRecord) -> bool {
+        let known = self.backend_ids().remove(&record.id).is_some();
+        if record.backend != BackendKind::ClaudeCode {
+            return known;
+        }
+        let session = record.id.clone();
+        let stored = self
+            .hub
+            .with_store_mut(move |store| {
+                let had = store
+                    .active_backend_ref(&session, BackendKind::ClaudeCode)?
+                    .is_some();
+                store.fail_backend_thread(&session, BackendKind::ClaudeCode)?;
+                Ok(had)
+            })
+            .await;
+        known
+            || stored.unwrap_or_else(|error| {
+                warn!(session = %record.id, %error, "could not mark the backend id as failed");
+                false
+            })
     }
 
     fn backend_ids(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, String>> {
@@ -755,8 +819,7 @@ impl Turns {
             info!(session = %session, turn = %turn, step = "cleanup", "stopping the backend");
             stop(&mut child, &session).await;
             if let Some(backend_id) = child.session_id_from_backend() {
-                self.backend_ids()
-                    .insert(session.clone(), backend_id.to_owned());
+                self.remember_backend_id(&record, &turn, backend_id).await;
             }
         }
         // Dropping the emitter closes the channel, which ends the publisher.

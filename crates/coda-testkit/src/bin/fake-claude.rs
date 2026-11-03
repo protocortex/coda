@@ -31,7 +31,8 @@
 //! `sleep` it started, one per line, and
 //! `flood` makes it fill stdout before it reads any input, and `start_gate`
 //! holds the start-up, before any output, until a file exists at that path, and
-//! exits non-zero if none appears within two minutes.
+//! exits non-zero if none appears within two minutes. `reject_resume` makes it exit
+//! at once, before any output, when it is started with `--resume`.
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -57,6 +58,7 @@ const ORPHAN_TRIGGER: &str = "orphan";
 const CREDENTIALS_TRIGGER: &str = "open-credentials";
 const ECHO_TRIGGER: &str = "echo-text";
 const PARK_INTERVAL: Duration = Duration::from_secs(3600);
+const RESUME_FLAG: &str = "--resume";
 const CRASH_TRIGGER: &str = "crash";
 const FLAKY_TRIGGER: &str = "flaky";
 const TOOL_DIE_TRIGGER: &str = "tooldie";
@@ -104,6 +106,10 @@ impl Control {
 
     fn flood(&self) -> bool {
         self.0["flood"] == true
+    }
+
+    fn rejects_resume(&self) -> bool {
+        self.0["reject_resume"] == true
     }
 }
 
@@ -312,6 +318,11 @@ fn main() -> io::Result<()> {
     let control = Control::load();
     if let Some(path) = control.path("report_path") {
         write_report(path)?;
+    }
+    if control.rejects_resume() && std::env::args().any(|arg| arg == RESUME_FLAG) {
+        let mut prompt = String::new();
+        io::stdin().lock().read_line(&mut prompt)?;
+        std::process::exit(CRASH_EXIT_CODE);
     }
     if let Some(gate) = control.path("start_gate") {
         let deadline = Instant::now() + GATE_LIMIT;
