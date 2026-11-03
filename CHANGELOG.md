@@ -32,6 +32,7 @@ All notable changes to Coda are recorded here. The format follows
 
 ### Fixed
 
+- A backend turn no longer loses events when it emits faster than the store writes. The event queue used to drop events once 1,024 were waiting, which could remove a result or a permission request from the log. Nothing is dropped now, and text streamed within 50 ms is stored as one chunk.
 - A Claude Code session keeps its conversation across a daemon restart. The backend's own session id is stored in a new `backend_threads` table, so the first send after a restart resumes it instead of starting with no context. An id the backend refuses to resume is marked `error` and the session starts fresh. Codex thread ids are not stored yet.
 - A skill body between 16 and 32 KiB reaches the model whole. It was shortened like any long tool result.
 - A `task` call for an agent whose definition file was skipped is refused with the problem. It used to run the built-in or user agent of that name without a word.

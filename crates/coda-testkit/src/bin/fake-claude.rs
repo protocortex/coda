@@ -12,7 +12,8 @@
 //! starts a `sleep` process, `orphan` also closes stdout so the reader sees
 //! end of file while the process lives on, and `open-credentials` opens
 //! `$HOME/.claude/.credentials.json` for writing and writes one byte, and
-//! `echo-text` sends the control file's `echo_text` back as a text delta.
+//! `echo-text` sends the control file's `echo_text` back as a text delta, and `delta_burst`
+//! makes every turn send that many one-character text deltas before it goes on.
 //! `tooldie` exits right after the tool call is answered, and `vanish` deletes
 //! its own binary before crashing like `crash`, so it cannot be started again.
 //! `tool-slow` runs a tool that needs no permission: it announces a `tool_use`,
@@ -59,6 +60,7 @@ const ORPHAN_TRIGGER: &str = "orphan";
 const CREDENTIALS_TRIGGER: &str = "open-credentials";
 const ECHO_TRIGGER: &str = "echo-text";
 const PARK_INTERVAL: Duration = Duration::from_secs(3600);
+const BURST_CHAR: &str = "x";
 const RESUME_FLAG: &str = "--resume";
 const CRASH_TRIGGER: &str = "crash";
 const FLAKY_TRIGGER: &str = "flaky";
@@ -108,6 +110,10 @@ impl Control {
 
     fn flood(&self) -> bool {
         self.0["flood"] == true
+    }
+
+    fn delta_burst(&self) -> u64 {
+        self.0["delta_burst"].as_u64().unwrap_or(0)
     }
 
     fn rejects_resume(&self) -> bool {
@@ -189,6 +195,13 @@ fn run_turn(
         &serde_json::json!({"type":"stream_event","event":{"type":"content_block_delta",
             "delta":{"type":"text_delta","text":"working"}}}),
     )?;
+    for _ in 0..control.delta_burst() {
+        emit(
+            out,
+            &serde_json::json!({"type":"stream_event","event":{"type":"content_block_delta",
+                "delta":{"type":"text_delta","text":BURST_CHAR}}}),
+        )?;
+    }
     if user_line.contains(ECHO_TRIGGER)
         && let Some(text) = control.text("echo_text")
     {
