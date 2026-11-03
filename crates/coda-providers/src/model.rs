@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The streaming model-provider trait and the clock and sleep seams that
 //! idle-timeout and retry logic share.

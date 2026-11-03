@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 # Accepts or rejects a finished self-hosting attempt: the diff touches
 # crates/coda-cli/src/main.rs and adds a test, `cargo test` passes and
 # `coda version --json` matches the crate metadata. The checks live in

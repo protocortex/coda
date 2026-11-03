@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: AGPL-3.0-only
+-- SPDX-License-Identifier: Apache-2.0
 -- Schema version 2: session details and resolved permission requests.
 
 ALTER TABLE sessions ADD COLUMN backend TEXT NOT NULL DEFAULT 'faux';

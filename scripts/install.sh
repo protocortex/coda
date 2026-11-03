@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 # Installs a coda release archive after checking it against the release SHA256SUMS.
 # It is a script only because nothing can run before coda is installed.
 set -eu

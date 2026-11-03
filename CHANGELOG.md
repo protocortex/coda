@@ -23,6 +23,10 @@ All notable changes to Coda are recorded here. The format follows
 - `coda doctor` warns when a `[routing]` alias uses another provider than the default session provider, since a `task` call in a session on that provider cannot use it.
 - Provider keys `max_output_tokens` (for `anthropic` and `openai_compat`), `max_tokens_field` (`"max_tokens"` or `"max_completion_tokens"`) and `stream_usage` (for `openai_compat`), so a server that rejects `max_tokens` or `stream_options`, or a small local model that cannot fit an 8192-token reply, can be used. The defaults keep the request as it was. See [docs/config.md](docs/config.md).
 
+### Changed
+
+- Coda is now licensed under Apache-2.0. It was AGPL-3.0-only. Every source header, the workspace license field, `NOTICE`, `deny.toml` and the SPDX check use the new identifier.
+
 ### Fixed
 
 - A skill body between 16 and 32 KiB reaches the model whole. It was shortened like any long tool result.

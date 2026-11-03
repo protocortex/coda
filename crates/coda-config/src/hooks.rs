@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `[[hooks]]` table: commands coda runs at session start and around tool
 //! calls. Hooks come from the user's `config.toml` only. No definition file and

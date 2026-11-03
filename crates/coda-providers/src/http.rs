@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The HTTP transport the streaming providers share: the client, base URL
 //! rules, key handling, idle detection and transport error mapping.

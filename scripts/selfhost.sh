@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 # Live self-hosting acceptance: up to 3 attempts of the pinned task through
 # `coda run` against the Anthropic API (default) or, with
 # `--backend claude-code`, your installed Claude Code login with no API key.

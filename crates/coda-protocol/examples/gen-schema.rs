@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Rewrites `schema/coda-protocol.schema.json` from the Rust types.
 //! Run with `cargo run -p coda-protocol --example gen-schema`.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Turn loop scenarios that exercise the budget, a blocked tool process and
 //! provider failures through the public API.

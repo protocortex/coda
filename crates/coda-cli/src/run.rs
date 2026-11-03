@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! `coda run`: sends one prompt to a new session, follows it to the end and
 //! exits with a code that names why the turn stopped.

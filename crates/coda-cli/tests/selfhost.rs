@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The self-hosting acceptance regression: the scripted faux provider makes
 //! the pinned change through the real `coda run` and daemon in a temporary

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Registration of the delegated agent backends with the daemon, and how their
 //! children are started with a pidfile the startup reaper can find.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Compaction scenarios: a conversation that outgrows the model window is
 //! summarized by the same provider, then the request is retried once.

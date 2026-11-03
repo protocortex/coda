@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Codex backend selection and fallback, driven against the scripted `fake-codex` in both modes.
 //! The wire shapes are SYNTHETIC: written from the documented names, not recorded.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The small slice of RFC 6455 a client needs to talk to a local Codex app-server.
 //!

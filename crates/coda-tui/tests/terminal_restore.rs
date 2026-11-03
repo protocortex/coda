@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The terminal is restored after a full UI run, checked on an in-memory pipe
 //! and on a real pseudo terminal.

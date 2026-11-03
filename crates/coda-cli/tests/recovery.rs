@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! What a restarted `coda daemon` recovers after the previous one died with
 //! SIGKILL in the middle of a turn that was waiting for a permission answer.

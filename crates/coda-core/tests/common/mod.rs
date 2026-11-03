@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Helpers for the hook tests: small scripts in a temporary directory, hook
 //! entries, log capture and bounded polling.

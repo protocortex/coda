@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! How a session reads the definitions it offers: off the store, once per
 //! send, quietly, and with the tokens it spent kept across a rebuild.

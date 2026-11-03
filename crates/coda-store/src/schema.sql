@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: AGPL-3.0-only
+-- SPDX-License-Identifier: Apache-2.0
 -- Schema version 1.
 --
 -- Privacy rule: `usage` and `event_log` are content-free. They hold integer

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The permission broker: applies the shared policy with store-backed grants,
 //! records every decision, and waits for a client on a prompt verdict.

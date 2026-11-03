@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The live acceptance run: up to a few attempts through the real `coda run`,
 //! each in a fresh copy of the repository.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! `coda doctor`: what each check reports for a healthy and a broken home, and
 //! what `--repair` removes and, above all, what it leaves alone.

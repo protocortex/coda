@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 # Fails listing every `coda daemon` of this checkout that is still running. Run it
 # after the tests: a test that autostarts a daemon must stop it again.
 # A daemon that was just told to stop gets LEAK_GRACE_SECONDS to exit.

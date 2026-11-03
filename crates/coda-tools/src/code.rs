@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The code tools: `code_search`, `code_symbol`, `code_outline` and
 //! `code_read_range`, answered from the workspace symbol index.

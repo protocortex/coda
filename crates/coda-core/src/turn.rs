@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The turn loop: stream a model reply, run its tool calls behind the
 //! permission gate, feed the results back, and stop for a named reason.

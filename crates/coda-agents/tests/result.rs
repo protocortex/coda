@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! What a child hands its parent: a typed result, with the agent's own words
 //! wrapped as data and capped in size.

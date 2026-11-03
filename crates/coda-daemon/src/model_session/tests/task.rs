@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `task` tool end to end: a model-API session dispatches a named agent as
 //! a child conversation, against the faux provider. One script feeds both

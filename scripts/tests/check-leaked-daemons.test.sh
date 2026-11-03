@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 set -u
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/check-leaked-daemons.sh"

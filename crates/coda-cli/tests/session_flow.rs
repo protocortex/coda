@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The real `coda daemon` process driven through the client: create a session,
 //! send a message, answer the permission prompt and read the result.

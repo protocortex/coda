@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Cleanup of what a daemon that died without cleaning up leaves in its run
 //! directory, for `coda doctor --repair`.

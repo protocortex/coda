@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: AGPL-3.0-only
+-- SPDX-License-Identifier: Apache-2.0
 -- Snapshot of schema version 2, used to test forward migration.
 
 -- Schema version 1.

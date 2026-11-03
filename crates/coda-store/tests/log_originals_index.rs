@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use coda_protocol::readers::{IndexReader, OriginalsReader, ReaderError, SymbolLocation};
 use coda_protocol::types::{BackendKind, Mode, OriginalId, SessionId};

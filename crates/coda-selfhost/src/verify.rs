@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The acceptance checks on a finished attempt: the diff, the tests and the
 //! printed version.

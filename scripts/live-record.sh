@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 # Records live transcripts from the installed `claude` and `codex` through coda's
 # adapters, scrubs them and writes them under crates/coda-testkit/fixtures/.
 # Spends subscription quota (about eight short calls), so it needs

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The Anthropic wire layer: SSE framing, event mapping, request building,
 //! status classification and retry timing. All fixtures are synthetic.

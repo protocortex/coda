@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The README quickstart and `docs/config.md` stay true: tagged code blocks run
 //! against the real `coda` binary and the faux provider, the account-risk notice

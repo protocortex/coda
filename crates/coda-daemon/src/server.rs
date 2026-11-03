@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Unix socket server: owns the socket and lock files, vets each peer, and runs
 //! one task per connection that frames bytes and hands payloads to the dispatcher.

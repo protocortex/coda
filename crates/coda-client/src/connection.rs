@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Connection state shared with the reader and writer tasks: in-flight requests
 //! and subscriptions, including de-duplication of replayed notifications.

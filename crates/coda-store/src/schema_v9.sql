@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: AGPL-3.0-only
+-- SPDX-License-Identifier: Apache-2.0
 -- Schema version 9: repositories whose project agent definitions the user
 -- trusts, with a digest of the definition files that were trusted.
 

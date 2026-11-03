@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! The seam between the turn loop and whatever runs a sub-agent for the
 //! `task` tool.
