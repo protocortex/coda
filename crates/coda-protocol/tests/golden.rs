@@ -133,6 +133,8 @@ golden_tests! {
     event_turn_interrupted: "event.turn_interrupted" => Event,
     event_turn_interrupted_minimal: "event.turn_interrupted.minimal" => Event,
     event_compaction: "event.compaction" => Event,
+    event_rate_limit: "event.rate_limit" => Event,
+    event_rate_limit_minimal: "event.rate_limit.minimal" => Event,
 }
 
 #[test]

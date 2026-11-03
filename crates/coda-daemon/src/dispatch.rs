@@ -268,7 +268,10 @@ fn initialize(params: Option<Value>) -> HandlerFuture {
         to_value(&InitializeResult {
             protocol_version: PROTOCOL_VERSION,
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
-            capabilities: Capabilities::default(),
+            capabilities: Capabilities {
+                usage_details: true,
+                rate_limit_events: true,
+            },
         })
     })
 }
@@ -329,6 +332,8 @@ mod tests {
         let result = result_of(response);
         assert_eq!(result["protocol_version"], json!(1));
         assert!(result["daemon_version"].is_string());
+        assert_eq!(result["capabilities"]["usage_details"], json!(true));
+        assert_eq!(result["capabilities"]["rate_limit_events"], json!(true));
     }
 
     #[tokio::test]

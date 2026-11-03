@@ -328,6 +328,15 @@ impl ClaudeSession {
                 text,
             }),
             Message::Assistant { .. } => {}
+            Message::Usage(usage) => emit(Event::Usage {
+                session_id: self.session_id.clone(),
+                turn_id: turn_id.clone(),
+                usage,
+            }),
+            Message::RateLimit(limit) => emit(Event::RateLimit {
+                session_id: self.session_id.clone(),
+                limit,
+            }),
             Message::ToolStarted { id } => gate.tool_started(&id),
             Message::ToolFinished { id } => gate.tool_finished(&id),
             Message::Result { is_error } => {

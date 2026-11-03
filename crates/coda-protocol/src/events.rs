@@ -34,6 +34,8 @@ pub const BACKEND_CRASHED_KIND: &str = "backend_crashed";
 pub const TURN_INTERRUPTED_KIND: &str = "turn_interrupted";
 /// Stored event kind of older messages replaced by a summary.
 pub const COMPACTION_KIND: &str = "compaction";
+/// Stored event kind of a provider's rate-limit report.
+pub const RATE_LIMIT_KIND: &str = "rate_limit";
 /// Stored event kind of the reason a blocking `session_start` hook stopped a turn.
 /// The body is a [`HookBlockedBody`]; clients show it to the user and never to the model.
 pub const HOOK_BLOCKED_KIND: &str = "hook_blocked";
@@ -43,6 +45,49 @@ pub const HOOK_BLOCKED_KIND: &str = "hook_blocked";
 pub struct HookBlockedBody {
     /// Which hook failed and why.
     pub reason: String,
+}
+
+/// One rate-limit window of a provider plan, such as `five_hour` or `seven_day`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RateLimitWindow {
+    /// The provider's name for the window.
+    pub name: String,
+    /// Share of the window used, in basis points: 900 is 9%.
+    pub utilization_bps: u32,
+    /// When the window resets, in seconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<u64>,
+}
+
+/// What a provider reported about its rate limits.
+///
+/// The status and window names are the provider's own words, since the set can
+/// grow without a protocol change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RateLimit {
+    /// The provider's status, such as `allowed`.
+    pub status: String,
+    /// The window the status is about, when the provider names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_type: Option<String>,
+    /// When that window resets, in seconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<u64>,
+    /// Every window the provider reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<RateLimitWindow>,
+    /// Whether the plan's usage is being billed as overage.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_using_overage: bool,
+    /// The provider's overage status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_status: Option<String>,
+    /// When the overage allowance resets, in seconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_resets_at: Option<u64>,
+    /// Why overage is unavailable, when the provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_disabled_reason: Option<String>,
 }
 
 /// Why a turn was cut short.
@@ -196,6 +241,13 @@ pub enum Event {
         /// How many recent messages were kept as they were.
         kept_messages: u32,
     },
+    /// The provider reported its rate-limit state.
+    RateLimit {
+        /// Affected session.
+        session_id: SessionId,
+        /// What the provider reported.
+        limit: RateLimit,
+    },
     /// An event of a type this peer does not know, sent by a newer one.
     #[serde(other)]
     Unknown,
@@ -222,6 +274,7 @@ mod tests {
             BACKEND_CRASHED_KIND,
             TURN_INTERRUPTED_KIND,
             COMPACTION_KIND,
+            RATE_LIMIT_KIND,
         ];
 
         for kind in kinds {
@@ -231,6 +284,7 @@ mod tests {
                 "turn_id": "t", "is_error": false, "reason": "x", "text": "",
                 "usage": {"input_tokens": 0, "output_tokens": 0},
                 "summary": "1", "replaced_messages": 0, "kept_messages": 0,
+                "limit": {"status": "allowed"},
             });
             let event: Event = serde_json::from_value(fields).unwrap();
 

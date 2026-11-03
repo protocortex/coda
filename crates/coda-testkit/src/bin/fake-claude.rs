@@ -19,6 +19,7 @@
 //! stays silent for `TOOL_SLOW`, then reports the `tool_result` and finishes,
 //! and `tool-hang` announces one and never reports it. `tool-flaky` announces a tool and
 //! crashes the first time (the control file's `crash_marker` remembers it), then stalls.
+//! `report-usage` reports a rate limit, then finishes with token usage on the result.
 //! `stream-long` streams `input_json_delta` and `thinking_delta` lines for longer than
 //! the idle limits the tests use, then finishes.
 //! `flaky` crashes like `crash` the first time and works afterwards, using
@@ -69,6 +70,7 @@ const TOOL_SLOW_TRIGGER: &str = "tool-slow";
 const TOOL_HANG_TRIGGER: &str = "tool-hang";
 const TOOL_FLAKY_TRIGGER: &str = "tool-flaky";
 const STREAM_LONG_TRIGGER: &str = "stream-long";
+const REPORT_USAGE_TRIGGER: &str = "report-usage";
 const STREAM_STEP: Duration = Duration::from_millis(100);
 const STREAM_STEPS: u32 = 15;
 const TOOL_USE_ID: &str = "toolu-1";
@@ -202,6 +204,9 @@ fn run_turn(
     if user_line.contains(STREAM_LONG_TRIGGER) {
         return stream_long(out);
     }
+    if user_line.contains(REPORT_USAGE_TRIGGER) {
+        return report_usage(out);
+    }
     if user_line.contains(VANISH_TRIGGER) {
         std::fs::remove_file(std::env::current_exe()?)?;
         std::process::exit(CRASH_EXIT_CODE);
@@ -238,6 +243,22 @@ fn run_turn(
         &serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
     )?;
     emit(out, &serde_json::json!({"type":"result","is_error":false}))
+}
+
+/// Sends a rate-limit report and a result with usage, in the shapes claude 2.1.296 wrote.
+fn report_usage(out: &mut impl Write) -> io::Result<()> {
+    emit(
+        out,
+        &serde_json::json!({"type":"rate_limit_event","rate_limit_info":{
+            "status":"allowed","rateLimitType":"seven_day","resetsAt":1_794_193_200_u64,
+            "unifiedWindows":{"seven_day":{"utilization":0.09,"resetsAt":1_794_193_200_u64}}}}),
+    )?;
+    emit(
+        out,
+        &serde_json::json!({"type":"result","is_error":false,"usage":{
+            "input_tokens":3,"output_tokens":11,
+            "cache_read_input_tokens":7,"cache_creation_input_tokens":5}}),
+    )
 }
 
 /// Announces a tool and crashes once; after the restart nothing is in flight and it stalls.

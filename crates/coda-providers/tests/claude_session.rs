@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use coda_protocol::events::{Event, InterruptCause};
-use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
+use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
 use coda_providers::claude_code::Diagnostic;
 use coda_providers::claude_session::{
     AdapterError, CancelHandle, ClaudeSession, SessionSpec, TurnOutcome,
@@ -164,6 +164,38 @@ async fn an_allowed_request_is_approved_and_the_turn_completes() {
     assert_eq!(seen[0].command.as_deref(), Some("ls"));
     assert_eq!(seen[0].cwd, fixture.cwd.path());
     assert_eq!(session.session_id_from_backend(), Some("fake-session-1"));
+}
+
+#[tokio::test]
+async fn usage_and_rate_limit_reports_become_events() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    let (outcome, events) = turn(&mut session, &gate, "report-usage").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Completed { is_error: false });
+    let usage = Event::Usage {
+        session_id: SessionId::new("s-1"),
+        turn_id: TurnId::new("t-1"),
+        usage: TokenUsage {
+            input_tokens: 3,
+            output_tokens: 11,
+            cache_read_tokens: 7,
+            cache_write_tokens: 5,
+        },
+    };
+    assert!(events.contains(&usage));
+    let limit = events.iter().find_map(|event| match event {
+        Event::RateLimit { limit, .. } => Some(limit),
+        _ => None,
+    });
+    let limit = limit.expect("no rate_limit event");
+    assert_eq!(limit.status, "allowed");
+    assert_eq!(limit.windows[0].utilization_bps, 900);
 }
 
 #[tokio::test]

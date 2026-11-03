@@ -4,7 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
-use coda_protocol::types::PermissionDecision;
+use coda_protocol::events::{RateLimit, RateLimitWindow};
+use coda_protocol::types::{PermissionDecision, TokenUsage};
 use serde_json::{Value, json};
 
 use crate::jsonl::{DiagnosticLog, Framed, LineFramer, bounded};
@@ -12,6 +13,8 @@ use crate::tool_request::{Tool, ToolRequest};
 
 const CAN_USE_TOOL: &str = "can_use_tool";
 const DENY_MESSAGE: &str = "denied by coda";
+/// Claude Code reports a window's utilization as a fraction of one.
+const BASIS_POINTS_PER_UNIT: f64 = 10_000.0;
 
 /// One message from the Claude Code output stream that coda acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +46,10 @@ pub enum Message {
         /// Whether the turn ended in an error.
         is_error: bool,
     },
+    /// The tokens the finished turn used; arrives just before its [`Message::Result`].
+    Usage(TokenUsage),
+    /// Claude Code reported the state of the plan's rate limits.
+    RateLimit(RateLimit),
     /// Claude Code asks permission to run a tool.
     PermissionRequest(PermissionAsk),
     /// A `can_use_tool` request that cannot be evaluated; the adapter must deny it.
@@ -155,8 +162,9 @@ impl StreamParser {
             self.record(Diagnostic::MalformedLine { line });
             return Vec::new();
         };
-        self.parse_line(&value, line)
+        result_usage(&value)
             .into_iter()
+            .chain(self.parse_line(&value, line))
             .chain(tool_markers(&value))
             .collect()
     }
@@ -176,8 +184,9 @@ impl StreamParser {
                     session_id: session_id.to_owned(),
                 })
             }
-            // Real streams also carry the model's own tool results and rate-limit updates.
-            "system" | "user" | "rate_limit_event" => None,
+            // Real streams also carry the model's own tool results.
+            "system" | "user" => None,
+            "rate_limit_event" => rate_limit(&value["rate_limit_info"]).map(Message::RateLimit),
             "stream_event" => text_delta(value).map(Message::TextDelta),
             "assistant" => Some(Message::Assistant {
                 text: assistant_text(value),
@@ -257,6 +266,55 @@ fn tool_markers(value: &Value) -> Vec<Message> {
         .collect()
 }
 
+fn result_usage(value: &Value) -> Option<Message> {
+    if value["type"] != "result" {
+        return None;
+    }
+    let usage = value["usage"].as_object()?;
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    Some(Message::Usage(TokenUsage {
+        input_tokens: count("input_tokens"),
+        output_tokens: count("output_tokens"),
+        cache_read_tokens: count("cache_read_input_tokens"),
+        cache_write_tokens: count("cache_creation_input_tokens"),
+    }))
+}
+
+fn rate_limit(info: &Value) -> Option<RateLimit> {
+    let text = |key: &str| info[key].as_str().map(str::to_owned);
+    let mut windows: Vec<_> = info["unifiedWindows"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, window)| {
+            Some(RateLimitWindow {
+                name: name.clone(),
+                utilization_bps: basis_points(window["utilization"].as_f64()?),
+                resets_at: window["resetsAt"].as_u64(),
+            })
+        })
+        .collect();
+    windows.sort_by(|a, b| a.name.cmp(&b.name));
+    Some(RateLimit {
+        status: text("status")?,
+        window_type: text("rateLimitType"),
+        resets_at: info["resetsAt"].as_u64(),
+        windows,
+        is_using_overage: info["isUsingOverage"].as_bool().unwrap_or(false),
+        overage_status: text("overageStatus"),
+        overage_resets_at: info["overageResetsAt"].as_u64(),
+        overage_disabled_reason: text("overageDisabledReason"),
+    })
+}
+
+/// The clamp keeps the value inside `u32`, so the cast cannot truncate or change sign.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn basis_points(fraction: f64) -> u32 {
+    (fraction * BASIS_POINTS_PER_UNIT)
+        .round()
+        .clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
 fn assistant_text(value: &Value) -> String {
     value["message"]["content"]
         .as_array()
@@ -331,6 +389,83 @@ mod tests {
         let mut input = lines.join("\n");
         input.push('\n');
         parser.feed(input.as_bytes())
+    }
+
+    // Field names and shapes as claude 2.1.296 wrote them (see live-text.jsonl).
+    const RATE_LIMIT: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1794193200,"rateLimitType":"seven_day","overageStatus":"rejected","overageDisabledReason":"out_of_credits","overageResetsAt":1796083200,"isUsingOverage":true,"unifiedWindows":{"seven_day":{"utilization":0.0912,"resetsAt":1794193200}}}}"#;
+    const RESULT_WITH_USAGE: &str = r#"{"type":"result","is_error":false,"usage":{"input_tokens":3,"cache_creation_input_tokens":5,"cache_read_input_tokens":7,"output_tokens":11}}"#;
+
+    #[test]
+    fn a_rate_limit_event_is_parsed_with_utilization_in_basis_points() {
+        // Arrange
+        let mut parser = StreamParser::new();
+
+        // Act
+        let messages = feed_lines(&mut parser, &[RATE_LIMIT]);
+
+        // Assert
+        let expected = RateLimit {
+            status: "allowed_warning".to_owned(),
+            window_type: Some("seven_day".to_owned()),
+            resets_at: Some(1_794_193_200),
+            windows: vec![RateLimitWindow {
+                name: "seven_day".to_owned(),
+                utilization_bps: 912,
+                resets_at: Some(1_794_193_200),
+            }],
+            is_using_overage: true,
+            overage_status: Some("rejected".to_owned()),
+            overage_resets_at: Some(1_796_083_200),
+            overage_disabled_reason: Some("out_of_credits".to_owned()),
+        };
+        assert_eq!(messages, vec![Message::RateLimit(expected)]);
+        assert_eq!(parser.diagnostics(), []);
+    }
+
+    #[test]
+    fn a_rate_limit_event_without_a_status_is_dropped() {
+        // Arrange
+        let mut parser = StreamParser::new();
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{}}"#;
+
+        // Act
+        let messages = feed_lines(&mut parser, &[line]);
+
+        // Assert
+        assert_eq!(messages, vec![]);
+    }
+
+    #[test]
+    fn a_result_reports_its_usage_before_the_turn_ends() {
+        // Arrange
+        let mut parser = StreamParser::new();
+
+        // Act
+        let messages = feed_lines(&mut parser, &[RESULT_WITH_USAGE]);
+
+        // Assert
+        let usage = TokenUsage {
+            input_tokens: 3,
+            output_tokens: 11,
+            cache_read_tokens: 7,
+            cache_write_tokens: 5,
+        };
+        assert_eq!(
+            messages,
+            vec![Message::Usage(usage), Message::Result { is_error: false }]
+        );
+    }
+
+    #[test]
+    fn a_result_without_usage_adds_no_usage_message() {
+        // Arrange
+        let mut parser = StreamParser::new();
+
+        // Act
+        let messages = feed_lines(&mut parser, &[RESULT]);
+
+        // Assert
+        assert_eq!(messages, vec![Message::Result { is_error: true }]);
     }
 
     #[test]
