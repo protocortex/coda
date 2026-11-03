@@ -1818,3 +1818,46 @@ async fn a_wait_that_ends_on_a_turn_nobody_cancelled_keeps_the_running_text() {
     assert_eq!(closed["error"]["code"], TURN_RUNNING, "{closed}");
     assert_eq!(closed["error"]["message"], "A turn is already running");
 }
+
+/// More text deltas than the old event queue held, sent in one burst.
+const DELTA_BURST: usize = 3_000;
+const STREAM_DELTA_KIND: &str = "stream_delta";
+
+#[tokio::test]
+async fn a_burst_larger_than_the_event_queue_loses_no_text_and_no_durable_event() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.control(&json!({ "delta_burst": DELTA_BURST }));
+
+    // Act
+    rig.send("hello").await;
+    let request = rig.wait_for_pending().await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let events = rig.events().await;
+    let deltas: Vec<&StoredEvent> = events
+        .iter()
+        .filter(|e| e.kind == STREAM_DELTA_KIND)
+        .collect();
+    let text: String = deltas
+        .iter()
+        .map(|e| {
+            let body: Value = serde_json::from_str(&e.body).unwrap();
+            body["text"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(text.len(), "working".len() + DELTA_BURST);
+    assert!(text.ends_with(&"x".repeat(DELTA_BURST)));
+    assert!(deltas.len() < DELTA_BURST, "the burst is stored in chunks");
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    for durable in ["permission_request", "approve", "result"] {
+        assert_eq!(
+            kinds.iter().filter(|k| **k == durable).count(),
+            1,
+            "{durable}"
+        );
+    }
+}

@@ -67,10 +67,10 @@ pub const BACKEND_UNSUPPORTED: i64 = -32004;
 pub use coda_core::history::USER_MESSAGE_KIND;
 const CLAUDE_BACKEND_NAME: &str = "claude_code";
 const CODEX_BACKEND_NAME: &str = "codex";
-/// Events buffered between the adapter and the store writer. The adapter's
-/// emit callback is synchronous and must not block, so when the store falls
-/// this far behind, further events are dropped with a warning.
-const EVENT_QUEUE_CAPACITY: usize = 1024;
+/// How long the publisher gathers consecutive text deltas into one stored chunk.
+const DELTA_WINDOW: Duration = Duration::from_millis(50);
+/// Largest stored text chunk, so a long stream is still stored in pieces.
+const MAX_DELTA_CHUNK_BYTES: usize = 16 * 1024;
 /// How long a request waits for a session whose turn is ending: its terminal
 /// event is out, or it was cancelled and has not ended yet. Stopping a backend
 /// after the cancel or the event can take a few seconds.
@@ -753,7 +753,7 @@ impl Turns {
             child,
             gate,
         } = job;
-        let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        let (tx, rx) = mpsc::unbounded_channel();
         let publisher = tokio::spawn(publish_events(
             Arc::clone(&self.hub),
             session.clone(),
@@ -776,8 +776,10 @@ impl Turns {
             {
                 reservation.wind_down();
             }
-            if tx.try_send(event).is_err() {
-                warn!(session = %emit_session, "event queue full or closed; dropping an event");
+            // The adapter's callback cannot wait, so the queue never refuses an
+            // event; the publisher coalesces text to keep up with a burst.
+            if tx.send(event).is_err() {
+                warn!(session = %emit_session, "the event publisher is gone; dropping an event");
             }
         };
         info!(session = %session, turn = %turn, step = "drive", "driving the backend");
@@ -950,12 +952,55 @@ async fn publish_events(
     hub: Arc<Hub>,
     session: SessionId,
     turn: TurnId,
-    mut events: mpsc::Receiver<Event>,
+    mut events: mpsc::UnboundedReceiver<Event>,
 ) {
-    while let Some(event) = events.recv().await {
+    let mut held = None;
+    loop {
+        let next = match held.take() {
+            Some(event) => event,
+            None => match events.recv().await {
+                Some(event) => event,
+                None => return,
+            },
+        };
+        let event = coalesce_text(next, &mut events, &mut held).await;
         if let Err(e) = store_event(&hub, &session, &turn, &event).await {
             warn!(session = %session, error = %e, "could not store an event");
         }
+    }
+}
+
+/// Joins the text deltas that follow `first` within [`DELTA_WINDOW`] into one.
+/// The first event that is not part of the chunk is left in `held`, so order
+/// is kept and no event is skipped.
+async fn coalesce_text(
+    first: Event,
+    events: &mut mpsc::UnboundedReceiver<Event>,
+    held: &mut Option<Event>,
+) -> Event {
+    let Event::StreamDelta {
+        session_id,
+        turn_id,
+        mut text,
+    } = first
+    else {
+        return first;
+    };
+    let deadline = tokio::time::Instant::now() + DELTA_WINDOW;
+    while text.len() < MAX_DELTA_CHUNK_BYTES {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Some(Event::StreamDelta { text: more, .. })) => text.push_str(&more),
+            Ok(other) => {
+                *held = other;
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    Event::StreamDelta {
+        session_id,
+        turn_id,
+        text,
     }
 }
 
