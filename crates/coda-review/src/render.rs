@@ -9,6 +9,18 @@ use crate::schema::{Finding, MAX_EFFORT, Review};
 const FENCE_CHAR: char = '`';
 const MIN_FENCE: usize = 3;
 const REPLACEMENT: char = '?';
+const HEADING_CHAR: char = '#';
+const CODE_FENCE: &str = "```";
+const TILDE_FENCE: &str = "~~~";
+const RULE_CHARS: [char; 4] = ['-', '=', '_', '*'];
+const QUOTE_CHAR: char = '>';
+const NUMBER_ENDS: [char; 2] = ['.', ')'];
+const BULLET_CHARS: [char; 3] = ['-', '*', '+'];
+const ESCAPE: &str = "\\";
+/// A zero-width space after `<` keeps it from opening a tag.
+const ANGLE_BREAK: &str = "<\u{200b}";
+/// A zero-width space after `@` keeps the host from turning the text into a mention.
+const MENTION_BREAK: &str = "@\u{200b}";
 
 /// Text for an inline code span: backticks and line breaks would end the span or the line.
 fn inline(text: &str) -> String {
@@ -30,6 +42,59 @@ fn one_line(text: &str) -> String {
         .collect()
 }
 
+/// Model prose for the body of the page. Line breaks stay; a line that would start a
+/// heading, a rule or a code fence is escaped, also after list and quote markers, and `<` and
+/// `@` cannot start HTML or a mention. The breaks are invisible zero-width spaces, so code
+/// spans keep their look.
+fn prose(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c != '\n' && c.is_control() { ' ' } else { c })
+        .collect();
+    cleaned
+        .lines()
+        .map(neutralize_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn neutralize_line(line: &str) -> String {
+    let body = line.trim_start();
+    let indent = &line[..line.len() - body.len()];
+    let escape = body.starts_with(HEADING_CHAR)
+        || body.starts_with(CODE_FENCE)
+        || body.starts_with(TILDE_FENCE)
+        || is_rule(body);
+    if !escape && let Some(marker) = container_marker(body) {
+        let rest = neutralize_line(&body[marker.len()..]);
+        return format!("{indent}{marker}{rest}");
+    }
+    let lead = if escape { ESCAPE } else { "" };
+    let body = body.replace('<', ANGLE_BREAK).replace('@', MENTION_BREAK);
+    format!("{indent}{lead}{body}")
+}
+
+/// The list or quote marker at the start of `body`, whose content is a block of its own.
+fn container_marker(body: &str) -> Option<&str> {
+    if body.starts_with(QUOTE_CHAR) {
+        return Some(&body[..QUOTE_CHAR.len_utf8()]);
+    }
+    let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+    let after = &body[digits..];
+    let numbered = digits > 0 && after.starts_with(NUMBER_ENDS);
+    let bulleted = digits == 0 && after.starts_with(BULLET_CHARS);
+    let len = digits + usize::from(numbered || bulleted);
+    (len > 0 && body[len..].starts_with(' ')).then(|| &body[..len])
+}
+
+/// A line of only `-`, `=` or `_` marks (with spaces) is a rule or the underline of a heading.
+fn is_rule(body: &str) -> bool {
+    let mut marks = body.chars().filter(|c| !c.is_whitespace());
+    marks
+        .next()
+        .is_some_and(|first| RULE_CHARS.contains(&first) && marks.all(|c| c == first))
+}
+
 /// A code fence longer than any run of backticks inside `body`.
 fn fence_for(body: &str) -> String {
     let mut longest = 0;
@@ -48,12 +113,12 @@ fn write_finding(out: &mut String, f: &Finding) {
         f.id,
         f.severity.as_str(),
         f.category.as_str(),
-        one_line(&f.title),
+        prose(&one_line(&f.title)),
         inline(&f.file),
         f.start_line,
         f.end_line,
         f.confidence.as_str(),
-        f.explanation,
+        prose(&f.explanation),
     );
     if let Some(patch) = &f.suggested_patch {
         let fence = fence_for(patch);
@@ -81,7 +146,7 @@ pub fn to_markdown(review: &Review) -> String {
         "# Review\n\nRisk: {}. Effort: {} of {MAX_EFFORT}.\n\n{}\n\n## Findings ({})\n\n",
         review.risk.as_str(),
         review.effort,
-        review.summary,
+        prose(&review.summary),
         review.findings.len(),
     );
     if review.findings.is_empty() {
@@ -250,6 +315,74 @@ Model: m1. Input: 900 characters. Findings dropped: 1.
 
         // Assert
         assert!(text.contains("bug: x # Fake\n"));
+    }
+
+    #[test]
+    fn model_prose_cannot_forge_headings_mentions_html_or_fences() {
+        // Arrange
+        let hostile = "x\n\n## Coverage\n\n  # Run\nReviewed (1):\n- `fake`\n@bob <script>alert(1)</script>\n```\nsecond\n---\n===\n~~~";
+        let mut r = review();
+        r.summary = hostile.to_owned();
+        r.findings[0].explanation = hostile.to_owned();
+        r.findings[0].title = "hi @alice".to_owned();
+
+        // Act
+        let text = to_markdown(&r);
+
+        // Assert
+        assert_eq!(text.matches("\n## Coverage\n").count(), 1, "{text}");
+        assert_eq!(text.matches("\n## Run\n").count(), 1, "{text}");
+        assert!(!text.contains("@bob"));
+        assert!(!text.contains("@alice"));
+        assert!(!text.contains("<script>"));
+        for line in text.lines() {
+            assert!(
+                !line.trim_start().starts_with("```") || line == "```",
+                "{line}"
+            );
+        }
+        assert!(!text.contains("\n---\n"));
+        assert!(!text.contains("\n===\n"));
+        assert!(!text.contains("\n~~~"));
+        assert!(text.contains("second"));
+    }
+
+    #[test]
+    fn headings_and_fences_nested_in_lists_or_quotes_are_escaped() {
+        // Arrange
+        let mut r = review();
+        r.findings[0].explanation =
+            "- # Coverage\n1. ## Run\n> # Findings (0)\n- > ```\n***\n* * *\n  + ~~~".to_owned();
+
+        // Act
+        let text = to_markdown(&r);
+
+        // Assert
+        for bad in [
+            "- # ",
+            "1. ## ",
+            "> # ",
+            "- > ```",
+            "\n***\n",
+            "\n* * *\n",
+            "+ ~~~",
+        ] {
+            assert!(!text.contains(bad), "{bad}\n{text}");
+        }
+        assert!(text.contains("- \\# Coverage"));
+    }
+
+    #[test]
+    fn plain_prose_is_left_as_written() {
+        // Arrange
+        let mut r = review();
+        r.findings[0].explanation = "Use a < b and `x`, then c.\n\nSecond paragraph.".to_owned();
+
+        // Act
+        let text = to_markdown(&r);
+
+        // Assert
+        assert!(text.contains("Use a <\u{200b} b and `x`, then c.\n\nSecond paragraph.\n"));
     }
 
     #[test]

@@ -100,3 +100,31 @@ fn packed_line_numbers_match_the_new_files() {
     assert!(packed.text.contains("- gone.rs\n"));
     assert_eq!(packed.omitted.len(), 1);
 }
+
+#[test]
+fn tracked_files_returns_odd_names_exactly() {
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    git(p, &["init", "-q", "-b", "main"]);
+    let names = [
+        "we ird\"q.txt",
+        "tab\tname.txt",
+        "back\\slash.txt",
+        "caf\u{e9}.txt",
+        "plain.rs",
+    ];
+    for name in names {
+        std::fs::write(p.join(name), "x").unwrap();
+    }
+    git(p, &["add", "."]);
+
+    // Act
+    let mut tracked = tracked_files(p).unwrap();
+
+    // Assert
+    tracked.sort();
+    let mut expected: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+    expected.sort();
+    assert_eq!(tracked, expected);
+}

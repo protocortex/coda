@@ -13,6 +13,10 @@ use serde::Deserialize;
 use crate::ignore::IgnoreSet;
 use crate::skip::SkipRules;
 
+/// A branch ref passed to [`read_default_branch_rules`] starts with one of these, which keeps
+/// git from looking the name up among tags first.
+const BRANCH_REF_PREFIXES: [&str; 2] = ["refs/heads/", "refs/remotes/"];
+
 /// Path of the repository rules file, read from the default branch only.
 pub const REPO_RULES_PATH: &str = ".coda/review.toml";
 
@@ -40,7 +44,7 @@ pub enum RulesError {
     /// The rules file on the default branch is not valid TOML for the schema.
     #[error("{REPO_RULES_PATH} on the default branch: {0}")]
     BadRepoFile(String),
-    /// The default branch ref is missing or looks like an option.
+    /// The default branch ref is not a fully qualified ref name or does not resolve.
     #[error("default branch ref {0:?} cannot be resolved")]
     BadRef(String),
     /// Running git failed.
@@ -143,8 +147,14 @@ fn git(repo_dir: &Path, args: &[&str]) -> Result<(bool, Vec<u8>), RulesError> {
     Ok((out.status.success(), out.stdout))
 }
 
-/// Reads the rules file from `default_ref`, the repository's default branch. The working
-/// tree and the pull request branch are not consulted. Returns `None` when the default
+fn is_valid_ref_name(repo_dir: &Path, name: &str) -> Result<bool, RulesError> {
+    Ok(git(repo_dir, &["check-ref-format", name])?.0)
+}
+
+/// Reads the rules file from `default_ref`, the repository's default branch, as a fully
+/// qualified ref such as `refs/remotes/origin/main`, so that a tag with the branch's name
+/// cannot take its place. Only `refs/heads/` and `refs/remotes/` refs are accepted. The
+/// working tree and the pull request branch are not consulted. Returns `None` when the default
 /// branch has no rules file.
 ///
 /// # Errors
@@ -153,7 +163,11 @@ pub fn read_default_branch_rules(
     repo_dir: &Path,
     default_ref: &str,
 ) -> Result<Option<ReviewConfig>, RulesError> {
-    if default_ref.is_empty() || default_ref.starts_with('-') {
+    if !BRANCH_REF_PREFIXES
+        .iter()
+        .any(|prefix| default_ref.starts_with(prefix))
+        || !is_valid_ref_name(repo_dir, default_ref)?
+    {
         return Err(RulesError::BadRef(default_ref.to_owned()));
     }
     let commit = format!("{default_ref}^{{commit}}");
@@ -235,7 +249,7 @@ mod tests {
         let dir = repo_with_head_branch_rules();
 
         // Act
-        let rules = load(&ReviewConfig::default(), dir.path(), "main").unwrap();
+        let rules = load(&ReviewConfig::default(), dir.path(), "refs/heads/main").unwrap();
 
         // Assert
         assert!(!rules.ignore.is_ignored("src/lib.rs"));
@@ -256,7 +270,7 @@ mod tests {
         run(dir.path(), &["commit", "-q", "-m", "base"]);
 
         // Act
-        let found = read_default_branch_rules(dir.path(), "main").unwrap();
+        let found = read_default_branch_rules(dir.path(), "refs/heads/main").unwrap();
 
         // Assert
         assert_eq!(found, None);
@@ -268,10 +282,41 @@ mod tests {
         let dir = repo_with_head_branch_rules();
 
         // Act and Assert
-        for bad in ["nope", "--output=x", ""] {
+        for bad in [
+            "nope",
+            "--output=x",
+            "",
+            "main",
+            "refs/heads/nope",
+            "refs/heads/main~1",
+            "refs/heads/ma in",
+            "refs/tags/main",
+            "refs/pull/5/head",
+        ] {
             let err = read_default_branch_rules(dir.path(), bad).unwrap_err();
             assert!(matches!(err, RulesError::BadRef(_)), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_tag_named_like_the_branch_cannot_win() {
+        // Arrange
+        let dir = repo_with_head_branch_rules();
+        let p = dir.path();
+        run(p, &["-c", "tag.gpgsign=false", "tag", "main", "pr"]);
+
+        // Act
+        let by_name = read_default_branch_rules(p, "main");
+        let by_ref = read_default_branch_rules(p, "refs/heads/main")
+            .unwrap()
+            .unwrap();
+
+        // Assert
+        assert!(matches!(by_name, Err(RulesError::BadRef(_))));
+        let by_tag = read_default_branch_rules(p, "refs/tags/main");
+        assert!(matches!(by_tag, Err(RulesError::BadRef(_))));
+        assert_eq!(by_ref.ignore.globs, ["docs/**"]);
+        assert!(!by_ref.skip.draft);
     }
 
     #[test]

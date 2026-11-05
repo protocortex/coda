@@ -264,12 +264,19 @@ impl DiffScope {
         Self::default()
     }
 
-    /// Adds an inclusive line range of `file`.
+    /// Adds an inclusive line range of `file`. Ranges that overlap or touch become one.
     pub fn add(&mut self, file: &str, start: u32, end: u32) {
-        self.ranges
-            .entry(file.to_owned())
-            .or_default()
-            .push((start, end));
+        let ranges = self.ranges.entry(file.to_owned()).or_default();
+        ranges.push((start, end));
+        ranges.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+        for &(s, e) in ranges.iter() {
+            match merged.last_mut() {
+                Some(last) if s <= last.1.saturating_add(1) => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        *ranges = merged;
     }
 
     /// True when every line from `start` to `end` is inside one range of `file`.
@@ -327,5 +334,22 @@ mod tests {
         assert!(scope.contains("f", 21, 21));
         assert!(!scope.contains("f", 8, 20));
         assert!(!scope.contains("g", 5, 5));
+    }
+
+    #[test]
+    fn touching_and_overlapping_ranges_merge() {
+        // Arrange
+        let mut scope = DiffScope::new();
+        scope.add("f", 6, 9);
+        scope.add("f", 1, 5);
+        scope.add("f", 8, 12);
+        scope.add("f", 20, 22);
+
+        // Act and Assert
+        assert!(scope.contains("f", 4, 12));
+        assert!(scope.contains("f", 1, 12));
+        assert!(!scope.contains("f", 12, 20));
+        assert!(!scope.contains("f", 13, 13));
+        assert!(scope.contains("f", 20, 22));
     }
 }

@@ -123,7 +123,7 @@ Each value is an integer number of milliseconds. A key left out keeps its defaul
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `max_findings` | integer | `5` | Most findings one review run reports. When the model returns more, the most severe are kept and the rest are counted in the run details. Must not be zero. |
-| `diff_budget_chars` | integer | `120000` | Most characters of diff text one review sends to the model. The diff is packed to fit: binary, vendored and ignored files and deletion-only hunks are dropped, files of the repository's main language go first and smaller files before larger ones, and each hunk carries three lines of context and its new-side line numbers. A file that does not fit whole is clipped to the hunks that do, and the files after it are left out. The review's coverage list names every file as reviewed, clipped or left out. Must not be zero. |
+| `diff_budget_chars` | integer | `120000` | Most characters of diff text one review sends to the model. The diff is packed to fit: binary, vendored and ignored files and deletion-only hunks are dropped, files of the repository's main language go first and smaller files before larger ones, and each hunk carries three lines of context and its new-side line numbers. Packing ends at the first file the budget cuts: that file keeps the hunks that fit whole, then the lines of the next hunk that fit (cut between lines, so one very large hunk still gives the model its first lines), and every later file is left out. A file where not even its header and the lines up to its first added line fit is left out too, and so are the files after it. A single line longer than the room that is left is not cut. The review's coverage list names every file as reviewed, clipped or left out. This is done by the `coda-review` library; the `coda review` command that applies it comes later (issue #202). Must not be zero. |
 
 ## `[review.ignore]`
 
@@ -131,12 +131,12 @@ Files a review leaves out.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `globs` | array of strings | `[]` | Globs matched against the path from the repository root. `*` stays inside one directory, `**/` and `/**` cross directories, `?` is one character. A glob with no `/` matches the file name at any depth, so `*.snap` ignores `a/b/c.snap`. |
+| `globs` | array of strings | `[]` | Globs matched against the path from the repository root. `*` stays inside one directory, `**/` and `/**` cross directories, `?` is one character. A glob with no `/` matches the file name at any depth, so `*.snap` ignores `a/b/c.snap`; it does not match the files under a directory of that name, so write `build/**` for those. A leading `/` pins the glob to the repository root, so `/docs/**` matches `docs/a.md` but not `x/docs/a.md`. A trailing `/` matches nothing. |
 | `builtin` | boolean | `true` | Also leave out generated files: lockfiles (`Cargo.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lock`, `poetry.lock`, `Pipfile.lock`, `Gemfile.lock`, `composer.lock`, `go.sum`), minified files (`*.min.js`, `*.min.css`), source maps (`*.map`) and generated protobuf code (`*.pb.go`, `*_pb2.py`, `*_pb2_grpc.py`). |
 
 ## `[review.skip]`
 
-Pull requests a review does not run on. Every rule is off until you set it, and one match skips the pull request. A skipped pull request exits 0 and prints one line with the reason. `--force` reviews it anyway.
+Pull requests a review does not run on. Every rule is off until you set it, and one match skips the pull request. The `coda-review` library returns the skip decision and a one-line reason, and a force flag overrides it. The `coda review` command that prints the line, exits 0 and takes `--force` comes later (issue #202); no command does this yet.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -150,7 +150,7 @@ Pull requests a review does not run on. Every rule is off until you set it, and 
 
 Regular expressions use the `regex` crate syntax and match anywhere in the text, so anchor them with `^` and `$` when you mean the whole value.
 
-Review rules are read from the global `config.toml` and from `.coda/review.toml` on the repository's default branch, with the same `[review.ignore]` and `[review.skip]` tables. Lists from both add up, `draft` and `bots` are on when either turns them on, and the built-in ignore list stays on only if both keep it. A `.coda/review.toml` on the pull request's own branch is never read, so a pull request cannot switch off its own review.
+Review rules are read from the global `config.toml` and from `.coda/review.toml` on the repository's default branch (the library takes a `refs/heads/` or `refs/remotes/` ref such as `refs/remotes/origin/main`, so a tag with the branch's name cannot stand in for it), with the same `[review.ignore]` and `[review.skip]` tables. Lists from both add up, `draft` and `bots` are on when either turns them on, and the built-in ignore list stays on only if both keep it. A `.coda/review.toml` on the pull request's own branch is never read, so a pull request cannot switch off its own review.
 
 ## `[[hooks]]`
 
