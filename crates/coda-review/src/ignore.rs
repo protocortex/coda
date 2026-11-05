@@ -51,10 +51,12 @@ impl IgnoreSet {
             .map(String::as_str)
             .chain(builtin_globs.iter().copied());
         for pattern in all {
-            let anchored = if pattern.contains(SEPARATOR) {
-                pattern.to_owned()
+            let rooted = pattern.strip_prefix(SEPARATOR);
+            let body = rooted.unwrap_or(pattern);
+            let anchored = if rooted.is_some() || body.contains(SEPARATOR) {
+                body.to_owned()
             } else {
-                format!("{ANY_DEPTH_PREFIX}{pattern}")
+                format!("{ANY_DEPTH_PREFIX}{body}")
             };
             let glob = GlobBuilder::new(&anchored)
                 .literal_separator(true)
@@ -107,6 +109,12 @@ mod tests {
             ("docs/**", "other/docs/a.md", false),
             ("a?.txt", "ab.txt", true),
             ("a?.txt", "a/b.txt", false),
+            ("/docs/**", "docs/a.md", true),
+            ("/docs/**", "x/docs/a.md", false),
+            ("/build", "build", true),
+            ("/build", "x/build", false),
+            ("/*.md", "README.md", true),
+            ("/*.md", "docs/README.md", false),
         ];
 
         for (glob, path, expected) in cases {

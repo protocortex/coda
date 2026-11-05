@@ -45,7 +45,8 @@ impl Default for ReviewConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ReviewIgnore {
-    /// Globs of files to leave out. A glob with no `/` matches the file name at any depth.
+    /// Globs of files to leave out. A glob with no `/` matches the file name at any depth; a
+    /// leading `/` pins it to the repository root.
     pub globs: Vec<String>,
     /// Whether the built-in list of generated files (lockfiles, minified files, source
     /// maps, generated protobuf code) is also left out.

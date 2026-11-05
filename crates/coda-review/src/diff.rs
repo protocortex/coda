@@ -25,6 +25,17 @@ const HUNK_MARK: &str = "@@ -";
 const HUNK_END: &str = " @@";
 const NO_NEWLINE: char = '\\';
 const PATH_SPLIT_EXTRA: usize = 5;
+const NUL: char = '\0';
+const QUOTE: char = '"';
+const QUOTED_NEW_START: &str = " \"b/";
+const OCTAL_DIGITS: u32 = 3;
+const OCTAL_BASE: u32 = 8;
+const BYTE_MASK: u32 = 0xff;
+const BAD_BYTE: u8 = b'?';
+const BELL: u8 = 0x07;
+const BACKSPACE: u8 = 0x08;
+const VERTICAL_TAB: u8 = 0x0b;
+const FORM_FEED: u8 = 0x0c;
 
 /// What happened to a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,8 +217,21 @@ fn side_path(raw: &str, prefix: &str) -> Option<String> {
     )
 }
 
+/// The new-side path of a `diff --git` header, which has no separator between the two
+/// names. Git quotes a name that holds a quote, backslash or control character.
 fn guess_path(rest: &str) -> String {
     let rest = rest.trim_end();
+    if rest.starts_with(QUOTE) {
+        if let Some((_, after)) = read_quoted(rest) {
+            let second = after.trim_start_matches(' ');
+            return strip_prefix_or_keep(&unquote(second), NEW_PREFIX);
+        }
+    } else if let Some((_, second)) = rest.rsplit_once(QUOTED_NEW_START) {
+        return strip_prefix_or_keep(
+            &unquote(&format!("{QUOTE}{NEW_PREFIX}{second}")),
+            NEW_PREFIX,
+        );
+    }
     let both = rest.len().saturating_sub(PATH_SPLIT_EXTRA);
     if both.is_multiple_of(2)
         && let Some(half) = rest.get(OLD_PREFIX.len()..OLD_PREFIX.len() + both / 2)
@@ -219,25 +243,73 @@ fn guess_path(rest: &str) -> String {
     unquote(after)
 }
 
-fn unquote(path: &str) -> String {
-    let Some(inner) = path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) else {
-        return path.to_owned();
-    };
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('t') => out.push('\t'),
-            Some('n') => out.push('\n'),
-            Some(other) => out.push(other),
-            None => out.push('\\'),
+fn strip_prefix_or_keep(path: &str, prefix: &str) -> String {
+    path.strip_prefix(prefix).unwrap_or(path).to_owned()
+}
+
+/// Reads one quoted name at the start of `text`. Returns the decoded name and what follows
+/// the closing quote.
+fn read_quoted(text: &str) -> Option<(String, &str)> {
+    let body = text.strip_prefix(QUOTE)?;
+    let bytes = body.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'"' => return Some((decode_escapes(&body[..at]), &body[at + 1..])),
+            _ => at += 1,
         }
     }
-    out
+    None
+}
+
+fn decode_escapes(inner: &str) -> String {
+    let bytes = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        at += 1;
+        if byte != b'\\' {
+            out.push(byte);
+            continue;
+        }
+        let Some(&next) = bytes.get(at) else {
+            out.push(b'\\');
+            break;
+        };
+        at += 1;
+        match next {
+            b'a' => out.push(BELL),
+            b'b' => out.push(BACKSPACE),
+            b'f' => out.push(FORM_FEED),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(VERTICAL_TAB),
+            b'0'..=b'7' => {
+                let mut value = u32::from(next - b'0');
+                let mut digits = 1;
+                while digits < OCTAL_DIGITS
+                    && let Some(&d @ b'0'..=b'7') = bytes.get(at)
+                {
+                    value = value * OCTAL_BASE + u32::from(d - b'0');
+                    at += 1;
+                    digits += 1;
+                }
+                out.push(u8::try_from(value & BYTE_MASK).unwrap_or(BAD_BYTE));
+            }
+            other => out.push(other),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn unquote(path: &str) -> String {
+    match read_quoted(path) {
+        Some((decoded, "")) => decoded,
+        _ => path.to_owned(),
+    }
 }
 
 fn parse_range(text: &str) -> Option<(u32, u32)> {
@@ -325,8 +397,12 @@ pub fn git_diff(repo_dir: &Path, base: &str, head: &str) -> Result<String, GitEr
 /// # Errors
 /// Returns [`GitError`] when git fails.
 pub fn tracked_files(repo_dir: &Path) -> Result<Vec<String>, GitError> {
-    let text = run_git(repo_dir, &["-c", "core.quotepath=false", "ls-files"])?;
-    Ok(text.lines().map(str::to_owned).collect())
+    let text = run_git(repo_dir, &["ls-files", "-z"])?;
+    Ok(text
+        .split(NUL)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 #[cfg(test)]
@@ -498,6 +574,71 @@ diff --git a/a b/a
 
         // Assert
         assert_eq!(files[0].path, "q\"x");
+    }
+
+    #[test]
+    fn a_quoted_header_without_a_content_line_still_gives_the_real_path() {
+        // Arrange
+        let cases = [
+            (
+                "diff --git \"a/x y\\t\" \"b/x y\\t\"\nold mode 100644\nnew mode 100755\n",
+                "x y\t",
+            ),
+            (
+                "diff --git \"a/\\001x\" \"b/\\001x\"\nBinary files a/x and b/x differ\n",
+                "\u{1}x",
+            ),
+            (
+                "diff --git \"a/caf\\303\\251\" \"b/caf\\303\\251\"\nold mode 100644\nnew mode 100755\n",
+                "caf\u{e9}",
+            ),
+            (
+                "diff --git \"a/q\\\"x\" \"b/q\\\"x\"\nold mode 100644\nnew mode 100755\n",
+                "q\"x",
+            ),
+            (
+                "diff --git \"a/a\\\\b\" \"b/a\\\\b\"\nold mode 100644\nnew mode 100755\n",
+                "a\\b",
+            ),
+            (
+                "diff --git \"a/\\a\\b\\f\\r\\v\" \"b/\\a\\b\\f\\r\\v\"\nold mode 100644\nnew mode 100755\n",
+                "\u{7}\u{8}\u{c}\r\u{b}",
+            ),
+        ];
+
+        for (text, expected) in cases {
+            // Act
+            let files = parse_diff(text);
+
+            // Assert
+            assert_eq!(files.len(), 1, "{text:?}");
+            assert_eq!(files[0].path, expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_pure_rename_keeps_both_real_paths() {
+        // Arrange
+        let text = "diff --git \"a/old\\tname\" \"b/new\\tname\"\nsimilarity index 100%\nrename from \"old\\tname\"\nrename to \"new\\tname\"\n";
+
+        // Act
+        let files = parse_diff(text);
+
+        // Assert
+        assert_eq!(files[0].path, "new\tname");
+        assert_eq!(files[0].old_path.as_deref(), Some("old\tname"));
+    }
+
+    #[test]
+    fn an_unquoted_old_name_with_a_quoted_new_name_gives_the_new_name() {
+        // Arrange
+        let text = "diff --git a/old \"b/new\\tname\"\nold mode 100644\nnew mode 100755\n";
+
+        // Act
+        let files = parse_diff(text);
+
+        // Assert
+        assert_eq!(files[0].path, "new\tname");
     }
 
     #[test]
