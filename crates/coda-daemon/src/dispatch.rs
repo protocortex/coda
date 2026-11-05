@@ -339,6 +339,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialize_result_matches_the_committed_wire_example() {
+        // Arrange
+        let request = r#"{"jsonrpc":"2.0","id":"a","method":"initialize","params":{"protocol_version":1,"client_name":"t"}}"#;
+        let mut example: Value = serde_json::from_str(include_str!(
+            "../../coda-protocol/tests/golden/initialize.result.json"
+        ))
+        .unwrap();
+
+        // Act
+        let mut result = result_of(call(request).await.unwrap());
+
+        // Assert
+        example["daemon_version"] = Value::Null;
+        result["daemon_version"] = Value::Null;
+        assert_eq!(result, example);
+    }
+
+    #[tokio::test]
     async fn initialize_with_other_version_gets_the_mismatch_code() {
         // Arrange
         let request = r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocol_version":99,"client_name":"t"}}"#;
