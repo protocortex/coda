@@ -200,7 +200,12 @@ impl<'a, E: Emit> Drive<'a, E> {
             }
         };
         if self.timed_out {
-            self.interrupted(InterruptCause::IdleTimeout).await;
+            // The event waits in the sink if the queue stays full; the turn's end sends it.
+            let limit = self.turns.config.timing.store_stall;
+            let sent = tokio::time::timeout(limit, self.interrupted(InterruptCause::IdleTimeout));
+            if sent.await.is_err() {
+                warn!(session = %session, turn = %turn, "the store did not answer; the interrupt is not sent yet");
+            }
         }
         // A crash that raced the user's cancel is the user's choice, not a failure to retry.
         let crashed = matches!(result, Ok(TurnOutcome::Crashed { .. }))
