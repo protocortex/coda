@@ -356,4 +356,193 @@ mod tests {
         // Assert
         assert!(err.to_string().contains("source_branch_regex"), "{err}");
     }
+
+    #[test]
+    fn a_flag_that_is_off_never_skips() {
+        // Arrange
+        let off = rules(|c| {
+            c.draft = false;
+            c.bots = false;
+        });
+        let draft = PrInfo {
+            draft: true,
+            ..pr()
+        };
+        let bot = PrInfo {
+            author_is_bot: true,
+            author: "x[bot]".to_owned(),
+            ..pr()
+        };
+
+        // Act and Assert
+        assert_eq!(off.decide(&draft, false), Decision::Review);
+        assert_eq!(off.decide(&bot, false), Decision::Review);
+    }
+
+    #[test]
+    fn authors_match_without_regard_to_case_and_keep_the_pr_spelling() {
+        // Arrange
+        let rules = rules(|c| c.authors = strings(&["alice"]));
+        let upper = PrInfo {
+            author: "ALICE".to_owned(),
+            ..pr()
+        };
+        let mixed = PrInfo {
+            author: "Alice".to_owned(),
+            ..pr()
+        };
+
+        // Act and Assert
+        assert_eq!(
+            rules.first_match(&upper),
+            Some(SkipReason::Author("ALICE".to_owned()))
+        );
+        assert_eq!(
+            rules.first_match(&mixed),
+            Some(SkipReason::Author("Alice".to_owned()))
+        );
+    }
+
+    #[test]
+    fn the_first_matching_rule_in_order_wins() {
+        // Arrange
+        let mut config = ReviewSkip {
+            draft: true,
+            labels: strings(&["bug"]),
+            title_regex: strings(&["fix"]),
+            source_branch_regex: strings(&["feature"]),
+            target_branch_regex: strings(&["main"]),
+            authors: strings(&["alice"]),
+            bots: true,
+        };
+        let mut pr = PrInfo {
+            draft: true,
+            author_is_bot: true,
+            ..pr()
+        };
+        let expected = [
+            SkipReason::Draft,
+            SkipReason::Label("Bug".to_owned()),
+            SkipReason::Title,
+            SkipReason::SourceBranch,
+            SkipReason::TargetBranch,
+            SkipReason::Author("alice".to_owned()),
+            SkipReason::Bot,
+        ];
+
+        for (n, reason) in expected.iter().enumerate() {
+            // Act
+            let got = SkipRules::compile(&config).unwrap().first_match(&pr);
+
+            // Assert
+            assert_eq!(got.as_ref(), Some(reason), "step {n}");
+            match n {
+                0 => pr.draft = false,
+                1 => config.labels.clear(),
+                2 => config.title_regex.clear(),
+                3 => config.source_branch_regex.clear(),
+                4 => config.target_branch_regex.clear(),
+                _ => config.authors.clear(),
+            }
+        }
+    }
+
+    #[test]
+    fn every_skip_message_is_one_exact_line() {
+        // Arrange
+        let hint = " (use --force to review anyway)";
+        let cases = [
+            (SkipReason::Draft, "the pull request is a draft"),
+            (SkipReason::Label("wip".to_owned()), "it has the label wip"),
+            (
+                SkipReason::Title,
+                "the title matches a review.skip.title_regex rule",
+            ),
+            (
+                SkipReason::SourceBranch,
+                "the source branch matches a review.skip.source_branch_regex rule",
+            ),
+            (
+                SkipReason::TargetBranch,
+                "the target branch matches a review.skip.target_branch_regex rule",
+            ),
+            (
+                SkipReason::Author("bo\nb\u{1b}".to_owned()),
+                "the author bob is in review.skip.authors",
+            ),
+            (SkipReason::Bot, "the author is a bot"),
+        ];
+
+        for (reason, why) in cases {
+            // Act
+            let line = reason.one_line();
+
+            // Assert
+            assert_eq!(line, format!("review skipped: {why}{hint}"));
+        }
+    }
+
+    #[test]
+    fn every_regex_key_is_named_in_its_error() {
+        // Arrange
+        let bad = strings(&["("]);
+        let cases = [
+            (
+                ReviewSkip {
+                    title_regex: bad.clone(),
+                    ..ReviewSkip::default()
+                },
+                "title_regex",
+            ),
+            (
+                ReviewSkip {
+                    source_branch_regex: bad.clone(),
+                    ..ReviewSkip::default()
+                },
+                "source_branch_regex",
+            ),
+            (
+                ReviewSkip {
+                    target_branch_regex: bad,
+                    ..ReviewSkip::default()
+                },
+                "target_branch_regex",
+            ),
+        ];
+
+        for (config, key) in cases {
+            // Act
+            let err = SkipRules::compile(&config).unwrap_err();
+
+            // Assert
+            assert!(
+                matches!(err, RulesError::BadRegex { key: k, .. } if k == key),
+                "{key}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_compare_equal_only_when_every_part_is_equal() {
+        // Arrange
+        let base = ReviewSkip::default();
+        let edits: [fn(&mut ReviewSkip); 7] = [
+            |c| c.draft = true,
+            |c| c.labels = vec!["x".to_owned()],
+            |c| c.title_regex = vec!["x".to_owned()],
+            |c| c.source_branch_regex = vec!["x".to_owned()],
+            |c| c.target_branch_regex = vec!["x".to_owned()],
+            |c| c.authors = vec!["x".to_owned()],
+            |c| c.bots = true,
+        ];
+        let plain = SkipRules::compile(&base).unwrap();
+
+        // Act and Assert
+        assert_eq!(plain, SkipRules::compile(&base).unwrap());
+        for (n, edit) in edits.into_iter().enumerate() {
+            let mut changed = base.clone();
+            edit(&mut changed);
+            assert_ne!(plain, SkipRules::compile(&changed).unwrap(), "edit {n}");
+        }
+    }
 }

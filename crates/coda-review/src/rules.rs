@@ -288,7 +288,7 @@ mod tests {
             "",
             "main",
             "refs/heads/nope",
-            "refs/heads/main~1",
+            "refs/heads/pr~1",
             "refs/heads/ma in",
             "refs/tags/main",
             "refs/pull/5/head",
@@ -352,5 +352,102 @@ mod tests {
 
         // Assert
         assert!(err.to_string().contains(REPO_RULES_PATH), "{err}");
+    }
+
+    fn full(tag: &str) -> ReviewConfig {
+        let mut config = ReviewConfig::default();
+        config.ignore.globs = vec![format!("{tag}/**")];
+        config.skip.labels = vec![format!("{tag}-label")];
+        config.skip.title_regex = vec![format!("{tag}-title")];
+        config.skip.source_branch_regex = vec![format!("{tag}-source")];
+        config.skip.target_branch_regex = vec![format!("{tag}-target")];
+        config.skip.authors = vec![format!("{tag}-author")];
+        config
+    }
+
+    #[test]
+    fn merging_joins_every_list_and_keeps_the_global_numbers() {
+        // Arrange
+        let mut global = full("g");
+        global.max_findings = 9;
+        global.diff_budget_chars = 777;
+        let mut repo = full("r");
+        repo.diff_budget_chars = 5;
+
+        // Act
+        let merged = merge(&global, Some(&repo));
+
+        // Assert
+        assert_eq!(merged.diff_budget_chars, 777);
+        assert_eq!(merged.ignore.globs, ["g/**", "r/**"]);
+        assert_eq!(merged.skip.labels, ["g-label", "r-label"]);
+        assert_eq!(merged.skip.title_regex, ["g-title", "r-title"]);
+        assert_eq!(merged.skip.source_branch_regex, ["g-source", "r-source"]);
+        assert_eq!(merged.skip.target_branch_regex, ["g-target", "r-target"]);
+        assert_eq!(merged.skip.authors, ["g-author", "r-author"]);
+    }
+
+    #[test]
+    fn merging_turns_a_switch_on_when_either_side_has_it() {
+        // Arrange
+        let off = ReviewConfig::default();
+        let mut bots = ReviewConfig::default();
+        bots.skip.bots = true;
+        let mut draft = ReviewConfig::default();
+        draft.skip.draft = true;
+
+        for (global, repo) in [(&bots, &off), (&off, &bots)] {
+            // Act
+            let merged = merge(global, Some(repo));
+
+            // Assert
+            assert!(merged.skip.bots);
+            assert!(!merged.skip.draft);
+        }
+        for (global, repo) in [(&draft, &off), (&off, &draft)] {
+            // Act
+            let merged = merge(global, Some(repo));
+
+            // Assert
+            assert!(merged.skip.draft);
+            assert!(!merged.skip.bots);
+        }
+        assert!(!merge(&off, Some(&off)).skip.bots);
+        let mut no_builtin = ReviewConfig::default();
+        no_builtin.ignore.builtin = false;
+        assert!(!merge(&off, Some(&no_builtin)).ignore.builtin);
+        assert!(!merge(&no_builtin, Some(&off)).ignore.builtin);
+    }
+
+    #[test]
+    fn without_repo_rules_the_global_config_comes_back_unchanged() {
+        // Arrange
+        let mut global = full("g");
+        global.skip.bots = true;
+        global.ignore.builtin = false;
+
+        // Act and Assert
+        assert_eq!(merge(&global, None), global);
+    }
+
+    #[test]
+    fn compiled_rules_keep_the_builtin_list_only_when_asked() {
+        // Arrange
+        let mut off = ReviewConfig::default();
+        off.ignore.builtin = false;
+
+        // Act and Assert
+        assert!(
+            Rules::compile(&ReviewConfig::default())
+                .unwrap()
+                .ignore
+                .is_ignored("Cargo.lock")
+        );
+        assert!(
+            !Rules::compile(&off)
+                .unwrap()
+                .ignore
+                .is_ignored("Cargo.lock")
+        );
     }
 }

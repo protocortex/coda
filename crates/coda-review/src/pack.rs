@@ -882,6 +882,202 @@ mod tests {
         assert!(packed.scope.contains("f.rs", 2, 5));
     }
 
+    fn deleted(path: &str) -> FileDiff {
+        let mut gone = file(path, vec![]);
+        gone.status = Status::Deleted;
+        gone
+    }
+
+    #[test]
+    fn the_budget_edge_is_exact_for_multibyte_text() {
+        // Arrange
+        let ignore = no_ignore();
+        let body = "+\u{e9}\u{e9}\u{1f600}\n".repeat(150);
+        let wanted = added("\u{e9}.rs", &body);
+        let size = candidate(&wanted).size;
+        let gone = ["\u{fc}/\u{eb}.rs"];
+        let probe = deletion_notice(&gone, size + 200).chars().count();
+        assert!(probe > 0);
+        let budget = size + probe;
+        assert_eq!(deletion_notice(&gone, budget).chars().count(), probe);
+        let files = [wanted, deleted(gone[0])];
+
+        // Act
+        let exact = pack(&files, opts(&ignore, budget, None));
+        let short = pack(&files, opts(&ignore, budget - 1, None));
+
+        // Assert
+        assert_eq!(exact.coverage.reviewed, names(&["\u{e9}.rs"]));
+        assert_eq!(exact.text.chars().count(), budget);
+        assert_eq!(short.coverage.reviewed, Vec::<String>::new());
+        assert!(short.text.chars().count() < budget);
+    }
+
+    #[test]
+    fn a_line_too_long_for_the_room_stops_the_packing() {
+        // Arrange
+        let ignore = no_ignore();
+        let huge = added("huge.rs", &format!("+{}", "x".repeat(1000)));
+        let small = added("z.md", "+x");
+
+        // Act
+        let packed = pack(&[huge, small], opts(&ignore, 300, Some("rs")));
+
+        // Assert
+        assert_eq!(packed.text, "");
+        assert_eq!(packed.coverage.left_out, names(&["huge.rs", "z.md"]));
+    }
+
+    #[test]
+    fn a_deleted_file_without_hunks_is_named_in_the_notice() {
+        // Arrange
+        let ignore = no_ignore();
+        let files = [deleted("gone/with\nbreak.rs"), added("a.rs", "+x")];
+
+        // Act
+        let packed = pack(&files, opts(&ignore, 10_000, None));
+
+        // Assert
+        assert!(packed.text.contains("- gone/with?break.rs\n"));
+        let reason = packed
+            .omitted
+            .iter()
+            .find(|o| o.path.starts_with("gone"))
+            .map(|o| o.reason);
+        assert_eq!(reason, Some(OmitReason::DeletionOnly));
+    }
+
+    #[test]
+    fn third_party_and_pods_directories_are_vendored() {
+        // Arrange
+        let ignore = no_ignore();
+        let files = [
+            added("third_party/lib/a.c", "+x"),
+            added("ios/Pods/Dep/b.m", "+x"),
+            added("src/keep.rs", "+x"),
+        ];
+
+        // Act
+        let packed = pack(&files, opts(&ignore, 10_000, None));
+
+        // Assert
+        assert_eq!(headers(&packed.text), ["src/keep.rs"]);
+        let reasons: Vec<_> = packed.omitted.iter().map(|o| o.reason).collect();
+        assert_eq!(reasons, [OmitReason::Vendored, OmitReason::Vendored]);
+    }
+
+    #[test]
+    fn headers_say_when_a_file_is_new_or_renamed() {
+        // Arrange
+        let ignore = no_ignore();
+        let mut new_file = added("new.rs", "+x");
+        new_file.status = Status::Added;
+        let mut moved = added("to.rs", "+y");
+        moved.status = Status::Renamed;
+        moved.old_path = Some("from\nold.rs".to_owned());
+        let mut moved_without_source = added("lost.rs", "+z");
+        moved_without_source.status = Status::Renamed;
+        let plain = added("plain.rs", "+w");
+
+        // Act
+        let packed = pack(
+            &[new_file, moved, moved_without_source, plain],
+            opts(&ignore, 10_000, None),
+        );
+
+        // Assert
+        let lines: Vec<&str> = packed
+            .text
+            .lines()
+            .filter(|l| l.starts_with("=== "))
+            .collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines.contains(&"=== new.rs (new file) ==="));
+        assert!(lines.contains(&"=== to.rs (renamed from from?old.rs) ==="));
+        assert!(lines.contains(&"=== lost.rs ==="));
+        assert!(lines.contains(&"=== plain.rs ==="));
+    }
+
+    #[test]
+    fn extension_counting_folds_case_and_skips_dotfiles() {
+        // Arrange and Act and Assert
+        assert_eq!(
+            main_extension(["a.MD", "b.md", "c.rs"]),
+            Some("md".to_owned())
+        );
+        assert_eq!(
+            main_extension([".gitignore", "a.rs"]),
+            Some("rs".to_owned())
+        );
+    }
+
+    #[test]
+    fn digits_counts_decimal_places() {
+        // Arrange and Act and Assert
+        for (n, expected) in [(0, 1), (9, 1), (10, 2), (99, 2), (100, 3), (1000, 4)] {
+            assert_eq!(digits(n), expected, "{n}");
+        }
+    }
+
+    #[test]
+    fn the_notice_keeps_its_reserve_and_its_exact_threshold() {
+        // Arrange
+        let two = ["ab", "cd"];
+
+        // Act
+        let notice = deletion_notice(&two, 1000);
+
+        // Assert
+        assert!(notice.chars().count() <= 100);
+        assert!(notice.contains("- ab\n"));
+        assert!(notice.contains("- and 1 more\n"));
+        assert_ne!(deletion_notice(&["ab"], 920), "");
+        assert_eq!(deletion_notice(&["ab"], 910), "");
+    }
+
+    #[test]
+    fn a_hunk_is_cut_exactly_at_the_limit() {
+        // Arrange
+        let h = hunk(1, "+a\n+b");
+        let whole = render_hunk(&h, 1, usize::MAX);
+        let header = whole.text.lines().next().unwrap().chars().count() + 1;
+        let first_line = "1 +a\n".chars().count();
+
+        // Act
+        let header_only = render_hunk(&h, 1, header);
+        let below_header = render_hunk(&h, 1, header - 1);
+        let one_line = render_hunk(&h, 1, header + first_line);
+        let short_of_one_line = render_hunk(&h, 1, header + first_line - 1);
+
+        // Assert
+        assert_eq!(header_only.chars, header);
+        assert!(!header_only.complete);
+        assert!(!header_only.has_added);
+        assert_eq!(below_header.text, "");
+        assert_eq!(one_line.chars, header + first_line);
+        assert!(one_line.has_added);
+        assert_eq!(one_line.new_lines, 1);
+        assert_eq!(short_of_one_line.chars, header);
+        assert!(!short_of_one_line.has_added);
+        assert!(whole.complete);
+    }
+
+    #[test]
+    fn a_notice_line_may_use_the_last_character_of_its_share() {
+        // Arrange
+        let budget = 1000;
+
+        // Act
+        let exact = deletion_notice(&["abcde"], budget);
+        let over = deletion_notice(&["abcdef"], budget);
+
+        // Assert
+        assert!(exact.contains("- abcde\n"));
+        assert!(!exact.contains("more"));
+        assert!(!over.contains("- abcdef\n"));
+        assert!(over.contains("- and 1 more\n"));
+    }
+
     #[test]
     fn packed_line_numbers_match_the_new_file() {
         // Arrange
