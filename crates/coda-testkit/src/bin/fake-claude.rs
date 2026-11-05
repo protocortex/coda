@@ -35,7 +35,8 @@
 //! `flood` makes it fill stdout before it reads any input, and `start_gate`
 //! holds the start-up, before any output, until a file exists at that path, and
 //! exits non-zero if none appears within two minutes. `reject_resume` makes it exit
-//! at once, before any output, when it is started with `--resume`. `prompt_path`
+//! at once, before any output, when it is started with `--resume`, and
+//! `reject_resume_of` does it only for a start that resumes that id, and `resume_crash_marker` does the same only the first time (the file remembers it). `prompt_path`
 //! appends every user line it reads to that file.
 
 use std::io::{self, BufRead, Write};
@@ -121,6 +122,18 @@ impl Control {
 
     fn rejects_resume(&self) -> bool {
         self.0["reject_resume"] == true
+    }
+
+    /// Whether this start resumes the one id `reject_resume_of` names.
+    fn rejects_this_resume(&self) -> bool {
+        let Some(refused) = self.text("reject_resume_of") else {
+            return false;
+        };
+        let args: Vec<String> = std::env::args().collect();
+        args.iter()
+            .position(|arg| arg == RESUME_FLAG)
+            .and_then(|at| args.get(at + 1))
+            .is_some_and(|id| id == refused)
     }
 }
 
@@ -377,7 +390,18 @@ fn main() -> io::Result<()> {
     if let Some(path) = control.path("report_path") {
         write_report(path)?;
     }
-    if control.rejects_resume() && std::env::args().any(|arg| arg == RESUME_FLAG) {
+    if (control.rejects_resume() && std::env::args().any(|arg| arg == RESUME_FLAG))
+        || control.rejects_this_resume()
+    {
+        let mut prompt = String::new();
+        io::stdin().lock().read_line(&mut prompt)?;
+        std::process::exit(CRASH_EXIT_CODE);
+    }
+    if let Some(marker) = control.path("resume_crash_marker")
+        && std::env::args().any(|arg| arg == RESUME_FLAG)
+        && !marker.exists()
+    {
+        std::fs::write(marker, b"crashed")?;
         let mut prompt = String::new();
         io::stdin().lock().read_line(&mut prompt)?;
         std::process::exit(CRASH_EXIT_CODE);

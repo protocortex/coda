@@ -18,6 +18,8 @@ use super::{USER_MESSAGE_KIND, next_after};
 
 const USER_ROLE: &str = "user";
 const ASSISTANT_ROLE: &str = "assistant";
+/// The two quote marks around a rendered JSON string.
+const QUOTES: usize = 2;
 const OMITTED_NOTE: &str = "older turns are left out";
 
 #[derive(Deserialize)]
@@ -35,6 +37,26 @@ struct Entry {
     text: String,
 }
 
+/// Bytes `text` takes once it is rendered as a JSON string, without the quotes.
+fn rendered_len(text: &str) -> usize {
+    serde_json::to_string(text).map_or(text.len(), |json| json.len() - QUOTES)
+}
+
+/// Where the longest tail of `text` that renders within `budget` bytes starts.
+fn tail_start(text: &str, budget: usize) -> usize {
+    let mut used = 0;
+    let mut start = text.len();
+    let mut buffer = [0; 4];
+    for (at, c) in text.char_indices().rev() {
+        used += rendered_len(c.encode_utf8(&mut buffer));
+        if used > budget {
+            break;
+        }
+        start = at;
+    }
+    start
+}
+
 /// The latest turns that fit a byte budget, oldest first.
 pub struct Transcript {
     entries: VecDeque<Entry>,
@@ -45,7 +67,7 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// An empty transcript that keeps at most about `budget` bytes of text.
+    /// An empty transcript that keeps at most about `budget` bytes of text, counted as rendered JSON strings.
     #[must_use]
     pub fn new(budget: usize) -> Self {
         Self {
@@ -96,7 +118,7 @@ impl Transcript {
         let Ok(TextBody { text }) = serde_json::from_str(&event.body) else {
             return;
         };
-        self.bytes += text.len();
+        self.bytes += rendered_len(&text);
         match (&speaker, self.entries.back_mut()) {
             (Speaker::Assistant, Some(last)) if matches!(last.speaker, Speaker::Assistant) => {
                 last.text.push_str(&text);
@@ -134,15 +156,12 @@ impl Transcript {
         while self.bytes > self.budget {
             if self.entries.len() > 1 {
                 if let Some(old) = self.entries.pop_front() {
-                    self.bytes -= old.text.len();
+                    self.bytes -= rendered_len(&old.text);
                 }
             } else if let Some(only) = self.entries.front_mut() {
-                let mut from = only.text.len() - self.budget;
-                while !only.text.is_char_boundary(from) {
-                    from += 1;
-                }
+                let from = tail_start(&only.text, self.budget);
                 only.text.drain(..from);
-                self.bytes = only.text.len();
+                self.bytes = rendered_len(&only.text);
             }
             self.trimmed = true;
         }
@@ -278,5 +297,35 @@ mod tests {
         let reply: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(reply["role"], "assistant");
         assert_eq!(reply["text"], fake);
+    }
+
+    #[test]
+    fn the_budget_counts_the_escaped_text_that_is_rendered() {
+        // Arrange
+        let quotes = "\"".repeat(10);
+        let events = [said(1, USER_MESSAGE_KIND, &quotes)];
+
+        // Act
+        let text = render(10, &events).unwrap();
+
+        // Assert
+        let entry: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(entry["text"], "\"".repeat(5));
+    }
+
+    #[test]
+    fn older_entries_go_when_their_escaped_size_is_over_the_budget() {
+        // Arrange
+        let events = [
+            said(1, USER_MESSAGE_KIND, &"\n".repeat(2)),
+            said(2, STREAM_DELTA_KIND, "ok"),
+        ];
+
+        // Act
+        let text = render(4, &events).unwrap();
+
+        // Assert
+        assert!(!text.contains("\\n"), "{text}");
+        assert!(text.contains("ok"));
     }
 }

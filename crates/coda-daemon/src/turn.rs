@@ -400,7 +400,7 @@ impl Turns {
         } else {
             CODEX_BACKEND_NAME
         };
-        let mut child = self.start_child(&record).await?;
+        let mut child = self.start_child(&record, false).await?;
         let turn = match Self::begin(&self.hub, &session_id, &text).await {
             Ok(turn) => turn,
             Err(e) => {
@@ -432,10 +432,18 @@ impl Turns {
     }
 
     /// Starts the backend child of `record`'s session, with its pidfile.
-    async fn start_child(&self, record: &SessionRecord) -> Result<AgentSession, StartError> {
+    async fn start_child(
+        &self,
+        record: &SessionRecord,
+        fresh: bool,
+    ) -> Result<AgentSession, StartError> {
         let session_id = record.id.clone();
         let cwd = PathBuf::from(&record.cwd);
-        let resume = self.resume_id(record).await;
+        let resume = if fresh {
+            None
+        } else {
+            self.resume_id(record).await
+        };
         let parent_env = self.config.parent_env.clone();
         let pidfile_dir = self.config.pidfile_dir.clone();
         if let (BackendKind::ClaudeCode, Some(binary)) = (record.backend, &self.config.binary) {
@@ -656,7 +664,7 @@ impl Turns {
     }
 
     /// The id to resume: the one this daemon saw, else the one stored before it restarted.
-    async fn resume_id(&self, record: &SessionRecord) -> Option<String> {
+    pub(super) async fn resume_id(&self, record: &SessionRecord) -> Option<String> {
         if let Some(id) = self.backend_ids().get(&record.id).cloned() {
             return Some(id);
         }
@@ -698,29 +706,10 @@ impl Turns {
         }
     }
 
-    /// Drops the id a start with `--resume` just failed on and marks its stored
-    /// row `error`. Returns whether there was an id to drop.
-    pub(super) async fn forget_backend_id(&self, record: &SessionRecord) -> bool {
-        let known = self.backend_ids().remove(&record.id).is_some();
-        if record.backend != BackendKind::ClaudeCode {
-            return known;
-        }
-        let session = record.id.clone();
-        let stored = self
-            .hub
-            .with_store_mut(move |store| {
-                let had = store
-                    .active_backend_ref(&session, BackendKind::ClaudeCode)?
-                    .is_some();
-                store.fail_backend_thread(&session, BackendKind::ClaudeCode)?;
-                Ok(had)
-            })
-            .await;
-        known
-            || stored.unwrap_or_else(|error| {
-                warn!(session = %record.id, %error, "could not mark the backend id as failed");
-                false
-            })
+    /// Stops the daemon from resuming the id it holds in memory. The stored row
+    /// stays active: only a conversation the backend names later replaces it.
+    pub(super) fn forget_resume_id(&self, record: &SessionRecord) {
+        self.backend_ids().remove(&record.id);
     }
 
     fn queues(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, mpsc::WeakSender<Event>>> {

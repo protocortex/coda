@@ -4,7 +4,7 @@
 
 use serde_json::{Value, json};
 
-use super::{Rig, relaxed};
+use super::{Rig, relaxed, timing};
 use coda_protocol::types::{BackendKind, TurnId};
 
 const REPORT: &str = "report.json";
@@ -74,7 +74,11 @@ async fn a_resume_the_backend_rejects_falls_back_to_a_fresh_start_and_is_not_tri
 
     // Assert
     assert_eq!(resumed_with(&args(&rig)), None);
-    assert_eq!(rig.count("backend_crashed").await, 1);
+    assert_eq!(
+        rig.count("backend_crashed").await,
+        2,
+        "the resume is tried twice before it counts as refused"
+    );
     let session = rig.session.clone();
     let stored = rig
         .hub
@@ -163,4 +167,99 @@ async fn the_backend_id_is_stored_when_the_backend_reports_it_not_when_the_turn_
     assert_eq!(stored.as_deref(), Some(BACKEND_ID));
     assert!(rig.turns.is_running(&rig.session), "the turn is still open");
     rig.turns.cancel(&rig.session);
+}
+
+const CRASH_MARKER: &str = "resume-crashed";
+/// Long enough for a turn that waits on nothing, short enough that the stalled retry ends fast.
+const SHORT_IDLE_MS: u64 = 2_000;
+
+#[tokio::test]
+async fn one_crash_before_the_backend_names_its_conversation_keeps_the_stored_id() {
+    // Arrange
+    let rig = Rig::new(relaxed(), Vec::new());
+    rig.control(&json!({
+        "report_path": rig.cwd.path().join(REPORT),
+        "prompt_path": rig.cwd.path().join(PROMPTS),
+        "resume_crash_marker": rig.cwd.path().join(CRASH_MARKER),
+    }));
+    let session = rig.session.clone();
+    rig.hub
+        .with_store_mut(move |store| {
+            store.record_backend_thread(
+                &session,
+                BackendKind::ClaudeCode,
+                STALE_ID,
+                &TurnId::new("0"),
+            )
+        })
+        .await
+        .unwrap();
+    let binary = coda_testkit::paths::fake_claude_path().unwrap();
+    let restarted = rig.turns_with(binary, rig.sleeper.clone());
+
+    // Act
+    rig.send_to(&restarted, NO_PERMISSION_TURN).await;
+    rig.wait_until_stopped(&restarted).await;
+
+    // Assert
+    assert_eq!(resumed_with(&args(&rig)), Some(STALE_ID));
+    let failed: i64 = rig
+        .db()
+        .query_row(
+            "SELECT count(*) FROM backend_threads WHERE status = 'error'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(failed, 0);
+    let prompts = std::fs::read_to_string(rig.cwd.path().join(PROMPTS)).unwrap();
+    assert!(
+        !prompts.contains(SEED_MARK),
+        "no history is sent on a resume"
+    );
+}
+
+#[tokio::test]
+async fn a_crash_after_the_fresh_start_names_its_conversation_resumes_that_conversation() {
+    // Arrange
+    let mut rig = Rig::new(timing(SHORT_IDLE_MS, 20_000), Vec::new());
+    rig.control(&json!({ "report_path": rig.cwd.path().join(REPORT) }));
+    rig.send("hello").await;
+    let request = rig.wait_for_pending().await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+    let session = rig.session.clone();
+    rig.hub
+        .with_store_mut(move |store| {
+            store.record_backend_thread(
+                &session,
+                BackendKind::ClaudeCode,
+                STALE_ID,
+                &TurnId::new("0"),
+            )
+        })
+        .await
+        .unwrap();
+    rig.control(&json!({
+        "report_path": rig.cwd.path().join(REPORT),
+        "prompt_path": rig.cwd.path().join(PROMPTS),
+        "reject_resume_of": STALE_ID,
+        "crash_marker": rig.cwd.path().join(CRASH_MARKER),
+    }));
+    let binary = coda_testkit::paths::fake_claude_path().unwrap();
+    let restarted = rig.turns_with(binary, rig.sleeper.clone());
+
+    // Act
+    rig.send_to(&restarted, "flaky").await;
+    rig.wait_until_stopped(&restarted).await;
+
+    // Assert
+    assert_eq!(resumed_with(&args(&rig)), Some(BACKEND_ID));
+    let prompts = std::fs::read_to_string(rig.cwd.path().join(PROMPTS)).unwrap();
+    assert_eq!(
+        prompts.matches(SEED_MARK).count(),
+        1,
+        "the history is sent once"
+    );
 }
