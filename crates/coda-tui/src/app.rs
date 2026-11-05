@@ -20,16 +20,18 @@ use crate::permission::{Overlay, PermissionPrompt};
 use crate::sessions::LinkCommand;
 use crate::status::Status;
 
-const TITLE: &str = " coda (/quit, Ctrl+D or Ctrl+C twice quits) ";
+const TITLE: &str = " coda (/quit to exit) ";
 /// How long after an idle Ctrl+C a second one still quits.
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_NOTICE: &str = "Press Ctrl+C again to quit.";
+/// Shown after Ctrl+C in a running turn, where a second press cancels again.
+const BUSY_HINT: &str = "Cancelling. Esc then Ctrl+D to quit.";
 /// Rows a page key moves the transcript.
 const PAGE_ROWS: usize = 5;
 /// Shown in the transcript when no provider is enabled in the config.
 pub const SETUP_GUIDANCE: &str = "No provider is enabled. Run `coda init`, enable one in config.toml, then run `coda daemon restart`.";
 /// Closes the connection line after the daemon went away.
-pub const LOST_DAEMON_HINT: &str = "Type /quit, then run `coda` to start it again.";
+pub const LOST_DAEMON_HINT: &str = "Ctrl+D quits. Run `coda` to start the daemon again.";
 const NO_SESSIONS: &str = "the daemon has no sessions";
 const BACKEND_SWITCH_BUSY: &str = "wait for the running turn to finish before switching backend";
 
@@ -82,6 +84,8 @@ pub struct App {
     user_commands: UserCommands,
     quit: bool,
     idle_ctrl_c_at: Option<Instant>,
+    /// A short-lived line that replaces the connection line.
+    hint: Option<(Instant, &'static str)>,
 }
 
 impl App {
@@ -99,6 +103,7 @@ impl App {
             user_commands: UserCommands::default(),
             quit: false,
             idle_ctrl_c_at: None,
+            hint: None,
         }
     }
 
@@ -225,12 +230,14 @@ impl App {
             return;
         }
         self.idle_ctrl_c_at = None;
+        self.hint = None;
         if self.overlay.is_active() {
             if let Some(answer) = self.overlay.handle_key(key, now) {
                 self.send(LinkCommand::Respond(answer));
             }
         } else if ctrl && key.code == KeyCode::Char('d') {
-            if self.input.text().is_empty() {
+            let lost = matches!(self.connection, ConnectionState::Disconnected(_));
+            if lost || self.input.text().is_empty() {
                 self.quit = true;
             }
         } else if key.code == KeyCode::Esc {
@@ -254,6 +261,9 @@ impl App {
         }
         if busy {
             self.idle_ctrl_c_at = None;
+            if self.turn_running {
+                self.hint = Some((now, BUSY_HINT));
+            }
             return;
         }
         let confirmed = self
@@ -263,7 +273,7 @@ impl App {
             self.quit = true;
         } else {
             self.idle_ctrl_c_at = Some(now);
-            self.chat.push_notice(QUIT_CONFIRM_NOTICE);
+            self.hint = Some((now, QUIT_CONFIRM_NOTICE));
         }
     }
 
@@ -354,10 +364,16 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, pasted: &str) {
+        self.idle_ctrl_c_at = None;
+        self.hint = None;
         self.input.handle_paste(pasted);
     }
 
     pub fn render(&self, frame: &mut Frame) {
+        self.render_at(frame, Instant::now());
+    }
+
+    fn render_at(&self, frame: &mut Frame, now: Instant) {
         let [body, input, connection, status] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(1),
@@ -370,18 +386,25 @@ impl App {
         frame.render_widget(block, body);
         self.chat.render(frame, transcript);
         self.input.render(frame, input);
-        frame.render_widget(Paragraph::new(self.connection_text()), connection);
+        frame.render_widget(Paragraph::new(self.connection_text(now)), connection);
         self.status.render(frame, status);
         self.overlay.render(frame, frame.area());
     }
 
-    fn connection_text(&self) -> String {
+    fn connection_text(&self, now: Instant) -> String {
+        let lost = matches!(self.connection, ConnectionState::Disconnected(_));
+        if let Some((shown_at, hint)) = self.hint
+            && !lost
+            && now.duration_since(shown_at) <= QUIT_CONFIRM_WINDOW
+        {
+            return hint.to_owned();
+        }
         match &self.connection {
             ConnectionState::Connecting => "Connecting to the daemon".to_owned(),
             ConnectionState::Connected => "Connected to the daemon".to_owned(),
             ConnectionState::Failed(reason) => format!("Not connected: {reason}"),
             ConnectionState::Disconnected(reason) => {
-                format!("Disconnected from the daemon: {reason}. {LOST_DAEMON_HINT}")
+                format!("{LOST_DAEMON_HINT} Disconnected from the daemon: {reason}")
             }
         }
     }
@@ -522,7 +545,7 @@ mod tests {
         app.handle_event(LinkEvent::Disconnected("EOF".to_owned()));
 
         // Assert
-        let screen = screen(&app);
+        let screen = wide_screen(&app);
         assert!(screen.contains("Disconnected"), "{screen}");
         assert!(screen.contains("EOF"), "{screen}");
     }
@@ -1205,5 +1228,231 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("anthropic | m-1"), "{shown}");
+    }
+
+    fn screen_at(app: &App, now: Instant) -> String {
+        crate::test_support::screen(WIDTH, HEIGHT, |frame| app.render_at(frame, now))
+    }
+
+    fn only_response(commands: &mut UnboundedReceiver<LinkCommand>) -> PermissionDecision {
+        match sent(commands).as_slice() {
+            [LinkCommand::Respond(answer)] => answer.decision,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_paste_between_two_ctrl_c_presses_resets_the_confirmation() {
+        // Arrange
+        let mut app = App::new();
+        let start = Instant::now();
+
+        // Act
+        app.handle_key_at(ctrl_c(), start);
+        app.handle_paste("keep me");
+        app.handle_key_at(ctrl_c(), start);
+
+        // Assert
+        assert!(!app.should_quit());
+        assert_eq!(app.input.text(), "keep me");
+    }
+
+    #[test]
+    fn the_title_fits_a_narrow_terminal_and_promises_only_what_is_true() {
+        // Arrange
+        let app = App::new();
+
+        // Act
+        let first_row = screen_at(&app, Instant::now())
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+
+        // Assert
+        assert!(first_row.contains(TITLE.trim()), "{first_row}");
+    }
+
+    #[test]
+    fn the_quit_confirmation_shows_once_and_goes_when_the_window_closes() {
+        // Arrange
+        let mut app = App::new();
+        let start = Instant::now();
+
+        // Act
+        app.handle_key_at(ctrl_c(), start);
+        app.handle_key_at(ctrl_c(), start + QUIT_CONFIRM_WINDOW * 2);
+        let inside = screen_at(&app, start + QUIT_CONFIRM_WINDOW * 2);
+        let after = screen_at(&app, start + QUIT_CONFIRM_WINDOW * 4);
+
+        // Assert
+        assert!(inside.contains(QUIT_CONFIRM_NOTICE), "{inside}");
+        assert!(!after.contains(QUIT_CONFIRM_NOTICE), "{after}");
+    }
+
+    #[test]
+    fn the_confirmation_does_not_pile_up_in_the_transcript() {
+        // Arrange
+        let mut app = App::new();
+        let start = Instant::now();
+
+        // Act
+        for step in 0..3 {
+            app.handle_key_at(ctrl_c(), start + QUIT_CONFIRM_WINDOW * (step * 3));
+        }
+
+        // Assert
+        let shown = screen_at(&app, start + QUIT_CONFIRM_WINDOW * 100);
+        assert!(!shown.contains(QUIT_CONFIRM_NOTICE), "{shown}");
+    }
+
+    #[test]
+    fn ctrl_c_in_a_busy_turn_tells_how_to_quit() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        type_line(&mut app, "go");
+        let start = Instant::now();
+
+        // Act
+        app.handle_key_at(ctrl_c(), start);
+
+        // Assert
+        let shown = screen_at(&app, start);
+        assert!(shown.contains(BUSY_HINT), "{shown}");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn ctrl_d_during_a_turn_does_nothing_with_text_and_quits_when_empty() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        type_line(&mut app, "go");
+        sent(&mut commands);
+        app.handle_key(press(KeyCode::Char('x')));
+
+        // Act
+        app.handle_key(ctrl_d());
+        let with_text = app.should_quit();
+        app.handle_key(press(KeyCode::Esc));
+        app.handle_key(ctrl_d());
+
+        // Assert
+        assert!(!with_text);
+        assert!(app.should_quit());
+        assert!(app.turn_running);
+        assert_eq!(sent(&mut commands), vec![]);
+    }
+
+    #[test]
+    fn the_lost_daemon_hint_shows_on_a_narrow_terminal_and_ctrl_c_keeps_the_reason() {
+        // Arrange
+        let mut app = App::new();
+        app.handle_event(LinkEvent::Disconnected("EOF".to_owned()));
+        let now = Instant::now();
+
+        // Act
+        app.handle_key_at(ctrl_c(), now);
+
+        // Assert
+        let shown = screen_at(&app, now);
+        assert!(shown.contains("Ctrl+D quits"), "{shown}");
+        assert!(!shown.contains(QUIT_CONFIRM_NOTICE), "{shown}");
+    }
+
+    #[test]
+    fn denying_a_prompt_with_ctrl_c_does_not_say_cancelling() {
+        // Arrange
+        let (mut app, _commands) = armed();
+        app.handle_event(prompt("r-1"));
+        let now = Instant::now();
+
+        // Act
+        app.handle_key_at(ctrl_c(), now);
+
+        // Assert
+        let shown = screen_at(&app, now);
+        assert!(!shown.contains(BUSY_HINT), "{shown}");
+    }
+
+    #[test]
+    fn esc_during_a_turn_clears_the_input_and_leaves_the_turn_running() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        type_line(&mut app, "go");
+        sent(&mut commands);
+        app.handle_key(press(KeyCode::Char('x')));
+
+        // Act
+        app.handle_key(press(KeyCode::Esc));
+
+        // Assert
+        assert_eq!(app.input.text(), "");
+        assert!(app.turn_running);
+        assert!(!app.should_quit());
+        assert_eq!(sent(&mut commands), vec![]);
+    }
+
+    #[test]
+    fn ctrl_d_with_a_prompt_open_neither_quits_nor_answers() {
+        // Arrange
+        let (mut app, mut commands) = armed();
+        app.handle_event(prompt("r-1"));
+
+        // Act
+        app.handle_key(ctrl_d());
+
+        // Assert
+        assert!(!app.should_quit());
+        assert!(app.overlay.is_active());
+        assert_eq!(sent(&mut commands), vec![]);
+    }
+
+    #[test]
+    fn esc_in_a_prompt_denies_the_request() {
+        // Arrange
+        let (mut app, mut commands) = armed();
+        app.handle_event(prompt("r-1"));
+
+        // Act
+        app.handle_key(press(KeyCode::Esc));
+
+        // Assert
+        assert_eq!(only_response(&mut commands), PermissionDecision::Deny);
+    }
+
+    #[test]
+    fn a_lost_daemon_with_text_left_in_the_input_can_still_quit() {
+        // Arrange
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('x')));
+        app.handle_event(LinkEvent::Disconnected("EOF".to_owned()));
+
+        // Act
+        app.handle_key(ctrl_d());
+
+        // Assert
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn a_lost_daemon_can_quit_with_ctrl_c_twice_and_with_slash_quit() {
+        // Arrange
+        let lost = || {
+            let mut app = App::new();
+            app.handle_event(LinkEvent::Disconnected("EOF".to_owned()));
+            app
+        };
+        let mut by_ctrl_c = lost();
+        let mut by_command = lost();
+        let start = Instant::now();
+
+        // Act
+        by_ctrl_c.handle_key_at(ctrl_c(), start);
+        by_ctrl_c.handle_key_at(ctrl_c(), start);
+        type_line(&mut by_command, "/quit");
+
+        // Assert
+        assert!(by_ctrl_c.should_quit());
+        assert!(by_command.should_quit());
     }
 }
