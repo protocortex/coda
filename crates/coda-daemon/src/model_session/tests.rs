@@ -23,7 +23,7 @@ use crate::subscribe::{Connection, Hub, Outbox};
 use crate::trace::capture::{Spans, install};
 use crate::turn::{BACKEND_UNSUPPORTED, TurnConfig, TurnState, Turns};
 use crate::watchdog::Timing;
-use coda_core::history::CONVERSATION_RESET_KIND;
+use coda_core::history::{CONVERSATION_RESET_KIND, PERMISSION_REQUEST_KIND};
 use coda_core::turn::{CancelToken, PROVIDER_CALL_SPAN, TOOL_CALL_SPAN};
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -275,17 +275,31 @@ impl Rig {
         created.await.unwrap()
     }
 
+    /// Polls until a permission request is waiting and its announcement is
+    /// stored: the request row is written first, and an answer in between
+    /// suppresses the announcement.
     async fn wait_for_pending(&self) -> String {
         tokio::time::timeout(WAIT, async {
             loop {
                 if let Some(first) = self.pending().await.first() {
-                    return first.id.as_str().to_owned();
+                    let id = first.id.as_str().to_owned();
+                    if self.announced(&id).await {
+                        return id;
+                    }
                 }
                 tokio::time::sleep(POLL).await;
             }
         })
         .await
-        .expect("no permission request was queued in time")
+        .expect("no permission request was queued and announced in time")
+    }
+
+    async fn announced(&self, request_id: &str) -> bool {
+        self.events().await.iter().any(|event| {
+            event.kind == PERMISSION_REQUEST_KIND
+                && serde_json::from_str::<Value>(&event.body)
+                    .is_ok_and(|body| body["request_id"] == request_id)
+        })
     }
 
     async fn respond(&mut self, request_id: &str, decision: &str) -> Value {

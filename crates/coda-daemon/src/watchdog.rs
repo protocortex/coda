@@ -23,6 +23,9 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 /// How long a backend may stay silent while a tool it runs is in flight.
 pub const DELEGATED_TOOL_TIMEOUT: Duration = Duration::from_mins(15);
 
+/// How long the end of an aborted turn waits for a stuck store.
+pub const STORE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The limits a turn runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
@@ -30,6 +33,8 @@ pub struct Timing {
     pub delegated_tool: Duration,
     /// How long a permission prompt waits before it is denied.
     pub permission: Duration,
+    /// How long the end of an aborted turn waits for the store before it lets go.
+    pub store_stall: Duration,
 }
 
 impl Default for Timing {
@@ -38,6 +43,7 @@ impl Default for Timing {
             idle: IDLE_TIMEOUT,
             delegated_tool: DELEGATED_TOOL_TIMEOUT,
             permission: PERMISSION_TIMEOUT,
+            store_stall: STORE_STALL_TIMEOUT,
         }
     }
 }
@@ -48,6 +54,7 @@ impl From<&coda_config::timing::Timing> for Timing {
             idle: config.idle_timeout,
             delegated_tool: config.delegated_tool,
             permission: config.permission_default_deny,
+            store_stall: STORE_STALL_TIMEOUT,
         }
     }
 }
@@ -185,6 +192,7 @@ mod tests {
             idle: SHORT,
             delegated_tool: LONG,
             permission: Duration::from_secs(1),
+            store_stall: Duration::from_secs(1),
         }
     }
 

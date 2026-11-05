@@ -7,8 +7,8 @@
 //! watchdog aborts a silent backend, and the child is stopped and its pidfile
 //! removed however the turn ends.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::PathBuf;
@@ -70,7 +70,8 @@ const CLAUDE_BACKEND_NAME: &str = "claude_code";
 const CODEX_BACKEND_NAME: &str = "codex";
 /// How long the publisher gathers consecutive text deltas into one stored chunk.
 const DELTA_WINDOW: Duration = Duration::from_millis(50);
-/// Largest stored text chunk, so a long stream is still stored in pieces.
+/// Size at which a stored text chunk stops growing, so a long stream is still stored
+/// in pieces. The last delta may take a chunk a little past it.
 const MAX_DELTA_CHUNK_BYTES: usize = 16 * 1024;
 /// How long a request waits for a session whose turn is ending: its terminal
 /// event is out, or it was cancelled and has not ended yet. Stopping a backend
@@ -782,7 +783,7 @@ impl Turns {
         } = job;
         let (tx, rx) = mpsc::channel(EVENT_QUEUE_BOUND);
         self.queues().insert(session.clone(), tx.downgrade());
-        let publisher = tokio::spawn(publish_events(
+        let mut publisher = tokio::spawn(publish_events(
             Arc::clone(&self.hub),
             session.clone(),
             turn.clone(),
@@ -795,7 +796,7 @@ impl Turns {
             tool_requested: AtomicBool::new(false),
         };
         let emit = EventSink {
-            tx,
+            outbox: EventOutbox::new(tx),
             watchdog: Arc::clone(&watchdog),
             turns: Arc::clone(&self),
             session: session.clone(),
@@ -828,6 +829,8 @@ impl Turns {
             timed_out,
             ..
         } = drive;
+        // A store that never answers must not hold the slot of a turn the watchdog aborted.
+        let limit = timed_out.then_some(self.config.timing.store_stall);
         // A turn the watchdog aborted may still run on the server, so it is not kept.
         let keep = !timed_out
             && matches!(
@@ -842,14 +845,14 @@ impl Turns {
             info!(session = %session, turn = %turn, step = "cleanup", "stopping the backend");
             stop(&mut child, &session).await;
             if let Some(backend_id) = child.session_id_from_backend() {
-                self.remember_backend_id(&record, &turn, backend_id).await;
+                let saved =
+                    within(limit, self.remember_backend_id(&record, &turn, backend_id)).await;
+                if saved.is_none() {
+                    warn!(session = %session, "the store did not answer; the backend id was not saved");
+                }
             }
         }
-        // Dropping the emitter closes the channel, which ends the publisher.
-        drop(emit);
-        if publisher.await.is_err() {
-            warn!(session = %session, "the event publisher stopped early");
-        }
+        let store_failures = settle_events(&session, emit, &mut publisher, limit).await;
         self.queues().remove(&session);
         if !keep {
             remove_pidfile(&self.config.pidfile_dir, &session);
@@ -858,13 +861,18 @@ impl Turns {
             warn!(session = %session, error = %e, "the turn failed");
         }
         // A cancelled turn is the user's choice, not a failure; a watchdog abort is one.
+        // An event that could not be stored leaves a hole in the log, which is a failure too.
         let failed = timed_out
+            || store_failures > 0
             || match &outcome {
                 Some(Ok(TurnOutcome::Completed { is_error })) => *is_error,
                 Some(Ok(TurnOutcome::Cancelled)) => false,
                 _ => true,
             };
-        Self::finish(&self.hub, &session, &turn, failed).await;
+        let ended = within(limit, Self::finish(&self.hub, &session, &turn, failed)).await;
+        if ended.is_none() {
+            warn!(session = %session, "the store did not answer; the turn is left open");
+        }
     }
 
     /// Denies the prompts the turn left open and records how it ended.
@@ -970,13 +978,68 @@ impl PermissionGate for WatchedGate {
     }
 }
 
+/// Events on their way to the publisher. An event is queued here before any
+/// wait, so dropping a flush that is parked on a full queue (a cancel, the idle
+/// timeout) leaves the event in place for the next flush instead of losing it.
+struct EventOutbox {
+    tx: mpsc::Sender<Event>,
+    pending: VecDeque<Event>,
+    lost: usize,
+}
+
+impl EventOutbox {
+    fn new(tx: mpsc::Sender<Event>) -> Self {
+        Self {
+            tx,
+            pending: VecDeque::new(),
+            lost: 0,
+        }
+    }
+
+    fn push(&mut self, event: Event) {
+        self.pending.push_back(event);
+    }
+
+    /// Sends every pending event in order, waiting while the queue is full.
+    /// Cancel safe: an event leaves `pending` only when its place is reserved.
+    /// Returns how many events the closed queue refused.
+    async fn flush(&mut self) -> usize {
+        let mut refused = 0;
+        while !self.pending.is_empty() {
+            if let Ok(permit) = self.tx.reserve().await {
+                if let Some(event) = self.pending.pop_front() {
+                    permit.send(event);
+                }
+            } else {
+                refused += self.pending.len();
+                self.pending.clear();
+            }
+        }
+        self.lost += refused;
+        refused
+    }
+
+    /// Events that never reached the publisher.
+    fn lost(&self) -> usize {
+        self.lost
+    }
+}
+
 /// Where a running turn's adapter puts its events. A full queue makes the adapter
 /// wait, so a slow store slows the backend instead of growing memory.
 struct EventSink {
-    tx: mpsc::Sender<Event>,
+    outbox: EventOutbox,
     watchdog: Arc<Watchdog>,
     turns: Arc<Turns>,
     session: SessionId,
+}
+
+impl EventSink {
+    /// Sends what an interrupted emit left behind, then reports the events lost.
+    async fn finish(&mut self) -> usize {
+        self.outbox.flush().await;
+        self.outbox.lost()
+    }
 }
 
 impl Emit for EventSink {
@@ -987,9 +1050,51 @@ impl Emit for EventSink {
         {
             reservation.wind_down();
         }
-        if self.tx.send(event).await.is_err() {
-            warn!(session = %self.session, "the event publisher is gone; dropping an event");
+        self.outbox.push(event);
+        let refused = self.outbox.flush().await;
+        if refused > 0 {
+            warn!(session = %self.session, refused, "the event publisher is gone; dropping events");
         }
+    }
+}
+
+/// Sends what a cancel or the idle timeout cut off mid-send, closes the queue and
+/// waits for the publisher. Returns how many events never reached the store.
+async fn settle_events(
+    session: &SessionId,
+    mut emit: EventSink,
+    publisher: &mut JoinHandle<usize>,
+    limit: Option<Duration>,
+) -> usize {
+    let mut failures = 0;
+    if let Some(lost) = within(limit, emit.finish()).await {
+        failures += lost;
+    } else {
+        warn!(session = %session, "the store did not answer; the last events were not sent");
+        failures += 1;
+    }
+    // Dropping the emitter closes the channel, which ends the publisher.
+    drop(emit);
+    match within(limit, &mut *publisher).await {
+        Some(Ok(failed)) => failures += failed,
+        Some(Err(_)) => {
+            warn!(session = %session, "the event publisher stopped early");
+            failures += 1;
+        }
+        None => {
+            warn!(session = %session, "the store did not answer; dropping the queued events");
+            publisher.abort();
+            failures += 1;
+        }
+    }
+    failures
+}
+
+/// Waits for `work`, or for `limit` when there is one. `None` means the limit passed.
+async fn within<T>(limit: Option<Duration>, work: impl Future<Output = T>) -> Option<T> {
+    match limit {
+        Some(limit) => tokio::time::timeout(limit, work).await.ok(),
+        None => Some(work.await),
     }
 }
 
@@ -998,19 +1103,21 @@ async fn publish_events(
     session: SessionId,
     turn: TurnId,
     mut events: mpsc::Receiver<Event>,
-) {
+) -> usize {
     let mut held = None;
+    let mut failed = 0;
     loop {
         let next = match held.take() {
             Some(event) => event,
             None => match events.recv().await {
                 Some(event) => event,
-                None => return,
+                None => return failed,
             },
         };
         let event = coalesce_text(next, &mut events, &mut held).await;
         if let Err(e) = store_event(&hub, &session, &turn, &event).await {
             warn!(session = %session, error = %e, "could not store an event");
+            failed += 1;
         }
     }
 }

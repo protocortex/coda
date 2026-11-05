@@ -15,10 +15,11 @@ use coda_store::{NewPending, NewSession, Store, StoredEvent};
 use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 
 use super::{
-    BACKEND_UNSUPPORTED, CancelHandle, EVENT_QUEUE_BOUND, Reservation, SESSION_NOT_FOUND,
-    TURN_RUNNING, TurnConfig, TurnState, Turns, WIND_DOWN_TIMEOUT,
+    BACKEND_UNSUPPORTED, CancelHandle, EVENT_QUEUE_BOUND, EventOutbox, Reservation,
+    SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig, TurnState, Turns, WIND_DOWN_TIMEOUT,
 };
 use crate::dispatch::Dispatcher;
 use crate::idle_pool::MAX_IDLE_SERVERS;
@@ -34,6 +35,9 @@ use coda_core::broker::DECISION_SPAN;
 /// An upper bound, not a duration: starting a process can stall for many
 /// seconds on a loaded machine, and a wait returns as soon as its event does.
 const WAIT: Duration = Duration::from_secs(60);
+const EVENTS_PAGE: u32 = 500;
+/// Short, so a test that stalls the store sees the limit pass quickly.
+const STORE_STALL: Duration = Duration::from_millis(400);
 const POLL: Duration = Duration::from_millis(20);
 /// Far above the backend start-up latency, so the idle limit cannot trip before the pause.
 const PAUSE_TEST_IDLE_MS: u64 = 5_000;
@@ -54,6 +58,7 @@ fn timing(idle_ms: u64, permission_ms: u64) -> Timing {
         idle: Duration::from_millis(idle_ms),
         delegated_tool: Duration::from_secs(30),
         permission: Duration::from_millis(permission_ms),
+        store_stall: STORE_STALL,
     }
 }
 
@@ -166,7 +171,18 @@ impl Rig {
     async fn events(&self) -> Vec<StoredEvent> {
         let session = self.session.clone();
         self.hub
-            .with_store(move |store| store.load_events(&session, 0, 1000))
+            .with_store(move |store| {
+                let mut all: Vec<StoredEvent> = Vec::new();
+                loop {
+                    let after = all.last().map_or(0, |e| e.seq);
+                    let page = store.load_events(&session, after, EVENTS_PAGE)?;
+                    let done = page.len() < EVENTS_PAGE as usize;
+                    all.extend(page);
+                    if done {
+                        return Ok(all);
+                    }
+                }
+            })
             .await
             .unwrap()
     }
@@ -520,6 +536,7 @@ fn tool_timing(tool_bound_ms: u64) -> Timing {
         idle: Duration::from_millis(TOOL_TEST_IDLE_MS),
         delegated_tool: Duration::from_millis(tool_bound_ms),
         permission: Duration::from_secs(20),
+        store_stall: STORE_STALL,
     }
 }
 
@@ -1938,7 +1955,10 @@ async fn a_stalled_publisher_holds_the_queue_at_its_bound_and_nothing_is_lost_af
 
     // Assert
     assert!(reached.is_ok(), "the queue never filled");
-    assert!(deepest <= EVENT_QUEUE_BOUND, "the queue grew to {deepest}");
+    assert_eq!(
+        deepest, EVENT_QUEUE_BOUND,
+        "the stalled queue is held at its bound"
+    );
     let text: String = rig
         .events()
         .await
@@ -1950,4 +1970,166 @@ async fn a_stalled_publisher_holds_the_queue_at_its_bound_and_nothing_is_lost_af
         })
         .collect();
     assert_eq!(text.len(), "working".len() + STALL_BURST);
+}
+
+const OUTBOX_BOUND: usize = 1;
+
+fn delta(text: &str) -> Event {
+    Event::StreamDelta {
+        session_id: SessionId::new("s-1"),
+        turn_id: TurnId::new("t-1"),
+        text: text.to_owned(),
+    }
+}
+
+fn text_of(event: Option<Event>) -> String {
+    match event {
+        Some(Event::StreamDelta { text, .. }) => text,
+        other => panic!("expected a delta, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_event_parked_on_a_full_queue_survives_the_emit_being_dropped() {
+    // Arrange
+    let (tx, mut rx) = mpsc::channel(OUTBOX_BOUND);
+    let mut outbox = EventOutbox::new(tx);
+    outbox.push(delta("first"));
+    assert_eq!(outbox.flush().await, 0);
+    outbox.push(delta("parked"));
+
+    // Act: the queue is full, so the flush parks; a ready branch drops it, as a cancel does.
+    tokio::select! {
+        biased;
+        _ = outbox.flush() => panic!("the queue was full"),
+        () = std::future::ready(()) => {}
+    }
+    assert_eq!(text_of(rx.recv().await), "first");
+    let lost = outbox.flush().await;
+
+    // Assert
+    assert_eq!(lost, 0);
+    assert_eq!(text_of(rx.recv().await), "parked");
+}
+
+#[tokio::test]
+async fn events_pushed_after_a_dropped_flush_keep_their_order() {
+    // Arrange
+    let (tx, mut rx) = mpsc::channel(OUTBOX_BOUND);
+    let mut outbox = EventOutbox::new(tx);
+    outbox.push(delta("first"));
+    outbox.flush().await;
+    outbox.push(delta("second"));
+    tokio::select! {
+        biased;
+        _ = outbox.flush() => panic!("the queue was full"),
+        () = std::future::ready(()) => {}
+    }
+
+    // Act
+    outbox.push(delta("third"));
+    let drain = async {
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(text_of(rx.recv().await));
+        }
+        seen
+    };
+    let (_, seen) = tokio::join!(outbox.flush(), drain);
+
+    // Assert
+    assert_eq!(seen, ["first", "second", "third"]);
+}
+
+#[tokio::test]
+async fn a_flush_into_a_closed_queue_reports_the_events_it_lost() {
+    // Arrange
+    let (tx, rx) = mpsc::channel(OUTBOX_BOUND);
+    let mut outbox = EventOutbox::new(tx);
+    drop(rx);
+    outbox.push(delta("a"));
+    outbox.push(delta("b"));
+
+    // Act
+    let lost = outbox.flush().await;
+
+    // Assert
+    assert_eq!(lost, 2);
+}
+
+#[tokio::test]
+async fn a_turn_whose_event_cannot_be_stored_is_failed_and_logged_as_an_error() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.send("hello").await;
+    rig.wait_for_pending().await;
+    rig.db()
+        .execute_batch(
+            "CREATE TRIGGER refuse_events BEFORE INSERT ON events \
+             WHEN NEW.kind = 'result' \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+
+    // Act
+    let request = rig.wait_for_pending().await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let log = dump(&rig.db(), "event_log");
+    assert!(log.contains("turn_ended"), "positive control: {log}");
+    assert!(log.contains("error"), "{log}");
+}
+
+const IDLE_BEFORE_STALL_MS: u64 = 300;
+
+#[tokio::test]
+async fn a_stuck_store_does_not_hold_the_session_after_an_idle_timeout() {
+    // Arrange
+    let mut rig = Rig::new(timing(IDLE_BEFORE_STALL_MS, 20_000), Vec::new());
+    rig.control(&json!({ "delta_burst": STALL_BURST }));
+    rig.send("hello").await;
+    let named = rig.session.clone();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let named = named.clone();
+            let found = rig
+                .hub
+                .with_store(move |store| store.active_backend_ref(&named, BackendKind::ClaudeCode))
+                .await
+                .unwrap();
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("the backend never named its conversation");
+    let store = rig.hub.store_handle();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let stall = std::thread::spawn(move || {
+        let _held = store.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    // Act
+    let freed = tokio::time::timeout(WAIT, async {
+        while rig.turns.is_running(&rig.session) {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await;
+    release_tx.send(()).unwrap();
+    stall.join().unwrap();
+
+    // Assert
+    assert!(
+        freed.is_ok(),
+        "the session stayed busy behind a stuck store"
+    );
 }
