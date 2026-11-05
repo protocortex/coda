@@ -54,7 +54,8 @@ pub struct HookBlockedBody {
 pub struct RateLimitWindow {
     /// The provider's name for the window.
     pub name: String,
-    /// Share of the window used, in basis points: 900 is 9%.
+    /// Share of the window used, in basis points: 900 is 9%. It is not capped, so
+    /// a window the plan has overrun reports more than 10000.
     pub utilization_bps: u32,
     /// When the window resets, in seconds since the Unix epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,7 +106,8 @@ pub enum UsageWindowKind {
     ModelScoped,
     /// A monthly window.
     Monthly,
-    /// A window this peer does not know, sent by a newer one.
+    /// A window this peer does not know, sent by a newer one. Also any name the
+    /// provider reports that has no kind of its own, such as `overage`.
     #[serde(other)]
     Unknown,
 }
@@ -167,6 +169,11 @@ impl InterruptCause {
 /// A variant added later reads as [`Event::Unknown`] on an older peer, so
 /// adding one does not need a `PROTOCOL_VERSION` bump. The daemon announces
 /// the matching `Capabilities` flag at `initialize`.
+///
+/// `Unknown` is receive-only. It keeps nothing of the original event, so it
+/// serializes as `{"type":"unknown"}`. A client or relay must not store or
+/// forward it as if it were the original; keep the raw JSON line instead when
+/// the original has to survive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -410,6 +417,28 @@ mod tests {
             serde_json::to_value(UsageWindowKind::ModelScoped).unwrap(),
             json!("model_scoped")
         );
+    }
+
+    #[test]
+    fn an_unknown_event_keeps_nothing_of_the_original_so_it_is_receive_only() {
+        // Arrange
+        let raw = json!({"type":"event_added_later","session_id":"s-1","extra":{"n":1}});
+
+        // Act
+        let event: Event = serde_json::from_value(raw.clone()).unwrap();
+        let written = serde_json::to_value(&event).unwrap();
+
+        // Assert
+        assert_eq!(event, Event::Unknown);
+        assert_eq!(written, json!({"type":"unknown"}));
+        assert_ne!(written, raw);
+    }
+
+    #[test]
+    fn an_event_without_a_type_does_not_read_as_unknown() {
+        let read = serde_json::from_value::<Event>(json!({"session_id":"s-1"}));
+
+        assert!(read.is_err());
     }
 
     #[test]

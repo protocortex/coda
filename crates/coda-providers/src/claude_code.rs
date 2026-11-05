@@ -15,6 +15,10 @@ const CAN_USE_TOOL: &str = "can_use_tool";
 const DENY_MESSAGE: &str = "denied by coda";
 /// Claude Code reports a window's utilization as a fraction of one.
 const BASIS_POINTS_PER_UNIT: f64 = 10_000.0;
+/// Reset times are seconds. A larger number is milliseconds or garbage; this is year 5138 in seconds.
+const MAX_EPOCH_SECONDS: u64 = 100_000_000_000;
+const WINDOW_WITHOUT_UTILIZATION: &str = "rate limit window without a numeric utilization";
+const UNUSABLE_RESET_TIME: &str = "rate limit reset time is not whole seconds since the epoch";
 
 /// One message from the Claude Code output stream that coda acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,11 +96,11 @@ pub enum Diagnostic {
         /// The unrecognized subtype.
         subtype: String,
     },
-    /// A record missing a field coda needs.
+    /// A record missing a field coda needs, or carrying a value coda cannot read.
     MalformedRequest {
         /// 1-based line number in the stream.
         line: u64,
-        /// What was missing.
+        /// What was missing or unreadable.
         reason: &'static str,
     },
     /// A Codex thread id that is missing or not a plain identifier.
@@ -186,7 +190,16 @@ impl StreamParser {
             }
             // Real streams also carry the model's own tool results.
             "system" | "user" => None,
-            "rate_limit_event" => rate_limit(&value["rate_limit_info"]).map(Message::RateLimit),
+            "rate_limit_event" => {
+                let mut unusable = Vec::new();
+                let limit = rate_limit(&value["rate_limit_info"], &mut unusable);
+                unusable.sort_unstable();
+                unusable.dedup();
+                for reason in unusable {
+                    self.record(Diagnostic::MalformedRequest { line, reason });
+                }
+                limit.map(Message::RateLimit)
+            }
             "stream_event" => text_delta(value).map(Message::TextDelta),
             "assistant" => Some(Message::Assistant {
                 text: assistant_text(value),
@@ -280,17 +293,22 @@ fn result_usage(value: &Value) -> Option<Message> {
     }))
 }
 
-fn rate_limit(info: &Value) -> Option<RateLimit> {
+/// Reads a rate-limit report; `unusable` collects what was present but could not be read.
+fn rate_limit(info: &Value, unusable: &mut Vec<&'static str>) -> Option<RateLimit> {
     let text = |key: &str| info[key].as_str().map(str::to_owned);
     let mut windows: Vec<_> = info["unifiedWindows"]
         .as_object()
         .into_iter()
         .flatten()
         .filter_map(|(name, window)| {
+            let Some(utilization) = window["utilization"].as_f64() else {
+                unusable.push(WINDOW_WITHOUT_UTILIZATION);
+                return None;
+            };
             Some(RateLimitWindow {
                 name: name.clone(),
-                utilization_bps: basis_points(window["utilization"].as_f64()?),
-                resets_at: window["resetsAt"].as_u64(),
+                utilization_bps: basis_points(utilization),
+                resets_at: epoch_seconds(&window["resetsAt"], unusable),
             })
         })
         .collect();
@@ -298,13 +316,41 @@ fn rate_limit(info: &Value) -> Option<RateLimit> {
     Some(RateLimit {
         status: text("status")?,
         window_type: text("rateLimitType"),
-        resets_at: info["resetsAt"].as_u64(),
+        resets_at: epoch_seconds(&info["resetsAt"], unusable),
         windows,
         is_using_overage: info["isUsingOverage"].as_bool().unwrap_or(false),
         overage_status: text("overageStatus"),
-        overage_resets_at: info["overageResetsAt"].as_u64(),
+        overage_resets_at: epoch_seconds(&info["overageResetsAt"], unusable),
         overage_disabled_reason: text("overageDisabledReason"),
     })
+}
+
+/// Reads a reset time as whole seconds since the Unix epoch.
+///
+/// A whole-number float is accepted. A negative, fractional or too large value
+/// (milliseconds, for one) is not guessed at: it reads as absent and is noted in `unusable`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn epoch_seconds(value: &Value, unusable: &mut Vec<&'static str>) -> Option<u64> {
+    if value.is_null() {
+        return None;
+    }
+    let seconds = value
+        .as_u64()
+        .or_else(|| {
+            let float = value.as_f64()?;
+            // The range check keeps the cast exact.
+            (float >= 0.0 && float.fract() == 0.0 && float <= MAX_EPOCH_SECONDS as f64)
+                .then_some(float as u64)
+        })
+        .filter(|seconds| *seconds <= MAX_EPOCH_SECONDS);
+    if seconds.is_none() {
+        unusable.push(UNUSABLE_RESET_TIME);
+    }
+    seconds
 }
 
 /// The clamp keeps the value inside `u32`, so the cast cannot truncate or change sign.
@@ -420,6 +466,90 @@ mod tests {
         };
         assert_eq!(messages, vec![Message::RateLimit(expected)]);
         assert_eq!(parser.diagnostics(), []);
+    }
+
+    fn parse_limit(info: &Value) -> (Option<RateLimit>, Vec<&'static str>) {
+        let mut unusable = Vec::new();
+        let limit = rate_limit(info, &mut unusable);
+        (limit, unusable)
+    }
+
+    #[test]
+    fn utilization_converts_to_basis_points_and_may_pass_one_hundred_percent() {
+        let cases = [
+            (0.0, 0),
+            (0.0001, 1),
+            (1.0, 10_000),
+            (1.5, 15_000),
+            (-0.5, 0),
+            (1e30, u32::MAX),
+        ];
+
+        for (fraction, expected) in cases {
+            assert_eq!(basis_points(fraction), expected, "{fraction}");
+        }
+    }
+
+    #[test]
+    fn a_window_without_a_numeric_utilization_is_dropped_and_noted() {
+        // Arrange
+        let info = json!({"status":"allowed","unifiedWindows":{
+            "five_hour":{"resetsAt":1_794_193_200},
+            "seven_day":{"utilization":null,"resetsAt":1_794_193_200},
+            "monthly":{"utilization":0.5,"resetsAt":1_794_193_200}}});
+
+        // Act
+        let (limit, unusable) = parse_limit(&info);
+
+        // Assert
+        let names: Vec<_> = limit.unwrap().windows.into_iter().map(|w| w.name).collect();
+        assert_eq!(names, ["monthly"]);
+        assert_eq!(unusable, [WINDOW_WITHOUT_UTILIZATION; 2]);
+    }
+
+    #[test]
+    fn reset_times_are_whole_seconds_and_anything_else_is_dropped_and_noted() {
+        let cases = [
+            (json!(1_794_193_200_u64), Some(1_794_193_200), 0),
+            (json!(1_794_193_200.0), Some(1_794_193_200), 0),
+            (json!(null), None, 0),
+            (json!(1_794_193_200.5), None, 1),
+            (json!(-5), None, 1),
+            (json!(-5.0), None, 1),
+            (json!("soon"), None, 1),
+            (json!(1_794_193_200_000_u64), None, 1),
+            (json!(1.794_193_2e12), None, 1),
+        ];
+
+        for (value, expected, notes) in cases {
+            let mut unusable = Vec::new();
+            assert_eq!(epoch_seconds(&value, &mut unusable), expected, "{value}");
+            assert_eq!(unusable.len(), notes, "{value}");
+        }
+    }
+
+    #[test]
+    fn an_unusable_reset_time_leaves_the_rest_of_the_report_and_is_recorded_with_its_line() {
+        // Arrange
+        let mut parser = StreamParser::new();
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1794193200000,"unifiedWindows":{"five_hour":{"utilization":1.0}}}}"#;
+
+        // Act
+        let messages = feed_lines(&mut parser, &[line]);
+
+        // Assert
+        let Message::RateLimit(limit) = &messages[0] else {
+            panic!("no rate limit");
+        };
+        assert_eq!(limit.resets_at, None);
+        assert_eq!(limit.windows[0].utilization_bps, 10_000);
+        assert_eq!(
+            parser.diagnostics(),
+            [Diagnostic::MalformedRequest {
+                line: 1,
+                reason: UNUSABLE_RESET_TIME
+            }]
+        );
     }
 
     #[test]

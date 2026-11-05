@@ -82,15 +82,22 @@ pub struct InitializeParams {
 ///
 /// Add a flag when a change adds events or fields and is not breaking. Bump
 /// [`PROTOCOL_VERSION`] only for a breaking change.
+///
+/// A flag is daemon-wide and says the daemon can send the event or field. It
+/// does not say every session does: today only Claude Code sessions produce
+/// `usage`, `rate_limit` and `usage_limit` details, so a session on another
+/// backend never sends them even when the flag is true. A client must not wait
+/// for one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Capabilities {
-    /// The daemon reports the full usage of a turn, including cache tokens.
+    /// The daemon can report the full usage of a turn, including cache tokens.
     #[serde(default)]
     pub usage_details: bool,
-    /// The daemon sends rate-limit events.
+    /// The daemon can send `rate_limit` events. Only Claude Code sessions do.
     #[serde(default)]
     pub rate_limit_events: bool,
-    /// The daemon sends a `usage_limit` event when a turn ends at the plan limit.
+    /// The daemon can send a `usage_limit` event when a turn ends at the plan limit.
+    /// Only Claude Code sessions do.
     #[serde(default)]
     pub usage_limit_events: bool,
 }
