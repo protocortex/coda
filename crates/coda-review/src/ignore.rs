@@ -172,4 +172,18 @@ mod tests {
         let err = IgnoreSet::new(&["[".to_owned()], false).unwrap_err();
         assert!(matches!(err, RulesError::BadGlob { .. }));
     }
+
+    #[test]
+    fn every_builtin_entry_ignores_a_nested_sample() {
+        // Arrange
+        let ignore = set(&[], true);
+
+        for glob in BUILTIN_GLOBS {
+            let sample = format!("some/dir/{}", glob.replace('*', "x"));
+
+            // Act and Assert
+            assert!(ignore.is_ignored(&sample), "{glob} vs {sample}");
+            assert!(!set(&[], false).is_ignored(&sample), "{glob} when off");
+        }
+    }
 }

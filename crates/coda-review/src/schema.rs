@@ -352,4 +352,15 @@ mod tests {
         assert!(!scope.contains("f", 13, 13));
         assert!(scope.contains("f", 20, 22));
     }
+
+    #[test]
+    fn a_range_inside_another_keeps_the_outer_end() {
+        // Arrange
+        let mut scope = DiffScope::new();
+        scope.add("f", 1, 10);
+        scope.add("f", 3, 5);
+
+        // Act and Assert
+        assert!(scope.contains("f", 1, 10));
+    }
 }
