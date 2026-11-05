@@ -187,5 +187,11 @@ fn v10_snapshot_migrates_forward_adding_backend_threads() {
         .query_row("SELECT count(*) FROM backend_threads", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, 0);
+    let sessions: i64 = old
+        .query_row("SELECT count(*) FROM sessions WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(sessions, 1, "the existing session survives the migration");
     assert_eq!(master_listing(&old), master_listing(&fresh));
 }
