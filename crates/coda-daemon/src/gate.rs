@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::subscribe::Hub;
-use crate::turn::permission_mode;
+use crate::turn::{Fence, permission_mode};
 
 pub use coda_core::broker::PERMISSION_TIMEOUT;
 
@@ -134,6 +134,7 @@ pub struct BrokerGate {
     hub: Arc<Hub>,
     session: SessionId,
     turn: Arc<Mutex<TurnId>>,
+    fence: Arc<Fence>,
 }
 
 impl BrokerGate {
@@ -144,6 +145,7 @@ impl BrokerGate {
         record: &SessionRecord,
         turn: Arc<Mutex<TurnId>>,
     ) -> Self {
+        let fence = Arc::new(Fence::default());
         let announce = Announce {
             hub: Arc::clone(hub),
             broker: Arc::clone(&broker),
@@ -152,6 +154,7 @@ impl BrokerGate {
                 .to_string_lossy()
                 .into_owned(),
             turn: Arc::clone(&turn),
+            fence: Arc::clone(&fence),
         };
         // Subscribed before the task starts, so no prompt is missed.
         let (notices, expired) = (broker.subscribe(), broker.subscribe_expired());
@@ -161,7 +164,13 @@ impl BrokerGate {
             hub: Arc::clone(hub),
             session: record.id.clone(),
             turn,
+            fence,
         }
+    }
+
+    /// Waits for the events queued before a prompt, once a turn attaches its queue.
+    pub(crate) fn fence(&self) -> &Arc<Fence> {
+        &self.fence
     }
 }
 
@@ -279,6 +288,8 @@ struct Announce {
     session: SessionId,
     repo: String,
     turn: Arc<Mutex<TurnId>>,
+    /// Holds each announcement back until the text streamed before the prompt is stored.
+    fence: Arc<Fence>,
 }
 
 impl Announce {
@@ -306,6 +317,7 @@ impl Announce {
 
     /// A prompt no client can see would wait out its whole timeout, so it is denied instead.
     async fn announce(&self, notice: PendingNotice) {
+        self.fence.wait().await;
         let turn = lock(&self.turn).clone();
         let pending = NewPending {
             session: self.session.clone(),
