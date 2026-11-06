@@ -88,6 +88,31 @@ fn explore_and_reviewer_have_exactly_the_read_only_tools() {
 }
 
 #[test]
+fn the_reviewer_has_no_tool_that_writes_a_file_or_runs_a_command() {
+    // Arrange
+    let catalog = Catalog::load(TempDir::new().unwrap().path(), None);
+    let tools = &catalog.agent("reviewer").unwrap().def.tools;
+
+    // Act and Assert
+    for tool in ["bash", "edit", "write", "task"] {
+        assert!(!tools.iter().any(|t| t == tool), "{tool}");
+    }
+}
+
+#[test]
+fn the_reviewer_follows_a_reply_format_that_the_request_gives() {
+    // Arrange
+    let catalog = Catalog::load(TempDir::new().unwrap().path(), None);
+    let body = &catalog.agent("reviewer").unwrap().def.body;
+
+    // Act and Assert
+    assert!(
+        body.contains("If the request gives its own reply format, use that one"),
+        "{body}"
+    );
+}
+
+#[test]
 fn the_implementer_can_edit_and_run_and_the_tester_can_run_but_not_edit_and_says_not_to_change_files()
  {
     // Arrange

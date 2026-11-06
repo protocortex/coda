@@ -342,6 +342,11 @@ impl App {
                 return;
             }
             Command::Backend(Some(name)) => LinkCommand::SwitchBackend(name),
+            Command::Review(target) => {
+                let typed = format!("/review {target}");
+                self.send_message(&commands::review_prompt(&target), typed.trim_end());
+                return;
+            }
             Command::Help => {
                 self.show_help();
                 return;
@@ -1158,6 +1163,23 @@ mod tests {
         assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
         let shown = wide_screen(&app);
         assert!(shown.contains("wait for the running turn"), "{shown}");
+    }
+
+    #[test]
+    fn the_review_command_sends_a_prompt_that_hands_the_change_to_the_reviewer() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+
+        // Act
+        type_line(&mut app, "/review the parser change");
+
+        // Assert
+        let all = sent(&mut commands);
+        let [LinkCommand::Send(prompt)] = all.as_slice() else {
+            panic!("expected one message");
+        };
+        assert!(prompt.contains("the parser change"), "{prompt}");
+        assert!(prompt.contains("\"reviewer\""), "{prompt}");
     }
 
     #[test]
