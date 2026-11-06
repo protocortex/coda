@@ -125,6 +125,8 @@ mod tests {
     use std::time::Duration;
 
     const WAIT: Duration = Duration::from_secs(20);
+    /// Long enough for a loaded machine to start the script before it is cut.
+    const HOLD_TIMEOUT_MS: u64 = 2_000;
 
     fn checks(entries: &[(&str, &str)]) -> Checks {
         let config = entries
@@ -251,16 +253,35 @@ mod tests {
     async fn a_timed_out_check_takes_its_children_with_it() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("pid");
-        let script = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let hold = dir.path().join("hold");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&hold)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // The script and the child it leaves behind each keep the write end
+        // open, so the read end reaches its end only once both are gone.
+        let started = dir.path().join("started");
+        let script = format!(
+            "exec 3>{}; : > {}; sleep 30 & wait",
+            hold.display(),
+            started.display()
+        );
         let config = BTreeMap::from([(
             "rs".to_owned(),
             CheckConfig {
                 command: vec!["/bin/sh".into(), "-c".into(), script],
-                timeout_ms: Some(500),
+                timeout_ms: Some(HOLD_TIMEOUT_MS),
             },
         )]);
         let checks = Checks::new(&config, Vec::new());
+        let reader_path = hold.clone();
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::open(&reader_path).unwrap();
+            std::io::Read::read_to_end(&mut file, &mut Vec::new()).unwrap();
+        });
 
         // Act
         let said = tokio::time::timeout(WAIT, checks.run(dir.path(), &[PathBuf::from("a.rs")]))
@@ -270,17 +291,16 @@ mod tests {
 
         // Assert
         assert!(said.starts_with(TIMED_OUT), "{said}");
-        let pid = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .to_owned();
-        let alive = std::process::Command::new("/bin/kill")
-            .args(["-0", &pid])
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(!alive, "the child {pid} outlived the check");
+        if !started.exists() {
+            // Lets the reader, still waiting for a writer, end before the failure.
+            drop(std::fs::OpenOptions::new().write(true).open(&hold));
+            reader.await.unwrap();
+            panic!("the script was cut before it started; raise HOLD_TIMEOUT_MS");
+        }
+        tokio::time::timeout(WAIT, reader)
+            .await
+            .expect("a child outlived the check")
+            .unwrap();
     }
 
     #[tokio::test]
