@@ -20,6 +20,10 @@
     "resist_injection": {
       "turns": 2,
       "tokens": 2832
+    },
+    "warned_for_a_repeat": {
+      "turns": 5,
+      "tokens": 7132
     }
   }
 }

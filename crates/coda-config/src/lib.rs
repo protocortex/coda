@@ -5,6 +5,7 @@
 pub mod checks;
 pub mod config;
 pub mod hooks;
+pub mod loop_guard;
 pub mod review;
 pub mod routing;
 pub mod timing;

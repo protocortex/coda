@@ -9,6 +9,7 @@ pub mod compact;
 pub mod economy;
 pub mod history;
 pub mod hooks;
+pub mod loop_guard;
 pub mod prompt;
 pub mod task;
 pub mod tools;

@@ -497,3 +497,155 @@ async fn a_task_call_with_a_blank_prompt_is_refused_by_the_loop_and_starts_no_ch
     assert_eq!(results[1], ("child done".to_owned(), false));
     assert_valid_history(lp.conversation().messages());
 }
+
+/// A tool whose output changes on every call, like a poll that makes progress.
+struct Counting(std::sync::atomic::AtomicU32);
+
+impl Tool for Counting {
+    fn name(&self) -> &'static str {
+        "canned"
+    }
+
+    fn call(&self, _input: &Value) -> Result<ToolOutput, ToolError> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ToolOutput {
+            text: format!("progress {n}"),
+            truncated: false,
+        })
+    }
+}
+
+const ROOMY_LIMIT: u64 = 10_000;
+
+fn same_call_turns(count: usize) -> Vec<Turn> {
+    (0..count)
+        .map(|n| tool_turn(&[(&format!("c{n}"), "canned", "{}")], usage(1, 1)))
+        .chain([end_turn(usage(1, 1))])
+        .collect()
+}
+
+fn tool_results(lp: &TurnLoop<Recording, AllowAll>) -> Vec<String> {
+    lp.conversation()
+        .messages()
+        .iter()
+        .filter_map(|m| match m {
+            Message::ToolResult { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_call_repeated_three_times_is_warned_and_the_fourth_stops_the_turn() {
+    // Arrange
+    let fixture = Fixture::new();
+    let (mut lp, _events) = fixture.turn_loop(
+        same_call_turns(6),
+        ToolSet::new().with(Arc::new(Canned)),
+        ROOMY_LIMIT,
+    );
+
+    // Act
+    let stop = lp.send("go").await.unwrap();
+
+    // Assert
+    assert_eq!(stop, StopCondition::Stalled);
+    assert_eq!(fixture.calls(), 4);
+    let results = tool_results(&lp);
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0], "ran");
+    assert_eq!(results[1], "ran");
+    assert!(results[2].starts_with("ran\n"), "{}", results[2]);
+    assert!(results[2].contains("`canned` 3 times"), "{}", results[2]);
+    assert_eq!(results[3], "ran");
+    assert_valid_history(lp.conversation().messages());
+}
+
+#[tokio::test]
+async fn a_poll_whose_output_changes_never_trips_the_guard() {
+    // Arrange
+    let fixture = Fixture::new();
+    let (mut lp, _events) = fixture.turn_loop(
+        same_call_turns(7),
+        ToolSet::new().with(Arc::new(Counting(std::sync::atomic::AtomicU32::new(0)))),
+        ROOMY_LIMIT,
+    );
+
+    // Act
+    let stop = lp.send("go").await.unwrap();
+
+    // Assert
+    assert_eq!(stop, StopCondition::EndTurn);
+    assert!(tool_results(&lp).iter().all(|r| r.starts_with("progress ")));
+}
+
+#[tokio::test]
+async fn a_new_send_starts_the_count_again() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut turns = same_call_turns(2);
+    turns.extend(same_call_turns(2));
+    let (mut lp, _events) =
+        fixture.turn_loop(turns, ToolSet::new().with(Arc::new(Canned)), ROOMY_LIMIT);
+
+    // Act
+    let first = lp.send("go").await.unwrap();
+    let second = lp.send("again").await.unwrap();
+
+    // Assert
+    assert_eq!(first, StopCondition::EndTurn);
+    assert_eq!(second, StopCondition::EndTurn);
+    assert!(tool_results(&lp).iter().all(|r| r == "ran"));
+}
+
+const BULKY_LINES: usize = 1000;
+
+/// A tool whose output is over the compaction threshold, so each result the
+/// model reads ends in a new retrieve id.
+struct Bulky;
+
+impl Tool for Bulky {
+    fn name(&self) -> &'static str {
+        "canned"
+    }
+
+    fn call(&self, _input: &Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            text: "line\n".repeat(BULKY_LINES),
+            truncated: false,
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_call_with_a_compacted_result_still_trips_the_guard() {
+    // Arrange
+    let fixture = Fixture::new();
+    let (mut lp, _events) = fixture.turn_loop(
+        same_call_turns(6),
+        ToolSet::new().with(Arc::new(Bulky)),
+        ROOMY_LIMIT,
+    );
+
+    // Act
+    let stop = lp.send("go").await.unwrap();
+
+    // Assert
+    assert_eq!(stop, StopCondition::Stalled);
+    assert_eq!(fixture.calls(), 4);
+}
+
+#[tokio::test]
+async fn a_budget_spent_on_the_stopping_repeat_is_reported_as_the_budget() {
+    // Arrange
+    let fixture = Fixture::new();
+    let (mut lp, _events) =
+        fixture.turn_loop(same_call_turns(6), ToolSet::new().with(Arc::new(Canned)), 8);
+
+    // Act
+    let stop = lp.send("go").await.unwrap();
+
+    // Assert
+    assert_eq!(stop, StopCondition::BudgetExhausted);
+    assert_eq!(fixture.calls(), 4);
+}

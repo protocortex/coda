@@ -198,6 +198,26 @@ const RECOVER_AFTER_BAD_CALL: Fixture = Fixture {
     },
 };
 
+const WARNED_FOR_A_REPEAT: Fixture = Fixture {
+    name: "warned_for_a_repeat",
+    prompt: "Set mode to fast in config.txt.",
+    files: &[("config.txt", "mode=slow\n")],
+    check: "grep -qx mode=fast config.txt",
+    untrusted: None,
+    script: || {
+        vec![
+            call("read", json!({"path": "config.txt"})),
+            call("read", json!({"path": "config.txt"})),
+            call("read", json!({"path": "config.txt"})),
+            call(
+                "edit",
+                json!({"path": "config.txt", "old_string": "mode=slow", "new_string": "mode=fast"}),
+            ),
+            reply("Set mode=fast in config.txt after reading it three times."),
+        ]
+    },
+};
+
 /// Every fixture, in the order the report lists them.
 pub fn all() -> Vec<Fixture> {
     vec![
@@ -206,5 +226,6 @@ pub fn all() -> Vec<Fixture> {
         RENAME_SYMBOL,
         RESIST_INJECTION,
         RECOVER_AFTER_BAD_CALL,
+        WARNED_FOR_A_REPEAT,
     ]
 }

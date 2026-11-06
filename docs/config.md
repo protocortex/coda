@@ -118,6 +118,15 @@ Each value is an integer number of milliseconds. A key left out keeps its defaul
 | `tool_execution_ms` | `300000` | Longest run time of one of coda's own tool calls (the tools coda runs itself, not a delegated backend's). |
 | `delegated_tool_ms` | `900000` | How long a delegated backend (Claude Code, Codex) may stay silent while a tool runs, before the turn is aborted. It covers tools the backend started on its own and tool calls coda approved for it. Above Claude Code's 10 minute Bash maximum; must not be zero. |
 
+## `[loop_guard]`
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `warn_after` | integer | `3` | Times the model must repeat one tool call, with the same arguments and the same result, before it is warned. Two calls taking turns, with the same results each round, count by rounds. The warning is added to the result of that call and names what repeated. At least 2. |
+| `stop_after` | integer | `4` | Times it must repeat before the turn ends with the stop condition `stalled` (exit code 5 for `coda run`). Must be above `warn_after`. |
+
+A different argument or a changed result starts the count again, so a poll whose output changes never trips the guard. The count also starts again with each new message you send. Identical calls in one reply count one by one. The same thresholds apply to sub-agents.
+
 ## `[review]`
 
 | Key | Type | Default | Notes |
@@ -232,6 +241,10 @@ This file uses every key. It is checked against the parser when the tests run.
 ```toml coda-config
 max_turns = 20
 token_cap = 500000
+
+[loop_guard]
+warn_after = 3
+stop_after = 5
 
 [permissions]
 mode = "accept-edits"
