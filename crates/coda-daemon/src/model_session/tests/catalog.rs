@@ -15,7 +15,10 @@ use tracing::Level;
 
 use super::skills::{schema_of, skill_file, write};
 use super::task::{agent_file, finish, task_call, text_of, tool_results};
-use super::{MAX_IDLE_LOOPS, Rig, StoreProbe, TOKEN_CAP, read_turn, text_turn};
+use super::{
+    FIFTHS, MAX_IDLE_LOOPS, Rig, StoreProbe, TOKEN_CAP, WINDOW_END_FIFTHS, WINDOW_START_FIFTHS,
+    read_turn, text_turn,
+};
 use crate::model_session::{Carried, Dropped, Limits, MAX_CARRIED, lock};
 use crate::trace::capture::{EventRecord, Spans, install};
 
@@ -29,10 +32,6 @@ const HOLD: Duration = Duration::from_millis(100);
 const MEASURABLE: Duration = Duration::from_millis(100);
 /// How many times a fast machine gets twice the files before the test gives up.
 const MAX_GROWTH: u32 = 4;
-/// The window inside the read, as fifths of it, where a store call must finish.
-const WINDOW_START_FIFTHS: u32 = 1;
-const WINDOW_END_FIFTHS: u32 = 4;
-const FIFTHS: u32 = 5;
 
 /// `count` large skill files under `root/dir`.
 fn write_bulk_skills(root: &Path, dir: &str, count: usize) {
