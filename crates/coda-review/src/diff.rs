@@ -26,6 +26,7 @@ const HUNK_END: &str = " @@";
 const NO_NEWLINE: char = '\\';
 const PATH_SPLIT_EXTRA: usize = 5;
 const NUL: char = '\0';
+const STAGED_FLAG: &str = "--cached";
 const QUOTE: char = '"';
 const QUOTED_NEW_START: &str = " \"b/";
 const OCTAL_DIGITS: u32 = 3;
@@ -372,7 +373,18 @@ pub fn git_diff(repo_dir: &Path, base: &str, head: &str) -> Result<String, GitEr
             return Err(GitError::BadRevision(rev.to_owned()));
         }
     }
-    let range = format!("{base}...{head}");
+    run_diff(repo_dir, &format!("{base}...{head}"))
+}
+
+/// Runs `git diff --cached` in `repo_dir`, the changes staged for the next commit.
+///
+/// # Errors
+/// Returns [`GitError`] when git fails.
+pub fn git_diff_staged(repo_dir: &Path) -> Result<String, GitError> {
+    run_diff(repo_dir, STAGED_FLAG)
+}
+
+fn run_diff(repo_dir: &Path, selection: &str) -> Result<String, GitError> {
     let unified = format!("-U{CONTEXT_LINES}");
     run_git(
         repo_dir,
@@ -386,7 +398,7 @@ pub fn git_diff(repo_dir: &Path, base: &str, head: &str) -> Result<String, GitEr
             "--src-prefix=a/",
             "--dst-prefix=b/",
             &unified,
-            &range,
+            selection,
             "--",
         ],
     )
@@ -656,5 +668,40 @@ diff --git a/a b/a
             let err = git_diff(dir, base, head).unwrap_err();
             assert!(matches!(err, GitError::BadRevision(_)), "{base} {head}");
         }
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{args:?}");
+    }
+
+    #[test]
+    fn the_staged_diff_holds_staged_changes_and_not_unstaged_ones() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git_in(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("a.txt"), "one\n").unwrap();
+        std::fs::write(p.join("b.txt"), "one\n").unwrap();
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-q", "-m", "base"]);
+        std::fs::write(p.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(p, &["add", "a.txt"]);
+        std::fs::write(p.join("b.txt"), "one\nthree\n").unwrap();
+
+        // Act
+        let text = git_diff_staged(p).unwrap();
+
+        // Assert
+        let files = parse_diff(&text);
+        assert_eq!(files.len(), 1, "{text}");
+        assert_eq!(files[0].path, "a.txt");
     }
 }
