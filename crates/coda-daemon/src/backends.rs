@@ -132,6 +132,8 @@ pub struct SessionStart {
     pub parent_env: Vec<(OsString, OsString)>,
     /// Directory that holds the child's pidfile.
     pub pidfile_dir: PathBuf,
+    /// Ban the tools that change files or run commands.
+    pub read_only: bool,
 }
 
 /// Starts the child and records its pidfile; the child is stopped again if
@@ -149,6 +151,7 @@ pub async fn start_claude_session(start: SessionStart) -> Result<ClaudeSession, 
         session_id: start.session_id,
         resume: start.resume,
         parent_env: start.parent_env,
+        read_only: start.read_only,
     })?;
     let written = match session.pid() {
         Some(pid) => pidfile::write(&path, pid, &start.binary)
@@ -412,6 +415,7 @@ mod tests {
             resume: None,
             parent_env: Vec::new(),
             pidfile_dir: dir.path().to_path_buf(),
+            read_only: false,
         }
     }
 

@@ -714,6 +714,215 @@ async fn sending_to_an_unknown_session_is_a_session_not_found_error() {
     assert_eq!(result["error"]["code"], SESSION_NOT_FOUND);
 }
 
+const AGENT_PROMPTS: &str = "agent-prompts.txt";
+const REVIEWER_OPENING: &str = "You are a code reviewer";
+
+impl Rig {
+    /// Makes a session in plan mode and sends to it from now on.
+    async fn use_plan_session(&mut self) {
+        let cwd = self.cwd.path().to_string_lossy().into_owned();
+        self.session = self
+            .hub
+            .with_store_mut(move |store| {
+                store.create_session(&NewSession {
+                    backend: BackendKind::ClaudeCode,
+                    model: None,
+                    cwd,
+                    mode: Mode::Plan,
+                })
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn run_agent(&mut self, agent: &str, text: &str) -> Value {
+        let params = json!({"session_id": self.session, "agent": agent, "text": text});
+        self.call("agent.run", params).await
+    }
+}
+
+#[tokio::test]
+async fn a_named_agent_is_run_on_the_prompt_with_its_instructions_in_front_and_read_only() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.use_plan_session().await;
+    let prompts = rig.cwd.path().join(AGENT_PROMPTS);
+    rig.control(&json!({ "prompt_path": prompts }));
+
+    // Act
+    let sent = rig.run_agent("reviewer", "the diff is here").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert!(sent["result"]["turn_id"].is_string(), "{sent}");
+    let given = std::fs::read_to_string(&prompts).unwrap();
+    assert!(given.contains(REVIEWER_OPENING), "{given}");
+    assert!(given.contains("the diff is here"), "{given}");
+    let kinds = rig.kinds().await;
+    assert!(kinds.contains(&"deny".to_owned()), "{kinds:?}");
+    assert!(!kinds.contains(&"approve".to_owned()), "{kinds:?}");
+    let stored = rig.wait_for("user_message").await;
+    assert_eq!(stored.body, json!({"text": "the diff is here"}).to_string());
+}
+
+#[tokio::test]
+async fn a_plan_mode_claude_session_cannot_use_its_editing_or_shell_tools_whatever_the_user_allows()
+{
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.use_plan_session().await;
+    let report = rig.cwd.path().join("report.json");
+    rig.control(&json!({ "report_path": report }));
+
+    // Act
+    rig.run_agent("reviewer", "hello").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let seen: Value = serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    let args: Vec<&str> = seen["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap())
+        .collect();
+    let at = args
+        .iter()
+        .position(|arg| *arg == "--disallowedTools")
+        .unwrap();
+    for tool in ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"] {
+        assert!(args[at + 1..].contains(&tool), "{tool} in {args:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_default_mode_claude_session_gets_no_tool_ban() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    let report = rig.cwd.path().join("report.json");
+    rig.control(&json!({ "report_path": report }));
+
+    // Act
+    rig.send("hello").await;
+    let request = rig.wait_for_pending().await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_for("result").await;
+
+    // Assert
+    let seen = std::fs::read_to_string(&report).unwrap();
+    assert!(!seen.contains("disallowedTools"), "{seen}");
+}
+
+#[tokio::test]
+async fn a_plan_mode_codex_session_stays_read_only_under_a_wider_configured_sandbox() {
+    // Arrange
+    let toml = format!(
+        "[providers.codex]\nenabled = true\nbinary = \"{}\"\nverified_versions = [\"0.0.0-fake\"]\n\
+         sandbox = \"workspace-write\"\nallow_wider_sandbox = true\n",
+        coda_testkit::paths::fake_codex_path().unwrap().display()
+    );
+    let config = coda_config::config::Config::from_toml_str(&toml)
+        .unwrap()
+        .config;
+    let mut rig = Rig::build(relaxed(), Vec::new(), BackendKind::CodexAppServer, config);
+    rig.write_codex_control(&json!({}));
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    rig.session = rig
+        .hub
+        .with_store_mut(move |store| {
+            store.create_session(&NewSession {
+                backend: BackendKind::CodexAppServer,
+                model: None,
+                cwd,
+                mode: Mode::Plan,
+            })
+        })
+        .await
+        .unwrap();
+
+    // Act
+    rig.run_agent("reviewer", "hello").await;
+    rig.wait_for("result").await;
+    rig.wait_until_turn_over().await;
+
+    // Assert
+    assert_eq!(rig.codex_report()["thread_start"]["sandbox"], "read-only");
+}
+
+#[tokio::test]
+async fn an_agent_is_refused_on_a_session_that_is_not_in_plan_mode() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+
+    // Act
+    let refused = rig.run_agent("reviewer", "hello").await;
+
+    // Assert
+    assert_eq!(
+        refused["error"]["code"],
+        coda_protocol::jsonrpc::INVALID_PARAMS
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("plan mode"),
+        "{refused}"
+    );
+    assert_eq!(rig.kinds().await, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn an_unknown_agent_is_refused_and_the_available_ones_are_named() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.use_plan_session().await;
+
+    // Act
+    let refused = rig.run_agent("nobody", "hello").await;
+
+    // Assert
+    assert_eq!(
+        refused["error"]["code"],
+        coda_protocol::jsonrpc::INVALID_PARAMS
+    );
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("nobody") && message.contains("reviewer"),
+        "{message}"
+    );
+    assert_eq!(rig.kinds().await, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn an_agent_is_refused_on_a_model_backend_session() {
+    // Arrange
+    let mut rig = Rig::build(
+        relaxed(),
+        Vec::new(),
+        BackendKind::Faux,
+        coda_config::config::Config::default(),
+    );
+
+    // Act
+    let refused = rig.run_agent("reviewer", "hello").await;
+
+    // Assert
+    assert_eq!(
+        refused["error"]["code"],
+        coda_protocol::jsonrpc::INVALID_PARAMS
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Claude Code or Codex"),
+        "{refused}"
+    );
+}
+
 #[tokio::test]
 async fn an_answer_from_another_session_is_refused_and_changes_nothing() {
     // Arrange

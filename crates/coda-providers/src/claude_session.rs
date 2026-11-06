@@ -37,6 +37,10 @@ const CLAUDE_FLAGS: &[&str] = &[
     "stdio",
 ];
 const RESUME_FLAG: &str = "--resume";
+/// The flag that bans tools, which wins over any allow rule in the user's settings.
+const DISALLOWED_TOOLS_FLAG: &str = "--disallowedTools";
+/// The tools a read-only session cannot use: those that change files or run commands.
+const READ_ONLY_BANNED_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"];
 /// Status Claude Code gives a rate-limit report when the plan limit blocks the turn.
 const REJECTED_STATUS: &str = "rejected";
 /// Parent variables a delegated agent may inherit. Credentials such as
@@ -109,6 +113,9 @@ pub struct SessionSpec {
     pub resume: Option<String>,
     /// The parent environment; only allowlisted names reach the child.
     pub parent_env: Vec<(OsString, OsString)>,
+    /// Ban the tools that change files or run commands, so the user's own allow
+    /// rules cannot let the session change anything.
+    pub read_only: bool,
 }
 
 /// Cancels a session's running or next turn; safe to call any number of times.
@@ -166,6 +173,11 @@ impl ClaudeSession {
         command.args(CLAUDE_FLAGS);
         if let Some(resume) = &spec.resume {
             command.args([RESUME_FLAG, resume]);
+        }
+        if spec.read_only {
+            command
+                .arg(DISALLOWED_TOOLS_FLAG)
+                .args(READ_ONLY_BANNED_TOOLS);
         }
         command
             .env_clear()

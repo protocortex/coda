@@ -86,8 +86,8 @@ fn a_report_with_missing_fields_or_wrong_types_is_rejected_with_the_reason() {
             "missing field `message`",
         ),
         (
-            r#"{"summary": "s", "findings": [{"severity": "critical", "message": "m"}]}"#,
-            "unknown variant `critical`",
+            r#"{"summary": "s", "findings": [{"severity": "fatal", "message": "m"}]}"#,
+            "unknown variant `fatal`",
         ),
         (r#"{"summary": "s""#, "EOF"),
     ];
@@ -100,6 +100,69 @@ fn a_report_with_missing_fields_or_wrong_types_is_rejected_with_the_reason() {
         assert!(error.starts_with("report is malformed: "), "{error}");
         assert!(error.contains(reason), "{reply}: {error}");
     }
+}
+
+#[test]
+fn a_report_in_the_coda_review_format_is_read_instead_of_rejected() {
+    // Arrange
+    let reply = r#"{"summary": "Adds a cache.", "effort": 2, "risk": "medium", "findings": [
+        {"file": "src/a.rs", "start_line": 3, "end_line": 4, "severity": "critical",
+         "category": "bug", "title": "Off by one", "explanation": "The loop skips the last item.",
+         "suggested_patch": null, "confidence": "high"},
+        {"file": "src/b.rs", "start_line": 9, "end_line": 9, "severity": "medium",
+         "category": "tests", "title": "No test", "explanation": "", "confidence": "low"},
+        {"file": "src/c.rs", "start_line": 1, "end_line": 1, "severity": "info",
+         "category": "docs", "title": "Typo", "explanation": "Fix it.", "confidence": "low"}]}"#;
+
+    // Act
+    let report = parse_report(reply).unwrap();
+
+    // Assert
+    assert_eq!(report.summary, "Adds a cache.");
+    assert_eq!(
+        report.findings,
+        [
+            finding(
+                Severity::Blocking,
+                "Off by one: The loop skips the last item.",
+                Some("src/a.rs:3")
+            ),
+            finding(Severity::NonBlocking, "No test", Some("src/b.rs:9")),
+            finding(Severity::Suggestion, "Typo: Fix it.", Some("src/c.rs:1")),
+        ]
+    );
+}
+
+#[test]
+fn every_review_severity_has_a_class() {
+    for (word, expected) in [
+        ("critical", Severity::Blocking),
+        ("high", Severity::Blocking),
+        ("medium", Severity::NonBlocking),
+        ("low", Severity::NonBlocking),
+        ("info", Severity::Suggestion),
+    ] {
+        // Arrange
+        let reply =
+            format!(r#"{{"summary": "s", "findings": [{{"severity": "{word}", "title": "t"}}]}}"#);
+
+        // Act
+        let report = parse_report(&reply).unwrap();
+
+        // Assert
+        assert_eq!(report.findings[0].severity, expected, "{word}");
+    }
+}
+
+#[test]
+fn a_finding_with_neither_a_message_nor_a_title_is_still_rejected() {
+    // Act
+    let error = parse_report(r#"{"summary": "s", "findings": [{"severity": "high"}]}"#)
+        .unwrap_err()
+        .to_string();
+
+    // Assert
+    assert!(error.contains("missing field `message`"), "{error}");
 }
 
 #[test]

@@ -19,14 +19,16 @@ use std::time::Duration;
 use coda_config::config::{Config, PermissionMode};
 use coda_core::history::Transcript;
 use coda_protocol::events::Event;
-use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR};
+use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, INVALID_PARAMS};
 use coda_protocol::methods::{
-    PermissionRespondParams, PermissionRespondResult, SessionCancelParams, SessionCancelResult,
-    SessionCloseParams, SessionCloseResult, SessionSendParams, SessionSendResult,
+    AgentRunParams, AgentRunResult, PermissionRespondParams, PermissionRespondResult,
+    SessionCancelParams, SessionCancelResult, SessionCloseParams, SessionCloseResult,
+    SessionSendParams, SessionSendResult,
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::TurnOutcome;
 use coda_providers::codex::Carried;
+use coda_providers::codex_exec::SandboxMode;
 use coda_providers::detect::DEFAULT_PROBE_TIMEOUT;
 use coda_providers::emit::Emit;
 use coda_providers::gate::PermissionGate;
@@ -66,6 +68,11 @@ pub const TURN_RUNNING: i64 = coda_protocol::methods::TURN_RUNNING_CODE;
 pub const BACKEND_UNSUPPORTED: i64 = -32004;
 
 pub use coda_core::history::USER_MESSAGE_KIND;
+const AGENT_NEEDS_DELEGATED: &str = "agent.run needs a Claude Code or Codex session; a model API session runs agents through its task tool";
+const AGENT_NEEDS_PLAN_MODE: &str =
+    "agent.run needs a session in plan mode, so the agent cannot change anything";
+/// Between an agent's instructions and the request it is given.
+const AGENT_REQUEST_HEADING: &str = "The request:";
 const CLAUDE_BACKEND_NAME: &str = "claude_code";
 const CODEX_BACKEND_NAME: &str = "codex";
 /// How long the publisher gathers consecutive text deltas into one stored chunk.
@@ -112,6 +119,9 @@ pub enum TurnError {
     Ending(SessionId),
     #[error("session {0} does not use a backend this daemon can run")]
     Unsupported(SessionId),
+    /// An `agent.run` request that cannot be served as asked. The text is for the caller.
+    #[error("{0}")]
+    Agent(String),
     #[error(transparent)]
     Hub(#[from] HubError),
     #[error(transparent)]
@@ -124,6 +134,7 @@ impl TurnError {
     pub(crate) fn into_rpc(self) -> ErrorObject {
         match self {
             Self::SessionNotFound(_) => error(SESSION_NOT_FOUND, "Session not found"),
+            Self::Agent(why) => error(INVALID_PARAMS, &why),
             Self::Busy(_) => error(TURN_RUNNING, "A turn is already running"),
             Self::Ending(_) => error(
                 TURN_RUNNING,
@@ -365,7 +376,7 @@ impl Turns {
         self.await_wind_down(&session_id).await?;
         match record.backend {
             BackendKind::ClaudeCode | BackendKind::CodexAppServer | BackendKind::CodexExec => {
-                self.send_agent(record, text).await
+                self.send_agent(record, text.clone(), text).await
             }
             BackendKind::Anthropic | BackendKind::OpenaiCompat | BackendKind::Faux => {
                 let limits = Limits {
@@ -378,10 +389,49 @@ impl Turns {
         }
     }
 
+    /// Runs the named agent on a prompt in a session of a delegated backend. The
+    /// backend is given the agent's instructions, then the prompt. The session must
+    /// be in plan mode, where every permission request is denied, so the agent can
+    /// read and cannot change anything. Only the prompt is stored as the user's message.
+    ///
+    /// # Errors
+    /// Returns [`TurnError::Agent`] when the backend is a model API, the session is
+    /// not in plan mode, or the agent cannot be run, and the errors of
+    /// [`Turns::send`] otherwise.
+    pub async fn run_agent(self: &Arc<Self>, params: AgentRunParams) -> Result<TurnId, TurnError> {
+        let AgentRunParams {
+            session_id,
+            agent,
+            text,
+        } = params;
+        let id = session_id.clone();
+        let record = self
+            .hub
+            .with_store(move |store| store.load_session(&id))
+            .await
+            .map_err(|e| not_found_or(e, &session_id))?;
+        self.await_wind_down(&session_id).await?;
+        if record.backend.is_model_backend() {
+            return Err(TurnError::Agent(AGENT_NEEDS_DELEGATED.to_owned()));
+        }
+        if record.mode != Mode::Plan {
+            return Err(TurnError::Agent(AGENT_NEEDS_PLAN_MODE.to_owned()));
+        }
+        let catalog = self.models.catalog(&record.cwd).await;
+        let entry = catalog
+            .dispatchable(&agent)
+            .map_err(|e| TurnError::Agent(e.to_string()))?;
+        let prompt = format!("{}\n\n{AGENT_REQUEST_HEADING}\n\n{text}", entry.def.body);
+        self.send_agent(record, text, prompt).await
+    }
+
+    /// Starts a turn on a delegated backend. `shown` is stored as the user's
+    /// message and `prompt` is what the backend is given.
     async fn send_agent(
         self: &Arc<Self>,
         record: SessionRecord,
-        text: String,
+        shown: String,
+        prompt: String,
     ) -> Result<TurnId, TurnError> {
         let session_id = record.id.clone();
         let is_claude = record.backend == BackendKind::ClaudeCode;
@@ -401,7 +451,7 @@ impl Turns {
             CODEX_BACKEND_NAME
         };
         let mut child = self.start_child(&record, false).await?;
-        let turn = match Self::begin(&self.hub, &session_id, &text).await {
+        let turn = match Self::begin(&self.hub, &session_id, &shown).await {
             Ok(turn) => turn,
             Err(e) => {
                 stop(&mut child, &session_id).await;
@@ -421,7 +471,7 @@ impl Turns {
             record,
             session: session_id,
             turn: turn.clone(),
-            text,
+            text: prompt,
             child,
             gate,
         };
@@ -454,6 +504,7 @@ impl Turns {
                 resume,
                 parent_env,
                 pidfile_dir,
+                read_only: record.mode == Mode::Plan,
             })
             .await?;
             return Ok(AgentSession::Claude(Box::new(session)));
@@ -462,12 +513,16 @@ impl Turns {
             return Ok(idle);
         }
         let search_dirs = path_dirs(&parent_env);
-        let settings = resolve_codex_off_worker(
+        let mut settings = resolve_codex_off_worker(
             self.config.models.clone(),
             search_dirs,
             DEFAULT_PROBE_TIMEOUT,
         )
         .await?;
+        // A plan-mode session reads and changes nothing, whatever sandbox is configured.
+        if record.mode == Mode::Plan {
+            settings.sandbox = SandboxMode::ReadOnly;
+        }
         let carried = if record.backend == BackendKind::CodexAppServer {
             self.carried(&session_id, None).await
         } else {
@@ -1233,6 +1288,16 @@ pub(crate) async fn send(turns: Option<&Arc<Turns>>, params: Option<Value>) -> H
         .await
         .map_err(TurnError::into_rpc)?;
     to_value(&SessionSendResult { turn_id })
+}
+
+/// Answers `agent.run`.
+pub(crate) async fn run_agent(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
+    let turns = turns.ok_or_else(unavailable)?;
+    let turn_id = turns
+        .run_agent(parse_params(params)?)
+        .await
+        .map_err(TurnError::into_rpc)?;
+    to_value(&AgentRunResult { turn_id })
 }
 
 /// Answers `session.cancel`.

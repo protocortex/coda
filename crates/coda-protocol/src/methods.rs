@@ -21,6 +21,8 @@ pub const INITIALIZE: &str = "initialize";
 pub const SESSION_CREATE: &str = "session.create";
 /// Sends a user message, starting a turn.
 pub const SESSION_SEND: &str = "session.send";
+/// Run a named agent on a prompt in a session of a delegated backend.
+pub const AGENT_RUN: &str = "agent.run";
 /// Cancels the running turn.
 pub const SESSION_CANCEL: &str = "session.cancel";
 /// Starts streaming a session's events to this connection.
@@ -53,6 +55,7 @@ pub const METHODS: &[&str] = &[
     INITIALIZE,
     SESSION_CREATE,
     SESSION_SEND,
+    AGENT_RUN,
     SESSION_CANCEL,
     SESSION_SUBSCRIBE,
     SESSION_RESUME,
@@ -157,6 +160,22 @@ pub struct SessionSendResult {
     /// The turn the message started.
     pub turn_id: TurnId,
 }
+
+/// Parameters of [`AGENT_RUN`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentRunParams {
+    /// Target session. It must use Claude Code or Codex and be in plan mode,
+    /// where the daemon denies every permission request, bans the editing and
+    /// shell tools of Claude Code and keeps Codex read-only.
+    pub session_id: SessionId,
+    /// Name of the agent definition to run, for example `reviewer`.
+    pub agent: String,
+    /// The request the agent is given, after its own instructions.
+    pub text: String,
+}
+
+/// Result of [`AGENT_RUN`]: the turn it started, as for [`SESSION_SEND`].
+pub type AgentRunResult = SessionSendResult;
 
 /// Parameters of [`SESSION_CANCEL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -428,6 +447,7 @@ mod tests {
             (INITIALIZE, "initialize"),
             (SESSION_CREATE, "session.create"),
             (SESSION_SEND, "session.send"),
+            (AGENT_RUN, "agent.run"),
             (SESSION_CANCEL, "session.cancel"),
             (SESSION_SUBSCRIBE, "session.subscribe"),
             (SESSION_RESUME, "session.resume"),

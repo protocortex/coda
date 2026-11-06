@@ -306,6 +306,11 @@ impl ModelSessions {
         })
     }
 
+    /// The agent definitions a session in `cwd` may run.
+    pub(crate) async fn catalog(&self, cwd: &str) -> Catalog {
+        self.children.catalog(cwd).await
+    }
+
     /// The enabled backends a session can start on: agent backends first,
     /// then the model APIs.
     pub(crate) fn available_backends(&self) -> Vec<BackendKind> {

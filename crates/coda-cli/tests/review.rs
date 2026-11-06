@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `coda review` against the real daemon binary, with the reviewer answering from a faux script.
+//! `coda review` against the real daemon binary, with the reviewer answering from a faux script or a fake Claude Code.
 
 mod common;
 
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
+use coda_cli::Context;
 use coda_review::schema::{Review, Risk, Severity};
-use common::{FauxRig, Outcome, cli, faux_rig};
+use common::{FauxRig, Outcome, StopDaemon, cli, context, faux_rig, short_dir};
 use serde_json::{Value, json};
+use tempfile::TempDir;
 
 const BASE_FILE: &str = "one\ntwo\nthree\n";
 const TOPIC_FILE: &str = "one\ntwo\nthree\nfour\nfive\n";
@@ -254,18 +256,121 @@ async fn a_branch_name_is_reviewed_against_the_default_branch() {
     assert_eq!(parsed.findings.len(), 1);
 }
 
+const PROMPTS: &str = "prompts.txt";
+
+/// A home that enables only Claude Code, played by `fake-claude`, and a work directory
+/// that is the repository of [`rig`]. The fake answers with `reply` after some narration.
+struct ClaudeRig {
+    // First, so the daemon is stopped while its home directory still exists.
+    _stop: StopDaemon,
+    _home: TempDir,
+    work: TempDir,
+    ctx: Context,
+}
+
+fn claude_rig(reply: &str) -> ClaudeRig {
+    let home = short_dir();
+    let work = short_dir();
+    let fake = coda_testkit::paths::fake_claude_path().unwrap();
+    let config = format!(
+        "[providers.claude_code]\nenabled = true\nbinary = {:?}\n",
+        fake.display().to_string()
+    );
+    std::fs::write(home.path().join("config.toml"), config).unwrap();
+    let dir = work.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("a.txt"), BASE_FILE).unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "base"]);
+    git(dir, &["checkout", "-q", "-b", "topic"]);
+    std::fs::write(dir.join("a.txt"), TOPIC_FILE).unwrap();
+    git(dir, &["commit", "-q", "-am", "topic"]);
+    let control = json!({"echo_text": reply, "prompt_path": dir.join(PROMPTS)});
+    std::fs::write(dir.join("fake-claude-control.json"), control.to_string()).unwrap();
+    ClaudeRig {
+        ctx: context(home.path()),
+        _stop: StopDaemon::new(home.path()),
+        _home: home,
+        work,
+    }
+}
+
+impl ClaudeRig {
+    async fn review(&self, flags: &[&str]) -> Outcome {
+        let cwd = self.work.path().display().to_string();
+        let mut args = vec![
+            "coda",
+            "review",
+            "--cwd",
+            &cwd,
+            "--instructions",
+            "echo-text",
+        ];
+        args.extend_from_slice(flags);
+        cli(&self.ctx, &args, "").await
+    }
+
+    fn prompts(&self) -> String {
+        std::fs::read_to_string(self.work.path().join(PROMPTS)).unwrap_or_default()
+    }
+}
+
 #[tokio::test]
-async fn a_backend_that_runs_its_own_agent_loop_is_refused_before_any_work() {
+async fn a_claude_code_review_gets_the_diff_in_the_prompt_and_leaves_no_hand_off_file() {
     // Arrange
-    let rig = rig(&[]);
+    let rig = claude_rig(&review_json(4));
 
     // Act
-    let outcome = review(&rig, &["--backend", "claude-code"]).await;
+    let outcome = rig.review(&["--backend", "claude-code", "--json"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let parsed: Review = serde_json::from_str(&outcome.out).unwrap();
+    assert_eq!(parsed.findings.len(), 1);
+    assert_eq!(parsed.findings[0].start_line, 4);
+    assert_eq!(parsed.run.model, "claude_code");
+    let prompts = rig.prompts();
+    assert!(prompts.contains("You are a code reviewer"), "{prompts}");
+    assert!(prompts.contains("+four"), "{prompts}");
+    assert!(!prompts.contains(".coda/review"), "{prompts}");
+    assert!(!rig.work.path().join(".coda").exists());
+}
+
+#[tokio::test]
+async fn claude_code_is_the_default_when_it_is_the_only_backend_enabled() {
+    // Arrange
+    let rig = claude_rig(&review_json(5));
+
+    // Act
+    let outcome = rig.review(&["--json"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let parsed: Review = serde_json::from_str(&outcome.out).unwrap();
+    assert_eq!(parsed.findings[0].start_line, 5);
+}
+
+#[tokio::test]
+async fn a_claude_code_answer_of_the_wrong_shape_is_asked_for_once_more_with_a_hint() {
+    // Arrange
+    let rig = claude_rig("not json");
+
+    // Act
+    let outcome = rig.review(&[]).await;
 
     // Assert
     assert_eq!(outcome.code, ExitCode::from(FAILURE), "{}", outcome.out);
-    assert!(outcome.err.contains("claude_code"), "{}", outcome.err);
-    assert_eq!(rig.requests(), Vec::<Value>::new());
+    assert!(outcome.err.contains("bad shape"), "{}", outcome.err);
+    let prompts = rig.prompts();
+    assert_eq!(
+        prompts.matches("You are a code reviewer").count(),
+        2,
+        "{prompts}"
+    );
+    assert!(
+        prompts.contains("Your last answer was rejected"),
+        "{prompts}"
+    );
 }
 
 #[tokio::test]

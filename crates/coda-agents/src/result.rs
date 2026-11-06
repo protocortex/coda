@@ -31,6 +31,7 @@ const OPEN_JSON: char = '{';
 /// The keys of a report. A JSON reply with neither is not a report.
 const SUMMARY_KEY: &str = "summary";
 const FINDINGS_KEY: &str = "findings";
+const MESSAGE_KEY: &str = "message";
 /// The words that open and close the data, and the number between them.
 const OPEN_MARKER: &str = "<<<DATA #";
 const CLOSE_MARKER: &str = "<<<END DATA #";
@@ -62,16 +63,22 @@ impl Status {
 }
 
 /// How much a finding matters, most serious first.
+///
+/// The five severities of `coda review` are read too, so a review agent's reply
+/// is a report: `critical` and `high` are blocking, `medium` and `low` are
+/// non-blocking, and `info` is a suggestion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     /// The change should not go ahead until this is fixed.
+    #[serde(alias = "critical", alias = "high")]
     Blocking,
     /// Worth fixing, but it does not stop the change. The hyphenated spelling
     /// is read too, because it is how the word is written in prose.
-    #[serde(alias = "non-blocking")]
+    #[serde(alias = "non-blocking", alias = "medium", alias = "low")]
     NonBlocking,
     /// An idea the author may take or leave.
+    #[serde(alias = "info")]
     Suggestion,
 }
 
@@ -88,13 +95,55 @@ impl Severity {
 }
 
 /// One thing a review agent found.
+///
+/// A finding in the `coda review` format, with a `title`, an `explanation`, a
+/// `file` and a `start_line` and no `message` or `location`, is read too: the
+/// message is the title and the explanation, and the location is the file and
+/// the first line.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawFinding")]
 pub struct Finding {
     pub severity: Severity,
     pub message: String,
     /// Where it is, for example `src/a.rs:10`.
-    #[serde(default)]
     pub location: Option<String>,
+}
+
+/// A finding as written, in either format.
+#[derive(Deserialize)]
+struct RawFinding {
+    severity: Severity,
+    message: Option<String>,
+    location: Option<String>,
+    title: Option<String>,
+    explanation: Option<String>,
+    file: Option<String>,
+    start_line: Option<u64>,
+}
+
+impl TryFrom<RawFinding> for Finding {
+    type Error = String;
+
+    fn try_from(raw: RawFinding) -> Result<Self, String> {
+        let message = match (raw.message, raw.title) {
+            (Some(message), _) => message,
+            (None, Some(title)) => match raw.explanation.filter(|text| !text.is_empty()) {
+                Some(explanation) => format!("{title}: {explanation}"),
+                None => title,
+            },
+            (None, None) => return Err(format!("missing field `{MESSAGE_KEY}`")),
+        };
+        let location = raw.location.or_else(|| match (raw.file, raw.start_line) {
+            (Some(file), Some(line)) => Some(format!("{file}:{line}")),
+            (Some(file), None) => Some(file),
+            _ => None,
+        });
+        Ok(Self {
+            severity: raw.severity,
+            message,
+            location,
+        })
+    }
 }
 
 /// The agent's own account of its work.

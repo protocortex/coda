@@ -21,9 +21,10 @@ use coda_protocol::events::{
     EVENT_NOTIFICATION, HOOK_BLOCKED_KIND, HookBlockedBody, InterruptCause,
 };
 use coda_protocol::methods::{
-    PERMISSION_RESPOND, PermissionRequestParams, PermissionRespondParams, PermissionRespondResult,
-    SESSION_CANCEL, SESSION_CREATE, SESSION_SEND, SessionCancelParams, SessionCancelResult,
-    SessionCreateParams, SessionCreateResult, SessionSendParams, SessionSendResult,
+    AGENT_RUN, AgentRunParams, AgentRunResult, PERMISSION_RESPOND, PermissionRequestParams,
+    PermissionRespondParams, PermissionRespondResult, SESSION_CANCEL, SESSION_CREATE, SESSION_SEND,
+    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
+    SessionSendParams, SessionSendResult,
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId};
 use coda_tui::sessions::HOOKS_NOT_RUN;
@@ -47,7 +48,7 @@ pub const MAX_COMMAND_INPUT_BYTES: usize = 256 * 1024;
 const FAUX_KEY: &str = "faux";
 const CLAUDE_CODE_KEY: &str = "claude_code";
 const CODEX_KEY: &str = "codex";
-const STREAM_DELTA_KIND: &str = "stream_delta";
+pub(crate) const STREAM_DELTA_KIND: &str = "stream_delta";
 const RESULT_KIND: &str = "result";
 const TURN_INTERRUPTED_KIND: &str = "turn_interrupted";
 
@@ -119,6 +120,7 @@ pub async fn run(
         prompt,
         cwd,
         backend: None,
+        agent: None,
         mode: args.mode.into(),
         max_turns: args.max_turns,
         token_cap: args.token_cap,
@@ -137,6 +139,9 @@ pub(crate) struct Job {
     pub(crate) cwd: String,
     /// The backend to use; the config picks one when absent.
     pub(crate) backend: Option<BackendKind>,
+    /// A named agent to run the prompt, which the daemon allows on delegated
+    /// backends in plan mode; the session's own agent runs it when absent.
+    pub(crate) agent: Option<String>,
     pub(crate) mode: Mode,
     pub(crate) max_turns: Option<u32>,
     pub(crate) token_cap: Option<u64>,
@@ -169,6 +174,7 @@ pub(crate) async fn drive(
         prompt,
         cwd,
         backend: chosen,
+        agent,
         mode,
         max_turns,
         token_cap,
@@ -198,13 +204,28 @@ pub(crate) async fn drive(
     // not earlier so Ctrl-C still stops the run while the daemon starts.
     let mut interrupts = signal(SignalKind::interrupt())?;
     info!(step = "send", session = %session, "sending the prompt");
-    let params = SessionSendParams {
-        session_id: session.clone(),
-        text: prompt,
-        max_turns,
-        token_cap,
+    let send = async {
+        if let Some(agent) = agent {
+            let params = AgentRunParams {
+                session_id: session.clone(),
+                agent,
+                text: prompt,
+            };
+            client
+                .request::<_, AgentRunResult>(AGENT_RUN, &params)
+                .await
+        } else {
+            let params = SessionSendParams {
+                session_id: session.clone(),
+                text: prompt,
+                max_turns,
+                token_cap,
+            };
+            client
+                .request::<_, SessionSendResult>(SESSION_SEND, &params)
+                .await
+        }
     };
-    let send = client.request::<_, SessionSendResult>(SESSION_SEND, &params);
     tokio::pin!(send);
     let mut interrupted = false;
     tokio::select! {

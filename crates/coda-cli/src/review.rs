@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `coda review`: packs a change, has the `reviewer` agent read it through the `task` tool
-//! and prints the checked findings. The command only reads: it posts nothing and edits no
-//! file of the repository.
+//! `coda review`: packs a change, has the `reviewer` agent read it and prints the checked
+//! findings. The command only reads: it posts nothing and edits no file of the repository.
 //!
-//! The packed diff is too large to ask the model to copy into a tool call, so it is written
-//! to a short-lived file in the working directory, and the reviewer is told to read it.
+//! On Claude Code and Codex the daemon runs the reviewer on a session in plan mode, with the
+//! packed diff in the prompt. On a model API the reviewer is a sub-agent of a session that
+//! hands the work over through the `task` tool. The packed diff is too large to ask that
+//! session's model to copy into a tool call, so it is written to a short-lived file in the
+//! working directory, and the reviewer is told to read it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,11 +20,11 @@ use coda_core::turn::StopCondition;
 use coda_protocol::types::{BackendKind, Mode};
 use coda_review::diff::{FileDiff, git_diff, git_diff_staged, parse_diff, tracked_files};
 use coda_review::pack::{PackOptions, Packed, main_extension, pack};
-use coda_review::parse::{BadShape, Parsed, parse_model_output};
+use coda_review::parse::{BadShape, Parsed, answer_object, parse_model_output};
 use coda_review::render::{to_json, to_markdown};
 use coda_review::request::{
-    GH_PR_FIELDS, REVIEWER_AGENT, Target, assemble, input_text, pr_info_from_gh, session_prompt,
-    task_prompt,
+    GH_PR_FIELDS, REVIEWER_AGENT, Target, assemble, direct_prompt, input_text, pr_info_from_gh,
+    session_prompt, task_prompt,
 };
 use coda_review::rules::{Rules, default_branch_ref, load};
 use coda_review::schema::{Coverage, MIN_EFFORT, Review, Risk, RunDetails};
@@ -34,7 +36,7 @@ use crate::cli::ReviewArgs;
 use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
 use crate::error::CliError;
-use crate::run::{Job, Tap, drive, pick_backend, session_cwd, stop_reason};
+use crate::run::{Job, STREAM_DELTA_KIND, Tap, drive, pick_backend, session_cwd, stop_reason};
 
 /// Where the packed input is written, relative to the working directory.
 const INPUT_DIR: &str = ".coda/review";
@@ -51,8 +53,8 @@ const END_TURN: &str = StopCondition::EndTurn.as_str();
 /// Runs the review. `force` reviews a pull request that a skip rule would skip.
 ///
 /// # Errors
-/// Returns a [`CliError`] when the change cannot be read, the backend runs its own agent
-/// loop, the run fails, or the reviewer does not answer in the review format twice.
+/// Returns a [`CliError`] when the change cannot be read, the run fails, or the reviewer
+/// does not answer in the review format twice.
 pub async fn run(
     ctx: &Context,
     io: &mut Io<'_>,
@@ -60,7 +62,7 @@ pub async fn run(
     args: ReviewArgs,
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&ctx.dirs)?;
-    let backend = review_backend(&config, args.backend.map(Into::into))?;
+    let backend = review_backend(&config, args.backend.map(Into::into));
     let cwd = session_cwd(&ctx.cwd, args.cwd.clone())?;
     let repo = Path::new(&cwd);
     info!(step = "read_change", "reading the change");
@@ -96,13 +98,21 @@ pub async fn run(
         args.instructions.as_deref(),
         config.review.max_findings,
     );
-    let file = InputFile::write(repo, &input)?;
+    // Kept until the review is over, which removes the file.
+    let file = if backend.is_model_backend() {
+        Some(InputFile::write(repo, &input)?)
+    } else {
+        None
+    };
     let mut reviewer = Live {
         ctx,
         io,
         backend,
         cwd: &cwd,
-        input: &file.relative,
+        handoff: match &file {
+            Some(file) => Handoff::File(&file.relative),
+            None => Handoff::Prompt(&input),
+        },
     };
     let (parsed, model) = until_usable(&packed, config.review.max_findings, &mut reviewer).await?;
     let model = model.unwrap_or_else(|| backend_name(backend));
@@ -134,25 +144,9 @@ fn notice(io: &mut Io<'_>, json: bool, text: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// The backend that runs the review: the one asked for, else the first model backend the
-/// config enables, else the Anthropic API. A backend that runs its own agent loop has no
-/// `task` tool of Coda's, so it is refused.
-fn review_backend(config: &Config, asked: Option<BackendKind>) -> Result<BackendKind, CliError> {
-    let backend = asked.unwrap_or_else(|| {
-        let picked = pick_backend(config);
-        if picked.is_model_backend() {
-            picked
-        } else {
-            BackendKind::Anthropic
-        }
-    });
-    if backend.is_model_backend() {
-        Ok(backend)
-    } else {
-        Err(CliError::ReviewBackend {
-            backend: backend_name(backend),
-        })
-    }
+/// The backend that runs the review: the one asked for, else the one `coda run` would use.
+fn review_backend(config: &Config, asked: Option<BackendKind>) -> BackendKind {
+    asked.unwrap_or_else(|| pick_backend(config))
 }
 
 /// The name of `backend` as the config and the protocol write it.
@@ -245,21 +239,47 @@ trait Reviewer {
     async fn run(&mut self, hint: Option<String>) -> Result<Answer, CliError>;
 }
 
+/// How the input reaches the reviewer.
+enum Handoff<'a> {
+    /// A model API: a session hands the work to the reviewer, which reads this file,
+    /// relative to the working directory.
+    File(&'a str),
+    /// Claude Code and Codex: the daemon runs the reviewer on this input as the prompt.
+    Prompt(&'a str),
+}
+
 /// The reviewer run by the daemon.
 struct Live<'a, 'b> {
     ctx: &'a Context,
     io: &'a mut Io<'b>,
     backend: BackendKind,
     cwd: &'a str,
-    /// Where the reviewer reads its input, relative to the working directory.
-    input: &'a str,
+    handoff: Handoff<'a>,
 }
 
 impl Reviewer for Live<'_, '_> {
     async fn run(&mut self, hint: Option<String>) -> Result<Answer, CliError> {
-        let prompt = session_prompt(&task_prompt(self.input, hint.as_deref()));
-        run_reviewer(self.ctx, self.io, self.backend, self.cwd, prompt).await
+        let hint = hint.as_deref();
+        let request = match self.handoff {
+            Handoff::File(path) => Request {
+                prompt: session_prompt(&task_prompt(path, hint)),
+                direct: false,
+            },
+            Handoff::Prompt(input) => Request {
+                prompt: direct_prompt(input, hint),
+                direct: true,
+            },
+        };
+        run_reviewer(self.ctx, self.io, self.backend, self.cwd, request).await
     }
+}
+
+/// One run of the reviewer.
+struct Request {
+    prompt: String,
+    /// Whether the daemon runs the reviewer on the prompt itself, in plan mode, instead of
+    /// a session handing the work over through the `task` tool.
+    direct: bool,
 }
 
 /// Runs `reviewer` until its answer parses, at most [`MAX_ATTEMPTS`] times. Every run
@@ -285,26 +305,36 @@ async fn until_usable(
     Err(CliError::ReviewOutput(last))
 }
 
-/// Runs one session that hands the work to the reviewer, and returns what the reviewer said.
+/// Runs the reviewer in a new session and returns what it said. A direct run is the
+/// reviewer on a session in plan mode, where every permission request is denied; its answer
+/// is the text it streamed. Otherwise a session hands the work to the reviewer and the answer
+/// is the reviewer's last reply.
 async fn run_reviewer(
     ctx: &Context,
     io: &mut Io<'_>,
     backend: BackendKind,
     cwd: &str,
-    prompt: String,
+    request: Request,
 ) -> Result<Answer, CliError> {
+    let Request { prompt, direct } = request;
     let job = Job {
         prompt,
         cwd: cwd.to_owned(),
         backend: Some(backend),
-        mode: Mode::Default,
+        agent: direct.then(|| REVIEWER_AGENT.to_owned()),
+        mode: if direct { Mode::Plan } else { Mode::Default },
         max_turns: None,
         token_cap: None,
     };
-    let mut text: Option<String> = None;
+    let mut reply: Option<String> = None;
+    let mut streamed = String::new();
     let mut watch = |kind: &str, body: &Value| {
-        if let Some(reply) = reviewer_text(kind, body) {
-            text = Some(reply);
+        if direct {
+            if let Some(piece) = delta_text(kind, body) {
+                streamed.push_str(piece);
+            }
+        } else if let Some(text) = reviewer_text(kind, body) {
+            reply = Some(text);
         }
     };
     let mut tap = Tap {
@@ -321,6 +351,11 @@ async fn run_reviewer(
     if !ended_well {
         return Err(CliError::ReviewFailed(stop_reason(&done.finish)));
     }
+    let text = if direct {
+        Some(answer_object(&streamed).to_owned()).filter(|text| !text.trim().is_empty())
+    } else {
+        reply
+    };
     let Some(text) = text else {
         return Err(CliError::ReviewFailed(format!(
             "the {REVIEWER_AGENT} agent gave no answer; see the daemon log"
@@ -330,6 +365,14 @@ async fn run_reviewer(
         text,
         model: done.model,
     })
+}
+
+/// The text a streamed piece of a direct run holds, when `kind` and `body` are that event.
+fn delta_text<'a>(kind: &str, body: &'a Value) -> Option<&'a str> {
+    if kind != STREAM_DELTA_KIND {
+        return None;
+    }
+    body["text"].as_str()
 }
 
 /// The text of a reply the reviewer agent wrote, when `kind` and `body` are that event.
@@ -395,7 +438,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_backend_that_runs_its_own_loop_is_refused_and_the_default_is_a_model_backend() {
+    fn the_backend_asked_for_is_used_and_the_default_is_the_one_coda_run_picks() {
         // Arrange
         let delegated = Config::from_toml_str("[providers.claude_code]\nenabled = true\n")
             .unwrap()
@@ -405,15 +448,23 @@ mod tests {
             .config;
 
         // Act and Assert
-        assert!(matches!(
-            review_backend(&delegated, Some(BackendKind::ClaudeCode)),
-            Err(CliError::ReviewBackend { .. })
-        ));
         assert_eq!(
-            review_backend(&delegated, None).unwrap(),
-            BackendKind::Anthropic
+            review_backend(&faux, Some(BackendKind::CodexAppServer)),
+            BackendKind::CodexAppServer
         );
-        assert_eq!(review_backend(&faux, None).unwrap(), BackendKind::Faux);
+        assert_eq!(review_backend(&delegated, None), BackendKind::ClaudeCode);
+        assert_eq!(review_backend(&faux, None), BackendKind::Faux);
+    }
+
+    #[test]
+    fn only_the_stream_of_a_direct_run_is_its_answer() {
+        // Arrange
+        let delta = serde_json::json!({"text": "x"});
+
+        // Act and Assert
+        assert_eq!(delta_text(STREAM_DELTA_KIND, &delta), Some("x"));
+        assert_eq!(delta_text("result", &delta), None);
+        assert_eq!(delta_text(STREAM_DELTA_KIND, &serde_json::json!({})), None);
     }
 
     #[test]

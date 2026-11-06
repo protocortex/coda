@@ -57,6 +57,9 @@ const CLAUDE_ALLOW_PROMPT: &str =
 const CLAUDE_READ_ONLY_PROMPT: &str =
     "Run the shell command `echo hello` with the Bash tool, then reply with the word done.";
 const CLAUDE_TEXT_PROMPT: &str = "Reply with the single word: ok";
+const NEW_FILE: &str = "new.txt";
+const CLAUDE_WRITE_PROMPT: &str = "Use the Write tool to create new.txt containing the word new, \
+    then reply with the word done.";
 const CODEX_FIRST_PROMPT: &str = "Reply with the single word: ok";
 const CODEX_SECOND_PROMPT: &str = "Reply with the single word: done";
 const CODEX_APPROVAL_PROMPT: &str = "Run the shell command `touch hello.txt`. The sandbox is \
@@ -298,6 +301,7 @@ async fn record_claude(
         session_id: SessionId::new("live"),
         resume: None,
         parent_env: parent_env(),
+        read_only: false,
     })
     .expect("could not start the shim");
     let gate = FixedGate::new(decision);
@@ -378,6 +382,52 @@ async fn claude_read_only_command_raises_no_permission_request() {
         lines.iter().all(|line| request_id_of(line).is_none()),
         "Claude Code asked about a read-only command"
     );
+}
+
+/// Runs the write prompt on a session in a directory whose project settings allow `Write`
+/// and `Bash`, and says whether the file was created.
+async fn claude_write_attempt(out: &Path, name: &str, read_only: bool) -> bool {
+    let real = find_binary("claude");
+    let (shim, _sent, _received) = claude_shim(out, name, &real);
+    let cwd = work_dir(out);
+    let settings = cwd.path().join(".claude");
+    fs::create_dir_all(&settings).unwrap();
+    fs::write(
+        settings.join("settings.json"),
+        r#"{"permissions": {"allow": ["Write", "Edit", "Bash"]}}"#,
+    )
+    .unwrap();
+    let mut session = ClaudeSession::spawn(SessionSpec {
+        binary: shim,
+        cwd: cwd.path().to_path_buf(),
+        session_id: SessionId::new("live"),
+        resume: None,
+        parent_env: parent_env(),
+        read_only,
+    })
+    .expect("could not start the shim");
+    let gate = FixedGate::new(PermissionDecision::Deny);
+    let turn = TurnId::new("t-1");
+    let outcome = tokio::time::timeout(
+        CLAUDE_TURN_BOUND,
+        session.run_turn(&turn, CLAUDE_WRITE_PROMPT, &gate, &mut |_| {}),
+    )
+    .await;
+    session.shutdown().await.unwrap();
+    assert!(
+        matches!(outcome, Ok(Ok(TurnOutcome::Completed { .. }))),
+        "the turn did not complete: {outcome:?}"
+    );
+    cwd.path().join(NEW_FILE).exists()
+}
+
+/// The check behind `coda review` on Claude Code: the real binary takes the flags of a
+/// read-only session, and that session cannot write a file when asked to.
+#[ignore = "spends Claude subscription quota; needs CODA_LIVE_TESTS=1"]
+#[tokio::test]
+async fn a_read_only_claude_session_cannot_write_a_file() {
+    let Some(out) = live_out() else { return };
+    assert!(!claude_write_attempt(&out, "claude-live-write-readonly", true).await);
 }
 
 #[ignore = "spends Claude subscription quota; needs CODA_LIVE_TESTS=1"]
@@ -692,6 +742,13 @@ async fn record_app_server(out: &Path, name: &str, run: AppServerRun) {
         approvals_seen > 0,
         "Codex never asked for approval, so this is not an approval transcript; see {name}.adapter.txt"
     );
+    // A denied command is how `coda review` keeps Codex from changing files.
+    if run.decision == PermissionDecision::Deny {
+        assert!(
+            !cwd.path().join("hello.txt").exists(),
+            "Codex ran the denied command; see {name}.adapter.txt"
+        );
+    }
 }
 
 #[ignore = "spends Codex quota; needs CODA_LIVE_TESTS=1"]

@@ -8,14 +8,15 @@ use std::path::PathBuf;
 
 use coda_protocol::events::{Event, InterruptCause};
 use coda_protocol::methods::{
-    Capabilities, DaemonBackendsParams, DaemonBackendsResult, DaemonShutdownParams,
-    DaemonShutdownResult, DaemonStatusParams, DaemonStatusResult, GrantAddParams, GrantAddResult,
-    InitializeParams, InitializeResult, PermissionRequestParams, PermissionRespondParams,
-    PermissionRespondResult, PingParams, PingResult, SessionCancelParams, SessionCancelResult,
-    SessionCloseParams, SessionCloseResult, SessionCreateParams, SessionCreateResult,
-    SessionListParams, SessionListResult, SessionResumeParams, SessionResumeResult,
-    SessionSendParams, SessionSendResult, SessionSetModelParams, SessionSetModelResult,
-    SessionSubscribeParams, SessionSubscribeResult, UsageSummaryParams, UsageSummaryResult,
+    AgentRunParams, AgentRunResult, Capabilities, DaemonBackendsParams, DaemonBackendsResult,
+    DaemonShutdownParams, DaemonShutdownResult, DaemonStatusParams, DaemonStatusResult,
+    GrantAddParams, GrantAddResult, InitializeParams, InitializeResult, PermissionRequestParams,
+    PermissionRespondParams, PermissionRespondResult, PingParams, PingResult, SessionCancelParams,
+    SessionCancelResult, SessionCloseParams, SessionCloseResult, SessionCreateParams,
+    SessionCreateResult, SessionListParams, SessionListResult, SessionResumeParams,
+    SessionResumeResult, SessionSendParams, SessionSendResult, SessionSetModelParams,
+    SessionSetModelResult, SessionSubscribeParams, SessionSubscribeResult, UsageSummaryParams,
+    UsageSummaryResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -90,6 +91,8 @@ golden_tests! {
     session_send_params: "session.send.params" => SessionSendParams,
     session_send_params_limits: "session.send.params.limits" => SessionSendParams,
     session_send_result: "session.send.result" => SessionSendResult,
+    agent_run_params: "agent.run.params" => AgentRunParams,
+    agent_run_result: "agent.run.result" => AgentRunResult,
     session_cancel_params: "session.cancel.params" => SessionCancelParams,
     session_cancel_result: "session.cancel.result" => SessionCancelResult,
     session_close_params: "session.close.params" => SessionCloseParams,
