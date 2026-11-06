@@ -19,6 +19,7 @@ use coda_providers::claude_code::Diagnostic;
 use coda_providers::claude_session::{
     AdapterError, CancelHandle, ClaudeSession, SessionSpec, TurnOutcome,
 };
+use coda_providers::emit::Emit;
 use coda_providers::gate::PermissionGate;
 use coda_providers::tool_request::{Tool, ToolRequest};
 use serde_json::Value;
@@ -611,6 +612,47 @@ async fn cancelling_while_a_permission_request_is_pending_ends_the_turn() {
             .iter()
             .any(|e| matches!(e, Event::Approve { .. } | Event::Deny { .. }))
     );
+}
+
+/// A sink whose queue is full: it cancels on the first text, then never takes an event.
+struct FullQueue {
+    cancel: CancelHandle,
+}
+
+impl Emit for FullQueue {
+    fn emit(&mut self, event: Event) -> impl Future<Output = ()> + Send {
+        if matches!(event, Event::StreamDelta { .. }) {
+            self.cancel.cancel();
+        }
+        std::future::pending()
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_kills_the_backend_even_while_the_event_queue_is_full() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let mut sink = FullQueue {
+        cancel: session.cancel_handle(),
+    };
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+    let turn_id = TurnId::new("t-1");
+
+    // Act
+    let killed = tokio::select! {
+        _ = session.run_turn(&turn_id, "grandchild", &gate, &mut sink) => false,
+        () = async {
+            let pid_file = fixture.cwd.path().join(PID_FILE);
+            while !pid_file.exists() {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            assert_gone_soon(fixture.grandchild_pid()).await;
+        } => true,
+    };
+
+    // Assert
+    assert!(killed, "the turn ended without waiting on the full queue");
 }
 
 #[tokio::test]

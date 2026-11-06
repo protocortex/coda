@@ -12,10 +12,11 @@ use std::time::Duration;
 use coda_protocol::events::Event;
 use coda_protocol::types::{PermissionDecision, SessionId, TokenUsage, TurnId};
 use coda_providers::claude_code::Diagnostic;
-use coda_providers::claude_session::{ENV_ALLOWLIST, TurnOutcome};
+use coda_providers::claude_session::{CancelHandle, ENV_ALLOWLIST, TurnOutcome};
 use coda_providers::codex_exec::{
     CodexError, CodexExecSession, CodexMessage, CodexParser, CodexSpec, SandboxMode,
 };
+use coda_providers::emit::Emit;
 use coda_providers::gate::PermissionGate;
 use coda_providers::tool_request::ToolRequest;
 use serde_json::Value;
@@ -374,6 +375,41 @@ async fn cancelling_kills_the_process_group_and_leaves_no_zombie() {
     assert_gone_soon(fixture.pid_from(PID_FILE, false)).await;
     assert_gone_soon(fixture.pid_from(REPORT_FILE, true)).await;
     assert_eq!(session.pid(), None);
+}
+
+/// A sink whose queue is full: it cancels on the first event, then never takes one.
+struct FullQueue {
+    cancel: CancelHandle,
+}
+
+impl Emit for FullQueue {
+    fn emit(&mut self, _event: Event) -> impl Future<Output = ()> + Send {
+        self.cancel.cancel();
+        std::future::pending()
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_kills_the_backend_even_while_the_event_queue_is_full() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = fixture.session();
+    let mut sink = FullQueue {
+        cancel: session.cancel_handle(),
+    };
+    let turn_id = TurnId::new("t-1");
+
+    // Act
+    let killed = tokio::select! {
+        _ = session.run_turn(&turn_id, "message-hang", &NoAsk, &mut sink) => false,
+        () = async {
+            wait_for_file(fixture.cwd.path().join(REPORT_FILE)).await;
+            assert_gone_soon(fixture.pid_from(REPORT_FILE, true)).await;
+        } => true,
+    };
+
+    // Assert
+    assert!(killed, "the turn ended without waiting on the full queue");
 }
 
 #[tokio::test]

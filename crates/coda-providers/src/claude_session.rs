@@ -278,7 +278,22 @@ impl ClaudeSession {
         let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
         loop {
             while let Some(message) = self.backlog.pop_front() {
-                if let Some(outcome) = self.handle(message, turn_id, gate, emit).await? {
+                // A sink that waits for room must not hold up a cancel. It keeps the
+                // event it was given, so dropping the wait loses nothing.
+                // Not a message that ends the turn or answers a permission request: a
+                // cancel dropping those would log a finished turn as interrupted.
+                let preemptible = !matches!(
+                    message,
+                    Message::Result { .. } | Message::PermissionRequest(_)
+                );
+                let cancel = self.cancel.subscribe();
+                let handled = tokio::select! {
+                    handled = self.handle(message, turn_id, gate, emit) => handled?,
+                    () = cancelled(cancel), if preemptible => {
+                        return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await;
+                    }
+                };
+                if let Some(outcome) = handled {
                     return Ok(outcome);
                 }
             }
@@ -472,13 +487,15 @@ impl ClaudeSession {
         cause: InterruptCause,
         emit: &mut impl Emit,
     ) -> Result<TurnOutcome, AdapterError> {
+        // Stop the backend before the event, which may wait for room in a full queue.
+        let stopped = self.shutdown().await;
         emit.emit(Event::TurnInterrupted {
             session_id: self.session_id.clone(),
             turn_id: turn_id.clone(),
             cause: Some(cause),
         })
         .await;
-        self.shutdown().await?;
+        stopped?;
         Ok(TurnOutcome::Cancelled)
     }
 

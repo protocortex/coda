@@ -22,7 +22,8 @@
 //! `tool-slow` starts a command item, stays silent for `TOOL_SLOW` and completes it;
 //! `tool-hang` starts one and never completes it. `stream-long` streams lines that carry no text
 //! (reasoning deltas, `item.updated`) for longer than the idle limits the tests use.
-//! `exec` takes all three prompts.
+//! `exec` takes all three prompts, and also `message-hang`, which parks the process
+//! after the agent message.
 //!
 //! Test controls come from `fake-codex-control.json` in the working
 //! directory, because the adapter passes the child only an allowlisted
@@ -175,6 +176,9 @@ fn run_turn(args: &[String], prompt: &str, out: &mut impl Write) -> io::Result<(
         &json!({"type": "item.completed", "item": {"id": "item_0", "type": "agent_message",
             "text": "working on it"}}),
     )?;
+    if prompt.contains("message-hang") {
+        park();
+    }
     emit(
         out,
         &json!({"type": "item.completed", "item": {"id": "item_1", "type": "command_execution",

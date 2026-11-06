@@ -443,7 +443,22 @@ impl CodexExecSession {
             }
             gate.progress();
             for message in self.parser.feed(&buffer[..read]) {
-                if let Some(is_error) = self.handle(message, turn_id, gate, emit).await {
+                // A sink that waits for room must not hold up a cancel. It keeps the
+                // event it was given, so dropping the wait loses nothing.
+                // Not a message that ends the turn: a cancel dropping that one would
+                // log a finished turn as interrupted.
+                let preemptible = !matches!(
+                    message,
+                    CodexMessage::TurnCompleted(_) | CodexMessage::TurnFailed
+                );
+                let cancel = self.cancel.subscribe();
+                let handled = tokio::select! {
+                    handled = self.handle(message, turn_id, gate, emit) => handled,
+                    () = cancelled(cancel), if preemptible => {
+                        return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await;
+                    }
+                };
+                if let Some(is_error) = handled {
                     self.reap(EXIT_GRACE).await?;
                     return Ok(TurnOutcome::Completed { is_error });
                 }
@@ -568,13 +583,15 @@ impl CodexExecSession {
         cause: InterruptCause,
         emit: &mut impl Emit,
     ) -> Result<TurnOutcome, CodexError> {
+        // Stop the backend before the event, which may wait for room in a full queue.
+        let stopped = self.reap(Duration::ZERO).await;
         emit.emit(Event::TurnInterrupted {
             session_id: self.spec.session_id.clone(),
             turn_id: turn_id.clone(),
             cause: Some(cause),
         })
         .await;
-        self.reap(Duration::ZERO).await?;
+        stopped?;
         Ok(TurnOutcome::Cancelled)
     }
 
