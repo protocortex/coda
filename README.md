@@ -142,6 +142,7 @@ kill "$(coda status | sed -n 's/^pid: //p')"
 | `coda status` | Show the daemon pid, version and uptime. It fails if no daemon runs. |
 | `coda ping` | Print `pong` if a daemon answers. It fails if no daemon runs. |
 | `coda run` | Run one prompt to completion. Flags: `--prompt`, `--command`, `--args`, `--cwd`, `--mode`, `--max-turns`, `--token-cap`. Without `--prompt` or `--command` it reads the prompt from standard input. `--command <name>` runs a command file and `--args` fills its `$ARGUMENTS`; without `--args`, piped standard input does (see [docs/agents.md](docs/agents.md)). |
+| `coda review` | Review a change and print the findings. Takes a pull request number or URL, a branch, a range such as `main...topic`, or nothing for the current branch against the default branch. Flags: `--staged`, `--instructions`, `--json`, `--backend`, `--cwd`, and `--force` to review a pull request that a skip rule would skip. It posts nothing and edits nothing. See [docs/config.md](docs/config.md#coda-review). |
 | `coda grant add` | Allow one command in a repository permanently. Flags: `--repo`, `--cwd`, `--tool`. |
 | `coda usage` | Show token usage and savings. `--session` limits it to one session. It asks a running daemon, or reads the database when none runs. |
 | `coda doctor` | Check the socket, lock, orphaned backends, database, schema, database release, config and backends. `--repair` removes a stale socket and kills orphaned backends. `--json` prints JSON. |
@@ -166,6 +167,8 @@ Every command accepts `--force`, but it only matters in two cases. A command tha
 | 5 | Any other stop, or a failed turn. This includes a conversation that could not be compacted (`compaction_failed`) and a blocking `session_start` hook that failed (`hook_blocked`), whose reason goes to standard error. |
 | 64 | Bad usage. |
 | 70 | The run itself failed. |
+
+`coda review`: 0 reviewed, or skipped by a rule, or nothing to review; 64 bad usage; 70 the review failed (no reachable backend, the run stopped early, or the reviewer did not answer in the review format twice).
 
 `coda doctor`: 0 healthy, 20 at least one check failed, 21 only warnings, 64 bad usage, 70 the check itself failed.
 

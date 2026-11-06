@@ -11,11 +11,11 @@ use crate::permission::sanitize;
 
 const SLASH: char = '/';
 /// The commands the UI itself runs. They win over a command file of the same name.
-const COMMANDS: [&str; 7] = [
-    "sessions", "new", "resume", "model", "backend", "help", "quit",
+const COMMANDS: [&str; 8] = [
+    "sessions", "new", "resume", "model", "backend", "review", "help", "quit",
 ];
 /// The built-in commands as `/help` lists them.
-const BUILT_IN_HELP: &str = "Built-in commands: /sessions, /new, /resume <id>, /model <alias>, /backend [name], /help, /quit";
+const BUILT_IN_HELP: &str = "Built-in commands: /sessions, /new, /resume <id>, /model <alias>, /backend [name], /review [target], /help, /quit";
 
 /// A command the user can type instead of a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,9 +30,29 @@ pub enum Command {
     Model(String),
     /// List the backends, or start a new session on the named one.
     Backend(Option<String>),
+    /// Ask the reviewer agent to review a change; the text is what to review, or empty.
+    Review(String),
     /// List the built-in commands and the ones from command files.
     Help,
     Quit,
+}
+
+/// The message `/review` sends: it hands `target` to the `reviewer` agent through the
+/// `task` tool. The reviewer cannot run commands, so the message asks for the change to
+/// be put in its prompt.
+#[must_use]
+pub fn review_prompt(target: &str) -> String {
+    let target = target.trim();
+    let target = if target.is_empty() {
+        "the changes on the current branch"
+    } else {
+        target
+    };
+    format!(
+        "Review {target} with the task tool: call it with agent \"reviewer\". The reviewer \
+         cannot run commands, so put the change in its prompt, as the output of `git diff` or \
+         the names of the files to read, and say what to look at. Then report its findings to me."
+    )
 }
 
 /// Why a line that starts with a slash is not a command.
@@ -88,6 +108,13 @@ pub fn parse(line: &str) -> Result<Option<Command>, CommandError> {
         )),
         "model" => Command::Model(words.next().ok_or(CommandError::MissingModel)?.to_owned()),
         "backend" => Command::Backend(words.next().map(str::to_owned)),
+        "review" => Command::Review(
+            line.trim()
+                .strip_prefix(word)
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+        ),
         _ => return Err(CommandError::Unknown(word.to_owned())),
     };
     match (&command, words.next()) {
@@ -328,6 +355,39 @@ mod tests {
 
             // Assert
             assert_eq!(parsed, expected, "{line}");
+        }
+    }
+
+    #[test]
+    fn review_takes_the_rest_of_the_line_and_may_take_none() {
+        for (line, expected) in [
+            ("/review", ""),
+            ("/review  main...topic  now", "main...topic  now"),
+        ] {
+            // Act
+            let parsed = parse(line);
+
+            // Assert
+            assert_eq!(
+                parsed,
+                Ok(Some(Command::Review(expected.to_owned()))),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_review_prompt_names_the_target_or_the_current_changes() {
+        // Act
+        let named = review_prompt("the parser change");
+        let bare = review_prompt("  ");
+
+        // Assert
+        assert!(named.contains("the parser change"));
+        assert!(bare.contains("the changes on the current branch"));
+        for prompt in [named, bare] {
+            assert!(prompt.contains("task tool"), "{prompt}");
+            assert!(prompt.contains("\"reviewer\""), "{prompt}");
         }
     }
 

@@ -9,6 +9,7 @@ pub mod ignore;
 pub mod pack;
 pub mod parse;
 pub mod render;
+pub mod request;
 pub mod rules;
 pub mod schema;
 pub mod skip;

@@ -123,7 +123,22 @@ Each value is an integer number of milliseconds. A key left out keeps its defaul
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `max_findings` | integer | `5` | Most findings one review run reports. When the model returns more, the most severe are kept and the rest are counted in the run details. Must not be zero. |
-| `diff_budget_chars` | integer | `120000` | Most characters of diff text one review sends to the model. The diff is packed to fit: binary, vendored and ignored files and deletion-only hunks are dropped, files of the repository's main language go first and smaller files before larger ones, and each hunk carries three lines of context and its new-side line numbers. Packing ends at the first file the budget cuts: that file keeps the hunks that fit whole, then the lines of the next hunk that fit (cut between lines, so one very large hunk still gives the model its first lines), and every later file is left out. A file where not even its header and the lines up to its first added line fit is left out too, and so are the files after it. A single line longer than the room that is left is not cut. The review's coverage list names every file as reviewed, clipped or left out. This is done by the `coda-review` library; the `coda review` command that applies it comes later (issue #202). Must not be zero. |
+| `diff_budget_chars` | integer | `120000` | Most characters of diff text one review sends to the model. The diff is packed to fit: binary, vendored and ignored files and deletion-only hunks are dropped, files of the repository's main language go first and smaller files before larger ones, and each hunk carries three lines of context and its new-side line numbers. Packing ends at the first file the budget cuts: that file keeps the hunks that fit whole, then the lines of the next hunk that fit (cut between lines, so one very large hunk still gives the model its first lines), and every later file is left out. A file where not even its header and the lines up to its first added line fit is left out too, and so are the files after it. A single line longer than the room that is left is not cut. The review's coverage list names every file as reviewed, clipped or left out. The `coda review` command applies it. Must not be zero. |
+
+## `coda review`
+
+`coda review [<target>]` reads a change, has the built-in `reviewer` agent look at it and prints the findings. It posts nothing and edits no file of the repository. The target is a pull request number or URL (read with the `gh` command, which uses your own `gh` login), a branch (against the default branch), a range such as `main...topic` (from the merge base; `main..` ends at `HEAD`), or nothing for the current branch against the default branch. All digits, or a URL with `/pull/`, is a pull request, so a branch named `42` cannot be reviewed by name; give it as a range. The default branch is where `origin/HEAD` points, else a local `main`, else a local `master`.
+
+| Flag | Meaning |
+| --- | --- |
+| `coda review --staged` | Review the staged changes instead of a target. |
+| `coda review --instructions <text>` | Extra instructions for the reviewer, from you. |
+| `coda review --json` | Print the review as JSON, in the schema of the `coda-review` crate, instead of markdown. |
+| `coda review --backend <name>` | `anthropic`. The reviewer runs in Coda's own agent loop through the `task` tool, so `claude-code` and `codex`, which run their own agents, are refused with an error. Without the flag, the faux provider is used if it is enabled, and the Anthropic API otherwise. |
+| `coda review --cwd <dir>` | The directory to review in. |
+| `coda review --force` | Review a pull request although a `[review.skip]` rule matches. |
+
+The diff is packed to `[review] diff_budget_chars` and the ignore rules apply (see above). The packed text is written to `.coda/review/input-<pid>.txt` in the working directory, because it is too large to ask the model to copy into a tool call, and the reviewer reads it with its `read` tool. The file is removed when the command ends. The reviewer has only read-only tools: no `bash`, `edit` or `task`. Each finding must point at lines the diff shows; others are dropped and counted. If the answer is not in the review format, the reviewer is asked once more. A review is skipped (exit 0, one line printed) when a skip rule matches a pull request, and when the change has no lines to look at. A failure exits 70 with the reason on standard error and nothing on standard output. In the terminal UI, `/review [target]` asks the session's model to hand the change to the reviewer.
 
 ## `[review.ignore]`
 
@@ -136,7 +151,7 @@ Files a review leaves out.
 
 ## `[review.skip]`
 
-Pull requests a review does not run on. Every rule is off until you set it, and one match skips the pull request. The `coda-review` library returns the skip decision and a one-line reason, and a force flag overrides it. The `coda review` command that prints the line, exits 0 and takes `--force` comes later (issue #202); no command does this yet.
+Pull requests a review does not run on. Every rule is off until you set it, and one match skips the pull request. `coda review` applies it to a pull request: it prints a one-line reason and exits 0, and `--force` reviews anyway.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
