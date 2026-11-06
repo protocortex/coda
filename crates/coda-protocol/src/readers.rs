@@ -34,6 +34,8 @@ pub struct SymbolLocation {
     pub path: String,
     /// One-based line of the definition.
     pub line: u32,
+    /// One-based last line of the definition; 0 when the index does not know it.
+    pub end_line: u32,
 }
 
 /// One match from a text search.
@@ -101,6 +103,7 @@ mod tests {
                 kind: "fn".to_owned(),
                 path: "src/lib.rs".to_owned(),
                 line: 3,
+                end_line: 5,
             }])
         }
 

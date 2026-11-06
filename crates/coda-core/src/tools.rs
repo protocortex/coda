@@ -22,6 +22,7 @@ use coda_tools::code::{
 use coda_tools::edit::{DEFAULT_MAX_FILE_BYTES, EditTool};
 use coda_tools::grep::GrepTool;
 use coda_tools::list::ListTool;
+use coda_tools::multi_edit::MultiEditTool;
 use coda_tools::read::ReadTool;
 use coda_tools::read_log::ReadLog;
 use coda_tools::retrieve::RetrieveTool;
@@ -310,6 +311,11 @@ pub fn base_tools(
         )))
         .with(Arc::new(RefreshAfterEdit::new(
             WriteTool::new(sandbox()?, DEFAULT_MAX_FILE_BYTES, read_log),
+            Arc::clone(&store),
+            config.workdir.clone(),
+        )))
+        .with(Arc::new(RefreshAfterEdit::new(
+            MultiEditTool::new(sandbox()?, DEFAULT_MAX_FILE_BYTES, Arc::clone(&index)),
             store,
             config.workdir.clone(),
         )))
@@ -327,7 +333,7 @@ pub fn base_tools(
             DEFAULT_MAX_OUTPUT_BYTES,
         )))
         .with(Arc::new(CodeOutlineTool::new(
-            index,
+            Arc::clone(&index),
             DEFAULT_MAX_OUTPUT_BYTES,
         )))
         .with(Arc::new(CodeReadRangeTool::new(
@@ -356,6 +362,41 @@ fn schema(
             "additionalProperties": false,
         }),
     }
+}
+
+fn multi_edit_schema() -> ToolSchema {
+    schema(
+        "multi_edit",
+        "Change several places, in one file or many, in one call that applies all of them or none. Give either edits or symbol. Each edit keeps the rules of edit: old_string must occur once in the file as it is now, and the edits of one call must not overlap or depend on each other. If any edit fails, no file changes and the result names the first one that failed.",
+        &json!({
+            "edits": {
+                "type": "array",
+                "description": "The edits to apply together.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path relative to the workspace."},
+                        "old_string": {"type": "string", "description": "The text to replace; it must occur once."},
+                        "new_string": {"type": "string", "description": "The replacement text."},
+                    },
+                    "required": ["path", "old_string", "new_string"],
+                    "additionalProperties": false,
+                },
+            },
+            "symbol": {
+                "type": "object",
+                "description": "Replace the whole definition of one symbol, using the lines the code index holds for it. Refused when the name is ambiguous in the file or the index is out of date.",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to the workspace."},
+                    "name": {"type": "string", "description": "The symbol name."},
+                    "new_text": {"type": "string", "description": "The new text for the definition's lines."},
+                },
+                "required": ["path", "name", "new_text"],
+                "additionalProperties": false,
+            },
+        }),
+        &[],
+    )
 }
 
 fn schemas() -> Vec<ToolSchema> {
@@ -430,6 +471,7 @@ fn schemas() -> Vec<ToolSchema> {
             }),
             &[],
         ),
+        multi_edit_schema(),
         schema(
             "read",
             "Read a byte range of a workspace file.",
@@ -487,7 +529,7 @@ mod tests {
         refresh_index, task_schema,
     };
 
-    const NAMES: [&str; 11] = [
+    const NAMES: [&str; 12] = [
         "bash",
         "code_outline",
         "code_read_range",
@@ -496,6 +538,7 @@ mod tests {
         "edit",
         "grep",
         "list",
+        "multi_edit",
         "read",
         "retrieve",
         "write",

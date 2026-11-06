@@ -72,7 +72,7 @@ pub fn decide(input: &PolicyInput<'_>) -> Verdict {
                 Verdict::Deny
             }
         }
-        Tool::Edit | Tool::Write => decide_edit(input),
+        Tool::Edit | Tool::Write | Tool::MultiEdit => decide_edit(input),
     }
 }
 
@@ -179,7 +179,7 @@ const PATH_SEPARATOR: char = '\u{1f}';
 /// an edit, the command line for other tools, empty when there is none.
 #[must_use]
 pub fn grant_pattern(tool: &Tool, command: Option<&str>, target_paths: &[PathBuf]) -> String {
-    if !matches!(tool, Tool::Edit | Tool::Write) {
+    if !matches!(tool, Tool::Edit | Tool::Write | Tool::MultiEdit) {
         return command.unwrap_or_default().to_owned();
     }
     let mut paths: Vec<String> = target_paths.iter().map(|p| normalized(p)).collect();
@@ -751,6 +751,7 @@ fn edit_prompt_and_allow_rows(rows: &mut Rows) {
 /// unless accept-edits or a grant allows it, and never leaves the workspace.
 fn write_rows(rows: &mut Rows) {
     use PermissionMode::{AcceptEdits, Prompt};
+    multi_edit_rows(rows);
     rows.add(
         "ask prompts for an inside write",
         Prompt,
@@ -804,6 +805,75 @@ fn write_rows(rows: &mut Rows) {
             "write with no target",
             mode,
             Tool::Write,
+            Vec::new(),
+            false,
+            Verdict::Deny,
+        );
+    }
+}
+
+/// `multi_edit` is one request for every file it names, decided like `edit`:
+/// one path outside the workspace denies the whole call, and one
+/// execution-affecting path makes accept-edits ask.
+fn multi_edit_rows(rows: &mut Rows) {
+    use PermissionMode::{AcceptEdits, Prompt};
+    let two = || {
+        vec![
+            target("src/a.rs", Target::Inside),
+            target("src/b.rs", Target::Inside),
+        ]
+    };
+    rows.add(
+        "ask prompts for a multi-file edit",
+        Prompt,
+        Tool::MultiEdit,
+        two(),
+        false,
+        Verdict::Prompt,
+    );
+    rows.add(
+        "accept-edits allows a multi-file edit",
+        AcceptEdits,
+        Tool::MultiEdit,
+        two(),
+        false,
+        Verdict::Allow,
+    );
+    rows.add_granting(
+        "a grant for one file does not allow a multi-file edit",
+        Prompt,
+        Tool::MultiEdit,
+        two(),
+        Some(inside("src/a.rs")),
+        Verdict::Prompt,
+    );
+    rows.add(
+        "accept-edits prompts when one of the files is execution-affecting",
+        AcceptEdits,
+        Tool::MultiEdit,
+        vec![
+            target("src/a.rs", Target::Inside),
+            target("build.rs", Target::Inside),
+        ],
+        false,
+        Verdict::Prompt,
+    );
+    for mode in [Prompt, AcceptEdits] {
+        rows.add(
+            "a multi-file edit with one target outside",
+            mode,
+            Tool::MultiEdit,
+            vec![
+                target("src/a.rs", Target::Inside),
+                target("/tmp/b", Target::Outside),
+            ],
+            true,
+            Verdict::Deny,
+        );
+        rows.add(
+            "a multi-file edit with no target",
+            mode,
+            Tool::MultiEdit,
             Vec::new(),
             false,
             Verdict::Deny,

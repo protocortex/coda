@@ -33,6 +33,7 @@ fn symbol_location(row: &Row<'_>) -> rusqlite::Result<SymbolLocation> {
         kind: row.get(1)?,
         path: row.get(2)?,
         line: row.get(3)?,
+        end_line: row.get(4)?,
     })
 }
 
@@ -71,7 +72,7 @@ impl Store {
 impl RepoIndex<'_> {
     fn match_symbols(&self, query: &str, limit: usize) -> Result<Vec<SymbolLocation>, StoreError> {
         let mut stmt = self.store.connection().prepare(
-            "SELECT s.name, s.kind, s.file_path, s.line FROM symbols_fts \
+            "SELECT s.name, s.kind, s.file_path, s.line, s.end_line FROM symbols_fts \
              JOIN symbols s ON s.id = symbols_fts.rowid \
              WHERE symbols_fts MATCH ?1 AND s.repo_path = ?2 \
              ORDER BY rank, s.file_path, s.line, s.id LIMIT ?3",
@@ -89,7 +90,7 @@ impl RepoIndex<'_> {
 
     fn file_outline(&self, path: &str) -> Result<Vec<SymbolLocation>, StoreError> {
         let mut stmt = self.store.connection().prepare(
-            "SELECT name, kind, file_path, line FROM symbols \
+            "SELECT name, kind, file_path, line, end_line FROM symbols \
              WHERE repo_path = ?1 AND file_path = ?2 ORDER BY line, id",
         )?;
         let rows = stmt.query_map([self.repo_path.as_str(), path], symbol_location)?;
