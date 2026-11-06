@@ -4,6 +4,7 @@
 
 pub mod broker;
 pub mod budget;
+pub mod checks;
 pub mod compact;
 pub mod economy;
 pub mod history;

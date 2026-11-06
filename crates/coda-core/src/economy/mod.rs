@@ -65,7 +65,8 @@ fn is_diff(text: &str) -> bool {
     false
 }
 
-fn shrink(raw: &[u8]) -> String {
+/// The shrunk form of `raw`, picked by its shape.
+pub(crate) fn shrink(raw: &[u8]) -> String {
     match detect(&String::from_utf8_lossy(raw)) {
         Kind::Diff => compress::compress_diff(raw),
         Kind::JsonArray => {

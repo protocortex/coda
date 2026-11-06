@@ -208,6 +208,23 @@ A hook that times out or whose turn is cancelled is killed together with everyth
 
 A key the schema does not know in a hook entry is an error, so a misspelled `blocking` never turns a guard into a log line.
 
+## `[checks.<extension>]`
+
+A check is a command coda runs after the model changes a file, so the model sees what it broke in the same tool result and can fix it at once. It runs in model-API sessions (`anthropic`, `openai_compat`, `faux`) after a successful `edit`, `write` or `multi_edit`, for files with the extension named in the table, for example `[checks.rs]`. The extension has no dot and is matched without regard to case. Nothing runs for an extension with no table, and there are no checks unless you add them. Checks come from this file only. A project file or a definition file cannot add one.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `command` | array of strings | Required. The program and its arguments, with the same rules as a hook's `command`: no shell, an absolute path or a bare name found on `PATH`, and the same environment as a hook. It runs in the session's directory. |
+| `timeout_ms` | integer | Longest run time, from 1 to 300000. Default 60000. |
+
+How it behaves:
+
+- It runs once after the last change in a model reply, not after each change. If a reply makes two edits, the model gets the check result in the result of the last one. Two extensions with the same command run it once.
+- A check that passes adds one line, `check passed (<program>)`. One that fails adds `check failed (<program>, exited with status N)` and the end of what it wrote to standard output and error, as plain text (colour codes removed). Only the last 32 KiB of output is read, and a long log is shortened to its start, its errors and its end. The result is added after the tool's `post_tool` hooks have run, so a `post_tool` hook does not see the check text: the command is one you chose in this file.
+- A check that times out adds `check timed out after N ms (<program>); the change was applied`, and one that cannot start adds `check could not run`. The change stays either way. A check never turns a successful edit into an error.
+- It is killed with its whole process group at its timeout or when the turn is cancelled. A change made when the reply's last edit failed is still checked, and the result is added to the failed edit's result.
+- A sub-agent started by the `task` tool runs the checks for its own changes.
+
 ## Example
 
 This file uses every key. It is checked against the parser when the tests run.
@@ -285,4 +302,8 @@ event = "pre_tool"
 command = ["/usr/local/bin/check-tool", "strict"]
 blocking = true
 timeout_ms = 5000
+
+[checks.rs]
+command = ["cargo", "check"]
+timeout_ms = 120000
 ```

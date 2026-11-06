@@ -28,6 +28,7 @@ use coda_agents::{
 use coda_config::config::Config;
 use coda_config::hooks::HookEvent;
 use coda_core::broker::RunGrants;
+use coda_core::checks::Checks;
 use coda_core::history::CHILD_EVENT_KIND;
 use coda_core::hooks::HookRunner;
 use coda_core::prompt::{Conversation, Message, Prefix, PromptError};
@@ -224,7 +225,8 @@ impl LoopFactory {
             parts.events,
         )
         .with_context_window(parts.window)
-        .with_hooks(self.hooks_for(depth));
+        .with_hooks(self.hooks_for(depth))
+        .with_checks(Checks::new(&self.env.config.checks, self.env.env.clone()));
         if let Some(runner) = below {
             turn_loop = turn_loop.with_tasks(runner);
         }
