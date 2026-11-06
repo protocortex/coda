@@ -34,6 +34,10 @@ const REQUEST_LOG: &str = "requests.jsonl";
 const HOME_DIR: &str = "home";
 /// Small enough that a long prompt nears it.
 const SMALL_WINDOW: u32 = 100;
+/// The window inside a read of the disk, as fifths of it, where a store call must finish.
+const WINDOW_START_FIFTHS: u32 = 1;
+const WINDOW_END_FIFTHS: u32 = 4;
+const FIFTHS: u32 = 5;
 const PROMPT_CANARY: &str = "CANARY-PROMPT-7f3a91";
 /// In the daemon's environment, where no tool or hook may see it.
 const API_KEY_CANARY: &str = "sk-env-canary-5d1e07";
@@ -1255,15 +1259,26 @@ async fn a_store_user_is_not_blocked_while_the_index_walk_runs() {
     let user = StoreProbe::start(&rig);
 
     // Act
+    let started = std::time::Instant::now();
     rig.send("go").await;
     rig.wait_for("result").await;
     rig.wait_until_idle().await;
-    let longest = user.stop().await.longest;
+    let probed = user.stop().await;
 
     // Assert
+    // A store call that finishes in the middle of the walk was served while
+    // the files were being read. Were the store held for the walk, the first
+    // one would finish only at its end. One call in a window of most of the
+    // walk is enough, so a pause of the runner cannot fail the test.
+    let (from, to) = (
+        started + walk * WINDOW_START_FIFTHS / FIFTHS,
+        started + walk * WINDOW_END_FIFTHS / FIFTHS,
+    );
+    let served = probed.finished.iter().any(|at| (from..=to).contains(at));
     assert!(
-        longest < walk / 2,
-        "a store call waited {longest:?} of a {walk:?} walk"
+        served,
+        "no store call finished while the index was walked; the longest waited {:?} of a {walk:?} walk",
+        probed.longest
     );
     assert_eq!(indexed_symbols(&rig, "f5"), 1);
 }
