@@ -46,7 +46,9 @@ use crate::gate::{BrokerGate, Brokers};
 use crate::idle_pool::IdlePool;
 use crate::subscribe::{Hub, HubError};
 use crate::trace::backend_span;
-use crate::turn::{Reservation, TurnError, TurnState, Turns, store_event};
+use crate::turn::{
+    DELTA_WINDOW, MAX_DELTA_CHUNK_BYTES, Reservation, TurnError, TurnState, Turns, store_event,
+};
 
 mod task;
 
@@ -778,6 +780,7 @@ impl ModelSessions {
             turn_loop, events, ..
         } = &mut model_loop;
         info!(session = %session, turn = %turn, step = "drive", "driving the turn loop");
+        let mut streamed = StreamedText::default();
         let outcome = {
             let send = turn_loop.send(&text);
             tokio::pin!(send);
@@ -785,14 +788,18 @@ impl ModelSessions {
                 tokio::select! {
                     outcome = &mut send => break outcome,
                     Some(event) = events.recv() => {
-                        publish_turn_event(&self.hub, &session, &turn, event).await;
+                        streamed.publish(&self.hub, &session, &turn, event).await;
+                    }
+                    () = streamed.due() => {
+                        streamed.flush(&self.hub, &session, &turn).await;
                     }
                 }
             }
         };
         while let Ok(event) = events.try_recv() {
-            publish_turn_event(&self.hub, &session, &turn, event).await;
+            streamed.publish(&self.hub, &session, &turn, event).await;
         }
+        streamed.flush(&self.hub, &session, &turn).await;
         let failed = outcome.is_err();
         match &outcome {
             Ok(condition) => {
@@ -943,6 +950,55 @@ async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Ro
         | TurnEvent::HookBlocked { .. }
         | TurnEvent::Compaction { .. }
         | TurnEvent::Child { .. } => Row::NotStored,
+    }
+}
+
+/// Answer text the loop streamed that is not stored yet. Consecutive chunks
+/// within [`DELTA_WINDOW`] become one row, as for a backend turn, so a long
+/// answer is not one row per token. Any other event flushes the text first, so
+/// the log keeps the order the loop produced.
+#[derive(Default)]
+struct StreamedText {
+    text: String,
+    /// When the oldest unstored chunk was held; `None` while nothing is held.
+    since: Option<tokio::time::Instant>,
+}
+
+impl StreamedText {
+    async fn publish(
+        &mut self,
+        hub: &Arc<Hub>,
+        session: &SessionId,
+        turn: &TurnId,
+        event: TurnEvent,
+    ) {
+        let TurnEvent::Text(chunk) = event else {
+            self.flush(hub, session, turn).await;
+            publish_turn_event(hub, session, turn, event).await;
+            return;
+        };
+        self.since.get_or_insert_with(tokio::time::Instant::now);
+        self.text.push_str(&chunk);
+        if self.text.len() >= MAX_DELTA_CHUNK_BYTES {
+            self.flush(hub, session, turn).await;
+        }
+    }
+
+    /// Resolves when the held text has waited out the window; never while none is held.
+    async fn due(&self) {
+        match self.since {
+            Some(since) => tokio::time::sleep_until(since + DELTA_WINDOW).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    async fn flush(&mut self, hub: &Arc<Hub>, session: &SessionId, turn: &TurnId) {
+        self.since = None;
+        if self.text.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.text);
+        publish_turn_event(hub, session, turn, TurnEvent::Text(text)).await;
     }
 }
 
