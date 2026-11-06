@@ -13,10 +13,14 @@ pub enum Tool {
     Bash,
     /// Change files.
     Edit,
+    /// Create a file, or replace one that was read.
+    Write,
     /// Read a file.
     Read,
     /// Search file contents or names.
     Grep,
+    /// List a directory, or search it by name pattern.
+    List,
     /// Read a line range of an indexed file.
     CodeReadRange,
     /// Fetch a stored original.
@@ -40,8 +44,10 @@ impl Tool {
         match self {
             Self::Bash => "bash",
             Self::Edit => "edit",
+            Self::Write => "write",
             Self::Read => "read",
             Self::Grep => "grep",
+            Self::List => "list",
             Self::CodeReadRange => "code_read_range",
             Self::Retrieve => "retrieve",
             Self::CodeSearch => "code_search",
@@ -76,8 +82,10 @@ mod tests {
         let cases = [
             (Tool::Bash, "bash"),
             (Tool::Edit, "edit"),
+            (Tool::Write, "write"),
             (Tool::Read, "read"),
             (Tool::Grep, "grep"),
+            (Tool::List, "list"),
             (Tool::CodeReadRange, "code_read_range"),
             (Tool::Retrieve, "retrieve"),
             (Tool::CodeSearch, "code_search"),

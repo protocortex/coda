@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The base tools every model-API session offers: read, grep, edit, bash,
-//! retrieve and the code index tools, with the schemas the model sees.
+//! The base tools every model-API session offers: read, list, grep, edit,
+//! write, bash, retrieve and the code index tools, with the schemas the model sees.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -21,9 +21,12 @@ use coda_tools::code::{
 };
 use coda_tools::edit::{DEFAULT_MAX_FILE_BYTES, EditTool};
 use coda_tools::grep::GrepTool;
+use coda_tools::list::ListTool;
 use coda_tools::read::ReadTool;
+use coda_tools::read_log::ReadLog;
 use coda_tools::retrieve::RetrieveTool;
 use coda_tools::sandbox::{Sandbox, SandboxError};
+use coda_tools::write::WriteTool;
 use coda_tools::{DEFAULT_MAX_OUTPUT_BYTES, Tool, ToolError, ToolOutput, task};
 use serde_json::Value;
 use serde_json::json;
@@ -233,7 +236,8 @@ pub fn refresh_index(store: &Mutex<Store>, root: &Path) {
     }
 }
 
-/// The edit tool, followed by an index refresh after every edit that applied.
+/// A tool that changes files, followed by an index refresh after every call
+/// that applied.
 /// The wrapped tool is generic so a test can stand in for it.
 pub struct RefreshAfterEdit<T = EditTool> {
     edit: T,
@@ -286,17 +290,26 @@ pub fn base_tools(
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         env: config.env.clone(),
     };
+    let read_log = ReadLog::new();
     let tools = ToolSet::new()
-        .with(Arc::new(ReadTool::new(
+        .with(Arc::new(
+            ReadTool::new(sandbox()?, DEFAULT_MAX_OUTPUT_BYTES).with_read_log(read_log.clone()),
+        ))
+        .with(Arc::new(GrepTool::new(
             sandbox()?,
             DEFAULT_MAX_OUTPUT_BYTES,
         )))
-        .with(Arc::new(GrepTool::new(
+        .with(Arc::new(ListTool::new(
             sandbox()?,
             DEFAULT_MAX_OUTPUT_BYTES,
         )))
         .with(Arc::new(RefreshAfterEdit::new(
             EditTool::new(sandbox()?, DEFAULT_MAX_FILE_BYTES),
+            Arc::clone(&store),
+            config.workdir.clone(),
+        )))
+        .with(Arc::new(RefreshAfterEdit::new(
+            WriteTool::new(sandbox()?, DEFAULT_MAX_FILE_BYTES, read_log),
             store,
             config.workdir.clone(),
         )))
@@ -408,6 +421,16 @@ fn schemas() -> Vec<ToolSchema> {
             &["pattern"],
         ),
         schema(
+            "list",
+            "List the entries of a workspace directory, directories marked with a trailing slash. With a pattern, search the tree for names that match it instead. Skips .git, target and node_modules.",
+            &json!({
+                "path": {"type": "string", "description": "Directory to list, relative to the workspace. Defaults to the workspace root."},
+                "pattern": {"type": "string", "description": "A glob such as *.rs or src/**/*.toml. Without a slash it is matched against each name; with a slash, against the path below the directory."},
+                "include_dirs": {"type": "array", "items": {"type": "string"}, "description": "Skipped directories to list anyway."},
+            }),
+            &[],
+        ),
+        schema(
             "read",
             "Read a byte range of a workspace file.",
             &json!({
@@ -422,6 +445,15 @@ fn schemas() -> Vec<ToolSchema> {
             "Fetch the full output behind a shortened tool result.",
             &json!({"id": {"type": "string", "description": "The id named in the shortened result."}}),
             &["id"],
+        ),
+        schema(
+            "write",
+            "Create a workspace file, or replace the whole content of one that you read and that has not changed since. The directory must already exist.",
+            &json!({
+                "path": {"type": "string", "description": "File path relative to the workspace."},
+                "content": {"type": "string", "description": "The full content of the file."},
+            }),
+            &["path", "content"],
         ),
     ]
 }
@@ -455,7 +487,7 @@ mod tests {
         refresh_index, task_schema,
     };
 
-    const NAMES: [&str; 9] = [
+    const NAMES: [&str; 11] = [
         "bash",
         "code_outline",
         "code_read_range",
@@ -463,8 +495,10 @@ mod tests {
         "code_symbol",
         "edit",
         "grep",
+        "list",
         "read",
         "retrieve",
+        "write",
     ];
     const LIB_SOURCE: &str = "pub fn alpha() {}\n";
     const INDEXED_AT: i64 = 10_000;

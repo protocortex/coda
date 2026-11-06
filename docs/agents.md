@@ -31,7 +31,7 @@ You review diffs. Report findings only.
 | `description` | Required. Routing reads it. It must say when to use the agent ("Use when ...") and when not to ("Do not use ..."). |
 | `tier` | Required. `fast`, `standard` or `deep`. A `[routing]` table in `config.toml` maps it to a model (see [config.md](config.md)). |
 | `effort` | Required. `low`, `medium` or `high`. |
-| `tools` | Required. The only tools the agent can call. Each must be a tool Coda ships: `bash`, `code_outline`, `code_read_range`, `code_search`, `code_symbol`, `edit`, `grep`, `read`, `retrieve`. An agent without `edit` and `bash` cannot change files, because the list holds no such tool, not because its prompt says so. `bash` can still change files, so an agent that has it is not read-only, and each command it runs goes through the permission broker. |
+| `tools` | Required. The only tools the agent can call. Each must be a tool Coda ships: `bash`, `code_outline`, `code_read_range`, `code_search`, `code_symbol`, `edit`, `grep`, `list`, `read`, `retrieve`, `write`. An agent without `edit`, `write` and `bash` cannot change files, because the list holds no such tool, not because its prompt says so. `bash` can still change files, so an agent that has it is not read-only, and each command it runs goes through the permission broker. |
 
 A `model` key is an error: an agent file never names a model id.
 

@@ -28,6 +28,13 @@ const MAX_FILES_VISITED: usize = 10_000;
 /// `include_dirs` on the tool input opts individual ones back in.
 const SKIPPED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
 
+/// Whether a walk skips the directory `name`: it is a heavy one that
+/// `include_dirs` did not opt back in.
+pub(crate) fn is_skipped_dir(name: &OsStr, include_dirs: &[String]) -> bool {
+    SKIPPED_DIRS.iter().any(|skipped| name == *skipped)
+        && !include_dirs.iter().any(|inc| name == inc.as_str())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GrepArgs {
@@ -125,8 +132,7 @@ impl Search<'_> {
     }
 
     fn is_skipped_dir(&self, name: &OsStr) -> bool {
-        SKIPPED_DIRS.iter().any(|skipped| name == *skipped)
-            && !self.include_dirs.iter().any(|inc| name == inc.as_str())
+        is_skipped_dir(name, self.include_dirs)
     }
 
     /// Turns a per-entry failure into a skip; sandbox violations stay fatal.

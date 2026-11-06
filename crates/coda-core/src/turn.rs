@@ -1012,12 +1012,17 @@ fn capped(text: &str, reason: &str) -> String {
     format!("{}\n[{reason}]", cap_ends(text))
 }
 
+/// The directory a `list` call without a path lists.
+const LIST_DEFAULT_PATH: &str = ".";
+
 fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
     let tool = match name {
         "bash" => RequestTool::Bash,
         "edit" => RequestTool::Edit,
+        "write" => RequestTool::Write,
         "read" => RequestTool::Read,
         "grep" => RequestTool::Grep,
+        "list" => RequestTool::List,
         "retrieve" => RequestTool::Retrieve,
         "code_search" => RequestTool::CodeSearch,
         "code_symbol" => RequestTool::CodeSymbol,
@@ -1026,14 +1031,15 @@ fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
         skill_tool::NAME => RequestTool::Skill,
         other => RequestTool::Unknown(other.to_owned()),
     };
+    let path = input.get("path").and_then(Value::as_str);
+    // A listing with no path lists the workspace root.
+    let path = match (&tool, path) {
+        (RequestTool::List, None) => Some(LIST_DEFAULT_PATH),
+        (_, path) => path,
+    };
     ToolRequest {
         tool,
-        target_paths: input
-            .get("path")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .into_iter()
-            .collect(),
+        target_paths: path.map(PathBuf::from).into_iter().collect(),
         command: input
             .get("command")
             .and_then(Value::as_str)
@@ -1079,6 +1085,8 @@ mod tests {
             ("code_outline", RequestTool::CodeOutline),
             ("code_read_range", RequestTool::CodeReadRange),
             (skill_tool::NAME, RequestTool::Skill),
+            ("write", RequestTool::Write),
+            ("list", RequestTool::List),
         ];
 
         for (name, expected) in names {
@@ -1090,6 +1098,18 @@ mod tests {
             assert_eq!(request.tool, expected, "{name}");
             assert_eq!(request.tool.name(), name, "{name} round-trips");
         }
+    }
+
+    #[test]
+    fn a_list_call_without_a_path_targets_the_workspace_root() {
+        // Arrange
+        let input = serde_json::json!({"pattern": "*.rs"});
+
+        // Act
+        let request = super::tool_request("list", &input, Path::new("/ws"));
+
+        // Assert
+        assert_eq!(request.target_paths, [std::path::PathBuf::from(".")]);
     }
 
     use std::ffi::OsString;

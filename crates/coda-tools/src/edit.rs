@@ -124,10 +124,10 @@ impl Tool for EditTool {
 }
 
 /// The file as it was when the tool opened and read it.
-struct Original<'a> {
-    file: &'a File,
-    stat: &'a Stat,
-    snapshot: &'a Metadata,
+pub(crate) struct Original<'a> {
+    pub(crate) file: &'a File,
+    pub(crate) stat: &'a Stat,
+    pub(crate) snapshot: &'a Metadata,
 }
 
 /// How often `needle` occurs in `haystack`, counting overlapping matches,
@@ -185,7 +185,7 @@ fn to_crlf(text: &str) -> String {
 
 /// Writes `contents` to a temp file next to `name` and renames it into place,
 /// unless `name` no longer is the file that was read.
-fn replace_file(
+pub(crate) fn replace_file(
     dir: &SandboxDir,
     name: &OsStr,
     original: &Original<'_>,
