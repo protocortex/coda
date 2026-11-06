@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use coda_protocol::types::Mode;
+use coda_protocol::types::{BackendKind, Mode};
 
 const DEFAULT_TOOL: &str = "bash";
 
@@ -40,6 +40,11 @@ pub enum Command {
     /// window full, 4 cancelled, 5 any other stop or a failed turn, 64 bad
     /// usage, 70 the run itself failed.
     Run(RunArgs),
+    /// Review a change and print the findings; nothing is posted or edited.
+    ///
+    /// Exit codes: 0 reviewed or skipped by a rule, 64 bad usage, 70 the review
+    /// failed.
+    Review(ReviewArgs),
     /// Manage standing permission grants.
     #[command(subcommand)]
     Grant(GrantCommand),
@@ -127,6 +132,47 @@ pub struct RunArgs {
     /// Maximum tokens for the run.
     #[arg(long)]
     pub token_cap: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReviewArgs {
+    /// A pull request number or URL, a branch, or a range such as `main...topic`.
+    /// Without one, the current branch is reviewed against the default branch.
+    pub target: Option<String>,
+    /// Review the staged changes instead.
+    #[arg(long, conflicts_with = "target")]
+    pub staged: bool,
+    /// Extra instructions for the reviewer.
+    #[arg(long)]
+    pub instructions: Option<String>,
+    /// Print the review as JSON instead of markdown.
+    #[arg(long)]
+    pub json: bool,
+    /// The backend that runs the reviewer. By default the first model backend the
+    /// config enables, else the Anthropic API.
+    #[arg(long, value_enum)]
+    pub backend: Option<BackendArg>,
+    /// Working directory of the review.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+}
+
+/// The backends as typed on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BackendArg {
+    Anthropic,
+    ClaudeCode,
+    Codex,
+}
+
+impl From<BackendArg> for BackendKind {
+    fn from(arg: BackendArg) -> Self {
+        match arg {
+            BackendArg::Anthropic => Self::Anthropic,
+            BackendArg::ClaudeCode => Self::ClaudeCode,
+            BackendArg::Codex => Self::CodexAppServer,
+        }
+    }
 }
 
 /// The autonomy modes as typed on the command line.
@@ -234,6 +280,33 @@ mod tests {
             // Assert
             assert!(parsed.is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn review_takes_a_target_or_staged_but_not_both() {
+        // Arrange
+        let both = ["coda", "review", "--staged", "main"];
+        let target = [
+            "coda",
+            "review",
+            "main...topic",
+            "--json",
+            "--backend",
+            "codex",
+        ];
+
+        // Act
+        let refused = Cli::try_parse_from(both);
+        let parsed = Cli::try_parse_from(target).unwrap();
+
+        // Assert
+        assert!(refused.is_err());
+        let Some(Command::Review(review)) = parsed.command else {
+            panic!("expected the review command");
+        };
+        assert_eq!(review.target.as_deref(), Some("main...topic"));
+        assert!(review.json);
+        assert_eq!(review.backend, Some(BackendArg::Codex));
     }
 
     #[test]

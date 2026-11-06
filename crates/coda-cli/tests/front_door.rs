@@ -221,7 +221,7 @@ async fn init_refuses_to_overwrite_an_existing_config() {
     assert_eq!(fs::read_to_string(&config_file).unwrap(), FAUX_ENABLED);
 }
 
-const REVIEW_COMMAND: &str = "+++\nname = \"review\"\ndescription = \"Reviews a change.\"\n\
+const CHECK_COMMAND: &str = "+++\nname = \"check\"\ndescription = \"Reviews a change.\"\n\
     argument_hint = \"<change>\"\n+++\nReview $ARGUMENTS.\n";
 const DEPLOY_COMMAND: &str = "+++\nname = \"deploy\"\ndescription = \"Ships it.\"\n+++\nDeploy.\n";
 
@@ -248,7 +248,7 @@ async fn the_tui_is_given_the_users_command_files() {
     // Arrange
     let dir = repo_home();
     let _stop = StopDaemon::new(dir.path());
-    write_file(dir.path(), "commands/review.md", REVIEW_COMMAND);
+    write_file(dir.path(), "commands/check.md", CHECK_COMMAND);
     let mut ctx = context(dir.path());
     ctx.is_tty = true;
     ctx.launch_tui = record_launch;
@@ -260,7 +260,7 @@ async fn the_tui_is_given_the_users_command_files() {
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
     let note = commands_note(dir.path());
     assert!(
-        note.contains("/review <change>: Reviews a change. (user)"),
+        note.contains("/check <change>: Reviews a change. (user)"),
         "{note}"
     );
 }
@@ -270,7 +270,7 @@ async fn the_tui_starts_with_a_warning_when_the_command_files_cannot_be_loaded()
     // Arrange
     let dir = repo_home();
     let _stop = StopDaemon::new(dir.path());
-    write_file(dir.path(), "commands/review.md", REVIEW_COMMAND);
+    write_file(dir.path(), "commands/check.md", CHECK_COMMAND);
     let mut ctx = context(dir.path());
     ctx.is_tty = true;
     ctx.launch_tui = record_launch;
@@ -287,7 +287,7 @@ async fn the_tui_starts_with_a_warning_when_the_command_files_cannot_be_loaded()
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
     let note = commands_note(dir.path());
     assert!(note.contains("command files could not be loaded"), "{note}");
-    assert!(!note.contains("/review"), "{note}");
+    assert!(!note.contains("/check"), "{note}");
 }
 
 #[tokio::test]

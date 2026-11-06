@@ -25,7 +25,7 @@ use coda_protocol::methods::{
     SESSION_CANCEL, SESSION_CREATE, SESSION_SEND, SessionCancelParams, SessionCancelResult,
     SessionCreateParams, SessionCreateResult, SessionSendParams, SessionSendResult,
 };
-use coda_protocol::types::{BackendKind, PermissionDecision, SessionId};
+use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId};
 use coda_tui::sessions::HOOKS_NOT_RUN;
 use serde::Deserialize;
 use serde_json::Value;
@@ -71,15 +71,15 @@ struct EventParams {
 }
 
 /// How a followed turn ended.
-struct Finish {
-    condition: Option<String>,
-    failed: bool,
+pub(crate) struct Finish {
+    pub(crate) condition: Option<String>,
+    pub(crate) failed: bool,
     /// The daemon cut the turn short instead of reporting a result.
-    cut_short: bool,
+    pub(crate) cut_short: bool,
     /// Why the daemon cut the turn short, when it said.
-    cause: Option<InterruptCause>,
+    pub(crate) cause: Option<InterruptCause>,
     /// What a blocking hook said when it stopped the turn.
-    hook_reason: Option<String>,
+    pub(crate) hook_reason: Option<String>,
 }
 
 /// Runs the prompt, from `--prompt` or else standard input, or the prompt of
@@ -115,10 +115,71 @@ pub async fn run(
         }
         None => read_prompt(io, args.prompt)?,
     };
+    let job = Job {
+        prompt,
+        cwd,
+        backend: None,
+        mode: args.mode.into(),
+        max_turns: args.max_turns,
+        token_cap: args.token_cap,
+    };
+    let mut tap = Tap {
+        watch: &mut |_, _| {},
+        print: true,
+    };
+    let done = drive(ctx, io, force, job, &mut tap).await?;
+    Ok(report(&done.finish, io)?)
+}
+
+/// One prompt to run in a new session.
+pub(crate) struct Job {
+    pub(crate) prompt: String,
+    pub(crate) cwd: String,
+    /// The backend to use; the config picks one when absent.
+    pub(crate) backend: Option<BackendKind>,
+    pub(crate) mode: Mode,
+    pub(crate) max_turns: Option<u32>,
+    pub(crate) token_cap: Option<u64>,
+}
+
+/// A job that ran to its end.
+pub(crate) struct Done {
+    pub(crate) finish: Finish,
+    /// The model the session ran on, when the daemon named one.
+    pub(crate) model: Option<String>,
+}
+
+/// What a caller does with the events of a followed turn.
+pub(crate) struct Tap<'a> {
+    /// Called with the kind and body of every session event.
+    pub(crate) watch: &'a mut dyn FnMut(&str, &Value),
+    /// Whether the text of the stream is written to the output.
+    pub(crate) print: bool,
+}
+
+/// Runs `job` in a new session and follows it until the turn ends.
+pub(crate) async fn drive(
+    ctx: &Context,
+    io: &mut Io<'_>,
+    force: bool,
+    job: Job,
+    tap: &mut Tap<'_>,
+) -> Result<Done, CliError> {
+    let Job {
+        prompt,
+        cwd,
+        backend: chosen,
+        mode,
+        max_turns,
+        token_cap,
+    } = job;
     info!(step = "connect", "reaching the daemon");
     let client = ensure_daemon(ctx, io, force).await?;
     info!(step = "create_session", "creating the session");
-    let backend = backend(ctx, io)?;
+    let backend = match chosen {
+        Some(backend) => backend,
+        None => backend(ctx, io)?,
+    };
     let created: SessionCreateResult = client
         .request(
             SESSION_CREATE,
@@ -126,10 +187,11 @@ pub async fn run(
                 backend,
                 cwd,
                 model: None,
-                mode: args.mode.into(),
+                mode,
             },
         )
         .await?;
+    let model = created.session.model;
     let session = created.session.id;
     let mut events = client.subscribe(&session, Some(0)).await?;
     // Registered before the send so an interrupt during it is never lost, and
@@ -139,8 +201,8 @@ pub async fn run(
     let params = SessionSendParams {
         session_id: session.clone(),
         text: prompt,
-        max_turns: args.max_turns,
-        token_cap: args.token_cap,
+        max_turns,
+        token_cap,
     };
     let send = client.request::<_, SessionSendResult>(SESSION_SEND, &params);
     tokio::pin!(send);
@@ -169,6 +231,7 @@ pub async fn run(
         &mut interrupts,
         interrupted,
         io,
+        tap,
     );
     let finish = if interrupted {
         tokio::time::timeout(CANCEL_GRACE, follow)
@@ -181,7 +244,7 @@ pub async fn run(
     if let Err(failure) = client.close_session(&session).await {
         warn!(session = %session, error = %failure, "could not close the session; the daemon evicts it later");
     }
-    Ok(report(&finish, io)?)
+    Ok(Done { finish, model })
 }
 
 /// Cancels a turn whose send the daemon has not answered yet, then waits for
@@ -307,6 +370,7 @@ async fn follow(
     interrupts: &mut Signal,
     mut interrupted: bool,
     io: &mut Io<'_>,
+    tap: &mut Tap<'_>,
 ) -> Result<Finish, CliError> {
     let mut condition = None;
     let mut hook_reason = None;
@@ -333,9 +397,10 @@ async fn follow(
                     continue;
                 };
                 let body: Value = serde_json::from_str(&event.body).unwrap_or(Value::Null);
+                (tap.watch)(&event.kind, &body);
                 match event.kind.as_str() {
                     STREAM_DELTA_KIND => {
-                        if let Some(text) = body["text"].as_str() {
+                        if let (true, Some(text)) = (tap.print, body["text"].as_str()) {
                             write!(io.out, "{text}")?;
                             printed = true;
                         }
@@ -407,7 +472,7 @@ async fn cancel_turn(client: &Client, session: &SessionId) -> bool {
 
 /// The directory the session runs in: the flag, resolved against the
 /// invocation directory and canonicalized, else the invocation directory.
-fn session_cwd(invoked_in: &Path, flag: Option<PathBuf>) -> Result<String, CliError> {
+pub(crate) fn session_cwd(invoked_in: &Path, flag: Option<PathBuf>) -> Result<String, CliError> {
     let Some(flag) = flag else {
         return Ok(invoked_in.display().to_string());
     };
@@ -441,26 +506,30 @@ fn report(finish: &Finish, io: &mut Io<'_>) -> std::io::Result<ExitCode> {
         (None, true) => exit::RUN_OTHER,
     };
     if code == exit::RUN_OTHER {
-        let reason = match (&finish.condition, finish.cut_short) {
-            (Some(condition), _) if condition == HOOK_BLOCKED => hook_blocked_message(finish),
-            (Some(condition), _) if condition == COMPACTION_FAILED => {
-                "the conversation could not be compacted to fit the context window; \
-                 see the daemon log"
-                    .to_owned()
-            }
-            (Some(condition), _) => format!("the run stopped: {condition}"),
-            (None, true) => match finish.cause {
-                Some(cause) => format!(
-                    "the run was cut short ({}); see the daemon log",
-                    cause.as_str()
-                ),
-                None => "the run was cut short; see the daemon log".to_owned(),
-            },
-            (None, false) => "the run failed; see the daemon log".to_owned(),
-        };
-        writeln!(io.err, "coda: {reason}")?;
+        writeln!(io.err, "coda: {}", stop_reason(finish))?;
     }
     Ok(ExitCode::from(code))
+}
+
+/// Why a turn did not end normally, in a sentence.
+pub(crate) fn stop_reason(finish: &Finish) -> String {
+    match (&finish.condition, finish.cut_short) {
+        (Some(condition), _) if condition == HOOK_BLOCKED => hook_blocked_message(finish),
+        (Some(condition), _) if condition == COMPACTION_FAILED => {
+            "the conversation could not be compacted to fit the context window; \
+             see the daemon log"
+                .to_owned()
+        }
+        (Some(condition), _) => format!("the run stopped: {condition}"),
+        (None, true) => match finish.cause {
+            Some(cause) => format!(
+                "the run was cut short ({}); see the daemon log",
+                cause.as_str()
+            ),
+            None => "the run was cut short; see the daemon log".to_owned(),
+        },
+        (None, false) => "the run failed; see the daemon log".to_owned(),
+    }
 }
 
 /// What `coda run` says on standard error when a hook stopped the turn. The

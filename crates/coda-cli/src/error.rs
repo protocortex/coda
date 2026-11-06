@@ -73,6 +73,16 @@ pub enum CliError {
     RestartDeclined,
     #[error("cannot use {}: {source}", path.display())]
     Path { path: PathBuf, source: io::Error },
+    #[error(
+        "coda review runs the reviewer in Coda's own agent loop, but {backend} runs its own; use --backend anthropic"
+    )]
+    ReviewBackend { backend: String },
+    #[error("cannot read the change to review: {0}")]
+    ReviewInput(String),
+    #[error("the review failed: {0}")]
+    ReviewFailed(String),
+    #[error("the reviewer did not give a usable answer: {0}")]
+    ReviewOutput(#[from] coda_review::parse::BadShape),
     #[error("could not read the process environment: {0}")]
     Environment(io::Error),
     #[error("could not wait for a shutdown signal: {0}")]

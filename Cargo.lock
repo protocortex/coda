@@ -293,6 +293,7 @@ dependencies = [
  "coda-daemon",
  "coda-protocol",
  "coda-providers",
+ "coda-review",
  "coda-selfhost",
  "coda-store",
  "coda-telemetry",

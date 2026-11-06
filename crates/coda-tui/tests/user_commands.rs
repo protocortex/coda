@@ -36,7 +36,7 @@ const SCREEN_WIDTH: u16 = 160;
 const SCREEN_HEIGHT: u16 = 24;
 const REQUEST_LOG: &str = "requests.jsonl";
 
-const REVIEW: &str = "+++\nname = \"review\"\ndescription = \"Reviews a change.\"\n\
+const CHECK: &str = "+++\nname = \"check\"\ndescription = \"Reviews a change.\"\n\
     argument_hint = \"<change>\"\n+++\nReview $ARGUMENTS and report problems only.\n";
 const STATUS: &str = "+++\nname = \"status\"\ndescription = \"Summarizes the repo.\"\n+++\n\
     Summarize the repository.\n";
@@ -138,11 +138,11 @@ fn screen(app: &App) -> String {
 fn a_user_command_file_runs_as_a_slash_command_and_sends_its_expanded_prompt() {
     // Arrange
     let f = files();
-    f.user_command("review", REVIEW);
+    f.user_command("check", CHECK);
     let (mut app, mut link) = app_with(f.untrusted());
 
     // Act
-    type_line(&mut app, "/review the parser change");
+    type_line(&mut app, "/check the parser change");
 
     // Assert
     assert_eq!(
@@ -157,11 +157,11 @@ fn a_user_command_file_runs_as_a_slash_command_and_sends_its_expanded_prompt() {
 fn text_that_looks_like_a_placeholder_in_the_arguments_is_sent_as_typed() {
     // Arrange
     let f = files();
-    f.user_command("review", REVIEW);
+    f.user_command("check", CHECK);
     let (mut app, mut link) = app_with(f.untrusted());
 
     // Act
-    type_line(&mut app, "/review $ARGUMENTS ${HOME} $(id)");
+    type_line(&mut app, "/check $ARGUMENTS ${HOME} $(id)");
 
     // Assert
     assert_eq!(
@@ -218,7 +218,7 @@ fn a_command_that_expands_to_a_blank_prompt_sends_nothing_and_says_why() {
 fn a_skipped_definition_file_is_announced_when_the_ui_opens_and_in_help() {
     // Arrange
     let f = files();
-    f.user_command("review", REVIEW);
+    f.user_command("check", CHECK);
     f.user_command("broken", "no frontmatter at all");
 
     // Act
@@ -300,7 +300,7 @@ fn a_pending_project_file_with_no_user_command_of_that_name_adds_no_replacement_
 fn no_notice_is_shown_when_every_definition_file_loads() {
     // Arrange
     let f = files();
-    f.user_command("review", REVIEW);
+    f.user_command("check", CHECK);
 
     // Act
     let (app, _link) = app_with(f.untrusted());
@@ -384,7 +384,7 @@ fn a_trusted_project_command_runs_and_help_names_its_source() {
 fn help_lists_the_built_ins_and_each_command_file_with_its_hint() {
     // Arrange
     let f = files();
-    f.user_command("review", REVIEW);
+    f.user_command("check", CHECK);
     f.user_command("status", STATUS);
     let (mut app, mut link) = app_with(f.untrusted());
 
@@ -396,7 +396,7 @@ fn help_lists_the_built_ins_and_each_command_file_with_its_hint() {
     let shown = screen(&app);
     assert!(shown.contains("Built-in commands: /sessions"), "{shown}");
     assert!(
-        shown.contains("/review <change>: Reviews a change. (user)"),
+        shown.contains("/check <change>: Reviews a change. (user)"),
         "{shown}"
     );
     assert!(
@@ -409,7 +409,7 @@ fn help_lists_the_built_ins_and_each_command_file_with_its_hint() {
 fn an_unknown_command_is_still_an_error_and_never_reaches_the_model() {
     // Arrange
     let f = files();
-    f.user_command("review", REVIEW);
+    f.user_command("check", CHECK);
     let (mut app, mut link) = app_with(f.untrusted());
 
     // Act
@@ -630,7 +630,7 @@ async fn a_command_file_typed_in_the_ui_reaches_the_model_as_its_expanded_prompt
     // Arrange
     let rig = Rig::start();
     let f = files();
-    f.user_command("review", REVIEW);
+    f.user_command("check", CHECK);
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (event_tx, mut events) = mpsc::unbounded_channel();
     tokio::spawn(run_link(
@@ -655,7 +655,7 @@ async fn a_command_file_typed_in_the_ui_reaches_the_model_as_its_expanded_prompt
     .await;
 
     // Act
-    type_line(&mut app, "/review PR 42");
+    type_line(&mut app, "/check PR 42");
     pump(&mut app, &mut events, |e| {
         matches!(e, LinkEvent::Session(Event::Result { .. }))
     })
