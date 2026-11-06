@@ -21,8 +21,8 @@ use coda_config::hooks::{HookConfig, HookEvent};
 use coda_protocol::types::SessionId;
 use rustix::process::{Pid, Signal, kill_process_group};
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{ChildStderr, ChildStdin, Command};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{ChildStdin, Command};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -43,9 +43,6 @@ pub const MAX_REASON_BYTES: usize = 1024;
 fn too_large(what: &str, cap: usize) -> String {
     format!("{what} too large for the hook to check (over {cap} bytes)")
 }
-/// The most of a hook's standard error held at once. Older bytes are dropped as
-/// newer ones arrive, down to [`MAX_REASON_BYTES`], so a chatty hook costs no memory.
-const TAIL_BUFFER_BYTES: usize = MAX_REASON_BYTES * 2;
 /// How long to wait for the end of a failed hook's standard error once the hook
 /// is gone, in case a process it left behind still holds the pipe.
 const READER_GRACE: Duration = Duration::from_millis(500);
@@ -54,6 +51,12 @@ const READ_CHUNK_BYTES: usize = 4 * 1024;
 const NO_PROGRAM: &str = "(no program)";
 /// The variable a bare program name is looked up in.
 const PATH_VAR: &str = "PATH";
+const ESCAPE: char = '\u{1b}';
+const CSI_START: char = '[';
+/// The bytes that end a control sequence.
+const CSI_FINAL: std::ops::RangeInclusive<char> = '@'..='~';
+/// Unicode line and paragraph separators, which start a new line without being control characters.
+const LINE_SEPARATORS: [char; 2] = ['\u{2028}', '\u{2029}'];
 /// A file any of whose permission bits is set in this mask can be run.
 const EXECUTE_BITS: u32 = 0o111;
 /// Unicode format characters (category Cf) that hide text or reorder it:
@@ -337,23 +340,74 @@ impl HookRunner {
         payload: &[u8],
         cwd: &Path,
     ) -> Result<(), (Failure, String)> {
-        let Some((program, arguments)) = hook.command.split_first() else {
-            return Err((Failure::EmptyCommand, String::new()));
+        let run = Run {
+            command: &hook.command,
+            payload,
+            cwd,
+            timeout: hook.timeout(),
+            capture: Capture::StderrOnFailure,
         };
-        let program =
-            resolve(program, &self.env).map_err(|error| (Failure::Start(error), String::new()))?;
+        let finished = self.run_process(&run).await;
+        finished
+            .failure
+            .map_or(Ok(()), |failure| Err((failure, finished.output)))
+    }
+
+    /// Runs `command` in `cwd` as a hook is run (no shell, the runner's
+    /// environment, its whole process group killed at the end of `timeout` or
+    /// when the call is dropped) and keeps the last `keep_bytes` of what it
+    /// wrote to standard output and error together, whether it passed or not.
+    pub async fn run_command(
+        &self,
+        command: &[String],
+        cwd: &Path,
+        timeout: Duration,
+        keep_bytes: usize,
+    ) -> CommandRun {
+        let run = Run {
+            command,
+            payload: &[],
+            cwd,
+            timeout,
+            capture: Capture::BothAlways(keep_bytes),
+        };
+        let finished = self.run_process(&run).await;
+        let end = match finished.failure {
+            None => CommandEnd::Passed,
+            Some(Failure::Exited(_)) => CommandEnd::Failed(finished.failure_text()),
+            Some(Failure::TimedOut(limit)) => CommandEnd::TimedOut(limit),
+            Some(_) => CommandEnd::NotRun(finished.failure_text()),
+        };
+        CommandRun {
+            end,
+            output: finished.output,
+        }
+    }
+
+    async fn run_process(&self, run: &Run<'_>) -> Finished {
+        let Some((program, arguments)) = run.command.split_first() else {
+            return Finished::failed(Failure::EmptyCommand);
+        };
+        let program = match resolve(program, &self.env) {
+            Ok(program) => program,
+            Err(error) => return Finished::failed(Failure::Start(error)),
+        };
+        let both = matches!(run.capture, Capture::BothAlways(_));
         let spawned = Command::new(program)
             .args(arguments)
-            .current_dir(cwd)
+            .current_dir(run.cwd)
             .env_clear()
             .envs(self.env.iter().map(|(name, value)| (name, value)))
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(if both { Stdio::piped() } else { Stdio::null() })
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true)
             .spawn();
-        let mut child = spawned.map_err(|error| (Failure::Start(error), String::new()))?;
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(error) => return Finished::failed(Failure::Start(error)),
+        };
         // Declared after `child`, so a dropped future kills the group before
         // the child's own kill-on-drop reaps the leader.
         let mut group = Group::new(
@@ -361,17 +415,22 @@ impl HookRunner {
                 .id()
                 .and_then(|id| Pid::from_raw(i32::try_from(id).ok()?)),
         );
-        let said = Arc::new(Mutex::new(Said::default()));
-        let stderr =
-            (child.stderr.take()).map(|pipe| tokio::spawn(read_said(pipe, Arc::clone(&said))));
+        let said = Arc::new(Mutex::new(Said::with_cap(run.capture.keep_bytes())));
+        let mut readers = Vec::new();
+        if let Some(pipe) = child.stderr.take() {
+            readers.push(tokio::spawn(read_said(pipe, Arc::clone(&said))));
+        }
+        if let Some(pipe) = child.stdout.take() {
+            readers.push(tokio::spawn(read_said(pipe, Arc::clone(&said))));
+        }
         let stdin = child.stdin.take();
         // The input is written while the hook is waited for, never before: a
         // hook that does not read it, or leaves a process holding the pipe,
         // would otherwise block the write past the hook's own end.
-        let finished = tokio::time::timeout(hook.timeout(), async {
+        let finished = tokio::time::timeout(run.timeout, async {
             tokio::select! {
                 status = child.wait() => status,
-                () = feed(stdin, payload) => child.wait().await,
+                () = feed(stdin, run.payload) => child.wait().await,
             }
         })
         .await;
@@ -379,7 +438,7 @@ impl HookRunner {
             Ok(Ok(status)) if status.success() => (None, true),
             Ok(Ok(status)) => (Some(Failure::Exited(status)), true),
             Ok(Err(error)) => (Some(Failure::Wait(error)), false),
-            Err(_) => (Some(Failure::TimedOut(hook.timeout())), false),
+            Err(_) => (Some(Failure::TimedOut(run.timeout)), false),
         };
         if !reaped {
             group.kill();
@@ -387,16 +446,84 @@ impl HookRunner {
         }
         // The leader is reaped, so its group id may belong to someone else now.
         group.disarm();
-        let tail = match (stderr, &failure) {
-            (Some(reader), Some(_)) => settle(reader, &said).await,
-            (Some(reader), None) => {
-                reader.abort();
-                String::new()
-            }
-            (None, _) => String::new(),
+        let output = if both || failure.is_some() {
+            settle(readers, &said).await
+        } else {
+            readers.iter().for_each(JoinHandle::abort);
+            String::new()
         };
-        failure.map_or(Ok(()), |failure| Err((failure, tail)))
+        Finished { failure, output }
     }
+}
+
+/// What to run for [`HookRunner::run_process`].
+struct Run<'a> {
+    command: &'a [String],
+    payload: &'a [u8],
+    cwd: &'a Path,
+    timeout: Duration,
+    capture: Capture,
+}
+
+/// What of a process's output is kept.
+#[derive(Clone, Copy)]
+enum Capture {
+    /// The end of standard error, and only when the process failed.
+    StderrOnFailure,
+    /// The end of standard output and error together, however it ended.
+    BothAlways(usize),
+}
+
+impl Capture {
+    fn keep_bytes(self) -> usize {
+        match self {
+            Self::StderrOnFailure => MAX_REASON_BYTES,
+            Self::BothAlways(bytes) => bytes,
+        }
+    }
+}
+
+/// How a process ended and what it said.
+struct Finished {
+    failure: Option<Failure>,
+    output: String,
+}
+
+impl Finished {
+    fn failed(failure: Failure) -> Self {
+        Self {
+            failure: Some(failure),
+            output: String::new(),
+        }
+    }
+
+    fn failure_text(&self) -> String {
+        self.failure
+            .as_ref()
+            .map(Failure::describe)
+            .unwrap_or_default()
+    }
+}
+
+/// How a command run by [`HookRunner::run_command`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandEnd {
+    /// It exited with status 0.
+    Passed,
+    /// It exited with another status or was ended by a signal; says which.
+    Failed(String),
+    /// It was still running after the limit and was killed.
+    TimedOut(Duration),
+    /// It never ran; says why.
+    NotRun(String),
+}
+
+/// A command run to its end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRun {
+    pub end: CommandEnd,
+    /// The end of what it wrote to standard output and error together.
+    pub output: String,
 }
 
 /// The file to run for `program`. An absolute path is run as it is. A bare name
@@ -441,16 +568,19 @@ async fn feed(stdin: Option<ChildStdin>, payload: &[u8]) {
     }
 }
 
-/// What a failed hook said on standard error, waiting at most [`READER_GRACE`]
-/// for the end of it. A reader still waiting then is aborted, not left running,
-/// and what it had read by then still counts.
-async fn settle(mut reader: JoinHandle<()>, said: &Mutex<Said>) -> String {
-    if tokio::time::timeout(READER_GRACE, &mut reader)
-        .await
-        .is_err()
-    {
-        // A process the hook left behind still holds the pipe.
-        reader.abort();
+/// What a process said, waiting at most [`READER_GRACE`] in all for the ends of
+/// its pipes. A reader still waiting then is aborted, not left running, and what
+/// it had read by then still counts.
+async fn settle(readers: Vec<JoinHandle<()>>, said: &Mutex<Said>) -> String {
+    let deadline = tokio::time::Instant::now() + READER_GRACE;
+    for mut reader in readers {
+        if tokio::time::timeout_at(deadline, &mut reader)
+            .await
+            .is_err()
+        {
+            // A process the hook left behind still holds the pipe.
+            reader.abort();
+        }
     }
     lock(said).tail()
 }
@@ -491,27 +621,36 @@ impl Drop for Group {
     }
 }
 
-/// The end of what a hook wrote to standard error, shared with the task that
-/// reads the pipe so that a read cut short loses nothing already read.
-#[derive(Default)]
+/// The end of what a process wrote, shared with the tasks that read its pipes
+/// so that a read cut short loses nothing already read. Older bytes are dropped
+/// as newer ones arrive, down to `cap`, so a chatty process costs no memory.
 struct Said {
     kept: Vec<u8>,
     /// Whether older bytes were dropped, so the start may split a character.
     dropped: bool,
+    cap: usize,
 }
 
 impl Said {
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            kept: Vec::new(),
+            dropped: false,
+            cap,
+        }
+    }
+
     fn push(&mut self, bytes: &[u8]) {
         self.kept.extend_from_slice(bytes);
-        if self.kept.len() > TAIL_BUFFER_BYTES {
-            self.kept.drain(..self.kept.len() - MAX_REASON_BYTES);
+        if self.kept.len() > self.cap * 2 {
+            self.kept.drain(..self.kept.len() - self.cap);
             self.dropped = true;
         }
     }
 
-    /// The last [`MAX_REASON_BYTES`] as trimmed text, starting on a character boundary.
+    /// The last `cap` bytes as trimmed text, starting on a character boundary.
     fn tail(&self) -> String {
-        let start = self.kept.len().saturating_sub(MAX_REASON_BYTES);
+        let start = self.kept.len().saturating_sub(self.cap);
         let mut end = &self.kept[start..];
         if self.dropped || start > 0 {
             end = after_partial_character(end);
@@ -521,7 +660,7 @@ impl Said {
 }
 
 /// Reads `pipe` to its end into `said`.
-async fn read_said(mut pipe: ChildStderr, said: Arc<Mutex<Said>>) {
+async fn read_said(mut pipe: impl AsyncRead + Unpin, said: Arc<Mutex<Said>>) {
     let mut chunk = [0_u8; READ_CHUNK_BYTES];
     loop {
         match pipe.read(&mut chunk).await {
@@ -554,6 +693,30 @@ fn head(text: &str, cap: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+/// `text` with its lines kept and no control or format characters except
+/// line breaks and tabs, so a check cannot move the cursor of a terminal or hide
+/// text through what it says.
+pub(crate) fn plain_lines(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ESCAPE && chars.peek() == Some(&CSI_START) {
+            // A colour or cursor sequence: skip to its final byte.
+            chars.next();
+            for next in chars.by_ref() {
+                if CSI_FINAL.contains(&next) {
+                    break;
+                }
+            }
+        } else if matches!(c, '\n' | '\t')
+            || !(c.is_control() || is_format(c) || LINE_SEPARATORS.contains(&c))
+        {
+            plain.push(c);
+        }
+    }
+    plain
 }
 
 /// `text` on one line with no control or format characters, so that a hook

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::checks::CheckConfig;
 use crate::hooks::{HookConfig, MAX_TIMEOUT_MS};
 use crate::review::{DIFF_BUDGET_CHARS_KEY, MAX_FINDINGS_KEY, REVIEW_KEY, ReviewConfig};
 use crate::routing::{Routing, Tier};
@@ -29,6 +30,7 @@ const PROVIDERS_KEY: &str = "providers";
 const MODELS_KEY: &str = "models";
 const ROUTING_KEY: &str = "routing";
 const HOOKS_KEY: &str = "hooks";
+const CHECKS_KEY: &str = "checks";
 const SECRET_KEY_SUFFIXES: [&str; 7] = [
     "api_key",
     "apikey",
@@ -243,6 +245,8 @@ pub struct Config {
     pub routing: Routing,
     /// Hooks run at session start and around tool calls; only this file can add them.
     pub hooks: Vec<HookConfig>,
+    /// Commands run after a file change, by file extension; only this file can add them.
+    pub checks: BTreeMap<String, CheckConfig>,
     /// Limits for `coda review`.
     pub review: ReviewConfig,
 }
@@ -259,6 +263,7 @@ impl Default for Config {
             timing: Timing::default(),
             routing: Routing::default(),
             hooks: Vec::new(),
+            checks: BTreeMap::new(),
             review: ReviewConfig::default(),
         }
     }
@@ -296,6 +301,7 @@ impl Config {
         config.check_timing()?;
         config.check_routing()?;
         config.check_hooks()?;
+        config.check_checks()?;
         config.check_review()?;
         Ok(Parsed {
             config,
@@ -322,23 +328,43 @@ impl Config {
         Ok(())
     }
 
-    fn check_hooks(&self) -> Result<(), ConfigError> {
-        for (index, hook) in self.hooks.iter().enumerate() {
-            let Some(program) = hook.command.first().filter(|program| !program.is_empty()) else {
+    fn check_checks(&self) -> Result<(), ConfigError> {
+        let mut seen = std::collections::BTreeSet::new();
+        for (extension, check) in &self.checks {
+            let name_is_plain = !extension.is_empty()
+                && extension
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'));
+            if !name_is_plain {
                 return Err(ConfigError::InvalidValue {
-                    path: format!("{HOOKS_KEY}[{index}].command"),
-                    allowed: "a list with the program first, then its arguments".to_owned(),
-                });
-            };
-            // A relative path would run a file of the session directory, which the model can edit.
-            if program.contains(std::path::is_separator) && !Path::new(program).is_absolute() {
-                return Err(ConfigError::InvalidValue {
-                    path: format!("{HOOKS_KEY}[{index}].command"),
-                    allowed: format!(
-                        "a program that is an absolute path or a bare name found on PATH, not `{program}`"
-                    ),
+                    path: format!("{CHECKS_KEY}.{extension}"),
+                    allowed: "an extension without a dot, such as `rs`".to_owned(),
                 });
             }
+            // Extensions are matched without regard to case, so `RS` would shadow `rs`.
+            if !seen.insert(extension.to_ascii_lowercase()) {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{CHECKS_KEY}.{extension}"),
+                    allowed: "one entry per extension, whatever its case".to_owned(),
+                });
+            }
+            check_command(&format!("{CHECKS_KEY}.{extension}.command"), &check.command)?;
+            if check
+                .timeout_ms
+                .is_some_and(|ms| ms == 0 || ms > MAX_TIMEOUT_MS)
+            {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{CHECKS_KEY}.{extension}.timeout_ms"),
+                    allowed: format!("a whole number of milliseconds from 1 to {MAX_TIMEOUT_MS}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_hooks(&self) -> Result<(), ConfigError> {
+        for (index, hook) in self.hooks.iter().enumerate() {
+            check_command(&format!("{HOOKS_KEY}[{index}].command"), &hook.command)?;
             if hook
                 .timeout_ms
                 .is_some_and(|ms| ms == 0 || ms > MAX_TIMEOUT_MS)
@@ -547,6 +573,26 @@ impl Dirs {
     pub fn socket_path(&self) -> PathBuf {
         self.run_dir().join(SOCKET_FILE_NAME)
     }
+}
+
+/// Refuses a command with no program, or whose program is a relative path.
+fn check_command(path: &str, command: &[String]) -> Result<(), ConfigError> {
+    let Some(program) = command.first().filter(|program| !program.is_empty()) else {
+        return Err(ConfigError::InvalidValue {
+            path: path.to_owned(),
+            allowed: "a list with the program first, then its arguments".to_owned(),
+        });
+    };
+    // A relative path would run a file of the session directory, which the model can edit.
+    if program.contains(std::path::is_separator) && !Path::new(program).is_absolute() {
+        return Err(ConfigError::InvalidValue {
+            path: path.to_owned(),
+            allowed: format!(
+                "a program that is an absolute path or a bare name found on PATH, not `{program}`"
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

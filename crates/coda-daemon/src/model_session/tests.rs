@@ -486,6 +486,47 @@ async fn a_write_over_an_unread_file_or_outside_the_workspace_is_refused() {
 }
 
 #[tokio::test]
+async fn a_configured_check_reports_its_result_with_the_edit() {
+    // Arrange
+    let edit = json!({"path": "a.txt", "old_string": "needle", "new_string": "thread"});
+    let calls = tool_turn(&[("c1", "edit", edit)]);
+    let check = coda_config::checks::CheckConfig {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "echo 'a.txt: the check is unhappy' >&2; exit 4".to_owned(),
+        ],
+        timeout_ms: Some(20_000),
+    };
+    let mut rig = Rig::custom(
+        Mode::AcceptEdits,
+        &[calls, text_turn("done")],
+        true,
+        None,
+        |config| {
+            config.checks.insert("txt".to_owned(), check);
+        },
+    );
+
+    // Act
+    rig.send("change it").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let finished = rig.bodies("tool_finished").await;
+    assert_eq!(finished[0]["is_error"], false, "{finished:?}");
+    let sent = rig.request_lines();
+    let text = task::text_of(&task::tool_results(sent.last().unwrap())[0]).to_owned();
+    assert!(text.contains("check failed"), "{text}");
+    assert!(text.contains("the check is unhappy"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(rig.cwd.join("a.txt")).unwrap(),
+        "one thread here\n"
+    );
+}
+
+#[tokio::test]
 async fn a_multi_edit_is_one_request_that_applies_every_file_or_none() {
     // Arrange
     let both = json!({"edits": [

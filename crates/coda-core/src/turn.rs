@@ -26,6 +26,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{Instrument, info, info_span, warn};
 
 use crate::budget::TokenBudget;
+use crate::checks::Checks;
 use crate::compact::{
     self as summary, CompactError, CompactionAck, KEEP_RECENT_MESSAGES, summary_message,
 };
@@ -280,6 +281,7 @@ pub struct TurnLoop<P, G> {
     /// Whether this send already tried to compact ahead of a request.
     compacted_ahead: bool,
     hooks: HookRunner,
+    checks: Checks,
     /// Whether the `session_start` hooks passed for this loop.
     session_started: bool,
     /// Whether a `session_start` hook already passed for this session, in an
@@ -324,6 +326,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             tasks: None,
             compacted_ahead: false,
             hooks: HookRunner::default(),
+            checks: Checks::default(),
             session_started: false,
             resumed: false,
         }
@@ -363,6 +366,13 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     #[must_use]
     pub fn with_hooks(mut self, hooks: HookRunner) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// Runs `checks` after a reply's last change to a file they cover.
+    #[must_use]
+    pub fn with_checks(mut self, checks: Checks) -> Self {
+        self.checks = checks;
         self
     }
 
@@ -720,12 +730,24 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     /// answering every remaining call, when the user cancels or the budget runs out.
     async fn run_tools(&mut self, calls: Vec<ToolCall>) -> Option<StopCondition> {
         let mut stop = None;
-        for call in calls {
-            let outcome = if stop.is_some() {
+        let last_change = calls.iter().rposition(|call| Checks::follows(&call.name));
+        let mut changed: Vec<PathBuf> = Vec::new();
+        for (index, call) in calls.into_iter().enumerate() {
+            let mut outcome = if stop.is_some() {
                 ToolOutcome::error(SKIPPED.to_owned())
             } else {
                 self.run_tool(&call).await
             };
+            if stop.is_none() && !self.checks.is_empty() && Checks::follows(&call.name) {
+                if !outcome.is_error {
+                    changed.extend(self.changed_paths(&call));
+                }
+                // One check per reply, after the last change in it, so the
+                // model hears about the files as they stand together.
+                if last_change == Some(index) {
+                    self.add_check(&changed, &mut outcome).await;
+                }
+            }
             if let Some(usage) = outcome.usage {
                 self.budget.record(usage);
                 self.emit(TurnEvent::Usage(usage));
@@ -746,6 +768,31 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             }
         }
         stop
+    }
+
+    /// The files a call to a file-changing tool names.
+    fn changed_paths(&self, call: &ToolCall) -> Vec<PathBuf> {
+        let Ok(input) = parse_arguments(call) else {
+            return Vec::new();
+        };
+        let tool = tool_request(&call.name, &input, &self.config.cwd).tool;
+        target_paths(&tool, &input)
+    }
+
+    /// Runs the checks for `changed` and adds what they say to `outcome`. A
+    /// cancel ends the check without a word.
+    async fn add_check(&self, changed: &[PathBuf], outcome: &mut ToolOutcome) {
+        if changed.is_empty() {
+            return;
+        }
+        let said = tokio::select! {
+            said = self.checks.run(&self.config.cwd, changed) => said,
+            () = self.cancel.cancelled() => None,
+        };
+        if let Some(said) = said {
+            outcome.text.push('\n');
+            outcome.text.push_str(&said);
+        }
     }
 
     fn after_tool(&self) -> Option<StopCondition> {
