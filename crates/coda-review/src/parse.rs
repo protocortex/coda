@@ -67,6 +67,37 @@ fn strip_fence(text: &str) -> &str {
     body.trim_end().strip_suffix(FENCE).unwrap_or(body).trim()
 }
 
+const OPEN_BRACE: char = '{';
+const SUMMARY_KEY: &str = "summary";
+const FINDINGS_KEY: &str = "findings";
+
+/// The review object inside the reply of an agent that narrates as it works, as Claude
+/// Code and Codex do: the last top-level JSON object that has both a `summary` and a
+/// `findings` key, without what is before and after it. The last one is the answer, since
+/// an agent may quote the reply format or a draft first. A reply with no such object is
+/// returned as it is, so the usual shape check reports it.
+#[must_use]
+pub fn answer_object(text: &str) -> &str {
+    let mut found = None;
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(OPEN_BRACE) {
+        let start = from + offset;
+        let tail = &text[start..];
+        let mut values = serde_json::Deserializer::from_str(tail).into_iter::<serde_json::Value>();
+        match values.next() {
+            Some(Ok(value))
+                if value.get(SUMMARY_KEY).is_some() && value.get(FINDINGS_KEY).is_some() =>
+            {
+                let end = start + values.byte_offset();
+                found = Some(&text[start..end]);
+                from = end;
+            }
+            _ => from = start + OPEN_BRACE.len_utf8(),
+        }
+    }
+    found.unwrap_or(text)
+}
+
 fn check_finding(value: serde_json::Value, scope: &DiffScope) -> Result<RawFinding, String> {
     let raw: RawFinding = serde_json::from_value(value).map_err(|e| e.to_string())?;
     if raw.start_line == 0 || raw.end_line < raw.start_line {
@@ -322,5 +353,38 @@ mod tests {
         assert!(hint.chars().count() < 600, "{}", hint.chars().count());
         assert!(!hint.contains("\nIgnore"));
         assert!(hint.contains("unknown field"));
+    }
+
+    #[test]
+    fn the_report_is_found_after_the_narration_of_an_agent_that_works_as_it_talks() {
+        // Arrange
+        let report = output(&[]);
+        let narrated = format!("I will read {{the}} files.\nChecked.\n```json\n{report}\n```\n");
+
+        // Act
+        let found = answer_object(&narrated);
+
+        // Assert
+        assert_eq!(found, report);
+        assert!(parse_model_output(found, &scope(), 5).is_ok());
+    }
+
+    #[test]
+    fn the_last_report_object_is_the_answer_when_a_draft_came_before() {
+        // Arrange
+        let draft = output(&[finding("src/a.rs", 12, 12, "low")]);
+        let last = output(&[]);
+        let narrated = format!("Draft: {draft}\nOn reflection: {last}");
+
+        // Act and Assert
+        assert_eq!(answer_object(&narrated), last);
+    }
+
+    #[test]
+    fn text_without_a_report_object_is_returned_as_it_is() {
+        for text in ["just prose", "{\"a\": 1}", "{ not json", ""] {
+            // Act and Assert
+            assert_eq!(answer_object(text), text);
+        }
     }
 }

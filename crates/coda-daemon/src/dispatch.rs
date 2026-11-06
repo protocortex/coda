@@ -17,7 +17,7 @@ use coda_protocol::jsonrpc::{
     PARSE_ERROR, Request, Response,
 };
 use coda_protocol::methods::{
-    Capabilities, DAEMON_BACKENDS, DAEMON_PING, DAEMON_SHUTDOWN, DAEMON_STATUS,
+    AGENT_RUN, Capabilities, DAEMON_BACKENDS, DAEMON_PING, DAEMON_SHUTDOWN, DAEMON_STATUS,
     DaemonShutdownResult, GRANT_ADD, INITIALIZE, InitializeParams, InitializeResult,
     PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult, SESSION_CANCEL, SESSION_CLOSE,
     SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_SEND, SESSION_SET_MODEL,
@@ -153,6 +153,7 @@ impl Dispatcher {
                 session_rpc::list(self.hub.as_ref(), running, params).await
             }
             SESSION_SEND => turn::send(self.turns.as_ref(), params).await,
+            AGENT_RUN => turn::run_agent(self.turns.as_ref(), params).await,
             SESSION_CANCEL => turn::cancel(self.turns.as_ref(), params),
             SESSION_CLOSE => turn::close(self.turns.as_ref(), params).await,
             SESSION_SET_MODEL => registry::set_model(self.turns.as_ref(), params).await,

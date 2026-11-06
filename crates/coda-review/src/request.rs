@@ -222,6 +222,21 @@ pub fn task_prompt(input_path: &str, retry_hint: Option<&str>) -> String {
     prompt
 }
 
+/// The prompt for an agent that is run on the input directly, with no file to read: the
+/// input is in the prompt itself.
+#[must_use]
+pub fn direct_prompt(input: &str, retry_hint: Option<&str>) -> String {
+    let mut prompt = format!(
+        "Review the change below. It holds the reply format and the diff. You may read other \
+         files of the repository to check how the changed code is used, but change nothing.\n\n{input}"
+    );
+    if let Some(hint) = retry_hint {
+        prompt.push_str("\n\n");
+        prompt.push_str(hint);
+    }
+    prompt
+}
+
 /// The first message of the session: it only hands the work to the reviewer.
 #[must_use]
 pub fn session_prompt(task_prompt: &str) -> String {
@@ -359,6 +374,19 @@ mod tests {
         assert!(first.contains("/w/.coda/in.txt"));
         assert!(again.starts_with(&first));
         assert!(again.ends_with("Answer again."));
+    }
+
+    #[test]
+    fn the_direct_prompt_holds_the_input_itself_and_the_retry_hint() {
+        // Act
+        let first = direct_prompt("FORMAT and DIFF", None);
+        let again = direct_prompt("FORMAT and DIFF", Some("Answer again."));
+
+        // Assert
+        assert!(first.ends_with("FORMAT and DIFF"));
+        assert!(first.contains("change nothing"));
+        assert!(again.starts_with(&first));
+        assert!(again.ends_with("\n\nAnswer again."));
     }
 
     #[test]

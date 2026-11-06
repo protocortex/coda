@@ -103,6 +103,7 @@ impl Fixture {
             session_id: SessionId::new("s-1"),
             resume: None,
             parent_env,
+            read_only: false,
         }
     }
 

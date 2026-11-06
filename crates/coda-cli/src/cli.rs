@@ -148,8 +148,7 @@ pub struct ReviewArgs {
     /// Print the review as JSON instead of markdown.
     #[arg(long)]
     pub json: bool,
-    /// The backend that runs the reviewer. By default the first model backend the
-    /// config enables, else the Anthropic API.
+    /// The backend that runs the reviewer. By default the one `coda run` uses.
     #[arg(long, value_enum)]
     pub backend: Option<BackendArg>,
     /// Working directory of the review.

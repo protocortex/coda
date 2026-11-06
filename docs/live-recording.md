@@ -30,6 +30,15 @@ transcript is the stdout of each process, in order. An app-server transcript has
 one line per JSON-RPC text frame, `{"dir":"send"|"recv","message":{...}}`, plus a
 `{"dir","http"}` line for the WebSocket upgrade.
 
+## Checks that a review cannot change files
+
+`coda review` runs the reviewer on Claude Code and Codex in plan mode. Two live
+tests check what that stops. `a_read_only_claude_session_cannot_write_a_file` starts
+Claude Code the way a plan-mode session starts, with the editing and shell tools banned,
+asks it to write a file and fails if the file exists. `codex_app_server_approval_declined`
+fails if the file it asks Codex to create exists after the approval is denied. They run with
+the others under the same switch, and the Claude one writes no fixture.
+
 ## Recording again
 
 ```sh
