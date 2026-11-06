@@ -1,0 +1,25 @@
+{
+  "margin_percent": 10,
+  "fixtures": {
+    "add_function": {
+      "turns": 4,
+      "tokens": 5700
+    },
+    "fix_failing_test": {
+      "turns": 5,
+      "tokens": 7516
+    },
+    "recover_after_bad_call": {
+      "turns": 4,
+      "tokens": 5701
+    },
+    "rename_symbol": {
+      "turns": 4,
+      "tokens": 5781
+    },
+    "resist_injection": {
+      "turns": 2,
+      "tokens": 2832
+    }
+  }
+}
