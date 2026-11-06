@@ -17,6 +17,11 @@ use crate::skip::SkipRules;
 /// git from looking the name up among tags first.
 const BRANCH_REF_PREFIXES: [&str; 2] = ["refs/heads/", "refs/remotes/"];
 
+/// Where a clone records the default branch of its remote.
+const ORIGIN_HEAD_REF: &str = "refs/remotes/origin/HEAD";
+/// Local branches tried for the default branch when there is no `origin/HEAD`.
+const LOCAL_DEFAULT_REFS: [&str; 2] = ["refs/heads/main", "refs/heads/master"];
+
 /// Path of the repository rules file, read from the default branch only.
 pub const REPO_RULES_PATH: &str = ".coda/review.toml";
 
@@ -184,6 +189,25 @@ pub fn read_default_branch_rules(
     }
     let text = String::from_utf8(bytes).map_err(|e| RulesError::BadRepoFile(e.to_string()))?;
     parse_repo_rules(&text).map(Some)
+}
+
+/// The ref of the repository's default branch: where `origin/HEAD` points, else a local
+/// `main`, else a local `master`. `None` when none of them exists.
+#[must_use]
+pub fn default_branch_ref(repo_dir: &Path) -> Option<String> {
+    let exists = |name: &str| {
+        git(repo_dir, &["rev-parse", "--verify", "--quiet", name]).is_ok_and(|(ok, _)| ok)
+    };
+    if let Ok((true, bytes)) = git(repo_dir, &["symbolic-ref", "--quiet", ORIGIN_HEAD_REF]) {
+        let target = String::from_utf8_lossy(&bytes).trim().to_owned();
+        if exists(&target) {
+            return Some(target);
+        }
+    }
+    LOCAL_DEFAULT_REFS
+        .iter()
+        .find(|name| exists(name))
+        .map(|name| (*name).to_owned())
 }
 
 /// Loads the rules for a review: the global config plus the default branch's rules file.
@@ -448,6 +472,37 @@ mod tests {
                 .unwrap()
                 .ignore
                 .is_ignored("Cargo.lock")
+        );
+    }
+
+    #[test]
+    fn the_default_branch_is_origin_head_else_a_local_main_or_master() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        run(p, &["init", "-q", "-b", "trunk"]);
+        write(p, "a.txt", "a");
+        run(p, &["add", "."]);
+        run(p, &["commit", "-q", "-m", "base"]);
+        assert_eq!(default_branch_ref(p), None);
+
+        // Act and Assert
+        run(p, &["branch", "master"]);
+        assert_eq!(default_branch_ref(p).as_deref(), Some("refs/heads/master"));
+        run(p, &["branch", "main"]);
+        assert_eq!(default_branch_ref(p).as_deref(), Some("refs/heads/main"));
+        run(p, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        run(
+            p,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+        assert_eq!(
+            default_branch_ref(p).as_deref(),
+            Some("refs/remotes/origin/trunk")
         );
     }
 }
