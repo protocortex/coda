@@ -9,8 +9,39 @@ use coda_protocol::paths::Target;
 
 use crate::tool_request::Tool;
 
-/// File names that change what a build runs, at any depth.
-const EXECUTION_FILE_NAMES: [&str; 3] = ["Cargo.toml", "build.rs", "rust-toolchain.toml"];
+/// File names that change what a build, install or task runner executes, at
+/// any depth, matched without regard to case because the usual macOS
+/// filesystem does not tell `Makefile` from `makefile`. `edit`, `write` and `multi_edit` all ask about these in
+/// accept-edits mode.
+const EXECUTION_FILE_NAMES: [&str; 27] = [
+    "Cargo.toml",
+    "build.rs",
+    "rust-toolchain.toml",
+    "Makefile",
+    "GNUmakefile",
+    "justfile",
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "tox.ini",
+    "noxfile.py",
+    "conftest.py",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "pom.xml",
+    "CMakeLists.txt",
+    "Rakefile",
+    "Gemfile",
+    "Dockerfile",
+    "Taskfile.yml",
+    "Taskfile.yaml",
+    ".envrc",
+    ".npmrc",
+    ".pre-commit-config.yaml",
+];
 const CARGO_DIR: &str = ".cargo";
 const CARGO_CONFIG_FILE: &str = "config.toml";
 /// Directories whose contents run on commits, in CI or by hand, from the root.
@@ -131,7 +162,10 @@ pub fn is_execution_affecting(workspace_root: &Path, path: &Path) -> bool {
     let Some(file_name) = parts.last() else {
         return false;
     };
-    if EXECUTION_FILE_NAMES.contains(&file_name.as_str()) {
+    if EXECUTION_FILE_NAMES
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(file_name))
+    {
         return true;
     }
     if parts.ends_with(&[CARGO_DIR.to_owned(), CARGO_CONFIG_FILE.to_owned()]) {
@@ -935,6 +969,67 @@ mod tests {
 
             // Assert
             assert!(!result, "{path} should be plain");
+        }
+    }
+
+    #[test]
+    fn accept_edits_prompts_for_every_build_and_package_file_with_each_file_tool() {
+        // Arrange
+        let names = [
+            "Makefile",
+            "makefile",
+            "GNUmakefile",
+            "justfile",
+            "Justfile",
+            "MAKEFILE",
+            "Package.json",
+            "dockerfile",
+            "cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "tox.ini",
+            "noxfile.py",
+            "conftest.py",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "pom.xml",
+            "CMakeLists.txt",
+            "Rakefile",
+            "Gemfile",
+            "Dockerfile",
+            "Taskfile.yml",
+            "Taskfile.yaml",
+            ".envrc",
+            ".npmrc",
+            ".pre-commit-config.yaml",
+        ];
+
+        for name in names {
+            for tool in [Tool::Edit, Tool::Write, Tool::MultiEdit] {
+                for path in [name.to_owned(), format!("packages/app/{name}")] {
+                    let targets = [ClassifiedTarget {
+                        path: PathBuf::from(&path),
+                        target: Target::Inside,
+                    }];
+                    let input = PolicyInput {
+                        mode: PermissionMode::AcceptEdits,
+                        tool: &tool,
+                        workspace_root: Path::new(ROOT),
+                        targets: &targets,
+                        granted: true,
+                    };
+
+                    // Act
+                    let verdict = decide(&input);
+
+                    // Assert
+                    assert_eq!(verdict, Verdict::Prompt, "{tool:?} on {path}");
+                }
+            }
         }
     }
 
