@@ -11,11 +11,14 @@ pub mod bash;
 pub mod code;
 pub mod edit;
 pub mod grep;
+pub mod list;
 pub mod read;
+pub mod read_log;
 pub mod retrieve;
 pub mod sandbox;
 pub mod skill;
 pub mod task;
+pub mod write;
 
 use std::sync::atomic::AtomicBool;
 
@@ -26,7 +29,7 @@ use crate::sandbox::SandboxError;
 
 /// The name of every tool the model can call, sorted. Agent definitions are
 /// checked against it.
-pub const TOOL_NAMES: [&str; 9] = [
+pub const TOOL_NAMES: [&str; 11] = [
     bash::NAME,
     code::OUTLINE_NAME,
     code::READ_RANGE_NAME,
@@ -34,8 +37,10 @@ pub const TOOL_NAMES: [&str; 9] = [
     code::SYMBOL_NAME,
     edit::NAME,
     grep::NAME,
+    list::NAME,
     read::NAME,
     retrieve::NAME,
+    write::NAME,
 ];
 
 /// Default cap on the bytes a tool returns in one call.
@@ -95,6 +100,12 @@ pub enum ToolError {
         path: String,
         /// The size limit in bytes.
         limit: usize,
+    },
+    /// The file exists and this session has not read it, so it is not replaced.
+    #[error("{path} already exists and was not read in this session; read it before replacing it")]
+    NotRead {
+        /// The workspace-relative path.
+        path: String,
     },
     /// The shell could not be started.
     #[error("starting the shell failed: {0}")]

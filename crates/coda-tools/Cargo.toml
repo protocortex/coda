@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 coda-protocol = { path = "../coda-protocol" }
+globset.workspace = true
 regex.workspace = true
 rustix = { workspace = true, features = ["fs", "pipe", "process"] }
 serde.workspace = true

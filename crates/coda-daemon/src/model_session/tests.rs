@@ -412,6 +412,80 @@ async fn a_faux_session_completes_a_tool_loop_with_the_base_tools() {
 }
 
 #[tokio::test]
+async fn accept_edits_creates_a_file_and_lists_it_without_a_prompt() {
+    // Arrange
+    let calls = tool_turn(&[
+        (
+            "c1",
+            "write",
+            json!({"path": "made.txt", "content": "fresh\n"}),
+        ),
+        ("c2", "list", json!({})),
+    ]);
+    let mut rig = Rig::new(Mode::AcceptEdits, &[calls, text_turn("done")]);
+
+    // Act
+    rig.send("make it").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert_eq!(rig.pending().await.len(), 0);
+    let finished = rig.bodies("tool_finished").await;
+    let tools: Vec<&str> = finished
+        .iter()
+        .map(|b| b["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(tools, ["write", "list"]);
+    assert!(
+        finished.iter().all(|b| b["is_error"] == false),
+        "{finished:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(rig.cwd.join("made.txt")).unwrap(),
+        "fresh\n"
+    );
+    let listing =
+        task::text_of(&task::tool_results(rig.request_lines().last().unwrap())[1]).to_owned();
+    assert!(listing.contains("made.txt"), "{listing}");
+}
+
+#[tokio::test]
+async fn a_write_over_an_unread_file_or_outside_the_workspace_is_refused() {
+    // Arrange
+    let calls = tool_turn(&[
+        (
+            "c1",
+            "write",
+            json!({"path": "a.txt", "content": "clobbered"}),
+        ),
+        (
+            "c2",
+            "write",
+            json!({"path": "../escape.txt", "content": "x"}),
+        ),
+    ]);
+    let mut rig = Rig::new(Mode::AcceptEdits, &[calls, text_turn("done")]);
+
+    // Act
+    rig.send("overwrite").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert_eq!(
+        std::fs::read_to_string(rig.cwd.join("a.txt")).unwrap(),
+        "one needle here\n"
+    );
+    assert!(!rig.cwd.parent().unwrap().join("escape.txt").exists());
+    let finished = rig.bodies("tool_finished").await;
+    assert!(
+        finished.iter().all(|b| b["is_error"] == true),
+        "{finished:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_denied_tool_call_does_not_run_and_the_turn_still_ends() {
     // Arrange
     let calls = tool_turn(&[("c1", "bash", json!({"command": "touch ran.txt"}))]);

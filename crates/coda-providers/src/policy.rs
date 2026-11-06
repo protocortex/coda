@@ -65,14 +65,14 @@ pub fn decide(input: &PolicyInput<'_>) -> Verdict {
         }
         Tool::Unknown(_) => Verdict::Prompt,
         Tool::Bash => grant_or_prompt(input.granted),
-        Tool::Read | Tool::Grep | Tool::CodeReadRange => {
+        Tool::Read | Tool::Grep | Tool::List | Tool::CodeReadRange => {
             if all_inside(input.targets) {
                 Verdict::Allow
             } else {
                 Verdict::Deny
             }
         }
-        Tool::Edit => decide_edit(input),
+        Tool::Edit | Tool::Write => decide_edit(input),
     }
 }
 
@@ -179,7 +179,7 @@ const PATH_SEPARATOR: char = '\u{1f}';
 /// an edit, the command line for other tools, empty when there is none.
 #[must_use]
 pub fn grant_pattern(tool: &Tool, command: Option<&str>, target_paths: &[PathBuf]) -> String {
-    if *tool != Tool::Edit {
+    if !matches!(tool, Tool::Edit | Tool::Write) {
         return command.unwrap_or_default().to_owned();
     }
     let mut paths: Vec<String> = target_paths.iter().map(|p| normalized(p)).collect();
@@ -276,6 +276,7 @@ pub fn decision_table() -> Vec<TableRow> {
         bash_and_scope_rows(&mut rows, mode);
     }
     edit_prompt_and_allow_rows(&mut rows);
+    write_rows(&mut rows);
     rows.0
 }
 
@@ -459,7 +460,7 @@ fn deny_all_rows(rows: &mut Rows) {
 }
 
 fn path_tool_rows(rows: &mut Rows, mode: PermissionMode) {
-    for tool in [Tool::Read, Tool::Grep, Tool::CodeReadRange] {
+    for tool in [Tool::Read, Tool::Grep, Tool::List, Tool::CodeReadRange] {
         rows.add(
             "read inside the workspace",
             mode,
@@ -742,6 +743,70 @@ fn edit_prompt_and_allow_rows(rows: &mut Rows) {
             inside(path),
             false,
             Verdict::Prompt,
+        );
+    }
+}
+
+/// `write` is decided exactly like `edit`: it changes files, so it prompts
+/// unless accept-edits or a grant allows it, and never leaves the workspace.
+fn write_rows(rows: &mut Rows) {
+    use PermissionMode::{AcceptEdits, Prompt};
+    rows.add(
+        "ask prompts for an inside write",
+        Prompt,
+        Tool::Write,
+        inside("src/new.rs"),
+        false,
+        Verdict::Prompt,
+    );
+    rows.add(
+        "ask allows a granted inside write",
+        Prompt,
+        Tool::Write,
+        inside("src/new.rs"),
+        true,
+        Verdict::Allow,
+    );
+    rows.add(
+        "accept-edits allows a plain write",
+        AcceptEdits,
+        Tool::Write,
+        inside("src/new.rs"),
+        false,
+        Verdict::Allow,
+    );
+    rows.add(
+        "accept-edits prompts for an execution-affecting write",
+        AcceptEdits,
+        Tool::Write,
+        inside("build.rs"),
+        false,
+        Verdict::Prompt,
+    );
+    for mode in [Prompt, AcceptEdits] {
+        rows.add(
+            "write outside the workspace",
+            mode,
+            Tool::Write,
+            outside(),
+            true,
+            Verdict::Deny,
+        );
+        rows.add(
+            "write through a symlink escape",
+            mode,
+            Tool::Write,
+            escapes(),
+            false,
+            Verdict::Deny,
+        );
+        rows.add(
+            "write with no target",
+            mode,
+            Tool::Write,
+            Vec::new(),
+            false,
+            Verdict::Deny,
         );
     }
 }

@@ -37,7 +37,7 @@ Keep the path short. A Unix socket path is limited to 104 bytes on macOS.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `mode` | string | `"prompt"` | One of `"prompt"` (ask for each request), `"deny-all"` (refuse every request), `"accept-edits"` (allow file edits, ask for the rest). Any other value is an error. |
+| `mode` | string | `"prompt"` | One of `"prompt"` (ask for each request), `"deny-all"` (refuse every request), `"accept-edits"` (allow file edits and `write`, ask for the rest). Any other value is an error. |
 | `grants` | array of strings | `[]` | Grants approved ahead of time. Each entry has the form `tool:pattern`, for example `"bash:ls"`, and the pattern may be empty. An entry without a colon, or with an empty tool, fails session start with an `InvalidGrant` error. `coda grant add` stores per-repository grants separately. |
 
 ## `[providers.<name>]`

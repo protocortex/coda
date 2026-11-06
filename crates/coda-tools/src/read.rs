@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::read_log::{FileStamp, ReadLog};
 use crate::sandbox::Sandbox;
 use crate::{Tool, ToolError, ToolOutput, parse_args};
 
@@ -26,6 +27,7 @@ struct ReadArgs {
 pub struct ReadTool {
     sandbox: Sandbox,
     max_output_bytes: usize,
+    read_log: Option<ReadLog>,
 }
 
 impl ReadTool {
@@ -35,7 +37,15 @@ impl ReadTool {
         Self {
             sandbox,
             max_output_bytes,
+            read_log: None,
         }
+    }
+
+    /// Records every file read in `log`, so `write` knows the session saw it.
+    #[must_use]
+    pub fn with_read_log(mut self, log: ReadLog) -> Self {
+        self.read_log = Some(log);
+        self
     }
 }
 
@@ -51,6 +61,7 @@ impl Tool for ReadTool {
             source,
         };
         let mut file = self.sandbox.open_file(Path::new(&args.path))?;
+        let metadata = file.metadata().map_err(io_err)?;
         file.seek(SeekFrom::Start(args.offset)).map_err(io_err)?;
         // One byte past the cap is enough to know the output was cut.
         let cap_plus_one = u64::try_from(self.max_output_bytes)
@@ -59,7 +70,15 @@ impl Tool for ReadTool {
         let want = args.length.map_or(cap_plus_one, |n| n.min(cap_plus_one));
         let mut bytes = Vec::new();
         file.take(want).read_to_end(&mut bytes).map_err(io_err)?;
-        Ok(ToolOutput::from_bytes(bytes, self.max_output_bytes))
+        let whole_file = args.offset == 0 && bytes.len() as u64 == metadata.len();
+        let output = ToolOutput::from_bytes(bytes, self.max_output_bytes);
+        if let Some(log) = &self.read_log
+            && whole_file
+            && !output.truncated
+        {
+            log.record(Path::new(&args.path), FileStamp::of(&metadata));
+        }
+        Ok(output)
     }
 }
 
