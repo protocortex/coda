@@ -834,7 +834,7 @@ async fn a_child_that_compacts_its_conversation_goes_on_and_reports_to_the_paren
     // Arrange
     // Four reads, then the model's window is exceeded: the child summarises its
     // early messages, which its parent never stores, and asks again.
-    let read = |n: u8| tool_turn(&[(&format!("r{n}"), "read", json!({"path": "a.txt"}))]);
+    let read = |n: u8| tool_turn(&[(&format!("r{n}"), "read", json!({"path": "a.txt", "n": n}))]);
     let mut script = vec![task_call("t1", "scout")];
     script.extend((1..=4).map(read));
     script.extend([

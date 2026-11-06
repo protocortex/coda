@@ -10,6 +10,9 @@ use serde::Deserialize;
 
 use crate::checks::CheckConfig;
 use crate::hooks::{HookConfig, MAX_TIMEOUT_MS};
+use crate::loop_guard::{
+    LOOP_GUARD_KEY, LoopGuardConfig, MIN_WARN_AFTER, STOP_AFTER_KEY, WARN_AFTER_KEY,
+};
 use crate::review::{DIFF_BUDGET_CHARS_KEY, MAX_FINDINGS_KEY, REVIEW_KEY, ReviewConfig};
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
@@ -249,6 +252,8 @@ pub struct Config {
     pub checks: BTreeMap<String, CheckConfig>,
     /// Limits for `coda review`.
     pub review: ReviewConfig,
+    /// Thresholds for the stall and loop detector.
+    pub loop_guard: LoopGuardConfig,
 }
 
 impl Default for Config {
@@ -265,6 +270,7 @@ impl Default for Config {
             hooks: Vec::new(),
             checks: BTreeMap::new(),
             review: ReviewConfig::default(),
+            loop_guard: LoopGuardConfig::default(),
         }
     }
 }
@@ -303,6 +309,7 @@ impl Config {
         config.check_hooks()?;
         config.check_checks()?;
         config.check_review()?;
+        config.check_loop_guard()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -415,6 +422,23 @@ impl Config {
             return Err(ConfigError::InvalidValue {
                 path: format!("{REVIEW_KEY}.{DIFF_BUDGET_CHARS_KEY}"),
                 allowed: "a whole number of characters above 0".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn check_loop_guard(&self) -> Result<(), ConfigError> {
+        let guard = &self.loop_guard;
+        if guard.warn_after < MIN_WARN_AFTER {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{LOOP_GUARD_KEY}.{WARN_AFTER_KEY}"),
+                allowed: format!("a whole number of repeats of at least {MIN_WARN_AFTER}"),
+            });
+        }
+        if guard.stop_after <= guard.warn_after {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{LOOP_GUARD_KEY}.{STOP_AFTER_KEY}"),
+                allowed: format!("a whole number of repeats above {WARN_AFTER_KEY}"),
             });
         }
         Ok(())
@@ -928,6 +952,49 @@ bots = true
         assert_eq!(review.skip.target_branch_regex, ["^release/"]);
         assert_eq!(review.skip.authors, ["alice"]);
         assert_eq!(parsed.unknown_keys.len(), 0);
+    }
+
+    #[test]
+    fn loop_guard_thresholds_default_to_3_and_4() {
+        // Act
+        let guard = Config::from_toml_str("").unwrap().config.loop_guard;
+
+        // Assert
+        assert_eq!((guard.warn_after, guard.stop_after), (3, 4));
+    }
+
+    #[test]
+    fn loop_guard_thresholds_are_read_from_the_file() {
+        // Arrange
+        let input = "[loop_guard]\nwarn_after = 2\nstop_after = 9\n";
+
+        // Act
+        let guard = Config::from_toml_str(input).unwrap().config.loop_guard;
+
+        // Assert
+        assert_eq!((guard.warn_after, guard.stop_after), (2, 9));
+    }
+
+    #[test]
+    fn bad_loop_guard_thresholds_are_rejected_naming_the_key() {
+        for (input, key) in [
+            ("[loop_guard]\nwarn_after = 1\n", "loop_guard.warn_after"),
+            ("[loop_guard]\nwarn_after = 0\n", "loop_guard.warn_after"),
+            ("[loop_guard]\nstop_after = 3\n", "loop_guard.stop_after"),
+            (
+                "[loop_guard]\nwarn_after = 5\nstop_after = 4\n",
+                "loop_guard.stop_after",
+            ),
+        ] {
+            // Act
+            let err = Config::from_toml_str(input).unwrap_err();
+
+            // Assert
+            assert!(
+                matches!(&err, ConfigError::InvalidValue { path, .. } if path == key),
+                "{input}: {err}"
+            );
+        }
     }
 
     #[test]

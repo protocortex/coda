@@ -226,7 +226,8 @@ impl LoopFactory {
         )
         .with_context_window(parts.window)
         .with_hooks(self.hooks_for(depth))
-        .with_checks(Checks::new(&self.env.config.checks, self.env.env.clone()));
+        .with_checks(Checks::new(&self.env.config.checks, self.env.env.clone()))
+        .with_loop_guard(self.env.config.loop_guard);
         if let Some(runner) = below {
             turn_loop = turn_loop.with_tasks(runner);
         }

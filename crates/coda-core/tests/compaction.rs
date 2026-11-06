@@ -230,7 +230,7 @@ fn tool_turn(ids: &[String]) -> Turn {
         });
         events.push(ModelEvent::ToolCallArgumentsDelta {
             call_id: id.clone(),
-            fragment: "{}".into(),
+            fragment: format!(r#"{{"id":"{id}"}}"#),
         });
     }
     events.push(ModelEvent::Stop {

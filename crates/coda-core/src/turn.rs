@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use coda_config::hooks::HookEvent;
+use coda_config::loop_guard::LoopGuardConfig;
 use coda_protocol::types::{OriginalId, PermissionDecision, SessionId};
 use coda_providers::gate::PermissionGate;
 use coda_providers::model::{
@@ -32,6 +33,7 @@ use crate::compact::{
 };
 use crate::economy::{cap_ends, compact};
 use crate::hooks::HookRunner;
+use crate::loop_guard::{self, LoopGuard, Verdict};
 use crate::prompt::{Conversation, Message, ToolCall};
 use crate::task::{TaskRequest, TaskRunner};
 
@@ -51,6 +53,8 @@ const HOOK_CANCELLED: &str = "not run: the turn was cancelled while a hook ran";
 /// before a blocking post-tool hook had checked its result.
 const RESULT_WITHHELD: &str =
     "ran, but the result is withheld: the turn was cancelled before a hook checked it";
+/// Starts the note that tells the model it is repeating a call.
+const WARNING_PREFIX: &str = "warning:";
 /// Name of the span around one model call.
 pub const PROVIDER_CALL_SPAN: &str = "coda.provider.call";
 /// Name of the span around one tool call.
@@ -83,6 +87,8 @@ pub enum StopCondition {
     CompactionFailed,
     /// A blocking `session_start` hook failed, so the turn did not start.
     HookBlocked,
+    /// The model kept repeating the same calls after being warned.
+    Stalled,
 }
 
 impl StopCondition {
@@ -100,6 +106,7 @@ impl StopCondition {
             Self::MaxTokens => "max_tokens",
             Self::CompactionFailed => "compaction_failed",
             Self::HookBlocked => "hook_blocked",
+            Self::Stalled => "stalled",
         }
     }
 }
@@ -288,6 +295,7 @@ pub struct TurnLoop<P, G> {
     /// earlier loop. Not whether the conversation has messages: a first send
     /// that a hook blocked leaves some, and the retry is still a first start.
     resumed: bool,
+    guard: LoopGuard,
 }
 
 /// How a compaction attempt ended.
@@ -329,7 +337,15 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             checks: Checks::default(),
             session_started: false,
             resumed: false,
+            guard: LoopGuard::new(LoopGuardConfig::default()),
         }
+    }
+
+    /// Sets when a repeating model is warned and stopped.
+    #[must_use]
+    pub fn with_loop_guard(mut self, config: LoopGuardConfig) -> Self {
+        self.guard = LoopGuard::new(config);
+        self
     }
 
     /// Sets the model's context window in tokens. With one, a request that
@@ -423,6 +439,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     pub async fn send(&mut self, text: &str) -> Result<StopCondition, TurnError> {
         self.conversation.push(Message::User(text.to_owned()));
         self.compacted_ahead = false;
+        self.guard.reset();
         let result = match self.start_session().await {
             Some(stop) => Ok(stop),
             None => self.run().await,
@@ -736,7 +753,8 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             let mut outcome = if stop.is_some() {
                 ToolOutcome::error(SKIPPED.to_owned())
             } else {
-                self.run_tool(&call).await
+                let outcome = self.run_tool(&call).await;
+                self.judge_repeats(&call, outcome, &mut stop)
             };
             if stop.is_none() && !self.checks.is_empty() && Checks::follows(&call.name) {
                 if !outcome.is_error {
@@ -795,6 +813,38 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         }
     }
 
+    /// Feeds a finished call to the loop guard. A warning is added to the
+    /// result the model reads; a repeat after it sets `stop`.
+    fn judge_repeats(
+        &mut self,
+        call: &ToolCall,
+        mut outcome: ToolOutcome,
+        stop: &mut Option<StopCondition>,
+    ) -> ToolOutcome {
+        let result = outcome
+            .raw_digest
+            .unwrap_or_else(|| loop_guard::digest(&outcome.text));
+        match self
+            .guard
+            .record(&call.name, &call.arguments, result, outcome.is_error)
+        {
+            Verdict::Fine => {}
+            Verdict::Warn(repeat) => {
+                warn!(tool = %call.name, times = repeat.times, "the model is repeating a call");
+                outcome.text = format!(
+                    "{}\n{WARNING_PREFIX} {}. Try something different or finish.",
+                    outcome.text,
+                    repeat.describe()
+                );
+            }
+            Verdict::Stop(repeat) => {
+                warn!(tool = %call.name, times = repeat.times, "the model kept repeating a call after a warning");
+                *stop = Some(self.after_tool().unwrap_or(StopCondition::Stalled));
+            }
+        }
+        outcome
+    }
+
     fn after_tool(&self) -> Option<StopCondition> {
         if self.cancel.is_cancelled() {
             Some(StopCondition::Cancelled)
@@ -842,6 +892,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             usage: Some(done.usage)
                 .filter(|used| used.input_tokens != 0 || used.output_tokens != 0),
             original: None,
+            raw_digest: None,
         }
     }
 
@@ -975,6 +1026,9 @@ struct ToolOutcome {
     usage: Option<Usage>,
     /// Where the full output is kept, when `text` is a shrunk version of it.
     original: Option<OriginalId>,
+    /// Digest of the tool's own output before it was shortened, for the loop
+    /// guard; a shortened text ends in an id that differs on every call.
+    raw_digest: Option<u64>,
 }
 
 impl ToolOutcome {
@@ -984,6 +1038,7 @@ impl ToolOutcome {
             is_error: true,
             usage: None,
             original: None,
+            raw_digest: None,
         }
     }
 }
@@ -1017,6 +1072,7 @@ impl ToolWork {
     fn run(self) -> ToolOutcome {
         match self.tool.call_cancellable(&self.input, &self.cancel) {
             Ok(output) => {
+                let raw_digest = Some(loop_guard::digest(&output.text));
                 let (text, original) = if self.tool.shrinkable() {
                     self.shrink(output.text)
                 } else {
@@ -1027,6 +1083,7 @@ impl ToolWork {
                     is_error: false,
                     usage: None,
                     original,
+                    raw_digest,
                 }
             }
             Err(error) => ToolOutcome::error(error.to_string()),
