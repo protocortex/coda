@@ -738,22 +738,17 @@ impl Turns {
     }
 
     /// Keeps the id the backend reported, in memory and, for Claude, in the store.
-    pub(super) async fn remember_backend_id(
-        &self,
-        record: &SessionRecord,
-        turn: &TurnId,
-        backend_id: &str,
-    ) {
+    pub(super) async fn remember_backend_id(&self, record: &SessionRecord, backend_id: &str) {
         self.backend_ids()
             .insert(record.id.clone(), backend_id.to_owned());
         if record.backend != BackendKind::ClaudeCode {
             return;
         }
-        let (session, turn, backend_id) = (record.id.clone(), turn.clone(), backend_id.to_owned());
+        let (session, backend_id) = (record.id.clone(), backend_id.to_owned());
         let stored = self
             .hub
             .with_store_mut(move |store| {
-                store.record_backend_thread(&session, BackendKind::ClaudeCode, &backend_id, &turn)
+                store.record_backend_thread(&session, BackendKind::ClaudeCode, &backend_id)
             })
             .await;
         if let Err(error) = stored {
@@ -889,8 +884,7 @@ impl Turns {
             info!(session = %session, turn = %turn, step = "cleanup", "stopping the backend");
             stop(&mut child, &session).await;
             if let Some(backend_id) = child.session_id_from_backend() {
-                let saved =
-                    within(limit, self.remember_backend_id(&record, &turn, backend_id)).await;
+                let saved = within(limit, self.remember_backend_id(&record, backend_id)).await;
                 if saved.is_none() {
                     warn!(session = %session, "the store did not answer; the backend id was not saved");
                 }

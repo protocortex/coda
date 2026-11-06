@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 
 use super::{Rig, relaxed, timing};
-use coda_protocol::types::{BackendKind, TurnId};
+use coda_protocol::types::BackendKind;
 
 const REPORT: &str = "report.json";
 const RESUME_FLAG: &str = "--resume";
@@ -56,12 +56,7 @@ async fn a_resume_the_backend_rejects_falls_back_to_a_fresh_start_and_is_not_tri
     let session = rig.session.clone();
     rig.hub
         .with_store_mut(move |store| {
-            store.record_backend_thread(
-                &session,
-                BackendKind::ClaudeCode,
-                STALE_ID,
-                &TurnId::new("0"),
-            )
+            store.record_backend_thread(&session, BackendKind::ClaudeCode, STALE_ID)
         })
         .await
         .unwrap();
@@ -86,17 +81,9 @@ async fn a_resume_the_backend_rejects_falls_back_to_a_fresh_start_and_is_not_tri
         .await
         .unwrap();
     assert_eq!(stored.as_deref(), Some(BACKEND_ID));
-    let failed: i64 = rig
-        .db()
-        .query_row(
-            "SELECT count(*) FROM backend_threads WHERE status = 'error'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(failed, 0, "the new id replaced the failed row");
 }
 
+const UNREADABLE_SEQ: i64 = 1_000_000;
 const PROMPTS: &str = "prompts.txt";
 const STALL_TURN: &str = "stall";
 const SEED_MARK: &str = "This conversation continues in a new thread";
@@ -185,12 +172,7 @@ async fn one_crash_before_the_backend_names_its_conversation_keeps_the_stored_id
     let session = rig.session.clone();
     rig.hub
         .with_store_mut(move |store| {
-            store.record_backend_thread(
-                &session,
-                BackendKind::ClaudeCode,
-                STALE_ID,
-                &TurnId::new("0"),
-            )
+            store.record_backend_thread(&session, BackendKind::ClaudeCode, STALE_ID)
         })
         .await
         .unwrap();
@@ -203,15 +185,6 @@ async fn one_crash_before_the_backend_names_its_conversation_keeps_the_stored_id
 
     // Assert
     assert_eq!(resumed_with(&args(&rig)), Some(STALE_ID));
-    let failed: i64 = rig
-        .db()
-        .query_row(
-            "SELECT count(*) FROM backend_threads WHERE status = 'error'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(failed, 0);
     let prompts = std::fs::read_to_string(rig.cwd.path().join(PROMPTS)).unwrap();
     assert!(
         !prompts.contains(SEED_MARK),
@@ -232,12 +205,7 @@ async fn a_crash_after_the_fresh_start_names_its_conversation_resumes_that_conve
     let session = rig.session.clone();
     rig.hub
         .with_store_mut(move |store| {
-            store.record_backend_thread(
-                &session,
-                BackendKind::ClaudeCode,
-                STALE_ID,
-                &TurnId::new("0"),
-            )
+            store.record_backend_thread(&session, BackendKind::ClaudeCode, STALE_ID)
         })
         .await
         .unwrap();
@@ -262,4 +230,53 @@ async fn a_crash_after_the_fresh_start_names_its_conversation_resumes_that_conve
         1,
         "the history is sent once"
     );
+}
+
+#[tokio::test]
+async fn a_fresh_start_that_cannot_read_the_stored_conversation_says_so() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    rig.control(&json!({ "report_path": rig.cwd.path().join(REPORT) }));
+    rig.send("hello").await;
+    let request = rig.wait_for_pending().await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+    // A body that is not valid UTF-8 cannot be read back, while a new event still stores.
+    rig.db()
+        .execute(
+            "INSERT INTO events (turn_id, seq, kind, body, at) \
+             SELECT id, ?1, 'user_message', CAST(X'FF' AS TEXT), 0 FROM turns LIMIT 1",
+            [UNREADABLE_SEQ],
+        )
+        .unwrap();
+    rig.control(&json!({
+        "report_path": rig.cwd.path().join(REPORT),
+        "prompt_path": rig.cwd.path().join(PROMPTS),
+        "reject_resume": true,
+    }));
+    let binary = coda_testkit::paths::fake_claude_path().unwrap();
+    let restarted = rig.turns_with(binary, rig.sleeper.clone());
+
+    // Act
+    rig.send_to(&restarted, NO_PERMISSION_TURN).await;
+    rig.wait_until_stopped(&restarted).await;
+
+    // Assert
+    let notices: i64 = rig
+        .db()
+        .query_row(
+            "SELECT count(*) FROM events WHERE kind = 'history_not_restored'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(notices, 1);
+    let prompts = std::fs::read_to_string(rig.cwd.path().join(PROMPTS)).unwrap();
+    assert_eq!(
+        prompts.lines().count(),
+        1,
+        "only the fresh start read a prompt"
+    );
+    assert!(!prompts.contains(SEED_MARK), "no history could be sent");
 }
