@@ -27,13 +27,8 @@ const EARLY_CRASHES_BEFORE_FRESH: u32 = 2;
 
 type Write<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
-fn save_id<'a>(
-    turns: &'a Turns,
-    record: &'a SessionRecord,
-    turn: &'a TurnId,
-    id: String,
-) -> Write<'a> {
-    Box::pin(async move { turns.remember_backend_id(record, turn, &id).await })
+fn save_id<'a>(turns: &'a Turns, record: &'a SessionRecord, id: String) -> Write<'a> {
+    Box::pin(async move { turns.remember_backend_id(record, &id).await })
 }
 
 /// Ends the id writes a run left open. After an abort a store that does not answer
@@ -50,7 +45,7 @@ async fn finish_writes(
             write.await;
         }
         if let Some(id) = waiting {
-            turns.remember_backend_id(record, turn, &id).await;
+            turns.remember_backend_id(record, &id).await;
         }
     };
     match limit {
@@ -222,7 +217,7 @@ impl<'a, E: Emit> Drive<'a, E> {
         let session = &self.record.id;
         if let Some(backend_id) = self.child.session_id_from_backend() {
             self.turns
-                .remember_backend_id(self.record, self.turn, backend_id)
+                .remember_backend_id(self.record, backend_id)
                 .await;
             // The conversation now holds the earlier turns, so a retry must not send them again.
             self.seed = None;
@@ -275,13 +270,13 @@ impl<'a, E: Emit> Drive<'a, E> {
                     }
                     id = reported(&mut ids) => {
                         if saving.is_none() {
-                            saving = Some(save_id(turns, record, turn, id));
+                            saving = Some(save_id(turns, record, id));
                         } else {
                             waiting = Some(id);
                         }
                     }
                     () = async { if let Some(write) = saving.as_mut() { write.await } }, if saving.is_some() => {
-                        saving = waiting.take().map(|id| save_id(turns, record, turn, id));
+                        saving = waiting.take().map(|id| save_id(turns, record, id));
                     }
                 }
             };
