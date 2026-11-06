@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 use super::{
-    BACKEND_UNSUPPORTED, CancelHandle, EVENT_QUEUE_BOUND, EventOutbox, Reservation,
+    BACKEND_UNSUPPORTED, CancelHandle, EVENT_QUEUE_BOUND, EventOutbox, Fence, Queued, Reservation,
     SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig, TurnState, Turns, WIND_DOWN_TIMEOUT,
 };
 use crate::dispatch::Dispatcher;
@@ -2191,9 +2191,9 @@ fn delta(text: &str) -> Event {
     }
 }
 
-fn text_of(event: Option<Event>) -> String {
+fn text_of(event: Option<Queued>) -> String {
     match event {
-        Some(Event::StreamDelta { text, .. }) => text,
+        Some(Queued::Event(Event::StreamDelta { text, .. })) => text,
         other => panic!("expected a delta, got {other:?}"),
     }
 }
@@ -2340,5 +2340,45 @@ async fn a_stuck_store_does_not_hold_the_session_after_an_idle_timeout() {
     assert!(
         freed.is_ok(),
         "the session stayed busy behind a stuck store"
+    );
+}
+
+#[tokio::test]
+async fn a_fence_with_no_queue_or_a_gone_publisher_returns_at_once() {
+    // Arrange
+    let unattached = Fence::default();
+    let (tx, rx) = mpsc::channel(OUTBOX_BOUND);
+    let gone = Fence::default();
+    gone.attach(tx.downgrade());
+    drop(rx);
+
+    // Act
+    let both = async {
+        unattached.wait().await;
+        gone.wait().await;
+    };
+    let finished = tokio::time::timeout(WAIT, both).await;
+
+    // Assert
+    assert!(finished.is_ok());
+}
+
+#[tokio::test]
+async fn text_streamed_before_a_permission_request_is_stored_before_its_announcement() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+
+    // Act
+    rig.send("hello").await;
+    let request = rig.wait_for_pending().await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_for("result").await;
+
+    // Assert
+    let kinds = rig.kinds().await;
+    let position = |kind: &str| kinds.iter().position(|k| k == kind).unwrap();
+    assert!(
+        position("stream_delta") < position("permission_request"),
+        "{kinds:?}"
     );
 }

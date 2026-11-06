@@ -13,7 +13,7 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use coda_config::config::{Config, PermissionMode};
@@ -39,7 +39,7 @@ use coda_store::{
     StoreError, UsageRecord,
 };
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, info, warn};
 
@@ -302,7 +302,7 @@ pub struct Turns {
     /// The backends' own session ids, so the next turn resumes the conversation.
     backend_ids: Mutex<HashMap<SessionId, String>>,
     /// The event queue of each running turn, to count what is waiting.
-    queues: Mutex<HashMap<SessionId, mpsc::WeakSender<Event>>>,
+    queues: Mutex<HashMap<SessionId, mpsc::WeakSender<Queued>>>,
     /// Codex app-servers between turns, one per session. A turn takes its
     /// session's server out, so turns of one session never share it at once.
     idle: IdlePool<AgentSession>,
@@ -762,7 +762,7 @@ impl Turns {
         self.backend_ids().remove(&record.id);
     }
 
-    fn queues(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, mpsc::WeakSender<Event>>> {
+    fn queues(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, mpsc::WeakSender<Queued>>> {
         self.queues.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -822,6 +822,7 @@ impl Turns {
         } = job;
         let (tx, rx) = mpsc::channel(EVENT_QUEUE_BOUND);
         self.queues().insert(session.clone(), tx.downgrade());
+        gate.fence().attach(tx.downgrade());
         let mut publisher = tokio::spawn(publish_events(
             Arc::clone(&self.hub),
             session.clone(),
@@ -1016,17 +1017,51 @@ impl PermissionGate for WatchedGate {
     }
 }
 
+/// What travels to the publisher: an event to store, or a fence.
+#[derive(Debug)]
+pub(crate) enum Queued {
+    Event(Event),
+    /// Answered once every event queued before it is stored.
+    Fence(oneshot::Sender<()>),
+}
+
+/// Lets something outside the event queue wait until the events already
+/// queued are stored, so what it writes next lands after them in the log.
+#[derive(Default)]
+pub(crate) struct Fence {
+    queue: OnceLock<mpsc::WeakSender<Queued>>,
+}
+
+impl Fence {
+    pub(crate) fn attach(&self, queue: mpsc::WeakSender<Queued>) {
+        // A turn's queue is attached once; a second attach has nothing to add.
+        let _ = self.queue.set(queue);
+    }
+
+    /// Returns when the queued events are stored, or at once when there is no
+    /// queue or its publisher is gone.
+    pub(crate) async fn wait(&self) {
+        let Some(queue) = self.queue.get().and_then(mpsc::WeakSender::upgrade) else {
+            return;
+        };
+        let (reached, stored) = oneshot::channel();
+        if queue.send(Queued::Fence(reached)).await.is_ok() {
+            let _ = stored.await;
+        }
+    }
+}
+
 /// Events on their way to the publisher. An event is queued here before any
 /// wait, so dropping a flush that is parked on a full queue (a cancel, the idle
 /// timeout) leaves the event in place for the next flush instead of losing it.
 struct EventOutbox {
-    tx: mpsc::Sender<Event>,
+    tx: mpsc::Sender<Queued>,
     pending: VecDeque<Event>,
     lost: usize,
 }
 
 impl EventOutbox {
-    fn new(tx: mpsc::Sender<Event>) -> Self {
+    fn new(tx: mpsc::Sender<Queued>) -> Self {
         Self {
             tx,
             pending: VecDeque::new(),
@@ -1046,7 +1081,7 @@ impl EventOutbox {
         while !self.pending.is_empty() {
             if let Ok(permit) = self.tx.reserve().await {
                 if let Some(event) = self.pending.pop_front() {
-                    permit.send(event);
+                    permit.send(Queued::Event(event));
                 }
             } else {
                 refused += self.pending.len();
@@ -1140,19 +1175,27 @@ async fn publish_events(
     hub: Arc<Hub>,
     session: SessionId,
     turn: TurnId,
-    mut events: mpsc::Receiver<Event>,
+    mut events: mpsc::Receiver<Queued>,
 ) -> usize {
     let mut held = None;
     let mut failed = 0;
     loop {
         let next = match held.take() {
-            Some(event) => event,
+            Some(queued) => queued,
             None => match events.recv().await {
-                Some(event) => event,
+                Some(queued) => queued,
                 None => return failed,
             },
         };
-        let event = coalesce_text(next, &mut events, &mut held).await;
+        let first = match next {
+            Queued::Event(event) => event,
+            Queued::Fence(reached) => {
+                // The asker may have stopped waiting.
+                let _ = reached.send(());
+                continue;
+            }
+        };
+        let event = coalesce_text(first, &mut events, &mut held).await;
         if let Err(e) = store_event(&hub, &session, &turn, &event).await {
             warn!(session = %session, error = %e, "could not store an event");
             failed += 1;
@@ -1165,8 +1208,8 @@ async fn publish_events(
 /// is kept and no event is skipped.
 async fn coalesce_text(
     first: Event,
-    events: &mut mpsc::Receiver<Event>,
-    held: &mut Option<Event>,
+    events: &mut mpsc::Receiver<Queued>,
+    held: &mut Option<Queued>,
 ) -> Event {
     let Event::StreamDelta {
         session_id,
@@ -1179,7 +1222,9 @@ async fn coalesce_text(
     let deadline = tokio::time::Instant::now() + DELTA_WINDOW;
     while text.len() < MAX_DELTA_CHUNK_BYTES {
         match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Some(Event::StreamDelta { text: more, .. })) => text.push_str(&more),
+            Ok(Some(Queued::Event(Event::StreamDelta { text: more, .. }))) => {
+                text.push_str(&more);
+            }
             Ok(other) => {
                 *held = other;
                 break;
