@@ -486,6 +486,65 @@ async fn a_write_over_an_unread_file_or_outside_the_workspace_is_refused() {
 }
 
 #[tokio::test]
+async fn a_multi_edit_is_one_request_that_applies_every_file_or_none() {
+    // Arrange
+    let both = json!({"edits": [
+        {"path": "a.txt", "old_string": "needle", "new_string": "thread"},
+        {"path": "b.txt", "old_string": "two", "new_string": "2"},
+    ]});
+    let bad = json!({"edits": [
+        {"path": "a.txt", "old_string": "thread", "new_string": "needle"},
+        {"path": "b.txt", "old_string": "absent", "new_string": "x"},
+    ]});
+    let calls = tool_turn(&[("c1", "multi_edit", both), ("c2", "multi_edit", bad)]);
+    let mut rig = Rig::new(Mode::AcceptEdits, &[calls, text_turn("done")]);
+    std::fs::write(rig.cwd.join("b.txt"), "one two\n").unwrap();
+
+    // Act
+    rig.send("change both").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert_eq!(rig.pending().await.len(), 0);
+    assert_eq!(
+        std::fs::read_to_string(rig.cwd.join("a.txt")).unwrap(),
+        "one thread here\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(rig.cwd.join("b.txt")).unwrap(),
+        "one 2\n"
+    );
+    let finished = rig.bodies("tool_finished").await;
+    assert_eq!(finished[0]["is_error"], false, "{finished:?}");
+    assert_eq!(finished[1]["is_error"], true, "{finished:?}");
+}
+
+#[tokio::test]
+async fn a_multi_edit_naming_one_outside_path_is_denied_whole() {
+    // Arrange
+    let edits = json!({"edits": [
+        {"path": "a.txt", "old_string": "needle", "new_string": "thread"},
+        {"path": "../outside.txt", "old_string": "x", "new_string": "y"},
+    ]});
+    let calls = tool_turn(&[("c1", "multi_edit", edits)]);
+    let mut rig = Rig::new(Mode::AcceptEdits, &[calls, text_turn("done")]);
+
+    // Act
+    rig.send("change both").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert_eq!(
+        std::fs::read_to_string(rig.cwd.join("a.txt")).unwrap(),
+        "one needle here\n"
+    );
+    let finished = rig.bodies("tool_finished").await;
+    assert_eq!(finished[0]["is_error"], true, "{finished:?}");
+}
+
+#[tokio::test]
 async fn a_denied_tool_call_does_not_run_and_the_turn_still_ends() {
     // Arrange
     let calls = tool_turn(&[("c1", "bash", json!({"command": "touch ran.txt"}))]);

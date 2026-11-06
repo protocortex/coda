@@ -12,6 +12,7 @@ pub mod code;
 pub mod edit;
 pub mod grep;
 pub mod list;
+pub mod multi_edit;
 pub mod read;
 pub mod read_log;
 pub mod retrieve;
@@ -29,7 +30,7 @@ use crate::sandbox::SandboxError;
 
 /// The name of every tool the model can call, sorted. Agent definitions are
 /// checked against it.
-pub const TOOL_NAMES: [&str; 11] = [
+pub const TOOL_NAMES: [&str; 12] = [
     bash::NAME,
     code::OUTLINE_NAME,
     code::READ_RANGE_NAME,
@@ -38,6 +39,7 @@ pub const TOOL_NAMES: [&str; 11] = [
     edit::NAME,
     grep::NAME,
     list::NAME,
+    multi_edit::NAME,
     read::NAME,
     retrieve::NAME,
     write::NAME,
@@ -100,6 +102,29 @@ pub enum ToolError {
         path: String,
         /// The size limit in bytes.
         limit: usize,
+    },
+    /// One edit of a `multi_edit` call cannot be applied, so none were.
+    #[error(
+        "edit {number} of {total} ({path}) cannot be applied, and no file was changed: {reason}"
+    )]
+    MultiEdit {
+        /// The one-based position of the first edit that failed.
+        number: usize,
+        /// How many edits the call held.
+        total: usize,
+        /// The workspace-relative path the edit names.
+        path: String,
+        /// Why it failed.
+        reason: String,
+    },
+    /// A `multi_edit` call failed after some files were already replaced and
+    /// could not put them all back.
+    #[error("{cause}; these files could not be restored and keep their new content: {paths}")]
+    PartlyApplied {
+        /// The error that stopped the call.
+        cause: String,
+        /// The workspace-relative paths left changed, separated by commas.
+        paths: String,
     },
     /// The file exists and this session has not read it, so it is not replaced.
     #[error("{path} already exists and was not read in this session; read it before replacing it")]

@@ -387,6 +387,7 @@ mod tests {
             kind: "fn".to_owned(),
             path: path.to_owned(),
             line,
+            end_line: line,
         }
     }
 

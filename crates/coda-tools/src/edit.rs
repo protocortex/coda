@@ -152,19 +152,43 @@ fn find_all(haystack: &str, needle: &str) -> (usize, Option<usize>) {
 /// CRLF endings is it retried with CRLF, so LF-only lines of a mixed file
 /// are edited as they are.
 fn replace_unique(path: &str, text: &str, old: &str, new: &str) -> Result<String, ToolError> {
+    let found = locate_unique(path, text, old, new)?;
+    let mut updated =
+        String::with_capacity(text.len() - (found.end - found.start) + found.new.len());
+    updated.push_str(&text[..found.start]);
+    updated.push_str(&found.new);
+    updated.push_str(&text[found.end..]);
+    Ok(updated)
+}
+
+/// Where the single match of an edit sits in the text, and what replaces it.
+pub(crate) struct Located {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) new: String,
+}
+
+/// Finds the one place `old` occurs in `text`, with the replacement spelled
+/// in the line endings that matched.
+pub(crate) fn locate_unique(
+    path: &str,
+    text: &str,
+    old: &str,
+    new: &str,
+) -> Result<Located, ToolError> {
     let mut attempts = vec![(old.to_owned(), new.to_owned())];
     if text.contains("\r\n") {
         attempts.push((to_crlf(old), to_crlf(new)));
     }
-    for (old, new) in &attempts {
-        match find_all(text, old) {
+    for (old, new) in attempts {
+        match find_all(text, &old) {
             (0, _) => {}
             (1, Some(at)) => {
-                let mut updated = String::with_capacity(text.len() - old.len() + new.len());
-                updated.push_str(&text[..at]);
-                updated.push_str(new);
-                updated.push_str(&text[at + old.len()..]);
-                return Ok(updated);
+                return Ok(Located {
+                    start: at,
+                    end: at + old.len(),
+                    new,
+                });
             }
             (count, _) => {
                 return Err(ToolError::NotUnique {
@@ -179,8 +203,52 @@ fn replace_unique(path: &str, text: &str, old: &str, new: &str) -> Result<String
     })
 }
 
-fn to_crlf(text: &str) -> String {
+pub(crate) fn to_crlf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+/// A replacement written to a temp file next to its target and checked
+/// against the original, waiting to be renamed into place.
+pub(crate) struct Staged {
+    temp: OsString,
+}
+
+impl Staged {
+    /// Renames the temp file over `name`.
+    pub(crate) fn commit(self, dir: &SandboxDir, name: &OsStr) -> Result<(), ToolError> {
+        let renamed = dir.rename(&self.temp, name);
+        if renamed.is_err() {
+            // Best effort: the rename error is the one worth reporting.
+            let _ = dir.remove(&self.temp);
+        }
+        renamed.map_err(ToolError::from)
+    }
+
+    /// Removes the temp file without replacing anything.
+    pub(crate) fn discard(self, dir: &SandboxDir) {
+        // Best effort: nothing else depends on the temp file going away.
+        let _ = dir.remove(&self.temp);
+    }
+}
+
+/// Writes `contents` to a temp file next to `name`, unless `name` no longer
+/// is the file that was read.
+pub(crate) fn stage_file(
+    dir: &SandboxDir,
+    name: &OsStr,
+    original: &Original<'_>,
+    contents: &[u8],
+    display: &str,
+) -> Result<Staged, ToolError> {
+    let temp = temp_name(name);
+    let staged = write_temp(dir, &temp, original, contents)
+        .map_err(ToolError::from)
+        .and_then(|()| ensure_unchanged(dir, name, original.snapshot, display));
+    if staged.is_err() {
+        // Best effort: the write error is the one worth reporting.
+        let _ = dir.remove(&temp);
+    }
+    staged.map(|()| Staged { temp })
 }
 
 /// Writes `contents` to a temp file next to `name` and renames it into place,
@@ -192,21 +260,12 @@ pub(crate) fn replace_file(
     contents: &[u8],
     display: &str,
 ) -> Result<(), ToolError> {
-    let temp = temp_name(name);
-    let written = write_temp(dir, &temp, original, contents)
-        .map_err(ToolError::from)
-        .and_then(|()| ensure_unchanged(dir, name, original.snapshot, display))
-        .and_then(|()| dir.rename(&temp, name).map_err(ToolError::from));
-    if written.is_err() {
-        // Best effort: the write error is the one worth reporting.
-        let _ = dir.remove(&temp);
-    }
-    written
+    stage_file(dir, name, original, contents, display)?.commit(dir, name)
 }
 
 /// Refuses when `name` is not the same file, with the same size and
 /// modification time, as `snapshot`.
-fn ensure_unchanged(
+pub(crate) fn ensure_unchanged(
     dir: &SandboxDir,
     name: &OsStr,
     snapshot: &Metadata,

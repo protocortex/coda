@@ -1012,6 +1012,29 @@ fn capped(text: &str, reason: &str) -> String {
     format!("{}\n[{reason}]", cap_ends(text))
 }
 
+/// Every path the call acts on, so the permission check sees all of them.
+fn target_paths(tool: &RequestTool, input: &Value) -> Vec<PathBuf> {
+    if *tool == RequestTool::MultiEdit {
+        let edits = input
+            .get("edits")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        return edits
+            .chain(input.get("symbol"))
+            .filter_map(|item| item.get("path").and_then(Value::as_str))
+            .map(PathBuf::from)
+            .collect();
+    }
+    let path = input.get("path").and_then(Value::as_str);
+    // A listing with no path lists the workspace root.
+    let path = match (tool, path) {
+        (RequestTool::List, None) => Some(LIST_DEFAULT_PATH),
+        (_, path) => path,
+    };
+    path.map(PathBuf::from).into_iter().collect()
+}
+
 /// The directory a `list` call without a path lists.
 const LIST_DEFAULT_PATH: &str = ".";
 
@@ -1020,6 +1043,7 @@ fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
         "bash" => RequestTool::Bash,
         "edit" => RequestTool::Edit,
         "write" => RequestTool::Write,
+        "multi_edit" => RequestTool::MultiEdit,
         "read" => RequestTool::Read,
         "grep" => RequestTool::Grep,
         "list" => RequestTool::List,
@@ -1031,15 +1055,10 @@ fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
         skill_tool::NAME => RequestTool::Skill,
         other => RequestTool::Unknown(other.to_owned()),
     };
-    let path = input.get("path").and_then(Value::as_str);
-    // A listing with no path lists the workspace root.
-    let path = match (&tool, path) {
-        (RequestTool::List, None) => Some(LIST_DEFAULT_PATH),
-        (_, path) => path,
-    };
+    let target_paths = target_paths(&tool, input);
     ToolRequest {
         tool,
-        target_paths: path.map(PathBuf::from).into_iter().collect(),
+        target_paths,
         command: input
             .get("command")
             .and_then(Value::as_str)
@@ -1087,6 +1106,7 @@ mod tests {
             (skill_tool::NAME, RequestTool::Skill),
             ("write", RequestTool::Write),
             ("list", RequestTool::List),
+            ("multi_edit", RequestTool::MultiEdit),
         ];
 
         for (name, expected) in names {
@@ -1098,6 +1118,29 @@ mod tests {
             assert_eq!(request.tool, expected, "{name}");
             assert_eq!(request.tool.name(), name, "{name} round-trips");
         }
+    }
+
+    #[test]
+    fn a_multi_edit_call_targets_every_file_it_names() {
+        // Arrange
+        let edits = serde_json::json!({"edits": [
+            {"path": "a.rs", "old_string": "x", "new_string": "y"},
+            {"path": "src/b.rs", "old_string": "x", "new_string": "y"},
+            {"path": "a.rs", "old_string": "p", "new_string": "q"},
+        ]});
+        let symbol = serde_json::json!({"symbol": {"path": "c.rs", "name": "f", "new_text": "t"}});
+
+        // Act
+        let many = super::tool_request("multi_edit", &edits, Path::new("/ws"));
+        let one = super::tool_request("multi_edit", &symbol, Path::new("/ws"));
+
+        // Assert
+        assert_eq!(many.tool, RequestTool::MultiEdit);
+        assert_eq!(
+            many.target_paths,
+            ["a.rs", "src/b.rs", "a.rs"].map(std::path::PathBuf::from)
+        );
+        assert_eq!(one.target_paths, [std::path::PathBuf::from("c.rs")]);
     }
 
     #[test]

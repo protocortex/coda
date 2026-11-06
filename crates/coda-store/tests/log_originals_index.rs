@@ -528,6 +528,7 @@ fn index_reader_finds_a_written_symbol_by_search_and_symbols() {
             kind: "fn".to_owned(),
             path: "src/lib.rs".to_owned(),
             line: 12,
+            end_line: 12,
         }]
     );
 }

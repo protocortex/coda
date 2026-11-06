@@ -15,6 +15,8 @@ pub enum Tool {
     Edit,
     /// Create a file, or replace one that was read.
     Write,
+    /// Change several places, possibly in several files, as one call.
+    MultiEdit,
     /// Read a file.
     Read,
     /// Search file contents or names.
@@ -45,6 +47,7 @@ impl Tool {
             Self::Bash => "bash",
             Self::Edit => "edit",
             Self::Write => "write",
+            Self::MultiEdit => "multi_edit",
             Self::Read => "read",
             Self::Grep => "grep",
             Self::List => "list",
@@ -83,6 +86,7 @@ mod tests {
             (Tool::Bash, "bash"),
             (Tool::Edit, "edit"),
             (Tool::Write, "write"),
+            (Tool::MultiEdit, "multi_edit"),
             (Tool::Read, "read"),
             (Tool::Grep, "grep"),
             (Tool::List, "list"),
