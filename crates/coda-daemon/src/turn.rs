@@ -76,10 +76,10 @@ const AGENT_REQUEST_HEADING: &str = "The request:";
 const CLAUDE_BACKEND_NAME: &str = "claude_code";
 const CODEX_BACKEND_NAME: &str = "codex";
 /// How long the publisher gathers consecutive text deltas into one stored chunk.
-const DELTA_WINDOW: Duration = Duration::from_millis(50);
+pub(crate) const DELTA_WINDOW: Duration = Duration::from_millis(50);
 /// Size at which a stored text chunk stops growing, so a long stream is still stored
 /// in pieces. The last delta may take a chunk a little past it.
-const MAX_DELTA_CHUNK_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_DELTA_CHUNK_BYTES: usize = 16 * 1024;
 /// How long a request waits for a session whose turn is ending: its terminal
 /// event is out, or it was cancelled and has not ended yet. Stopping a backend
 /// after the cancel or the event can take a few seconds.

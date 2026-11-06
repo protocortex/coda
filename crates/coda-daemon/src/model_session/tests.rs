@@ -1413,3 +1413,63 @@ async fn a_send_or_close_right_after_the_result_is_accepted() {
         rig.wait_idle(&session).await;
     }
 }
+
+/// Far more chunks than a person could read one by one.
+const STREAMED_CHUNKS: usize = 200;
+/// The most rows those chunks may fill: a tenth of them.
+const MAX_STORED_ROWS: usize = STREAMED_CHUNKS / 10;
+
+#[tokio::test]
+async fn a_streamed_answer_is_stored_in_a_few_rows_with_all_its_text() {
+    // Arrange
+    let mut events: Vec<Value> = (0..STREAMED_CHUNKS)
+        .map(|n| json!({"type": "text_delta", "text": format!("{n},")}))
+        .collect();
+    events.push(json!({"type": "stop", "reason": "end_turn"}));
+    let mut rig = Rig::new(Mode::AcceptEdits, &[json!({ "events": events })]);
+    let expected = (0..STREAMED_CHUNKS).fold(String::new(), |all, n| all + &format!("{n},"));
+
+    // Act
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let deltas = rig.bodies("stream_delta").await;
+    let text: String = deltas.iter().map(|d| d["text"].as_str().unwrap()).collect();
+    assert_eq!(text, expected);
+    assert!(
+        deltas.len() <= MAX_STORED_ROWS,
+        "{} rows for {STREAMED_CHUNKS} chunks",
+        deltas.len()
+    );
+}
+
+#[tokio::test]
+async fn text_streamed_before_a_tool_call_is_stored_before_the_call() {
+    // Arrange
+    let mut turn = read_turn();
+    turn["events"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, json!({"type": "text_delta", "text": "looking"}));
+    let mut rig = Rig::new(Mode::AcceptEdits, &[turn, text_turn("done")]);
+
+    // Act
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let kinds: Vec<String> = rig.events().await.into_iter().map(|e| e.kind).collect();
+    let position = |kind: &str| kinds.iter().position(|k| k == kind).unwrap();
+    assert!(
+        position("stream_delta") < position("assistant_message"),
+        "{kinds:?}"
+    );
+    assert!(
+        position("assistant_message") < position("tool_finished"),
+        "{kinds:?}"
+    );
+    assert_eq!(rig.bodies("stream_delta").await[0]["text"], "looking");
+}
