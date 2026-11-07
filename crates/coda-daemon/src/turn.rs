@@ -55,12 +55,14 @@ mod diff;
 mod drive;
 mod mode;
 mod queue;
+mod reset;
 mod rewind;
 mod steer;
 
 use self::drive::Drive;
 pub use self::queue::Sent;
 pub(crate) use self::queue::session_queue;
+pub(crate) use self::reset::resume_at_reset;
 pub(crate) use self::steer::STEERED_FIELD;
 use crate::checkpoint;
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
@@ -339,6 +341,8 @@ pub struct Turns {
     queues: Mutex<HashMap<SessionId, mpsc::WeakSender<Queued>>>,
     /// Held while a queued message is read, started and removed.
     queue_gate: tokio::sync::Mutex<()>,
+    /// Sessions that resume at the plan reset, and the resumes now waiting.
+    reset: Mutex<reset::ResetState>,
     /// One send with a request id at a time, so a duplicate sees the first answer.
     request_gate: tokio::sync::Mutex<()>,
     /// Codex app-servers between turns, one per session. A turn takes its
@@ -390,6 +394,7 @@ impl Turns {
             backend_ids: Mutex::default(),
             queues: Mutex::default(),
             steers: Mutex::default(),
+            reset: Mutex::default(),
             queue_gate: tokio::sync::Mutex::new(()),
             request_gate: tokio::sync::Mutex::new(()),
             idle: IdlePool::new(MAX_IDLE_SERVERS),
@@ -433,11 +438,17 @@ impl Turns {
     /// not end in time, [`TurnError::Start`] when the backend cannot start,
     /// and [`TurnError::Hub`] when the store refuses.
     pub async fn send(self: &Arc<Self>, params: SessionSendParams) -> Result<Sent, TurnError> {
-        match params.mode {
+        let session = params.session_id.clone();
+        let sent = match params.mode {
             SendMode::Start => self.send_now(params).await.map(Sent::started),
             SendMode::Queue => self.send_queued(params).await,
             SendMode::Steer => self.send_steer(params).await,
+        }?;
+        // A message that waits behind the limit hold starts nothing, so it keeps the wait.
+        if !sent.queued {
+            self.cancel_resume(&session);
         }
+        Ok(sent)
     }
 
     /// Starts a turn with the message of `params`, or refuses when one runs.
@@ -508,7 +519,9 @@ impl Turns {
             .dispatchable(&agent)
             .map_err(|e| TurnError::Agent(e.to_string()))?;
         let prompt = format!("{}\n\n{AGENT_REQUEST_HEADING}\n\n{text}", entry.def.body);
-        self.send_agent(record, text, prompt, true, None).await
+        let turn = self.send_agent(record, text, prompt, true, None).await?;
+        self.cancel_resume(&session_id);
+        Ok(turn)
     }
 
     /// Starts a turn on a delegated backend. `shown` is stored as the user's
@@ -718,6 +731,7 @@ impl Turns {
     /// Cancels the running turn of `session`; `false` when none is running.
     /// A turn whose backend is still starting is cancelled as soon as it can be.
     pub fn cancel(&self, session: &SessionId) -> bool {
+        self.cancel_resume(session);
         match self.running().get_mut(session) {
             Some(reservation) => reservation.request_cancel(CancelHandle::cancel),
             None => self.models.cancel(session),
@@ -727,6 +741,7 @@ impl Turns {
     /// Cancels like [`Self::cancel`], then kills the backend's process group at
     /// once instead of waiting for it to answer the cancel. For a stop that did not take.
     pub async fn force_cancel(&self, session: &SessionId) -> bool {
+        self.cancel_resume(session);
         if !self.running().contains_key(session) {
             return self.models.force_cancel(session);
         }
@@ -753,6 +768,7 @@ impl Turns {
     /// [`TurnError::Ending`] when a cancelled turn does not end in time.
     pub async fn close(&self, session: &SessionId) -> Result<bool, TurnError> {
         self.await_wind_down(session).await?;
+        self.forget_resume(session);
         Ok(self.release(session).await)
     }
 
@@ -770,6 +786,7 @@ impl Turns {
 
     pub async fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
+        self.cancel_all_resumes();
         self.models.shutdown().await;
         for (session, mut child) in self.idle.close() {
             stop(&mut child, &session).await;
@@ -1378,6 +1395,15 @@ impl EventSink {
 impl Emit for EventSink {
     async fn emit(&mut self, event: Event) {
         self.watchdog.observe(&event);
+        if let Event::UsageLimit {
+            turn_id,
+            reset_at: Some(reset_at),
+            ..
+        } = &event
+        {
+            self.turns
+                .note_usage_limit(&self.session, turn_id, *reset_at);
+        }
         if matches!(event, Event::Result { .. } | Event::TurnInterrupted { .. })
             && let Some(reservation) = self.turns.running().get_mut(&self.session)
         {

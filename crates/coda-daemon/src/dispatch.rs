@@ -20,10 +20,10 @@ use coda_protocol::methods::{
     AGENT_RUN, CHECKPOINTS_PRUNE, Capabilities, DAEMON_BACKENDS, DAEMON_PING, DAEMON_SHUTDOWN,
     DAEMON_STATUS, DaemonShutdownResult, GRANT_ADD, INITIALIZE, InitializeParams, InitializeResult,
     PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult, SESSION_CANCEL, SESSION_CLOSE,
-    SESSION_CREATE, SESSION_DIFF, SESSION_LIST, SESSION_QUEUE, SESSION_RESUME, SESSION_REWIND,
-    SESSION_SEND, SESSION_SET_MODE, SESSION_SET_MODEL, SESSION_SHIP, SESSION_SUBSCRIBE,
-    SESSION_WATCH_PR, SESSION_WORKTREE, SessionSubscribeParams, SessionSubscribeResult,
-    USAGE_SUMMARY, WORKTREE_CLEAN,
+    SESSION_CREATE, SESSION_DIFF, SESSION_LIST, SESSION_QUEUE, SESSION_RESUME,
+    SESSION_RESUME_AT_RESET, SESSION_REWIND, SESSION_SEND, SESSION_SET_MODE, SESSION_SET_MODEL,
+    SESSION_SHIP, SESSION_SUBSCRIBE, SESSION_WATCH_PR, SESSION_WORKTREE, SessionSubscribeParams,
+    SessionSubscribeResult, USAGE_SUMMARY, WORKTREE_CLEAN,
 };
 use coda_protocol::types::SessionId;
 use serde::de::DeserializeOwned;
@@ -231,6 +231,7 @@ impl Dispatcher {
             }
             SESSION_SEND => turn::send(self.turns.as_ref(), params).await,
             SESSION_QUEUE => turn::session_queue(self.turns.as_ref(), params).await,
+            SESSION_RESUME_AT_RESET => turn::resume_at_reset(self.turns.as_ref(), params).await,
             AGENT_RUN => turn::run_agent(self.turns.as_ref(), params).await,
             SESSION_CANCEL => turn::cancel(self.turns.as_ref(), params).await,
             SESSION_CLOSE => turn::close(self.turns.as_ref(), params).await,
@@ -363,6 +364,7 @@ fn initialize(params: Option<Value>) -> HandlerFuture {
                 queued_sends: true,
                 steer: true,
                 idempotent_commands: true,
+                resume_at_reset: true,
             },
         })
     })
@@ -436,6 +438,7 @@ mod tests {
         assert_eq!(result["capabilities"]["queued_sends"], json!(true));
         assert_eq!(result["capabilities"]["steer"], json!(true));
         assert_eq!(result["capabilities"]["idempotent_commands"], json!(true));
+        assert_eq!(result["capabilities"]["resume_at_reset"], json!(true));
     }
 
     #[tokio::test]

@@ -15,12 +15,13 @@ use coda_protocol::methods::{
     PingParams, PingResult, SessionAttention, SessionCancelParams, SessionCancelResult,
     SessionCloseParams, SessionCloseResult, SessionCreateParams, SessionCreateResult,
     SessionDiffParams, SessionDiffResult, SessionListParams, SessionListResult, SessionQueueParams,
-    SessionQueueResult, SessionResumeParams, SessionResumeResult, SessionRewindParams,
-    SessionRewindResult, SessionSendParams, SessionSendResult, SessionSetModeParams,
-    SessionSetModeResult, SessionSetModelParams, SessionSetModelResult, SessionShipParams,
-    SessionShipResult, SessionSubscribeParams, SessionSubscribeResult, SessionWatchPrParams,
-    SessionWatchPrResult, SessionWorktreeParams, SessionWorktreeResult, UsageSummaryParams,
-    UsageSummaryResult, WorktreeCleanParams, WorktreeCleanResult,
+    SessionQueueResult, SessionResumeAtResetParams, SessionResumeAtResetResult,
+    SessionResumeParams, SessionResumeResult, SessionRewindParams, SessionRewindResult,
+    SessionSendParams, SessionSendResult, SessionSetModeParams, SessionSetModeResult,
+    SessionSetModelParams, SessionSetModelResult, SessionShipParams, SessionShipResult,
+    SessionSubscribeParams, SessionSubscribeResult, SessionWatchPrParams, SessionWatchPrResult,
+    SessionWorktreeParams, SessionWorktreeResult, UsageSummaryParams, UsageSummaryResult,
+    WorktreeCleanParams, WorktreeCleanResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -105,6 +106,8 @@ golden_tests! {
     session_queue_params: "session.queue.params" => SessionQueueParams,
     session_queue_params_discard: "session.queue.params.discard" => SessionQueueParams,
     session_queue_result: "session.queue.result" => SessionQueueResult,
+    session_resume_at_reset_params: "session.resume_at_reset.params" => SessionResumeAtResetParams,
+    session_resume_at_reset_result: "session.resume_at_reset.result" => SessionResumeAtResetResult,
     agent_run_params: "agent.run.params" => AgentRunParams,
     agent_run_result: "agent.run.result" => AgentRunResult,
     session_cancel_params: "session.cancel.params" => SessionCancelParams,

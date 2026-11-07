@@ -64,6 +64,7 @@ const STASHED: &str = "prompt stashed; press Ctrl+S on an empty prompt to bring 
 const ALREADY_PLANNING: &str = "the session is already in plan mode";
 const NO_LIMITS: &str = "no plan limits reported yet";
 const NO_DIFF: &str = "this daemon cannot show a diff";
+const NO_RESUME_AT_RESET: &str = "this daemon cannot resume a session at the plan reset";
 const NO_CHANGES: &str = "the last turn changed no files";
 const NOT_PLANNING: &str =
     "the session is not in plan mode, so there is no plan to carry out; use /plan first";
@@ -643,6 +644,15 @@ impl App {
                 return;
             }
             Command::Diff => LinkCommand::Diff,
+            Command::ResumeAtReset(_)
+                if self
+                    .capabilities
+                    .is_some_and(|known| !known.resume_at_reset) =>
+            {
+                self.chat.push_notice(NO_RESUME_AT_RESET.to_owned());
+                return;
+            }
+            Command::ResumeAtReset(enabled) => LinkCommand::ResumeAtReset(enabled),
             Command::New => LinkCommand::New,
             Command::Resume(id) => LinkCommand::Resume(id),
             Command::Model(alias) => LinkCommand::SetModel(alias),
@@ -1882,6 +1892,28 @@ mod tests {
         // Assert
         assert_eq!(one, "changed 1 file +1 -0 (/diff)");
         assert_eq!(cut, "changed 2+ files +2 -0 (/diff)");
+    }
+
+    #[test]
+    fn resume_at_reset_asks_the_daemon_when_it_can_and_says_so_when_it_cannot() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        app.handle_event(LinkEvent::Capabilities(Capabilities::default()));
+
+        // Act
+        type_line(&mut app, "/resume-at-reset");
+        let refused = sent(&mut commands);
+        app.handle_event(LinkEvent::Capabilities(Capabilities {
+            resume_at_reset: true,
+            ..Capabilities::default()
+        }));
+        type_line(&mut app, "/resume-at-reset off");
+        let asked = sent(&mut commands);
+
+        // Assert
+        assert!(refused.is_empty(), "{refused:?}");
+        assert!(tall_screen(&app).contains(NO_RESUME_AT_RESET));
+        assert_eq!(asked, vec![LinkCommand::ResumeAtReset(false)]);
     }
 
     #[test]

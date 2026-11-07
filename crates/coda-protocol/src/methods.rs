@@ -27,6 +27,8 @@ pub const SESSION_CREATE: &str = "session.create";
 pub const SESSION_SEND: &str = "session.send";
 /// Lists, resumes or edits the follow-up messages queued behind a running turn.
 pub const SESSION_QUEUE: &str = "session.queue";
+/// Turns on or off continuing a session when the plan window that stopped it resets.
+pub const SESSION_RESUME_AT_RESET: &str = "session.resume_at_reset";
 /// Run a named agent on a prompt in a session of a delegated backend.
 pub const AGENT_RUN: &str = "agent.run";
 /// Cancels the running turn.
@@ -78,6 +80,7 @@ pub const METHODS: &[&str] = &[
     SESSION_CREATE,
     SESSION_SEND,
     SESSION_QUEUE,
+    SESSION_RESUME_AT_RESET,
     AGENT_RUN,
     SESSION_CANCEL,
     SESSION_SUBSCRIBE,
@@ -168,6 +171,9 @@ pub struct Capabilities {
     /// and `session.cancel`.
     #[serde(default)]
     pub idempotent_commands: bool,
+    /// The daemon serves `session.resume_at_reset`.
+    #[serde(default)]
+    pub resume_at_reset: bool,
 }
 
 /// Result of [`INITIALIZE`].
@@ -268,6 +274,24 @@ pub struct SessionSendResult {
     /// The message was added to the running turn, which `turn_id` names.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub steered: bool,
+}
+
+/// Parameters of [`SESSION_RESUME_AT_RESET`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionResumeAtResetParams {
+    /// Target session.
+    pub session_id: SessionId,
+    /// Whether the daemon continues the session when the plan window that stopped
+    /// it resets. The setting is kept in memory, so a daemon restart clears it, and
+    /// it ends a wait that is already running when turned off.
+    pub enabled: bool,
+}
+
+/// Result of [`SESSION_RESUME_AT_RESET`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionResumeAtResetResult {
+    /// The setting after the change.
+    pub enabled: bool,
 }
 
 /// Parameters of [`SESSION_QUEUE`].

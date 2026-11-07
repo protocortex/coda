@@ -12,10 +12,11 @@ use crate::permission::sanitize;
 const SLASH: char = '/';
 const PLAN_SAVE: &str = "save";
 /// The commands the UI itself runs. They win over a command file of the same name.
-const COMMANDS: [&str; 12] = [
+const COMMANDS: [&str; 13] = [
     "sessions",
     "diff",
     "limits",
+    "resume-at-reset",
     "new",
     "resume",
     "model",
@@ -27,7 +28,7 @@ const COMMANDS: [&str; 12] = [
     "quit",
 ];
 /// The built-in commands as `/help` lists them.
-const BUILT_IN_HELP: &str = "Built-in commands: /sessions or Ctrl+K, /new, /resume <id>, /model <alias>, /backend [name], /plan [save <path>], /implement, /diff, /review [target], /limits, /help, /quit";
+const BUILT_IN_HELP: &str = "Built-in commands: /sessions or Ctrl+K, /new, /resume <id>, /model <alias>, /backend [name], /plan [save <path>], /implement, /diff, /review [target], /limits, /resume-at-reset [on|off], /help, /quit";
 
 /// A command the user can type instead of a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,8 @@ pub enum Command {
     Diff,
     /// Show the plan limits the provider last reported.
     Limits,
+    /// Turn on or off continuing the session when the plan window that stopped it resets.
+    ResumeAtReset(bool),
     /// Ask the reviewer agent to review a change; the text is what to review, or empty.
     Review(String),
     /// List the built-in commands and the ones from command files.
@@ -104,6 +107,8 @@ pub enum CommandError {
     MissingPlanPath,
     #[error("/plan takes no argument, or `save <path>`")]
     PlanUsage,
+    #[error("/resume-at-reset takes `on` or `off`, or nothing for on")]
+    ResumeAtResetUsage,
     #[error("{0} takes a single argument; remove the extra words")]
     ExtraArguments(String),
 }
@@ -155,6 +160,11 @@ pub fn parse(line: &str) -> Result<Option<Command>, CommandError> {
         "implement" => Command::Implement,
         "diff" => Command::Diff,
         "limits" => Command::Limits,
+        "resume-at-reset" => match words.next() {
+            None | Some("on") => Command::ResumeAtReset(true),
+            Some("off") => Command::ResumeAtReset(false),
+            Some(_) => return Err(CommandError::ResumeAtResetUsage),
+        },
         "review" => Command::Review(
             line.trim()
                 .strip_prefix(word)
@@ -170,7 +180,8 @@ pub fn parse(line: &str) -> Result<Option<Command>, CommandError> {
             | Command::Backend(_)
             | Command::Implement
             | Command::Diff
-            | Command::Limits,
+            | Command::Limits
+            | Command::ResumeAtReset(_),
             Some(_),
         ) => Err(CommandError::ExtraArguments(word.to_owned())),
         _ => Ok(Some(command)),
@@ -487,6 +498,35 @@ mod tests {
     }
 
     #[test]
+    fn resume_at_reset_takes_on_or_off_and_defaults_to_on() {
+        for (line, expected) in [
+            ("/resume-at-reset", Ok(Some(Command::ResumeAtReset(true)))),
+            (
+                "/resume-at-reset on",
+                Ok(Some(Command::ResumeAtReset(true))),
+            ),
+            (
+                "/resume-at-reset off",
+                Ok(Some(Command::ResumeAtReset(false))),
+            ),
+            (
+                "/resume-at-reset maybe",
+                Err(CommandError::ResumeAtResetUsage),
+            ),
+            (
+                "/resume-at-reset on now",
+                Err(CommandError::ExtraArguments("/resume-at-reset".to_owned())),
+            ),
+        ] {
+            // Arrange / Act
+            let parsed = parse(line);
+
+            // Assert
+            assert_eq!(parsed, expected, "{line}");
+        }
+    }
+
+    #[test]
     fn plan_and_implement_take_no_arguments() {
         for (line, expected) in [
             ("/plan", Ok(Some(Command::Plan))),
@@ -592,7 +632,9 @@ mod tests {
                 matches!(parsed, Ok(Some(_)))
                     || matches!(
                         parsed,
-                        Err(CommandError::ExtraArguments(_) | CommandError::PlanUsage)
+                        Err(CommandError::ExtraArguments(_)
+                            | CommandError::PlanUsage
+                            | CommandError::ResumeAtResetUsage)
                     ),
                 "{name} is in COMMANDS but parse does not know it: {parsed:?}"
             );
