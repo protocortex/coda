@@ -318,7 +318,13 @@ async fn running_session(client: &Client) -> Option<SessionId> {
 
 async fn cancel(client: &Client, session_id: SessionId) -> SessionCancelResult {
     client
-        .request(SESSION_CANCEL, &SessionCancelParams { session_id })
+        .request(
+            SESSION_CANCEL,
+            &SessionCancelParams {
+                session_id,
+                force: false,
+            },
+        )
         .await
         .unwrap()
 }

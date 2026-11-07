@@ -2,6 +2,7 @@
 
 //! Terminal UI for coda.
 
+pub mod activity;
 pub mod app;
 pub mod chat;
 pub mod commands;

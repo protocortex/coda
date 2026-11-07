@@ -1997,6 +1997,32 @@ async fn a_send_right_after_a_cancel_waits_for_a_codex_turn_to_end() {
     assert!(waited >= IGNORED_INTERRUPT_WAIT, "{waited:?}");
 }
 
+#[tokio::test]
+async fn a_forced_cancel_kills_a_codex_server_that_ignores_the_interrupt() {
+    // Arrange
+    let mut rig = codex_rig(&json!({"ignore_interrupt": true}));
+    rig.send("please stall").await;
+    rig.wait_for_prompts(1).await;
+    let session = rig.session.clone();
+
+    // Act
+    let cancelled = rig
+        .call(
+            "session.cancel",
+            json!({"session_id": session, "force": true}),
+        )
+        .await;
+    let started = Instant::now();
+    let sent = rig.send("again").await;
+    let waited = started.elapsed();
+    rig.wait_until_turn_over().await;
+
+    // Assert
+    assert_eq!(cancelled["result"]["cancelled"], true);
+    assert!(sent["result"]["turn_id"].is_string(), "{sent}");
+    assert!(waited < IGNORED_INTERRUPT_WAIT, "{waited:?}");
+}
+
 /// Closes a session whose reservation no turn task will ever release, and
 /// returns the response with the virtual time the close waited.
 async fn close_with_a_stuck_reservation(stuck: Reservation<CancelHandle>) -> (Value, Duration) {
