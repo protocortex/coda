@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use coda_protocol::events::{RateLimit, RateLimitWindow};
-use coda_protocol::types::{PermissionDecision, TokenUsage};
+use coda_protocol::types::{ContextFill, PermissionDecision, TokenUsage};
 use serde_json::{Value, json};
 
 use crate::jsonl::{DiagnosticLog, Framed, LineFramer, bounded};
@@ -59,6 +59,9 @@ pub enum Message {
     },
     /// The tokens the finished turn used; arrives just before its [`Message::Result`].
     Usage(TokenUsage),
+    /// How full the context was at the turn's last model call; arrives just before
+    /// its [`Message::Usage`], and only when the result names the model's window.
+    Context(ContextFill),
     /// Claude Code reported the state of the plan's rate limits.
     RateLimit(RateLimit),
     /// Claude Code asks permission to run a tool.
@@ -300,18 +303,63 @@ fn tool_markers(value: &Value) -> Vec<Message> {
         .collect()
 }
 
-fn result_usage(value: &Value) -> Option<Message> {
+fn result_usage(value: &Value) -> Vec<Message> {
     if value["type"] != "result" {
-        return None;
+        return Vec::new();
     }
-    let usage = value["usage"].as_object()?;
+    let Some(usage) = value["usage"].as_object() else {
+        return Vec::new();
+    };
     let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-    Some(Message::Usage(TokenUsage {
+    let total = TokenUsage {
         input_tokens: count("input_tokens"),
         output_tokens: count("output_tokens"),
         cache_read_tokens: count("cache_read_input_tokens"),
         cache_write_tokens: count("cache_creation_input_tokens"),
-    }))
+    };
+    let mut messages: Vec<Message> = context_fill(value, total)
+        .map(Message::Context)
+        .into_iter()
+        .collect();
+    messages.push(Message::Usage(total));
+    messages
+}
+
+/// How full the context was. The result's `usage` adds up every model call of the
+/// turn, so the last entry of `iterations` is read when there is one. The window
+/// is the largest `contextWindow` among the models that ran.
+fn context_fill(result: &Value, total: TokenUsage) -> Option<ContextFill> {
+    let window = result["modelUsage"]
+        .as_object()?
+        .values()
+        .filter_map(|model| model["contextWindow"].as_u64())
+        .filter_map(|window| u32::try_from(window).ok())
+        .max()
+        .filter(|window| *window > 0)?;
+    let held = |usage: &Value| {
+        [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .map(|key| usage[key].as_u64().unwrap_or(0))
+        .fold(0_u64, u64::saturating_add)
+    };
+    let used_tokens = match result["usage"]["iterations"]
+        .as_array()
+        .and_then(|calls| calls.last())
+    {
+        Some(last) => held(last),
+        None => total
+            .input_tokens
+            .saturating_add(total.cache_read_tokens)
+            .saturating_add(total.cache_write_tokens),
+    };
+    Some(ContextFill {
+        used_tokens,
+        window_tokens: window,
+    })
 }
 
 /// Reads a rate-limit report; `unusable` collects what was present but could not be read.
@@ -606,6 +654,81 @@ mod tests {
             messages,
             vec![Message::Usage(usage), Message::Result { is_error: false }]
         );
+    }
+
+    #[test]
+    fn a_result_with_a_window_reports_the_last_calls_context_before_its_usage() {
+        // Arrange
+        let mut parser = StreamParser::new();
+        let result = r#"{"type":"result","is_error":false,"usage":{"input_tokens":3,"output_tokens":11,"iterations":[{"input_tokens":2,"cache_read_input_tokens":1000,"cache_creation_input_tokens":40},{"input_tokens":1,"cache_read_input_tokens":2000,"cache_creation_input_tokens":9}]},"modelUsage":{"m":{"contextWindow":200000}}}"#;
+
+        // Act
+        let messages = feed_lines(&mut parser, &[result]);
+
+        // Assert
+        let fill = ContextFill {
+            used_tokens: 2010,
+            window_tokens: 200_000,
+        };
+        assert!(
+            matches!(messages.as_slice(), [Message::Context(found), Message::Usage(_), Message::Result { .. }] if *found == fill),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn without_iterations_the_context_is_the_turns_input_and_cache() {
+        // Arrange
+        let mut parser = StreamParser::new();
+        let result = r#"{"type":"result","is_error":false,"usage":{"input_tokens":3,"cache_creation_input_tokens":5,"cache_read_input_tokens":7,"output_tokens":11},"modelUsage":{"m":{"contextWindow":1000000}}}"#;
+
+        // Act
+        let messages = feed_lines(&mut parser, &[result]);
+
+        // Assert
+        let fill = ContextFill {
+            used_tokens: 15,
+            window_tokens: 1_000_000,
+        };
+        assert_eq!(messages[0], Message::Context(fill));
+    }
+
+    #[test]
+    fn the_largest_window_of_the_models_that_ran_is_used() {
+        // Arrange
+        let mut parser = StreamParser::new();
+        let result = r#"{"type":"result","is_error":false,"usage":{"input_tokens":1},"modelUsage":{"a":{"contextWindow":200000},"b":{"contextWindow":1000000},"c":{}}}"#;
+
+        // Act
+        let messages = feed_lines(&mut parser, &[result]);
+
+        // Assert
+        assert!(matches!(&messages[0], Message::Context(fill) if fill.window_tokens == 1_000_000));
+    }
+
+    #[test]
+    fn a_missing_or_zero_window_adds_no_context_message() {
+        for model_usage in [
+            r#""modelUsage":{"m":{}}"#,
+            r#""modelUsage":{"m":{"contextWindow":0}}"#,
+            r#""modelUsage":{}"#,
+            r#""other":1"#,
+        ] {
+            // Arrange
+            let mut parser = StreamParser::new();
+            let result = format!(
+                r#"{{"type":"result","is_error":false,"usage":{{"input_tokens":1}},{model_usage}}}"#
+            );
+
+            // Act
+            let messages = feed_lines(&mut parser, &[&result]);
+
+            // Assert
+            assert!(
+                !messages.iter().any(|m| matches!(m, Message::Context(_))),
+                "{model_usage}"
+            );
+        }
     }
 
     #[test]

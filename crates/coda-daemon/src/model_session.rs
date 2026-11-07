@@ -35,7 +35,7 @@ use coda_protocol::events::{
     tool_summary,
 };
 use coda_protocol::types::{
-    BackendKind, OriginalId, PermissionDecision, SessionId, TokenUsage, TurnId,
+    BackendKind, ContextFill, OriginalId, PermissionDecision, SessionId, TokenUsage, TurnId,
 };
 use coda_providers::faux::{FauxError, FauxProvider};
 use coda_providers::model::{ModelProvider, ModelRequest, ModelStream, ProviderError};
@@ -1179,6 +1179,7 @@ async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Ro
         },
         TurnEvent::Text(_)
         | TurnEvent::Usage(_)
+        | TurnEvent::Context { .. }
         | TurnEvent::SessionStarted
         | TurnEvent::HookBlocked { .. }
         | TurnEvent::GuardContinued { .. }
@@ -1200,6 +1201,8 @@ struct StreamedText {
     text: String,
     /// When the oldest unstored chunk was held; `None` while nothing is held.
     since: Option<tokio::time::Instant>,
+    /// How full the context was at the call whose usage comes next.
+    context: Option<ContextFill>,
 }
 
 impl StreamedText {
@@ -1210,10 +1213,22 @@ impl StreamedText {
         turn: &TurnId,
         event: TurnEvent,
     ) {
+        if let TurnEvent::Context {
+            used_tokens,
+            window_tokens,
+        } = event
+        {
+            self.context = Some(ContextFill {
+                used_tokens,
+                window_tokens,
+            });
+            return;
+        }
         let TurnEvent::Text(chunk) = event else {
             self.flush(hub, session, turn).await;
             let calls = self.tool_calls(session, turn, &event);
-            publish_turn_event(hub, session, turn, event).await;
+            let context = self.context.take();
+            publish_turn_event(hub, session, turn, event, context).await;
             for call in calls {
                 log_failure(store_event(hub, session, turn, &call).await);
             }
@@ -1280,11 +1295,17 @@ impl StreamedText {
             return;
         }
         let text = std::mem::take(&mut self.text);
-        publish_turn_event(hub, session, turn, TurnEvent::Text(text)).await;
+        publish_turn_event(hub, session, turn, TurnEvent::Text(text), None).await;
     }
 }
 
-async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, event: TurnEvent) {
+async fn publish_turn_event(
+    hub: &Arc<Hub>,
+    session: &SessionId,
+    turn: &TurnId,
+    event: TurnEvent,
+    context: Option<ContextFill>,
+) {
     if let Row::Stored { kind, body } = event_row(hub, session, &event).await {
         log_failure(publish_kind(hub, session, turn, kind, &body).await);
         return;
@@ -1307,6 +1328,7 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
                     output_tokens: used.output_tokens,
                     ..TokenUsage::default()
                 },
+                context,
             };
             store_event(hub, session, turn, &usage).await
         }
@@ -1366,8 +1388,9 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
             ack.confirm(stored.is_ok());
             stored
         }
-        // Stored above, as plain rows.
-        TurnEvent::Assistant { .. }
+        // Stored above, as plain rows, or held by `StreamedText` for the usage that follows.
+        TurnEvent::Context { .. }
+        | TurnEvent::Assistant { .. }
         | TurnEvent::ToolFinished { .. }
         | TurnEvent::ContextOverflow
         | TurnEvent::ModelFallback { .. }

@@ -582,6 +582,7 @@ impl CodexExecSession {
                     session_id: session_id.clone(),
                     turn_id: turn_id.clone(),
                     usage,
+                    context: None,
                 })
                 .await;
                 emit.emit(Event::Result {

@@ -134,6 +134,7 @@ golden_tests! {
     event_timeout: "event.timeout" => Event,
     event_result: "event.result" => Event,
     event_usage: "event.usage" => Event,
+    event_usage_context: "event.usage.context" => Event,
     event_approvals_unavailable: "event.approvals_unavailable" => Event,
     event_history_not_restored: "event.history_not_restored" => Event,
     event_stream_delta: "event.stream_delta" => Event,

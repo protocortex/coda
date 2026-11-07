@@ -13,7 +13,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use coda_protocol::events::{Event, ToolCallStatus};
-use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
+use coda_protocol::types::{
+    ContextFill, PermissionDecision, RequestId, SessionId, TokenUsage, TurnId,
+};
 use coda_providers::claude_session::{CancelHandle, ENV_ALLOWLIST, TurnOutcome};
 use coda_providers::codex_app_server::{AppServerError, AppServerSpec, CodexAppServerSession};
 use coda_providers::codex_exec::SandboxMode;
@@ -218,6 +220,10 @@ async fn a_turn_maps_app_server_notifications_to_coda_events() {
                     cache_read_tokens: 100,
                     cache_write_tokens: 0,
                 },
+                context: Some(ContextFill {
+                    used_tokens: 120,
+                    window_tokens: 258_400,
+                }),
             },
             Event::Result {
                 session_id,

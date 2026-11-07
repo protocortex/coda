@@ -1186,6 +1186,7 @@ async fn a_prompt_canary_is_stored_as_content_and_never_in_logs_usage_or_spans()
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         },
+        context: None,
     };
     super::store_event(&rig.hub, &rig.session, &turn, &usage)
         .await

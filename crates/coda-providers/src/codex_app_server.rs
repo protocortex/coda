@@ -29,7 +29,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use coda_protocol::events::{Event, InterruptCause};
-use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
+use coda_protocol::types::{
+    ContextFill, PermissionDecision, RequestId, SessionId, TokenUsage, TurnId,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -292,6 +294,8 @@ pub struct CodexAppServerSession {
     tool_calls: ToolCalls,
     /// The server's id for the turn in flight, which `turn/interrupt` names.
     server_turn: Option<String>,
+    /// How full the context was after the turn's last model call.
+    context: Option<ContextFill>,
     /// Whether the server accepted the last `turn/start`.
     turn_accepted: bool,
     /// Messages that arrived while an approval was pending.
@@ -353,6 +357,7 @@ impl CodexAppServerSession {
             next_id: 0,
             items: HashMap::new(),
             server_turn: None,
+            context: None,
             turn_accepted: false,
             queued: VecDeque::new(),
             closed: false,
@@ -514,6 +519,7 @@ impl CodexAppServerSession {
         let turn_request = self.send_request("turn/start", params).await?;
         self.server_turn = None;
         let mut usage = None;
+        self.context = None;
         // Set once a `cancel` answer promised that the server ends the turn.
         let mut deadline: Option<Instant> = None;
         loop {
@@ -622,7 +628,10 @@ impl CodexAppServerSession {
                     }
                 }
             }
-            "thread/tokenUsage/updated" => add_usage(usage, &params["tokenUsage"]["last"]),
+            "thread/tokenUsage/updated" => {
+                add_usage(usage, &params["tokenUsage"]["last"]);
+                self.context = context_of(&params["tokenUsage"]);
+            }
             "turn/completed" => {
                 let is_error = params["turn"]["status"] != "completed";
                 if let Some(usage) = usage.take() {
@@ -630,6 +639,7 @@ impl CodexAppServerSession {
                         session_id: self.session_id.clone(),
                         turn_id: turn_id.clone(),
                         usage,
+                        context: self.context.take(),
                     })
                     .await;
                 }
@@ -1089,6 +1099,18 @@ fn add_usage(total: &mut Option<TokenUsage>, last: &Value) {
     });
 }
 
+/// How full the context was after the last call of `token_usage`. Codex counts
+/// the cached tokens inside `inputTokens`.
+fn context_of(token_usage: &Value) -> Option<ContextFill> {
+    let window = u32::try_from(token_usage["modelContextWindow"].as_u64()?)
+        .ok()
+        .filter(|window| *window > 0)?;
+    Some(ContextFill {
+        used_tokens: token_usage["last"]["inputTokens"].as_u64()?,
+        window_tokens: window,
+    })
+}
+
 fn usage_of(usage: &Value) -> TokenUsage {
     let count = |key: &str| usage[key].as_u64().unwrap_or(0);
     TokenUsage {
@@ -1128,6 +1150,40 @@ mod tests {
     /// Server messages of the live approval run, in order.
     fn live_received() -> Vec<Value> {
         live_messages(LIVE_ACCEPT, "recv")
+    }
+    #[test]
+    fn the_live_token_report_says_how_full_the_context_is() {
+        // Arrange
+        let received = live_received();
+        let report = received
+            .iter()
+            .rfind(|message| message["method"] == "thread/tokenUsage/updated")
+            .expect("no token report in the fixture");
+
+        // Act
+        let fill = context_of(&report["params"]["tokenUsage"]);
+
+        // Assert
+        assert_eq!(
+            fill,
+            Some(ContextFill {
+                used_tokens: 14805,
+                window_tokens: 258_400
+            })
+        );
+    }
+
+    #[test]
+    fn a_token_report_without_a_window_or_a_count_says_nothing_about_the_context() {
+        // Arrange
+        let no_window = json!({"last": {"inputTokens": 5}});
+        let zero_window = json!({"last": {"inputTokens": 5}, "modelContextWindow": 0});
+        let no_count = json!({"last": {}, "modelContextWindow": 1000});
+
+        // Act and Assert
+        assert_eq!(context_of(&no_window), None);
+        assert_eq!(context_of(&zero_window), None);
+        assert_eq!(context_of(&no_count), None);
     }
 
     #[test]

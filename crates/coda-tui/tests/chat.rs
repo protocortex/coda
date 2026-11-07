@@ -91,6 +91,7 @@ fn streamed_deltas_and_usage_reach_the_screen_through_the_event_channel() {
                 output_tokens: 34,
                 ..TokenUsage::default()
             },
+            context: None,
         }))
         .unwrap();
     let mut keys = Keys::codes([KeyCode::Char('h')]);

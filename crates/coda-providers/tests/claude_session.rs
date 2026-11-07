@@ -14,7 +14,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use coda_protocol::events::{Event, InterruptCause, ToolCallStatus, UsageWindowKind};
-use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
+use coda_protocol::types::{
+    ContextFill, PermissionDecision, RequestId, SessionId, TokenUsage, TurnId,
+};
 use coda_providers::claude_code::Diagnostic;
 use coda_providers::claude_session::{
     AdapterError, CancelHandle, ClaudeSession, SessionSpec, TurnOutcome,
@@ -204,6 +206,10 @@ async fn usage_and_rate_limit_reports_become_events() {
             cache_read_tokens: 7,
             cache_write_tokens: 5,
         },
+        context: Some(ContextFill {
+            used_tokens: 8,
+            window_tokens: 200_000,
+        }),
     };
     assert!(events.contains(&usage));
     let limit = events.iter().find_map(|event| match event {

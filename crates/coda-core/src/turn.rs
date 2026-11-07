@@ -213,6 +213,14 @@ pub enum TurnEvent {
         /// What was done.
         how: Recovery,
     },
+    /// How full the model's context was at a call, sent just before that call's
+    /// [`TurnEvent::Usage`] and only when the model's window is known.
+    Context {
+        /// Tokens the call held in its context.
+        used_tokens: u64,
+        /// The most the model's context can hold.
+        window_tokens: u32,
+    },
     /// A marker, not an event. Whoever reads the channel answers it once every
     /// event sent before it is stored, so the sender can write after them.
     Fence(FenceAck),
@@ -1075,6 +1083,12 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         // Tokens were spent even when the stream failed or was cancelled.
         if let Some(usage) = draft.usage {
             self.budget.record(usage);
+            if let Some(window_tokens) = self.context_window {
+                self.emit(TurnEvent::Context {
+                    used_tokens: usage.input_tokens,
+                    window_tokens,
+                });
+            }
             self.emit(TurnEvent::Usage(usage));
         }
         Attempt {
@@ -1917,6 +1931,7 @@ mod tests {
     const GOLDEN: &str = include_str!("../tests/golden/prefix.json");
     const BOUND: Duration = Duration::from_secs(10);
     const POLL: Duration = Duration::from_millis(20);
+    const CONTEXT_WINDOW: u32 = 200_000;
     const SMALL_USAGE: Usage = Usage {
         input_tokens: 1,
         output_tokens: 1,
@@ -2845,6 +2860,57 @@ mod tests {
             }
         }
         assert_eq!(usages, vec![first, SMALL_USAGE]);
+    }
+
+    #[tokio::test]
+    async fn a_model_call_reports_how_full_the_context_was_just_before_its_usage() {
+        // Arrange
+        let fixture = Fixture::new();
+        let used = Usage {
+            input_tokens: 4_000,
+            output_tokens: 7,
+        };
+        let reply = stop_turn("ok", StopReason::EndTurn, used);
+        let (lp, mut events) = fixture.allowing(vec![reply], canned(None));
+        let mut lp = lp.with_context_window(Some(CONTEXT_WINDOW));
+
+        // Act
+        lp.send("go").await.unwrap();
+
+        // Assert
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                TurnEvent::Context {
+                    used_tokens,
+                    window_tokens,
+                } => seen.push(format!("context {used_tokens} of {window_tokens}")),
+                TurnEvent::Usage(_) => seen.push("usage".to_owned()),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                format!("context 4000 of {CONTEXT_WINDOW}"),
+                "usage".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loop_with_no_known_window_reports_no_context() {
+        // Arrange
+        let fixture = Fixture::new();
+        let (mut lp, mut events) = fixture.allowing(vec![end_turn("ok")], canned(None));
+
+        // Act
+        lp.send("go").await.unwrap();
+
+        // Assert
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, TurnEvent::Context { .. }), "{event:?}");
+        }
     }
 
     #[tokio::test]

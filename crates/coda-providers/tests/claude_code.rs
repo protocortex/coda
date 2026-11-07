@@ -27,6 +27,7 @@ fn kinds(messages: &[Message]) -> Vec<&'static str> {
             Message::ToolFinished { .. } => "tool-end",
             Message::Result { .. } => "result",
             Message::Usage(_) => "usage",
+            Message::Context(_) => "context",
             Message::RateLimit(_) => "rate-limit",
             Message::PermissionRequest(_) => "ask",
             Message::InvalidPermissionRequest { .. } => "invalid",

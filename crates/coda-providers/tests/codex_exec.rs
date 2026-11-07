@@ -157,6 +157,7 @@ async fn a_turn_maps_codex_events_to_coda_events() {
                     cache_read_tokens: 100,
                     cache_write_tokens: 7,
                 },
+                context: None,
             },
             Event::Result {
                 session_id,

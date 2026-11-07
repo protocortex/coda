@@ -167,6 +167,19 @@ A different argument or a changed result starts the count again, so a poll whose
 | --- | --- | --- | --- |
 | `notify` | string | `"bell"` | What the terminal UI writes to the terminal when a turn ends or a new approval or question waits while the terminal does not have focus. `"off"` writes nothing, `"bell"` rings the bell, `"osc9"` sends an OSC 9 desktop notification (iTerm2 and others) and `"osc777"` an OSC 777 one (VTE terminals and others). A terminal that does not report focus changes never gets one, and the UI counts the terminal as focused until it hears otherwise. It also rings when the backend crashes for good or the link to the daemon drops during a turn. Under tmux, focus reports and OSC 9 or 777 need `set -g focus-events on` and `set -g allow-passthrough on`. |
 
+### Context meter
+
+The status line shows `ctx 41% of 200k` once the terminal UI knows how full the model's context is and how big its window is. It is the share of the window that the last model call held, counting cached input, and it is not a running total, so it falls after a compaction. A `usage` event carries it in an optional `context` object (`used_tokens` and `window_tokens`). The terminal UI keeps the last one, and a `usage` event without one (a sub-agent's or a compaction's) leaves the meter as it was. The share rounds down and the window is cut to whole thousands or millions. A percentage over 100 shows as 100%.
+
+Where each backend gets it:
+
+- Claude Code: `used_tokens` is the last call of the turn, the last entry of `usage.iterations` of the result (input plus cache read plus cache write), or the whole turn's input and cache when the result has no `iterations`. `window_tokens` is the largest `contextWindow` in the result's `modelUsage`.
+- Codex app server: `used_tokens` is the `inputTokens` of the last call, which already counts cached tokens, and `window_tokens` is `modelContextWindow` of the token report.
+- Model-API sessions (`anthropic`, `openai_compat`, `faux`): `used_tokens` is the input of the call, cache included, and `window_tokens` is the model's `context_window`, built in or set in `[models.<alias>]`. It is the window of the model that answered, so a fallback model shows its own.
+- Codex `exec`: no meter, because its report has no window.
+
+A model with no known window shows no meter. A sub-agent's calls and the calls of a compaction do not move the meter. For Claude Code the window is the largest among the models that ran, so a sub-agent on a larger model can raise it.
+
 ## `[review]`
 
 | Key | Type | Default | Notes |
