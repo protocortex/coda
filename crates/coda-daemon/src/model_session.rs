@@ -50,6 +50,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::{Instrument, Span, info, warn};
 
+use crate::checkpoint;
 use crate::gate::{BrokerGate, Brokers};
 use crate::idle_pool::IdlePool;
 use crate::subscribe::{Hub, HubError};
@@ -1021,6 +1022,7 @@ async fn close_turn(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, failed: 
     };
     log_failure(store_event(hub, session, turn, &result).await);
     Turns::finish(hub, session, turn, failed).await;
+    checkpoint::after_turn(hub, session, turn).await;
 }
 
 /// The schema of the skill tool: the index is its description, and only the

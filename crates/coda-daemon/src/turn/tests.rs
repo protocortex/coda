@@ -68,6 +68,7 @@ fn relaxed() -> Timing {
     timing(20_000, 20_000)
 }
 
+mod checkpoints;
 mod restarts;
 mod resume;
 

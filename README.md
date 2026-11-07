@@ -193,6 +193,10 @@ The permission broker decides tool requests in three modes: `prompt`, `accept-ed
 
 For delegated sessions the broker is not authoritative for tools that Claude Code auto-allows through its own settings.
 
+## Checkpoints
+
+When a session's folder is inside a git repository, Coda snapshots the working tree before the first turn and after every turn, for every backend. A snapshot holds tracked and untracked files and leaves out what `.gitignore` excludes. It is a commit built from a scratch copy of the index and kept only under a private ref, `refs/coda/checkpoints/<session>/<turn>` (`base` for the snapshot before the first turn). Your index, `HEAD` and branches are never touched, and `git log`, `git branch` and `git status` do not show it. The refs are stored on the turn rows, and a failed snapshot is logged and never stops a turn. A folder that is not a repository gets none.
+
 ## Upgrades and the database
 
 Every database migration is tied to the release that introduced it. A database written by a newer release is refused, not guessed at. Move to a newer release, not back to an older one.
