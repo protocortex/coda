@@ -252,7 +252,8 @@ impl Rebuild {
     ) -> Result<Option<u64>, StoreError> {
         let lookup = |id: &OriginalId| store.load_original(session, id).ok().flatten();
         let page = store.load_events(session, after, PAGE_SIZE)?;
-        for event in &page {
+        let rolled_back = store.rolled_back_turns(session)?;
+        for event in page.iter().filter(|e| !rolled_back.contains(&e.turn)) {
             self.apply(event, &lookup);
         }
         Ok(next_after(&page))

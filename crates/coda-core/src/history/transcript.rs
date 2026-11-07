@@ -99,7 +99,8 @@ impl Transcript {
         after: u64,
     ) -> Result<Option<u64>, StoreError> {
         let page = store.load_events(session, after, super::PAGE_SIZE)?;
-        for event in &page {
+        let rolled_back = store.rolled_back_turns(session)?;
+        for event in page.iter().filter(|e| !rolled_back.contains(&e.turn)) {
             self.apply(event);
         }
         Ok(next_after(&page))
