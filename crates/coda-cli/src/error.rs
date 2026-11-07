@@ -83,6 +83,8 @@ pub enum CliError {
         name: String,
         source: coda_agents::ExpandError,
     },
+    #[error("scheduled prompt: {0}")]
+    Schedule(String),
     #[error("no session has the id {id}")]
     SessionNotFound { id: String },
     #[error("the connection to the daemon was lost before the run ended")]

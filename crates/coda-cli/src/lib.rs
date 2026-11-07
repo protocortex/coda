@@ -24,6 +24,7 @@ mod review_memory;
 mod review_post;
 mod review_route;
 mod run;
+mod schedule_cmd;
 mod session;
 mod size;
 mod status;
@@ -88,6 +89,9 @@ async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<ExitCode, C
         Some(Command::Describe(args)) => return describe::run(ctx, io, args).await,
         Some(Command::Changelog(args)) => return changelog::run(ctx, io, args).await,
         Some(Command::Hooks(command)) => return hooks_cmd::run(ctx, io, &command),
+        Some(Command::Schedule(command)) => {
+            return schedule_cmd::run(ctx, io, force, command).await;
+        }
         Some(Command::Session(command)) => return session::run(ctx, io, force, command).await,
         None if ctx.is_tty => tui_cmd::open(ctx, io, force).await,
         None => status::start(ctx, io, force).await,

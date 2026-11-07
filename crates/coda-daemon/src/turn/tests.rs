@@ -81,6 +81,7 @@ mod reset;
 mod restarts;
 mod resume;
 mod rewind;
+mod schedule;
 mod steer;
 
 struct Rig {
