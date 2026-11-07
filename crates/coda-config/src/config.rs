@@ -21,7 +21,9 @@ use crate::review::{
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
 use crate::tui::TuiConfig;
-use crate::worktree::{DIR_KEY, SETUP_KEY, WORKTREE_KEY, WorktreeConfig};
+use crate::worktree::{
+    CLEAN_COMMAND_KEY, CLEANUP_KEY, DIR_KEY, IDLE_DAYS_KEY, SETUP_KEY, WORKTREE_KEY, WorktreeConfig,
+};
 
 /// Output limit of a model request when `max_output_tokens` is unset.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
@@ -604,6 +606,19 @@ impl Config {
         if worktree.setup.first().is_some_and(String::is_empty) {
             return Err(ConfigError::InvalidValue {
                 path: format!("{WORKTREE_KEY}.{SETUP_KEY}"),
+                allowed: "a program name first, then its arguments".to_owned(),
+            });
+        }
+        let cleanup = &worktree.cleanup;
+        if cleanup.idle_days == 0 {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{WORKTREE_KEY}.{CLEANUP_KEY}.{IDLE_DAYS_KEY}"),
+                allowed: "a whole number of days above 0".to_owned(),
+            });
+        }
+        if cleanup.clean_command.first().is_some_and(String::is_empty) {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{WORKTREE_KEY}.{CLEANUP_KEY}.{CLEAN_COMMAND_KEY}"),
                 allowed: "a program name first, then its arguments".to_owned(),
             });
         }
@@ -1378,6 +1393,47 @@ bots = true
         );
         assert_eq!(parsed.config.worktree.setup, ["npm", "install"]);
         assert_eq!(parsed.unknown_keys, Vec::<String>::new());
+    }
+
+    #[test]
+    fn worktree_cleanup_is_off_by_default_and_read_from_the_file() {
+        // Arrange
+        let text = "[worktree.cleanup]\nenabled = true\nidle_days = 3\nclean_command = [\"cargo\", \"clean\"]\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config.worktree.cleanup;
+        let read = Config::from_toml_str(text).unwrap().config.worktree.cleanup;
+
+        // Assert
+        assert!(!default.enabled);
+        assert_eq!(default.idle_days, 14);
+        assert_eq!(default.clean_command, Vec::<String>::new());
+        assert!(read.enabled);
+        assert_eq!(read.idle_days, 3);
+        assert_eq!(read.clean_command, ["cargo", "clean"]);
+    }
+
+    #[test]
+    fn a_zero_idle_period_or_an_empty_clean_program_is_rejected() {
+        // Arrange
+        let cases = [
+            (
+                "[worktree.cleanup]\nidle_days = 0\n",
+                "worktree.cleanup.idle_days",
+            ),
+            (
+                "[worktree.cleanup]\nclean_command = [\"\"]\n",
+                "worktree.cleanup.clean_command",
+            ),
+        ];
+
+        for (text, key) in cases {
+            // Act
+            let err = Config::from_toml_str(text).unwrap_err();
+
+            // Assert
+            assert!(err.to_string().contains(key), "{err}");
+        }
     }
 
     #[test]

@@ -22,7 +22,7 @@ use coda_protocol::methods::{
     PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult, SESSION_CANCEL, SESSION_CLOSE,
     SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_REWIND, SESSION_SEND, SESSION_SET_MODE,
     SESSION_SET_MODEL, SESSION_SUBSCRIBE, SESSION_WORKTREE, SessionSubscribeParams,
-    SessionSubscribeResult, USAGE_SUMMARY,
+    SessionSubscribeResult, USAGE_SUMMARY, WORKTREE_CLEAN,
 };
 use coda_protocol::types::SessionId;
 use serde::de::DeserializeOwned;
@@ -172,6 +172,18 @@ impl Dispatcher {
             SESSION_RESUME => session_rpc::resume(self.hub.as_ref(), params).await,
             SESSION_WORKTREE => {
                 session_rpc::worktree(self.hub.as_ref(), self.worktrees.as_ref(), params).await
+            }
+            WORKTREE_CLEAN => {
+                let turns = self.turns.clone();
+                let running =
+                    move |id: &SessionId| turns.as_ref().is_some_and(|t| t.is_running(id));
+                session_rpc::clean_worktrees(
+                    self.hub.as_ref(),
+                    self.worktrees.as_ref(),
+                    running,
+                    params,
+                )
+                .await
             }
             SESSION_LIST => {
                 let turns = self.turns.as_ref();

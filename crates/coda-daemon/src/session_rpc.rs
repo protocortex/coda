@@ -12,7 +12,7 @@ use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, INVALID_PARAMS, METHOD
 use coda_protocol::methods::{
     SessionCreateParams, SessionCreateResult, SessionListParams, SessionListResult,
     SessionResumeParams, SessionResumeResult, SessionStatus, SessionSummary, SessionWorktreeParams,
-    SessionWorktreeResult, WORKTREE_REFUSED_CODE,
+    SessionWorktreeResult, WORKTREE_REFUSED_CODE, WorktreeCleanParams,
 };
 use coda_protocol::types::{SessionId, SessionInfo};
 use coda_store::{
@@ -27,6 +27,7 @@ use crate::subscribe::{Hub, HubError};
 use crate::trace::session_span;
 use crate::turn::SESSION_NOT_FOUND;
 use crate::worktree::{Worktrees, remove_made};
+use crate::worktree_clean::{Probes, clean, pull_request_merged};
 
 pub(crate) fn info(record: SessionRecord) -> SessionInfo {
     SessionInfo {
@@ -211,6 +212,51 @@ pub(crate) async fn ensure_checkout(
     blocking_worktree(move || trees.restore(&id, &recorded)).await
 }
 
+/// Answers `worktree.clean`: reports every worktree coda made and what cleanup
+/// would do, and removes the removable ones only when `apply` is set and
+/// `[worktree.cleanup] enabled` is on.
+pub(crate) async fn clean_worktrees(
+    hub: Option<&Arc<Hub>>,
+    trees: Option<&Arc<Worktrees>>,
+    running: impl Fn(&SessionId) -> bool + Send + 'static,
+    params: Option<Value>,
+) -> HandlerResult {
+    let hub = hub.ok_or_else(unavailable)?;
+    let trees = trees.ok_or_else(unavailable)?;
+    let params: WorktreeCleanParams = parse_params(params)?;
+    if params.apply && !trees.cleanup().enabled {
+        return Err(refused(
+            "worktree cleanup is off; set `enabled = true` under [worktree.cleanup] to allow it",
+        ));
+    }
+    let rows = hub
+        .with_store(coda_store::Store::worktree_sessions)
+        .await
+        .map_err(failed)?;
+    let trees = Arc::clone(trees);
+    let done = tokio::task::spawn_blocking(move || {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+            });
+        let probes = Probes {
+            now_ms,
+            running: &running,
+            merged: &pull_request_merged,
+        };
+        clean(&trees, &rows, trees.cleanup(), &probes, params.apply)
+    })
+    .await;
+    match done {
+        Ok(result) => to_value(&result),
+        Err(e) => {
+            error!(error = %e, "worktree cleanup task failed");
+            Err(error(INTERNAL_ERROR, "Internal error"))
+        }
+    }
+}
+
 fn refused(message: &str) -> ErrorObject {
     error(WORKTREE_REFUSED_CODE, message)
 }
@@ -289,7 +335,7 @@ mod tests {
 
     use coda_protocol::methods::WORKTREE_REFUSED_CODE;
 
-    use super::{create, ensure_checkout, list, worktree};
+    use super::{clean_worktrees, create, ensure_checkout, list, worktree};
     use crate::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
     use crate::worktree::Worktrees;
 
@@ -635,5 +681,38 @@ mod tests {
         // Assert
         assert!(result.is_ok());
         assert!(!f.trees.root().exists());
+    }
+
+    #[tokio::test]
+    async fn applying_cleanup_is_refused_while_it_is_off_but_the_report_is_allowed() {
+        // Arrange
+        let f = repo_with_hub();
+        let id = new_session(&f).await;
+        worktree(
+            Some(&f.hub),
+            Some(&f.trees),
+            Some(json!({"session_id": id})),
+        )
+        .await
+        .unwrap();
+
+        // Act
+        let refused = clean_worktrees(
+            Some(&f.hub),
+            Some(&f.trees),
+            |_| false,
+            Some(json!({"apply": true})),
+        )
+        .await
+        .unwrap_err();
+        let report = clean_worktrees(Some(&f.hub), Some(&f.trees), |_| false, Some(json!({})))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(refused.code, WORKTREE_REFUSED_CODE);
+        assert_eq!(report["applied"], json!(false));
+        assert_eq!(report["worktrees"].as_array().unwrap().len(), 1);
+        assert!(f.trees.path_for(&SessionId::new(id)).exists());
     }
 }

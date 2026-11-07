@@ -25,3 +25,4 @@ pub mod turn;
 pub mod usage_rpc;
 pub mod watchdog;
 pub mod worktree;
+mod worktree_clean;

@@ -33,7 +33,7 @@ const NOTICE_SENTENCES: [&str; 4] = [
     "The claude_code and codex backends stay disabled until you enable them.",
 ];
 const CANARY_KEY: &str = "sk-canary-must-not-reach-a-block";
-const HELP_COMMANDS: [&[&str]; 16] = [
+const HELP_COMMANDS: [&[&str]; 17] = [
     &[],
     &["tui"],
     &["init"],
@@ -50,6 +50,7 @@ const HELP_COMMANDS: [&[&str]; 16] = [
     &["session", "send"],
     &["session", "show"],
     &["session", "rewind"],
+    &["worktree", "clean"],
 ];
 
 struct Block {

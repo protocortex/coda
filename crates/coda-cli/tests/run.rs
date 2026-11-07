@@ -139,6 +139,42 @@ async fn a_run_with_worktree_works_on_its_own_branch_and_leaves_the_checkout_alo
 }
 
 #[tokio::test]
+async fn worktree_clean_reports_without_changing_anything_and_refuses_to_apply_while_off() {
+    // Arrange
+    let rig = rig(&[text_turn("all done")], "");
+    let repo = rig.work.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-q", "-m", "first"]);
+    run(&rig, &["--worktree"]).await;
+    let session = only_session(&rig).await;
+    let folder = Dirs::from_base(rig.home.path())
+        .data_dir()
+        .join("worktrees")
+        .join(session.id.as_str());
+    let stray = folder.parent().unwrap().join("stray");
+    std::fs::create_dir_all(&stray).unwrap();
+
+    // Act
+    let report = cli(&rig.ctx, &["coda", "worktree", "clean"], "").await;
+    let applied = cli(&rig.ctx, &["coda", "worktree", "clean", "--apply"], "").await;
+
+    // Assert
+    assert_eq!(report.code, ExitCode::SUCCESS, "{}", report.err);
+    assert!(
+        report.out.contains(folder.to_str().unwrap()),
+        "{}",
+        report.out
+    );
+    assert!(report.out.contains("unknown folder"), "{}", report.out);
+    assert_eq!(applied.code, ExitCode::from(70), "{}", applied.out);
+    assert!(applied.err.contains("enabled"), "{}", applied.err);
+    assert!(folder.join("a.txt").exists());
+    assert!(stray.exists());
+}
+
+#[tokio::test]
 async fn a_run_with_worktree_outside_a_repository_fails_before_any_turn() {
     // Arrange
     let rig = rig(&[text_turn("never")], "");

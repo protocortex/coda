@@ -49,14 +49,17 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
     let store = Store::open(&data_dir)?;
     let uid = own_uid(&data_dir)?;
     info!("step 3: binding the socket");
-    let worktrees = Arc::new(Worktrees::new(
-        config
-            .worktree
-            .dir
-            .clone()
-            .unwrap_or_else(|| data_dir.join(DEFAULT_DIR_NAME)),
-        config.worktree.setup.clone(),
-    ));
+    let worktrees = Arc::new(
+        Worktrees::new(
+            config
+                .worktree
+                .dir
+                .clone()
+                .unwrap_or_else(|| data_dir.join(DEFAULT_DIR_NAME)),
+            config.worktree.setup.clone(),
+        )
+        .with_cleanup(config.worktree.cleanup.clone()),
+    );
     let state = DaemonState::new(data_dir);
     let bound = bind(ServerConfig::new(ctx.dirs.socket_path(), uid)).await?;
     let hub = Hub::new(store, DEFAULT_QUEUE_CAPACITY);
