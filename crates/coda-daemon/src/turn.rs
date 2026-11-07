@@ -582,6 +582,9 @@ impl Turns {
     ) -> Result<AgentSession, StartError> {
         let session_id = record.id.clone();
         let cwd = PathBuf::from(&record.cwd);
+        if let Some(idle) = self.reuse_idle(&session_id).await {
+            return Ok(idle);
+        }
         let resume = if fresh {
             None
         } else {
@@ -603,9 +606,6 @@ impl Turns {
             })
             .await?;
             return Ok(AgentSession::Claude(Box::new(session)));
-        }
-        if let Some(idle) = self.reuse_idle(&session_id).await {
-            return Ok(idle);
         }
         let search_dirs = path_dirs(&parent_env);
         let mut settings = resolve_codex_off_worker(
@@ -636,14 +636,15 @@ impl Turns {
         Ok(AgentSession::Codex(Box::new(session)))
     }
 
-    /// The idle server of `session` when it still runs. One that died while idle
-    /// is stopped, so the caller starts a single new one.
+    /// The idle backend of `session` when it still runs: a Codex server, or a Claude
+    /// Code process whose turn was interrupted. One that died while idle is stopped,
+    /// so the caller starts a single new one.
     async fn reuse_idle(&self, session: &SessionId) -> Option<AgentSession> {
         let mut idle = self.idle.take(session)?;
         if idle.is_reusable() {
             return Some(idle);
         }
-        info!(session = %session, "the idle Codex server is gone; starting a new one");
+        info!(session = %session, "the idle backend is gone; starting a new one");
         stop(&mut idle, session).await;
         remove_pidfile(&self.config.pidfile_dir, session);
         None
@@ -684,7 +685,7 @@ impl Turns {
     /// or all of them once the daemon stops, is stopped here.
     async fn park(&self, session: &SessionId, child: AgentSession) {
         if let Some((id, mut evicted)) = self.idle.keep(session.clone(), child) {
-            info!(session = %id, "stopping an idle Codex server");
+            info!(session = %id, "stopping an idle backend");
             let pid = evicted.pid();
             stop(&mut evicted, &id).await;
             remove_pidfile_of(&self.config.pidfile_dir, &id, pid);

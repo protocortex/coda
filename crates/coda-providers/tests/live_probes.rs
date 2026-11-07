@@ -433,7 +433,7 @@ async fn set_permission_mode_and_set_model_are_answered_without_a_turn() {
 
 #[ignore = "spends Claude subscription quota; needs CODA_LIVE_TESTS=1"]
 #[tokio::test]
-async fn the_interrupt_request_stops_a_running_turn() {
+async fn the_interrupt_request_stops_a_running_turn_and_the_process_takes_the_next() {
     if !live() {
         return;
     }
@@ -454,6 +454,13 @@ async fn the_interrupt_request_stops_a_running_turn() {
         result["subtype"], result["is_error"]
     );
     assert_eq!(result["is_error"], true, "the turn was not interrupted");
+
+    claude.user(TEXT_PROMPT).await;
+    let next = claude.next_result().await;
+    assert_eq!(
+        next["is_error"], false,
+        "the process took no turn after the interrupt"
+    );
 }
 
 #[ignore = "spends Claude subscription quota; needs CODA_LIVE_TESTS=1"]

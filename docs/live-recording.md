@@ -77,7 +77,7 @@ they found with claude 2.1.296 on 2026-11-08:
 | usage and rate limits | the usage event is read, and each `rate_limit_event` line becomes a `rate_limit` event |
 | `initialize` | answers `success`; the account block has `apiProvider`, `email`, `organization` and `subscriptionType`, and no `apiKeySource` or `tokenSource` |
 | `set_permission_mode`, `set_model` | both answer `success` with no turn running |
-| `interrupt` | answers `success`; the turn then ends with a `result` of subtype `error_during_execution` and `is_error` true |
+| `interrupt` | answers `success`; the turn then ends with a `result` of subtype `error_during_execution` and `is_error` true, and the same process takes the next message (coda keeps it for the session's next turn) |
 | a message sent mid-turn | in a turn that only streams text it queues: the first message gets its own `result` and the second gets another. The manual run under Steer, with a tool still running, gave one `result` for both, so the answer depends on the turn |
 | helper call | `run_structured` returns JSON with a non-empty `title` that fits its schema |
 | login commands | `claude auth login --help` and `codex login --help` answer, and the `auth status` probe and the Codex account read both see the installed login (no quota, no token read) |

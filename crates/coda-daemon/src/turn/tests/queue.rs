@@ -111,7 +111,7 @@ async fn a_cancelled_turn_holds_the_queue_until_it_is_resumed() {
     rig.call("session.cancel", json!({"session_id": rig.session}))
         .await;
     rig.wait_for("turn_interrupted").await;
-    rig.wait_until_idle().await;
+    rig.wait_until_turn_over().await;
     tokio::time::sleep(SETTLE).await;
     let held = queue_call(&mut rig, json!({"action": "list"})).await;
     let started_while_held = user_messages(&rig).await;
@@ -167,7 +167,7 @@ async fn a_full_queue_refuses_another_message() {
     );
     rig.call("session.cancel", json!({"session_id": rig.session}))
         .await;
-    rig.wait_until_idle().await;
+    rig.wait_until_turn_over().await;
 }
 
 #[tokio::test]
@@ -180,7 +180,7 @@ async fn a_plain_send_to_a_held_session_releases_the_queue_behind_it() {
     rig.call("session.cancel", json!({"session_id": rig.session}))
         .await;
     rig.wait_for("turn_interrupted").await;
-    rig.wait_until_idle().await;
+    rig.wait_until_turn_over().await;
 
     // Act
     rig.send("third").await;

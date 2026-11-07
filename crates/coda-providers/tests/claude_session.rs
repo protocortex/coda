@@ -1258,3 +1258,125 @@ async fn a_full_session_is_never_warned_about() {
     // Assert
     assert_eq!(warnings, Vec::<String>::new());
 }
+
+async fn cancel_on_tool_start(
+    session: &mut ClaudeSession,
+    text: &str,
+) -> (TurnOutcome, Vec<Event>) {
+    let handle = session.cancel_handle();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+    let mut events = Vec::new();
+    let outcome = tokio::time::timeout(
+        TURN_TIMEOUT,
+        session.run_turn(&TurnId::new("t-1"), text, &gate, &mut |event| {
+            if matches!(
+                event,
+                Event::ToolCall {
+                    status: ToolCallStatus::Started,
+                    ..
+                }
+            ) {
+                handle.cancel();
+            }
+            events.push(event);
+        }),
+    )
+    .await
+    .expect("cancel did not end the turn")
+    .unwrap();
+    (outcome, events)
+}
+
+#[tokio::test]
+async fn a_cancel_interrupts_the_turn_and_keeps_the_process_for_the_next_one() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let pid = session.pid();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    let (outcome, events) = cancel_on_tool_start(&mut session, "interruptible").await;
+    let reusable = session.is_reusable();
+    let (next, _) = turn(&mut session, &gate, "run ls").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Cancelled);
+    assert!(events.contains(&Event::TurnInterrupted {
+        session_id: SessionId::new("s-1"),
+        turn_id: TurnId::new("t-1"),
+        cause: Some(InterruptCause::Cancelled),
+    }));
+    assert!(reusable);
+    assert_eq!(next, TurnOutcome::Completed { is_error: false });
+    assert_eq!(session.pid(), pid);
+}
+
+#[tokio::test]
+async fn a_child_that_ignores_the_interrupt_is_killed_after_the_grace_period() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+
+    // Act
+    let (outcome, _) = cancelled_turn(&mut session, "stall").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Cancelled);
+    assert!(!session.is_reusable());
+}
+
+#[tokio::test]
+async fn a_cancel_before_the_turn_starts_leaves_the_next_turn_uncancelled() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+    session.cancel_handle().cancel();
+
+    // Act
+    let (first, _) = turn(&mut session, &gate, "run ls").await;
+    let (second, _) = turn(&mut session, &gate, "run ls").await;
+
+    // Assert
+    assert_eq!(first, TurnOutcome::Cancelled);
+    assert_eq!(second, TurnOutcome::Completed { is_error: false });
+}
+
+#[tokio::test]
+async fn a_completed_turn_is_not_kept() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    turn(&mut session, &gate, "run ls").await;
+
+    // Assert
+    assert!(!session.is_reusable());
+}
+
+#[tokio::test]
+async fn a_cancel_after_a_steer_stops_the_process_instead_of_keeping_it() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let steer = session.steer_handle();
+    let cancel = session.cancel_handle();
+    let acting = tokio::spawn(async move {
+        tokio::time::sleep(STEER_AFTER).await;
+        assert!(steer.steer("and use tabs"));
+        tokio::time::sleep(STEER_AFTER).await;
+        cancel.cancel();
+    });
+
+    // Act
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+    let (outcome, _) = turn(&mut session, &gate, "interruptible").await;
+    acting.await.unwrap();
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Cancelled);
+    assert!(!session.is_reusable());
+}

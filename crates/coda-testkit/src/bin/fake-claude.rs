@@ -23,6 +23,8 @@
 //! crashes the first time (the control file's `crash_marker` remembers it), then stalls.
 //! `tool-quick` runs one that succeeds at once and `tool-error` one that fails at once.
 //! `report-usage` reports a rate limit, then finishes with token usage and a context window on the result.
+//! `interruptible` announces a tool and waits for an `interrupt` control request, answers it
+//! and ends the turn with an error result, as claude does, then takes the next message.
 //! `hit-limit` reports a rejected seven-day limit, then ends the turn with an error.
 //! `stream-long` streams `input_json_delta` and `thinking_delta` lines for longer than
 //! the idle limits the tests use, then finishes.
@@ -34,6 +36,7 @@
 //! environment. `report_path` makes the binary write its arguments and
 //! environment facts there, `pid_path` receives the `sleep` pid, `pid_log` collects the pid of every
 //! `sleep` it started, one per line, and
+//! `start_log` collects the pid of every process start, one per line, and
 //! `flood` makes it fill stdout before it reads any input, and `start_gate`
 //! holds the start-up, before any output, until a file exists at that path, and
 //! exits non-zero if none appears within two minutes. `reject_resume` makes it exit
@@ -86,6 +89,8 @@ const TOOL_QUICK_TRIGGER: &str = "tool-quick";
 const TOOL_ERROR_TRIGGER: &str = "tool-error";
 const REPORT_USAGE_TRIGGER: &str = "report-usage";
 const HIT_LIMIT_TRIGGER: &str = "hit-limit";
+const INTERRUPTIBLE_TRIGGER: &str = "interruptible";
+const INTERRUPT_SUBTYPE: &str = "interrupt";
 const STREAM_STEP: Duration = Duration::from_millis(100);
 const STREAM_STEPS: u32 = 15;
 const TOOL_USE_ID: &str = "toolu-1";
@@ -214,6 +219,34 @@ fn park() -> ! {
     }
 }
 
+/// The turns that end in a fixed script, chosen by a word in the user line.
+fn scripted_ending(
+    user_line: &str,
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+    out: &mut impl Write,
+    control: &Control,
+) -> Option<io::Result<()>> {
+    if user_line.contains(TOOL_FLAKY_TRIGGER) {
+        return Some(run_tool_flaky(control, out));
+    }
+    if user_line.contains(STREAM_LONG_TRIGGER) {
+        return Some(stream_long(out));
+    }
+    if user_line.contains(TOOL_QUICK_TRIGGER) || user_line.contains(TOOL_ERROR_TRIGGER) {
+        return Some(run_quick_tool(user_line.contains(TOOL_ERROR_TRIGGER), out));
+    }
+    if user_line.contains(REPORT_USAGE_TRIGGER) {
+        return Some(report_usage(out));
+    }
+    if user_line.contains(HIT_LIMIT_TRIGGER) {
+        return Some(hit_limit(out));
+    }
+    if user_line.contains(INTERRUPTIBLE_TRIGGER) {
+        return Some(run_interruptible(lines, out));
+    }
+    None
+}
+
 fn run_turn(
     user_line: &str,
     lines: &mut impl Iterator<Item = io::Result<String>>,
@@ -265,20 +298,8 @@ fn run_turn(
                 "delta":{"type":"text_delta","text":text}}}),
         )?;
     }
-    if user_line.contains(TOOL_FLAKY_TRIGGER) {
-        return run_tool_flaky(control, out);
-    }
-    if user_line.contains(STREAM_LONG_TRIGGER) {
-        return stream_long(out);
-    }
-    if user_line.contains(TOOL_QUICK_TRIGGER) || user_line.contains(TOOL_ERROR_TRIGGER) {
-        return run_quick_tool(user_line.contains(TOOL_ERROR_TRIGGER), out);
-    }
-    if user_line.contains(REPORT_USAGE_TRIGGER) {
-        return report_usage(out);
-    }
-    if user_line.contains(HIT_LIMIT_TRIGGER) {
-        return hit_limit(out);
+    if let Some(done) = scripted_ending(user_line, lines, out, control) {
+        return done;
     }
     if user_line.contains(VANISH_TRIGGER) {
         std::fs::remove_file(std::env::current_exe()?)?;
@@ -320,6 +341,33 @@ fn run_turn(
         &serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
     )?;
     emit(out, &serde_json::json!({"type":"result","is_error":false}))
+}
+
+/// Announces a tool, then waits for an `interrupt` request, answers it and ends the turn in error.
+fn run_interruptible(
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    emit(
+        out,
+        &serde_json::json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":TOOL_USE_ID,"name":"Bash","input":{"command":"ls"}}]}}),
+    )?;
+    while let Some(line) = lines.next().transpose()? {
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        if request["request"]["subtype"] == INTERRUPT_SUBTYPE {
+            emit(
+                out,
+                &serde_json::json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":request["request_id"]}}),
+            )?;
+            return emit(
+                out,
+                &serde_json::json!({"type":"result","subtype":"error_during_execution","is_error":true}),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Sends a rate-limit report and a result with usage, in the shapes claude 2.1.296 wrote.
@@ -458,6 +506,13 @@ fn main() -> io::Result<()> {
     let control = Control::load();
     if let Some(path) = control.path("report_path") {
         write_report(path)?;
+    }
+    if let Some(path) = control.path("start_log") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(file, "{}", std::process::id())?;
     }
     if (control.rejects_resume() && std::env::args().any(|arg| arg == RESUME_FLAG))
         || control.rejects_this_resume()

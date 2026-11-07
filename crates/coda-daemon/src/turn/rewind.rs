@@ -212,7 +212,7 @@ impl Turns {
         let server = self.idle.take(session);
         let released = server.is_some();
         if let Some(mut server) = server {
-            info!(session = %session, "closing the session's Codex server");
+            info!(session = %session, "closing the session's idle backend");
             let pid = server.pid();
             stop(&mut server, session).await;
             remove_pidfile_of(&self.config.pidfile_dir, session, pid);
