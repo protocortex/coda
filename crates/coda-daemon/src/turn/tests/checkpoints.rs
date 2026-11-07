@@ -9,6 +9,10 @@ use coda_store::TurnCheckpoint;
 use super::{Rig, relaxed};
 
 const NO_PERMISSION_TURN: &str = "tool-slow";
+/// A coverage run makes the fake backend write one of these into the session
+/// folder as it starts or ends, at no fixed point of a turn. It is not the
+/// agent's change, so the repository ignores it.
+const COVERAGE_DATA: &str = "*.profraw\n";
 
 pub(super) fn git(rig: &Rig, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -35,6 +39,9 @@ pub(super) fn git(rig: &Rig, args: &[&str]) -> String {
 pub(super) fn repo_rig() -> Rig {
     let rig = Rig::new(relaxed(), Vec::new());
     git(&rig, &["init", "-q", "-b", "main"]);
+    let exclude = rig.cwd.path().join(".git/info/exclude");
+    let kept = std::fs::read_to_string(&exclude).unwrap_or_default();
+    std::fs::write(&exclude, format!("{kept}{COVERAGE_DATA}")).unwrap();
     std::fs::write(rig.cwd.path().join("a.txt"), "one\n").unwrap();
     git(&rig, &["add", "."]);
     git(&rig, &["commit", "-q", "-m", "first"]);
