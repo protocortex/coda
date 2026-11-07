@@ -13,8 +13,9 @@ use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, INVALID_PARAMS, METHOD
 use coda_protocol::methods::{
     SESSION_CREATE, SHIP_REFUSED_CODE, SessionAttention, SessionCreateParams, SessionCreateResult,
     SessionListParams, SessionListResult, SessionResumeParams, SessionResumeResult,
-    SessionShipParams, SessionStatus, SessionSummary, SessionWorktreeParams, SessionWorktreeResult,
-    WORKTREE_REFUSED_CODE, WorktreeCleanParams,
+    SessionShipParams, SessionStatus, SessionSummary, SessionWatchPrParams, SessionWatchPrResult,
+    SessionWorktreeParams, SessionWorktreeResult, WATCH_REFUSED_CODE, WORKTREE_REFUSED_CODE,
+    WorktreeCleanParams,
 };
 use coda_protocol::types::{SessionId, SessionInfo};
 use coda_store::{
@@ -25,6 +26,7 @@ use serde_json::Value;
 use tracing::{Instrument, error, warn};
 
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
+use crate::pr_watches::PrWatches;
 use crate::receipts;
 use crate::ship::{ShipTools, ship};
 use crate::subscribe::{Hub, HubError};
@@ -297,6 +299,31 @@ fn refused(message: &str) -> ErrorObject {
     error(WORKTREE_REFUSED_CODE, message)
 }
 
+/// Answers `session.watch_pr`: starts a watch of a pull request that wakes the session on news.
+pub(crate) async fn watch_pr(
+    hub: Option<&Arc<Hub>>,
+    watches: Option<&Arc<PrWatches>>,
+    params: Option<Value>,
+) -> HandlerResult {
+    let hub = hub.ok_or_else(unavailable)?;
+    let watches = watches.ok_or_else(unavailable)?;
+    let params: SessionWatchPrParams = parse_params(params)?;
+    let id = params.session_id;
+    let record = hub
+        .with_store({
+            let id = id.clone();
+            move |store| store.load_session(&id)
+        })
+        .await
+        .map_err(failed)?;
+    watches
+        .start(&id, PathBuf::from(record.cwd), &params.pr)
+        .map_err(|e| error(WATCH_REFUSED_CODE, &e.to_string()))?;
+    to_value(&SessionWatchPrResult {
+        watching: watches.watching(&id),
+    })
+}
+
 static SHIPPING: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
 
 /// Holds a session's place among the ships in flight, so two ships of one session never share
@@ -475,7 +502,7 @@ mod tests {
 
     use coda_protocol::methods::WORKTREE_REFUSED_CODE;
 
-    use super::{clean_worktrees, create, ensure_checkout, list, ship_session, worktree};
+    use super::{clean_worktrees, create, ensure_checkout, list, ship_session, watch_pr, worktree};
     use crate::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
     use crate::worktree::Worktrees;
 
@@ -1026,6 +1053,76 @@ mod tests {
             crate::ship::ShipTools::default(),
             |_| false,
             Some(ship_body("999", "commit")),
+        )
+        .await
+        .unwrap_err();
+
+        // Assert
+        assert_eq!(error.code, crate::turn::SESSION_NOT_FOUND);
+    }
+
+    fn quiet_watches(f: &Fixture) -> Arc<crate::pr_watches::PrWatches> {
+        use std::os::unix::fs::PermissionsExt;
+        let script = f.repo.parent().unwrap().join("quiet-gh");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::pr_watches::PrWatches::with(
+            script.into_os_string(),
+            std::time::Duration::from_secs(3600),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_watch_started_over_the_request_is_listed_in_its_answer() {
+        // Arrange
+        let f = repo_with_hub();
+        let id = new_session(&f).await;
+        let watches = quiet_watches(&f);
+
+        // Act
+        let done = watch_pr(
+            Some(&f.hub),
+            Some(&watches),
+            Some(json!({"session_id": id, "pr": "7"})),
+        )
+        .await
+        .unwrap();
+
+        // Assert
+        assert_eq!(done["watching"], json!(["7"]));
+    }
+
+    #[tokio::test]
+    async fn a_watch_of_something_that_is_not_a_pull_request_is_refused() {
+        // Arrange
+        let f = repo_with_hub();
+        let id = new_session(&f).await;
+        let watches = quiet_watches(&f);
+
+        // Act
+        let refused = watch_pr(
+            Some(&f.hub),
+            Some(&watches),
+            Some(json!({"session_id": id, "pr": "--web"})),
+        )
+        .await
+        .unwrap_err();
+
+        // Assert
+        assert_eq!(refused.code, coda_protocol::methods::WATCH_REFUSED_CODE);
+    }
+
+    #[tokio::test]
+    async fn a_watch_for_an_unknown_session_is_session_not_found() {
+        // Arrange
+        let f = repo_with_hub();
+        let watches = quiet_watches(&f);
+
+        // Act
+        let error = watch_pr(
+            Some(&f.hub),
+            Some(&watches),
+            Some(json!({"session_id": "999", "pr": "7"})),
         )
         .await
         .unwrap_err();

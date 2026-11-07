@@ -371,3 +371,33 @@ async fn ship_with_nothing_changed_fails_the_command_with_the_reason() {
     );
     assert!(shipped.err.contains("nothing to commit"), "{}", shipped.err);
 }
+
+#[tokio::test]
+async fn watch_refuses_a_pull_request_that_could_be_read_as_a_flag() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one")]);
+    let id = rig.start_session().await;
+
+    // Act
+    let watched = rig.coda(&["session", "watch", &id, "--pr", "--web"]).await;
+
+    // Assert
+    assert_ne!(watched.code, ExitCode::SUCCESS, "{}", watched.out);
+}
+
+#[tokio::test]
+async fn watch_refuses_an_unknown_session() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one")]);
+
+    // Act
+    let watched = rig.coda(&["session", "watch", "999", "--pr", "7"]).await;
+
+    // Assert
+    assert_eq!(
+        watched.code,
+        ExitCode::from(EXIT_FAILURE),
+        "{}",
+        watched.out
+    );
+}
