@@ -2,8 +2,10 @@
 
 //! The `usage.summary` request: sums token usage straight from the store.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use coda_protocol::events::{Event, RATE_LIMIT_KIND, RateLimitWindow};
 use coda_protocol::jsonrpc::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 use coda_protocol::methods::{UsageSummaryParams, UsageSummaryResult};
 use coda_protocol::types::{SessionId, TokenUsage};
@@ -17,7 +19,8 @@ use crate::trace::session_span;
 
 /// Reads the usage summary from `store`, for one session or for all of them.
 ///
-/// The store records no cache counts yet, so those report zero.
+/// The limit windows come from the newest stored `rate_limit` events of any session, the
+/// newest report of each window winning.
 ///
 /// # Errors
 /// Returns [`StoreError::SessionNotFound`] for an unknown session, or the
@@ -32,10 +35,29 @@ pub fn report(
         usage: TokenUsage {
             input_tokens: summary.input_tokens,
             output_tokens: summary.output_tokens,
-            ..TokenUsage::default()
+            cache_read_tokens: summary.cache_read_tokens,
+            cache_write_tokens: summary.cache_write_tokens,
         },
         saved_bytes,
+        limits: latest_limits(store)?,
     })
+}
+
+/// How many stored reports to look through, newest first. A window not reported within
+/// this many reports is left out.
+const LIMIT_REPORTS_LOOKED_AT: u32 = 1_000;
+
+fn latest_limits(store: &Store) -> Result<Vec<RateLimitWindow>, StoreError> {
+    let mut latest: BTreeMap<String, RateLimitWindow> = BTreeMap::new();
+    for body in store.recent_event_bodies(RATE_LIMIT_KIND, LIMIT_REPORTS_LOOKED_AT)? {
+        let Ok(Event::RateLimit { limit, .. }) = serde_json::from_str(&body) else {
+            continue;
+        };
+        for window in limit.windows {
+            latest.entry(window.name.clone()).or_insert(window);
+        }
+    }
+    Ok(latest.into_values().collect())
 }
 
 /// Answers `usage.summary`. Without a hub the daemon has no store and the

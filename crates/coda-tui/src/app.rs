@@ -62,6 +62,7 @@ const CLEARED: &str = "prompt cleared; Ctrl+S brings it back";
 const NOTHING_STASHED: &str = "nothing is stashed";
 const STASHED: &str = "prompt stashed; press Ctrl+S on an empty prompt to bring it back";
 const ALREADY_PLANNING: &str = "the session is already in plan mode";
+const NO_LIMITS: &str = "no plan limits reported yet";
 const NO_DIFF: &str = "this daemon cannot show a diff";
 const NO_CHANGES: &str = "the last turn changed no files";
 const NOT_PLANNING: &str =
@@ -679,6 +680,16 @@ impl App {
             }
             Command::Help => {
                 self.show_help();
+                return;
+            }
+            Command::Limits => {
+                let lines = self.status.limit_lines();
+                if lines.is_empty() {
+                    self.chat.push_notice(NO_LIMITS.to_owned());
+                }
+                for line in lines {
+                    self.chat.push_notice(line);
+                }
                 return;
             }
             Command::Quit => {
@@ -1771,6 +1782,44 @@ mod tests {
 
         // Assert
         assert_eq!(sent(&mut commands), vec![LinkCommand::TurnChanges]);
+    }
+
+    #[test]
+    fn limits_lists_each_window_the_provider_reported_or_says_there_are_none() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        type_line(&mut app, "/limits");
+        let empty = tall_screen(&app);
+        let resets_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        app.handle_event(LinkEvent::Session(Event::RateLimit {
+            session_id: SessionId::new("s-1"),
+            limit: coda_protocol::events::RateLimit {
+                status: "allowed".to_owned(),
+                window_type: None,
+                resets_at: None,
+                windows: vec![coda_protocol::events::RateLimitWindow {
+                    name: "seven_day".to_owned(),
+                    utilization_bps: 2_500,
+                    resets_at: Some(resets_at),
+                }],
+                is_using_overage: false,
+                overage_status: None,
+                overage_resets_at: None,
+                overage_disabled_reason: None,
+            },
+        }));
+
+        // Act
+        type_line(&mut app, "/limits");
+        let shown = tall_screen(&app);
+
+        // Assert
+        assert!(empty.contains(NO_LIMITS), "{empty}");
+        assert!(shown.contains("7d 75% left, resets in "), "{shown}");
     }
 
     #[test]
