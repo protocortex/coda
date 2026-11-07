@@ -9,6 +9,7 @@ pub mod claude_session;
 pub mod codex;
 pub mod codex_app_server;
 pub mod codex_exec;
+mod codex_limits;
 pub mod detect;
 pub mod emit;
 pub mod faux;

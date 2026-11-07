@@ -273,6 +273,13 @@ mod app_server {
         std::fs::write(path, report.to_string())
     }
 
+    fn read_report(key: &str) -> Value {
+        control_path("report_path")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .map_or(Value::Null, |report| report[key].clone())
+    }
+
     fn read_head(stream: &mut UnixStream) -> io::Result<()> {
         let mut head = Vec::new();
         let mut byte = [0_u8; 1];
@@ -403,6 +410,17 @@ mod app_server {
                         &mut stream,
                         &json!({"id": id, "result": {"thread": thread}}),
                     )?;
+                }
+                "account/rateLimits/read" => {
+                    let reads = read_report("rate_limit_reads").as_u64().unwrap_or(0) + 1;
+                    update_report("rate_limit_reads", &json!(reads))?;
+                    let reply = match control_value("rate_limits") {
+                        Some(result) => json!({"id": id, "result": result}),
+                        None => {
+                            json!({"id": id, "error": {"code": -32000, "message": "no limits"}})
+                        }
+                    };
+                    send(&mut stream, &reply)?;
                 }
                 "turn/start" if control_value("reject_turn_start").is_some() => send(
                     &mut stream,
@@ -566,6 +584,65 @@ mod app_server {
         Ok(false)
     }
 
+    /// `limit-update` reports a changed snapshot and goes on; `limit-hit` reports a full
+    /// window and fails the turn at the plan limit; `limit-bare` fails it with no snapshot; `limit-other` fails it for another reason after a full window, `limit-other-recovered` after the window recovered.
+    fn limit_turn(stream: &mut UnixStream, prompt: &str) -> io::Result<()> {
+        if prompt.contains("limit-update") {
+            let snapshot = json!({"primary": {"usedPercent": 70, "windowDurationMins": 300, "resetsAt": 1_794_000_000}});
+            notify(
+                stream,
+                "account/rateLimits/updated",
+                &json!({"rateLimits": snapshot}),
+            )?;
+            return complete(stream);
+        }
+        if prompt.contains("limit-hit") {
+            let snapshot = json!({"secondary": {"usedPercent": 100, "windowDurationMins": 10080, "resetsAt": 1_794_500_000}});
+            notify(
+                stream,
+                "account/rateLimits/updated",
+                &json!({"rateLimits": snapshot}),
+            )?;
+        }
+        if prompt.contains("limit-other") {
+            let full = json!({"secondary": {"usedPercent": 100, "windowDurationMins": 10080}});
+            let roomy = json!({"secondary": {"usedPercent": 20, "windowDurationMins": 10080}});
+            let snapshot = if prompt.contains("limit-other-recovered") {
+                notify(
+                    stream,
+                    "account/rateLimits/updated",
+                    &json!({"rateLimits": full}),
+                )?;
+                roomy
+            } else {
+                full
+            };
+            notify(
+                stream,
+                "account/rateLimits/updated",
+                &json!({"rateLimits": snapshot}),
+            )?;
+            let error = json!({"message": "overloaded", "codexErrorInfo": "serverOverloaded"});
+            return notify(
+                stream,
+                "turn/completed",
+                &json!({"turn": {"status": "failed", "error": error}}),
+            );
+        }
+        let error =
+            json!({"message": "You hit your usage limit.", "codexErrorInfo": "usageLimitExceeded"});
+        notify(
+            stream,
+            "error",
+            &json!({"error": error, "willRetry": false}),
+        )?;
+        notify(
+            stream,
+            "turn/completed",
+            &json!({"turn": {"status": "failed", "error": error}}),
+        )
+    }
+
     fn run_turn(stream: &mut UnixStream, prompt: &str) -> io::Result<()> {
         if prompt.contains("crash") {
             std::process::exit(CRASH_EXIT_CODE);
@@ -653,6 +730,9 @@ mod app_server {
         }
         if scripted_command(stream, prompt)? {
             return Ok(());
+        }
+        if prompt.contains("limit-") {
+            return limit_turn(stream, prompt);
         }
         if prompt.contains("approve-file") {
             let item = json!({"id": "item-2", "type": "fileChange",

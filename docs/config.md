@@ -288,7 +288,7 @@ Chooses the model that reviews each part of a change by its size, and says what 
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `fallback` | boolean | `true` | Whether a part that hits a usage limit, or whose backend process is lost, runs again on the other of Claude Code and Codex when that one is enabled. Off, or with one backend enabled, that part fails. Only Claude Code reports a usage limit today (#325); a lost backend moves a part from either. |
+| `fallback` | boolean | `true` | Whether a part that hits a usage limit, or whose backend process is lost, runs again on the other of Claude Code and Codex when that one is enabled. Off, or with one backend enabled, that part fails. Claude Code and the Codex app server report a usage limit, Codex exec does not yet (#325); a lost backend moves a part from any of them. |
 | `rules` | array of tables | none | Rules tried in order for each part. The first one that fits sets the model. |
 
 Each `[[review.routing.rules]]` has `model` (a model name the backend accepts, not empty) and any of `max_hunks`, `max_files` and `max_chars`. A rule fits a part when every limit it sets holds, counted on the packed part: hunks, files sent to the model (whole or clipped) and characters of packed diff. A rule with no limit fits every part, so put it last. When no rule fits, the backend runs on its own default model.
