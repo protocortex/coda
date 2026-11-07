@@ -89,6 +89,7 @@ jobs:
       - run: bash scripts/check-spdx.sh
       - run: bash scripts/tests/check-spdx.test.sh
       - run: bash scripts/tests/check-leaked-daemons.test.sh
+      - run: bash scripts/tests/ci-aggregate.test.sh
 
   zizmor:
     runs-on: ubuntu-latest
@@ -103,3 +104,15 @@ jobs:
         with:
           version: 1.31.1
           advanced-security: false
+
+  check:
+    if: ${{ always() }}
+    needs: [fmt, clippy, test, coverage, deny, spdx, zizmor]
+    runs-on: ubuntu-latest
+    env:
+      RESULTS: ${{ join(needs.*.result, ' ') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash scripts/ci-aggregate.sh $RESULTS
