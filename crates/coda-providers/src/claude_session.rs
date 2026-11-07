@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coda_config::config::ClaudeProfile;
+
+use crate::init_check::{InitReport, LEAN_TOOLS};
 use coda_protocol::events::{Event, InterruptCause, UsageWindowKind};
 
 use crate::account::billing_of_api_key_source;
@@ -23,6 +25,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tracing::warn;
 
 use crate::claude_code::{
     Diagnostic, Message, PermissionAsk, StreamParser, control_response, map_tool,
@@ -57,8 +60,8 @@ const NO_SETTINGS_SOURCES: &str = "";
 const LEAN_SYSTEM_PROMPT: &str = "You are a coding agent working in the user's repository \
 through Coda. Read files before you change them, keep changes small, and say plainly what \
 you did.";
-/// The tools of the lean profile, named as `--tools` expects, comma separated.
-const LEAN_TOOLS: &str = "Read,Grep,Glob,Edit,Write,Bash";
+/// How `--tools` takes its list.
+const TOOL_LIST_SEPARATOR: &str = ",";
 /// Most stderr bytes kept to find the flag a start-up error names.
 const STDERR_KEEP_BYTES: u64 = 8 * 1024;
 /// Words that mark a stderr line as a complaint, in lower case.
@@ -178,6 +181,7 @@ pub struct ClaudeSession {
     /// Reads the child's stderr, which is kept only to name a flag it rejects.
     stderr: Option<JoinHandle<Vec<u8>>>,
     stdin: Option<ChildStdin>,
+    init_warnings: Vec<String>,
     stdout: ChildStdout,
     parser: StreamParser,
     /// Messages parsed while a write was in flight, handled before the next read.
@@ -262,6 +266,7 @@ impl ClaudeSession {
         let (steer, steer_inbox) = steer::channel();
         Ok(Self {
             profile: spec.profile,
+            init_warnings: Vec::new(),
             stderr,
             child,
             stdin: Some(stdin),
@@ -313,6 +318,13 @@ impl ClaudeSession {
     #[must_use]
     pub fn backend_id_updates(&self) -> watch::Receiver<Option<String>> {
         self.backend_id_tx.subscribe()
+    }
+
+    /// What the session's `init` message held that its profile should have removed;
+    /// empty before `init` arrives and for the `full` profile.
+    #[must_use]
+    pub fn init_warnings(&self) -> &[String] {
+        &self.init_warnings
     }
 
     /// What the parser skipped so far; never carries message content.
@@ -445,6 +457,17 @@ impl ClaudeSession {
         }
     }
 
+    fn check_init(&mut self, report: &InitReport) {
+        let found = report.unexpected(self.profile);
+        // `init` may come again; log only what is new.
+        if found != self.init_warnings {
+            for warning in &found {
+                warn!(session = %self.session_id, warning = warning.as_str(), "init check");
+            }
+            self.init_warnings = found;
+        }
+    }
+
     async fn handle<G: PermissionGate>(
         &mut self,
         message: Message,
@@ -456,6 +479,7 @@ impl ClaudeSession {
             Message::Init {
                 session_id,
                 api_key_source,
+                report,
             } => {
                 self.backend_id_tx.send_replace(Some(session_id.clone()));
                 self.backend_session_id = Some(session_id);
@@ -468,6 +492,7 @@ impl ClaudeSession {
                     })
                     .await;
                 }
+                self.check_init(&report);
             }
             Message::TextDelta(text) => {
                 emit.emit(Event::StreamDelta {
@@ -730,8 +755,8 @@ impl Drop for ClaudeSession {
 /// `--tools` is never given an empty list: with no tools and MCP servers still on,
 /// the prompt grows by about 22k tokens, so the lean profile also sets
 /// `--strict-mcp-config`.
-fn profile_args(profile: ClaudeProfile) -> Vec<&'static str> {
-    match profile {
+fn profile_args(profile: ClaudeProfile) -> Vec<String> {
+    let args: Vec<&str> = match profile {
         ClaudeProfile::Full => Vec::new(),
         ClaudeProfile::Project => vec![
             SETTING_SOURCES_FLAG,
@@ -747,9 +772,13 @@ fn profile_args(profile: ClaudeProfile) -> Vec<&'static str> {
             SYSTEM_PROMPT_FLAG,
             LEAN_SYSTEM_PROMPT,
             TOOLS_FLAG,
-            LEAN_TOOLS,
         ],
+    };
+    let mut args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+    if profile == ClaudeProfile::Lean {
+        args.push(LEAN_TOOLS.join(TOOL_LIST_SEPARATOR));
     }
+    args
 }
 
 /// Whether a stderr line is an error that names `flag`, such as `error: unknown option
@@ -759,7 +788,7 @@ fn is_error_about(line: &str, flag: &str) -> bool {
     line.contains(flag) && ERROR_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
-fn profile_flag_names(profile: ClaudeProfile) -> Vec<&'static str> {
+fn profile_flag_names(profile: ClaudeProfile) -> Vec<String> {
     profile_args(profile)
         .into_iter()
         .filter(|arg| arg.starts_with("--"))

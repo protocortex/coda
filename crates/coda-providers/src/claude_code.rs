@@ -8,6 +8,7 @@ use coda_protocol::events::{RateLimit, RateLimitWindow};
 use coda_protocol::types::{ContextFill, PermissionDecision, TokenUsage};
 use serde_json::{Value, json};
 
+use crate::init_check::InitReport;
 use crate::jsonl::{DiagnosticLog, Framed, LineFramer, bounded};
 use crate::tool_call::{CallInfo, claude_call};
 use crate::tool_request::{Tool, ToolRequest};
@@ -30,6 +31,8 @@ pub enum Message {
         session_id: String,
         /// Where the API key came from, `none` when no key backs the session.
         api_key_source: Option<String>,
+        /// The tools, MCP servers and skills the session loaded.
+        report: InitReport,
     },
     /// A streamed fragment of model text.
     TextDelta(String),
@@ -201,6 +204,7 @@ impl StreamParser {
                 Some(Message::Init {
                     session_id: session_id.to_owned(),
                     api_key_source: value["apiKeySource"].as_str().map(str::to_owned),
+                    report: InitReport::from_init(value),
                 })
             }
             // Real streams also carry the model's own tool results.
@@ -766,6 +770,7 @@ mod tests {
                 Message::Init {
                     session_id: "sess-1".to_owned(),
                     api_key_source: None,
+                    report: InitReport::default(),
                 },
                 Message::TextDelta("hi".to_owned()),
                 Message::PermissionRequest(PermissionAsk {
@@ -843,6 +848,7 @@ mod tests {
             vec![Message::Init {
                 session_id: "sess-1".to_owned(),
                 api_key_source: None,
+                report: InitReport::default(),
             }]
         );
     }

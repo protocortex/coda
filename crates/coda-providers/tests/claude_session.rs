@@ -26,6 +26,7 @@ use coda_providers::claude_session::{
 };
 use coda_providers::emit::Emit;
 use coda_providers::gate::PermissionGate;
+use coda_providers::init_check::LEAN_TOOLS;
 use coda_providers::steer::SteerHandle;
 use coda_providers::tool_request::{Tool, ToolRequest};
 use serde_json::Value;
@@ -1036,8 +1037,7 @@ async fn the_lean_profile_sets_its_own_prompt_tools_and_no_settings() {
         "{args:?}"
     );
     let tools = flag_value(&args, "--tools").expect("a tool list");
-    assert_ne!(tools, "");
-    assert!(tools.split(',').all(|tool| !tool.is_empty()));
+    assert_eq!(tools.split(',').collect::<Vec<_>>(), LEAN_TOOLS);
 }
 
 #[tokio::test]
@@ -1157,4 +1157,70 @@ async fn the_full_profile_never_blames_a_flag() {
 
     // Assert
     assert_eq!(detail, None);
+}
+
+fn write_init_control(fixture: &Fixture, init: &serde_json::Value) {
+    let control = serde_json::json!({
+        "report_path": fixture.cwd.path().join(REPORT_FILE),
+        "pid_path": fixture.cwd.path().join(PID_FILE),
+        "init": init,
+    });
+    fs::write(fixture.cwd.path().join(CONTROL_FILE), control.to_string()).unwrap();
+}
+
+async fn init_warnings_for(profile: ClaudeProfile, init: serde_json::Value) -> Vec<String> {
+    let fixture = Fixture::new();
+    write_init_control(&fixture, &init);
+    let mut spec = fixture.spec(env(&[]));
+    spec.profile = profile;
+    let mut session = ClaudeSession::spawn(spec).unwrap();
+    turn(
+        &mut session,
+        &FixedGate::new(PermissionDecision::Deny),
+        "run ls",
+    )
+    .await;
+    session.init_warnings().to_vec()
+}
+
+#[tokio::test]
+async fn a_project_session_that_loaded_mcp_servers_or_skills_is_warned_about() {
+    // Act
+    let warnings = init_warnings_for(
+        ClaudeProfile::Project,
+        serde_json::json!({"mcp_servers": [{"name": "docs"}], "skills": ["review"]}),
+    )
+    .await;
+
+    // Assert
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(warnings[0].contains("docs"));
+    assert!(warnings[1].contains("review"));
+}
+
+#[tokio::test]
+async fn a_lean_session_with_a_tool_outside_its_list_is_warned_about() {
+    // Act
+    let warnings = init_warnings_for(
+        ClaudeProfile::Lean,
+        serde_json::json!({"tools": ["Read", "WebFetch"]}),
+    )
+    .await;
+
+    // Assert
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("WebFetch"));
+}
+
+#[tokio::test]
+async fn a_full_session_is_never_warned_about() {
+    // Act
+    let warnings = init_warnings_for(
+        ClaudeProfile::Full,
+        serde_json::json!({"mcp_servers": [{"name": "docs"}], "tools": ["WebFetch"]}),
+    )
+    .await;
+
+    // Assert
+    assert_eq!(warnings, Vec::<String>::new());
 }
