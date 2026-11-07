@@ -39,6 +39,10 @@ impl<R: OriginalsReader + Send + Sync> Tool for RetrieveTool<R> {
         NAME
     }
 
+    fn shrinkable(&self) -> bool {
+        false
+    }
+
     fn call(&self, input: &Value) -> Result<ToolOutput, ToolError> {
         let args: RetrieveArgs = parse_args(NAME, input)?;
         let text = self.reader.fetch_original(&OriginalId::new(args.id))?;
@@ -98,6 +102,15 @@ mod tests {
                 truncated: true
             }
         );
+    }
+
+    #[test]
+    fn the_loop_never_shrinks_what_the_model_asked_to_see_whole() {
+        // Arrange
+        let tool = RetrieveTool::new(Fake, 64);
+
+        // Act / Assert
+        assert!(!tool.shrinkable());
     }
 
     #[test]

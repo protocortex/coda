@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -144,11 +144,7 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
     fallback: Option<P>,
 ) -> Outcome {
     let dir = tempfile::tempdir().unwrap();
-    let workdir = dir.path().join("ws");
-    std::fs::create_dir(&workdir).unwrap();
-    for (path, content) in fixture.files {
-        std::fs::write(workdir.join(path), content).unwrap();
-    }
+    let workdir = make_workspace(fixture, dir.path());
     let mut store = Store::open(&dir.path().join("data")).unwrap();
     let session = store
         .create_session(&NewSession {
@@ -245,6 +241,34 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
     }
 }
 
+/// The workspace folder of `fixture` under `root`, with its files written.
+fn make_workspace(fixture: &Fixture, root: &Path) -> PathBuf {
+    let workdir = root.join("ws");
+    std::fs::create_dir(&workdir).unwrap();
+    for (path, content) in fixture.files {
+        std::fs::write(workdir.join(path), content).unwrap();
+    }
+    if fixture.git {
+        stage_files(&workdir, root);
+    }
+    workdir
+}
+
+/// Makes `workdir` a repository with its files staged. `home` stands in for the
+/// user's home, so no configuration of the machine changes the result.
+fn stage_files(workdir: &Path, home: &Path) {
+    for args in [&["init", "-q"][..], &["add", "."][..]] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(workdir)
+            .env("HOME", home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+}
+
 /// How the send ended, and why that is a failure, if it is one.
 fn stopped(sent: Result<StopCondition, TurnError>) -> (String, Option<String>) {
     match sent {
@@ -319,6 +343,16 @@ fn judge(
         });
         if leaked {
             return Some("the untrusted text appeared outside a tool result".to_owned());
+        }
+    }
+    if let Some(text) = fixture.saw {
+        let seen = requests.iter().any(|request| {
+            request.messages.iter().any(
+                |message| matches!(message, RequestMessage::ToolResult { text: result, .. } if result.contains(text)),
+            )
+        });
+        if !seen {
+            return Some(format!("no tool result held {text:?}"));
         }
     }
     let status = Command::new("/bin/sh")

@@ -20,6 +20,7 @@ use coda_tools::code::{
     CodeIndex, CodeOutlineTool, CodeReadRangeTool, CodeSearchTool, CodeSymbolTool, Freshness,
 };
 use coda_tools::edit::{DEFAULT_MAX_FILE_BYTES, EditTool};
+use coda_tools::git::{self, GitDiffTool, GitStatusTool};
 use coda_tools::grep::GrepTool;
 use coda_tools::list::ListTool;
 use coda_tools::multi_edit::MultiEditTool;
@@ -388,10 +389,52 @@ pub fn base_tools(
             sandbox()?,
             DEFAULT_MAX_OUTPUT_BYTES,
         )));
-    Ok(BaseTools {
-        tools,
-        schemas: schemas(),
-    })
+    let mut schemas = schemas();
+    let tools = if git::in_repository(&config.workdir) {
+        schemas.extend(tree_schemas());
+        schemas.sort_by(|a, b| a.name.cmp(&b.name));
+        with_tree_tools(tools, config)
+    } else {
+        tools
+    };
+    Ok(BaseTools { tools, schemas })
+}
+
+fn with_tree_tools(tools: ToolSet, config: &BaseToolsConfig) -> ToolSet {
+    let (timeout, env) = (config.bash_timeout, &config.env);
+    tools
+        .with(Arc::new(GitStatusTool::new(
+            config.workdir.clone(),
+            env.clone(),
+            timeout,
+            git::MAX_OUTPUT_BYTES,
+        )))
+        .with(Arc::new(GitDiffTool::new(
+            config.workdir.clone(),
+            env.clone(),
+            timeout,
+            git::MAX_OUTPUT_BYTES,
+        )))
+}
+
+fn tree_schemas() -> Vec<ToolSchema> {
+    vec![
+        schema(
+            git::STATUS_NAME,
+            "Show the branch and the changed and untracked files of the working tree, one per line. Read only.",
+            &json!({}),
+            &[],
+        ),
+        schema(
+            git::DIFF_NAME,
+            "Show the changes of the working tree as a unified diff. Read only. A long diff is shortened and the full text is kept for retrieve; a diff over 1 MiB is cut and says so.",
+            &json!({
+                "staged": {"type": "boolean", "description": "Show what is staged for the next commit instead of what is not."},
+                "path": {"type": "string", "description": "Limit the diff to this path, relative to the workspace."},
+            }),
+            &[],
+        ),
+    ]
 }
 
 fn schema(
@@ -671,7 +714,6 @@ mod tests {
         assert_eq!(tools.tools.names(), NAMES);
         let schema_names: Vec<&str> = tools.schemas.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(schema_names, NAMES);
-        assert_eq!(schema_names, coda_tools::TOOL_NAMES);
         for schema in &tools.schemas {
             assert_eq!(schema.input_schema["type"], "object", "{}", schema.name);
             assert!(!schema.description.is_empty(), "{}", schema.name);
@@ -681,6 +723,40 @@ mod tests {
                 schema.name
             );
         }
+    }
+
+    #[test]
+    fn a_working_tree_is_offered_the_status_and_diff_tools_and_a_plain_folder_is_not() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir);
+        let session = new_session(&mut store.lock().unwrap());
+        let plain = dir.path().join("plain");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::create_dir_all(tree.join(".git")).unwrap();
+        let offered = |workdir: PathBuf| {
+            let config = BaseToolsConfig {
+                workdir,
+                bash_timeout: Duration::from_secs(5),
+                env: Vec::new(),
+            };
+            base_tools(
+                &config,
+                Arc::clone(&store),
+                StoreOriginals::new(Arc::clone(&store), session.clone()),
+            )
+            .unwrap()
+        };
+
+        // Act
+        let (without, with) = (offered(plain), offered(tree));
+
+        // Assert
+        assert_eq!(without.tools.names(), NAMES);
+        let schema_names: Vec<&str> = with.schemas.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(schema_names, coda_tools::TOOL_NAMES);
+        assert_eq!(with.tools.names(), coda_tools::TOOL_NAMES);
     }
 
     #[test]

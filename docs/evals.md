@@ -19,6 +19,8 @@ checks the result by running a command in a temporary workspace. They live in
 | `kept_a_todo_list` | an edit made while the model keeps a todo list with the `todo` tool, which adds its schema to every request and costs tokens in the baseline |
 | `asked_the_user` | the model asks which mode the user prefers, the offline user picks the first option, and the model edits to match |
 | `read_files_in_parallel` | three reads in one reply, which run at the same time, then three edits in one reply, which run in order and one at a time |
+| `saw_the_change` | an edit followed by `git_status` and `git_diff` in a staged working tree; the diff must show the changed line |
+| `shrank_a_large_diff` | a 400 line file written with `bash`, then `git_diff` and `retrieve`; the long run of added lines is cut to its ends, and `retrieve` returns the full diff, middle included |
 | `finished_too_early` | the model says it is done before it edits; an `end_turn` guard sends it back, then it edits |
 
 ## Offline run

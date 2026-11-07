@@ -186,6 +186,39 @@ mod offline {
     }
 
     #[tokio::test]
+    async fn the_working_tree_fixture_reads_status_and_diff_without_a_tool_error() {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "saw_the_change");
+        assert_eq!(outcome.tool_errors, 0, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn the_diff_of_a_large_change_is_shrunk_and_the_original_kept() {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "shrank_a_large_diff");
+        assert!(outcome.shrunk_bytes > 0, "{outcome:?}");
+        assert_eq!(outcome.tool_errors, 0, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_tool_results_lack_the_expected_text_fails() {
+        let mut fixture = fixtures::all()
+            .into_iter()
+            .find(|f| f.name == "saw_the_change")
+            .unwrap();
+        fixture.saw = Some("a line no tool result holds");
+
+        let outcome = runner::run_offline(&fixture).await;
+
+        assert!(!outcome.passed, "{outcome:?}");
+        assert!(outcome.failure.unwrap().contains("no tool result held"));
+    }
+
+    #[tokio::test]
     async fn a_rate_limit_with_no_fallback_fails_the_fixture() {
         let mut fixture = fixtures::all()
             .into_iter()
