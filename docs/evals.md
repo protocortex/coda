@@ -63,3 +63,13 @@ run it only on a machine where that is acceptable. It does not compare against t
 ```sh
 CODA_LIVE_EVALS=1 cargo test -p coda-core --test evals -- --ignored live --nocapture
 ```
+
+## Review fixture
+
+`crates/coda-review/tests/fixtures/verify/` holds a change, the findings a reviewer
+reported for it (two real, three false or doubtful) and the scores a scripted verifier
+gives. `verify_fixture.rs` checks that applying those scores drops each known false positive
+and keeps the real findings ranked by score, that the verifier is shown each finding with
+the lines it points at, and that a verifier that fails drops nothing. The scores are fixed
+by the fixture, so it tests coda's side of the pass, not a model.
+It runs offline with the rest of the tests.

@@ -1,0 +1,37 @@
+{
+  "summary": "Adds a cache behind a mutex.",
+  "effort": 2,
+  "risk": "medium",
+  "findings": [
+    {
+      "file": "src/cache.rs", "start_line": 10, "end_line": 10, "severity": "medium",
+      "category": "bug", "title": "Poisoned lock panics the reader",
+      "explanation": "unwrap on lock() panics for every later caller once one thread panicked while holding the lock.",
+      "suggested_patch": null, "confidence": "medium"
+    },
+    {
+      "file": "src/cache.rs", "start_line": 4, "end_line": 4, "severity": "low",
+      "category": "maintainability", "title": "Cache does not derive Debug",
+      "explanation": "The struct should derive Debug.",
+      "suggested_patch": null, "confidence": "low"
+    },
+    {
+      "file": "src/cache.rs", "start_line": 11, "end_line": 11, "severity": "high",
+      "category": "bug", "title": "Lock is held across an await",
+      "explanation": "The guard lives across an await point, which can deadlock the executor.",
+      "suggested_patch": null, "confidence": "medium"
+    },
+    {
+      "file": "src/cache.rs", "start_line": 9, "end_line": 9, "severity": "info",
+      "category": "docs", "title": "get has no doc comment",
+      "explanation": "Public functions should be documented.",
+      "suggested_patch": null, "confidence": "low"
+    },
+    {
+      "file": "src/cache.rs", "start_line": 5, "end_line": 5, "severity": "medium",
+      "category": "performance", "title": "One mutex serializes all readers",
+      "explanation": "A Mutex blocks concurrent readers; an RwLock would let them run together.",
+      "suggested_patch": null, "confidence": "medium"
+    }
+  ]
+}

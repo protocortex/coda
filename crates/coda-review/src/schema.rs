@@ -173,6 +173,20 @@ pub struct Finding {
     pub suggested_patch: Option<String>,
     /// How sure the model is.
     pub confidence: Confidence,
+    /// The verifier's score from 0 to 10. Absent when no verifier scored the finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<u8>,
+    /// The verifier's one-line reason for the score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_reason: Option<String>,
+    /// True when a verifier was asked and gave this finding no usable score.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unverified: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What the model is asked to return.
@@ -232,6 +246,13 @@ pub struct RunDetails {
     pub input_chars: usize,
     /// Findings the model returned that were not kept: over the cap or failed a check.
     pub dropped_findings: usize,
+    /// The backend asked to verify the findings, when a verifier ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier: Option<String>,
+    /// Findings the verifier dropped as false or too doubtful. They are not in
+    /// `dropped_findings`.
+    #[serde(default)]
+    pub verifier_dropped: usize,
     /// Parts the change was split into, each reviewed by its own run.
     #[serde(default)]
     pub chunks: usize,

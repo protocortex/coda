@@ -14,3 +14,4 @@ pub mod request;
 pub mod rules;
 pub mod schema;
 pub mod skip;
+pub mod verify;

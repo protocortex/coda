@@ -26,6 +26,15 @@ pub const CHUNK_CONCURRENCY_KEY: &str = "chunk_concurrency";
 /// Chunks reviewed at the same time when the file does not say.
 pub const DEFAULT_CHUNK_CONCURRENCY: usize = 3;
 
+/// Key of the verifier switch inside `[review]`.
+pub const VERIFY_KEY: &str = "verify";
+/// Key of the verifier score floor inside `[review]`.
+pub const VERIFY_THRESHOLD_KEY: &str = "verify_threshold";
+/// Findings the verifier scores below this are dropped when the file does not say.
+pub const DEFAULT_VERIFY_THRESHOLD: u8 = 4;
+/// Highest score the verifier gives.
+pub const VERIFY_THRESHOLD_MAX: u8 = 10;
+
 /// The `[review]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -39,6 +48,11 @@ pub struct ReviewConfig {
     pub max_chunks: usize,
     /// Most parts reviewed at the same time. Must not be zero.
     pub chunk_concurrency: usize,
+    /// Whether a second agent checks the findings and drops the ones it doubts.
+    pub verify: bool,
+    /// Findings the verifier scores below this, from 0 to 10, are dropped. A score of 0 is
+    /// always dropped.
+    pub verify_threshold: u8,
     /// Files left out of a review.
     pub ignore: ReviewIgnore,
     /// Pull requests that are not reviewed.
@@ -52,6 +66,8 @@ impl Default for ReviewConfig {
             diff_budget_chars: DEFAULT_DIFF_BUDGET_CHARS,
             max_chunks: DEFAULT_MAX_CHUNKS,
             chunk_concurrency: DEFAULT_CHUNK_CONCURRENCY,
+            verify: true,
+            verify_threshold: DEFAULT_VERIFY_THRESHOLD,
             ignore: ReviewIgnore::default(),
             skip: ReviewSkip::default(),
         }

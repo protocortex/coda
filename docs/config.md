@@ -139,6 +139,8 @@ A different argument or a changed result starts the count again, so a poll whose
 | `diff_budget_chars` | integer | `120000` | Most characters of diff text one review sends to the model. The diff is packed to fit (one part, when the review is split): binary, vendored and ignored files and deletion-only hunks are dropped, files of the repository's main language go first and smaller files before larger ones, and each hunk carries three lines of context and its new-side line numbers. Packing ends at the first file the budget cuts: that file keeps the hunks that fit whole, then the lines of the next hunk that fit (cut between lines, so one very large hunk still gives the model its first lines), and every later file is left out. A file where not even its header and the lines up to its first added line fit is left out too, and so are the files after it. A single line longer than the room that is left is not cut. The review's coverage list names every file as reviewed, clipped or left out. The `coda review` command applies it, and a change that does not fit is split into parts (see `max_chunks`). Must not be zero. |
 | `max_chunks` | integer | `4` | Most parts one review splits a change into. When the packed diff does not fit `diff_budget_chars`, the files the budget cut go to a next part, each part is reviewed by its own run, and the results are merged. Files past the last part are listed as left out. Must not be zero. |
 | `chunk_concurrency` | integer | `3` | Most parts reviewed at the same time. Must not be zero. |
+| `verify` | boolean | `true` | Whether a `verifier` agent checks the findings before they are shown. |
+| `verify_threshold` | integer | `4` | Findings the verifier scores below this, on its scale of 0 to 10, are dropped. A score of 0 is always dropped. At most 10. |
 
 ## `coda review`
 
@@ -306,6 +308,8 @@ max_findings = 5
 diff_budget_chars = 120000
 max_chunks = 4
 chunk_concurrency = 3
+verify = true
+verify_threshold = 4
 
 [review.ignore]
 globs = ["docs/generated/**"]
