@@ -45,6 +45,12 @@ pub enum Command {
     /// Exit codes: 0 reviewed or skipped by a rule, 64 bad usage, 70 the review
     /// failed.
     Review(ReviewArgs),
+    /// List, message and read stored sessions from a script.
+    ///
+    /// `send --wait` uses the exit codes of `coda run`; the other commands exit
+    /// 0, 64 for bad usage, or 70 when they fail.
+    #[command(subcommand)]
+    Session(SessionCommand),
     /// Manage standing permission grants.
     #[command(subcommand)]
     Grant(GrantCommand),
@@ -59,6 +65,59 @@ pub enum Command {
     /// Check, list and trust agent, skill and command definitions.
     #[command(subcommand)]
     Agents(AgentsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCommand {
+    /// List stored sessions, newest first.
+    List(SessionListArgs),
+    /// Send a message to a session; with --wait, follow the turn to its end.
+    Send(SessionSendArgs),
+    /// Print a session's conversation.
+    Show(SessionShowArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SessionListArgs {
+    /// Only sessions started in this directory.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// Most sessions to list.
+    #[arg(long)]
+    pub limit: Option<u32>,
+    /// Print the sessions as a JSON array.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionSendArgs {
+    /// The session to message.
+    pub session: String,
+    /// The message. Without it, standard input is the message.
+    #[arg(long)]
+    pub prompt: Option<String>,
+    /// Wait for the turn to end and exit with the code `coda run` would.
+    #[arg(long)]
+    pub wait: bool,
+    /// Print a JSON object instead of text.
+    #[arg(long)]
+    pub json: bool,
+    /// Maximum agent turns.
+    #[arg(long)]
+    pub max_turns: Option<u32>,
+    /// Maximum tokens for the turn.
+    #[arg(long)]
+    pub token_cap: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionShowArgs {
+    /// The session to read.
+    pub session: String,
+    /// Print the session and its stored events as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -306,6 +365,41 @@ mod tests {
         assert_eq!(review.target.as_deref(), Some("main...topic"));
         assert!(review.json);
         assert_eq!(review.backend, Some(BackendArg::Codex));
+    }
+
+    #[test]
+    fn session_commands_parse_their_flags() {
+        // Arrange
+        let list = [
+            "coda", "session", "list", "--cwd", "/x", "--limit", "5", "--json",
+        ];
+        let send = ["coda", "session", "send", "s-1", "--prompt", "hi", "--wait"];
+        let show = ["coda", "session", "show", "s-1", "--json"];
+
+        // Act
+        let list = Cli::try_parse_from(list).unwrap();
+        let send = Cli::try_parse_from(send).unwrap();
+        let show = Cli::try_parse_from(show).unwrap();
+
+        // Assert
+        let Some(Command::Session(SessionCommand::List(list))) = list.command else {
+            panic!("expected session list");
+        };
+        assert_eq!(
+            (list.cwd, list.limit, list.json),
+            (Some(PathBuf::from("/x")), Some(5), true)
+        );
+        let Some(Command::Session(SessionCommand::Send(send))) = send.command else {
+            panic!("expected session send");
+        };
+        assert_eq!(
+            (send.session.as_str(), send.prompt.as_deref(), send.wait),
+            ("s-1", Some("hi"), true)
+        );
+        let Some(Command::Session(SessionCommand::Show(show))) = show.command else {
+            panic!("expected session show");
+        };
+        assert!(show.json);
     }
 
     #[test]
