@@ -96,6 +96,8 @@ golden_tests! {
     session_send_params_queue: "session.send.params.queue" => SessionSendParams,
     session_send_result: "session.send.result" => SessionSendResult,
     session_send_result_queued: "session.send.result.queued" => SessionSendResult,
+    session_send_params_steer: "session.send.params.steer" => SessionSendParams,
+    session_send_result_steered: "session.send.result.steered" => SessionSendResult,
     session_queue_params: "session.queue.params" => SessionQueueParams,
     session_queue_params_discard: "session.queue.params.discard" => SessionQueueParams,
     session_queue_result: "session.queue.result" => SessionQueueResult,

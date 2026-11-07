@@ -348,6 +348,7 @@ fn initialize(params: Option<Value>) -> HandlerFuture {
                 set_mode: true,
                 diff: true,
                 queued_sends: true,
+                steer: true,
             },
         })
     })
@@ -419,6 +420,7 @@ mod tests {
         assert_eq!(result["capabilities"]["set_mode"], json!(true));
         assert_eq!(result["capabilities"]["diff"], json!(true));
         assert_eq!(result["capabilities"]["queued_sends"], json!(true));
+        assert_eq!(result["capabilities"]["steer"], json!(true));
     }
 
     #[tokio::test]

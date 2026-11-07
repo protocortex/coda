@@ -30,6 +30,16 @@ transcript is the stdout of each process, in order. An app-server transcript has
 one line per JSON-RPC text frame, `{"dir":"send"|"recv","message":{...}}`, plus a
 `{"dir","http"}` line for the WebSocket upgrade.
 
+## Steer
+
+`session.send` with `mode: steer` rests on two probes, neither of which is a recorded
+fixture. A manual run with claude 2.1.296 wrote `Use the Bash tool to run sleep 15`, then a second
+`user` line on the same stream-json input seven seconds in. The tool result came back, and the
+one `result` of the turn answered both messages. The schema that `codex app-server
+generate-json-schema` writes for codex-cli 0.163.0 has `turn/steer` with a required
+`expectedTurnId`, which coda sends; a live Codex turn was not run. Both used the
+installed logins and about two short calls.
+
 ## Checks that a review cannot change files
 
 `coda review` runs the reviewer on Claude Code and Codex in plan mode. Two live

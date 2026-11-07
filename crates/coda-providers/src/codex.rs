@@ -21,6 +21,7 @@ use crate::codex_app_server::{AppServerError, AppServerSpec, CodexAppServerSessi
 use crate::codex_exec::{CodexError, CodexExecSession, CodexSpec};
 use crate::emit::Emit;
 use crate::gate::PermissionGate;
+use crate::steer::SteerHandle;
 
 pub use crate::codex_exec::{SandboxMode, SpawnHook};
 
@@ -279,6 +280,16 @@ impl CodexSession {
         match &self.active {
             Active::AppServer(server) => server.cancel_handle(),
             Active::Exec(exec) => exec.cancel_handle(),
+        }
+    }
+
+    /// A handle that adds a user message to the running turn from another task.
+    /// `None` for the exec backend, which cannot take one mid-turn.
+    #[must_use]
+    pub fn steer_handle(&self) -> Option<SteerHandle> {
+        match &self.active {
+            Active::AppServer(server) => Some(server.steer_handle()),
+            Active::Exec(_) => None,
         }
     }
 

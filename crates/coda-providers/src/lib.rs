@@ -22,6 +22,7 @@ pub mod models;
 pub mod openai_compat;
 pub mod policy;
 pub mod registry;
+pub mod steer;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod think;

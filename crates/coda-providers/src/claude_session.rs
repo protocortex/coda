@@ -29,6 +29,7 @@ use crate::claude_code::{
 };
 use crate::emit::Emit;
 use crate::gate::PermissionGate;
+use crate::steer::{self, SteerHandle, SteerInbox};
 use crate::tool_call::{CallInfo, ToolCalls};
 use crate::tool_request::{ToolRequest, reason_from};
 
@@ -184,6 +185,8 @@ pub struct ClaudeSession {
     /// Inputs of `can_use_tool` requests that still await an answer.
     pending: HashMap<String, Value>,
     cancel: Arc<watch::Sender<bool>>,
+    steer: SteerHandle,
+    steer_inbox: SteerInbox,
     session_id: SessionId,
     cwd: PathBuf,
     backend_session_id: Option<String>,
@@ -256,6 +259,7 @@ impl ClaudeSession {
                 kept
             })
         });
+        let (steer, steer_inbox) = steer::channel();
         Ok(Self {
             profile: spec.profile,
             stderr,
@@ -266,6 +270,8 @@ impl ClaudeSession {
             backlog: VecDeque::new(),
             pending: HashMap::new(),
             cancel: Arc::new(watch::channel(false).0),
+            steer,
+            steer_inbox,
             tool_calls: ToolCalls::new(spec.session_id.clone()),
             session_id: spec.session_id,
             cwd: spec.cwd,
@@ -282,6 +288,13 @@ impl ClaudeSession {
     #[must_use]
     pub fn cancel_handle(&self) -> CancelHandle {
         CancelHandle(Arc::clone(&self.cancel))
+    }
+
+    /// A handle that adds a user message to the running turn from another task.
+    /// Claude Code takes a message written while it works and answers it in the same turn.
+    #[must_use]
+    pub fn steer_handle(&self) -> SteerHandle {
+        self.steer.clone()
     }
 
     /// The child's process id, until it has been reaped.
@@ -331,10 +344,11 @@ impl ClaudeSession {
                 .await;
         }
         self.tool_calls.clear();
-        let user = json!({"type": "user", "message": {"role": "user", "content": text}});
+        steer::clear(&mut self.steer_inbox);
+        let user = user_line(text);
         // A child that already exited, for example on a rejected flag, is a crash with
         // its stderr to read, not an I/O failure.
-        let written = match self.write_line(&user.to_string()).await {
+        let written = match self.write_line(&user).await {
             Err(AdapterError::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                 return self.crashed(turn_id, emit).await;
             }
@@ -371,6 +385,12 @@ impl ClaudeSession {
                 read = self.stdout.read(&mut buffer) => read?,
                 () = cancelled(self.cancel.subscribe()) => {
                     return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await;
+                }
+                Some(text) = self.steer_inbox.recv() => {
+                    if !self.write_line(&user_line(&text)).await? {
+                        return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await;
+                    }
+                    continue;
                 }
             };
             if read == 0 {
@@ -762,6 +782,10 @@ pub(crate) fn kill_group(pid: u32) {
     if let Some(group) = group {
         let _ = kill_process_group(group, Signal::KILL);
     }
+}
+
+fn user_line(text: &str) -> String {
+    json!({"type": "user", "message": {"role": "user", "content": text}}).to_string()
 }
 
 pub(crate) async fn cancelled(mut flag: watch::Receiver<bool>) {

@@ -1882,3 +1882,49 @@ async fn a_cancelled_model_turn_holds_the_queue() {
     assert_eq!(held["result"]["messages"][0]["text"], "second");
     assert_eq!(rig.bodies("user_message").await.len(), 1);
 }
+
+#[tokio::test]
+async fn a_message_steered_into_a_model_turn_is_added_before_the_next_model_call() {
+    // Arrange
+    let calls = tool_turn(&[("c1", "bash", json!({"command": "true"}))]);
+    let mut rig = Rig::new(Mode::Default, &[calls, text_turn("done")]);
+    rig.send("first").await;
+    let request = rig.wait_for_pending().await;
+    let params = json!({"session_id": rig.session, "text": "use tabs", "mode": "steer"});
+
+    // Act
+    let steered = rig.call("session.send", params).await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_for_results(1).await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert_eq!(steered["result"]["steered"], true, "{steered}");
+    let rows = rig.bodies("user_message").await;
+    let texts: Vec<_> = rows.iter().map(|b| b["text"].as_str().unwrap()).collect();
+    assert_eq!(texts, ["first", "use tabs"]);
+    assert_eq!(rows[1]["steered"], true);
+    let last_request = rig.requests().pop().unwrap();
+    assert!(
+        last_request
+            .iter()
+            .any(|m| m.to_string().contains("use tabs")),
+        "{last_request:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_steer_after_the_model_turn_ended_is_refused() {
+    // Arrange
+    let mut rig = Rig::new(Mode::Default, &[text_turn("one"), text_turn("two")]);
+    rig.send("first").await;
+    rig.wait_for_results(1).await;
+    rig.wait_until_idle().await;
+    let params = json!({"session_id": rig.session, "text": "late", "mode": "steer"});
+
+    // Act
+    let late = rig.call("session.send", params).await;
+
+    // Assert
+    assert!(late.get("error").is_some(), "{late}");
+}

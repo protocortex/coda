@@ -41,6 +41,7 @@ use crate::hooks::HookRunner;
 use crate::loop_guard::{self, LoopGuard, Verdict};
 use crate::prompt::{Conversation, Message, ToolCall};
 use crate::repair;
+use crate::steer::SteerQueue;
 use crate::task::{TaskRequest, TaskRunner};
 
 /// What the model is told about a call that got no run slot.
@@ -140,6 +141,9 @@ impl StopCondition {
 pub enum TurnEvent {
     /// A piece of answer text.
     Text(String),
+    /// A message the user steered into the send was added to the conversation
+    /// at a step boundary.
+    Steered(String),
     /// A tool call finished, failed or was denied.
     ToolFinished {
         /// The tool that was called.
@@ -460,6 +464,8 @@ pub struct TurnLoop<P, G> {
     todos: Option<Mutex<TodoList>>,
     /// Whether the model may put a question to the user with `ask`.
     asks: bool,
+    /// Messages steered into the running send, added at its next step boundary.
+    steer: SteerQueue,
 }
 
 /// How a compaction attempt ended.
@@ -508,7 +514,15 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             chain: None,
             todos: None,
             asks: false,
+            steer: SteerQueue::default(),
         }
+    }
+
+    /// The queue a client steers messages into while a send runs. A message the
+    /// send never reached stays in it, for the caller to take.
+    #[must_use]
+    pub fn steer_queue(&self) -> SteerQueue {
+        self.steer.clone()
     }
 
     /// Lets the model put a question to the user with the `ask` tool. Left off
@@ -853,6 +867,9 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             if self.cancel.is_cancelled() {
                 return Ok(StopCondition::Cancelled);
             }
+            if turn > 0 {
+                self.add_steered();
+            }
             if let Err(exhausted) = self.budget.admit() {
                 info!(%exhausted, "model call refused");
                 return Ok(StopCondition::BudgetExhausted);
@@ -902,6 +919,11 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                 tool_calls: calls.clone(),
             });
             match stop {
+                StopReason::ToolUse | StopReason::EndTurn
+                    if calls.is_empty() && !last_turn && !self.steer.is_empty() =>
+                {
+                    // The user spoke while the model was answering, so it is not done.
+                }
                 StopReason::ToolUse if calls.is_empty() => {
                     if let Some(stop) = self.guard_end(&answer, &mut continues, last_turn).await {
                         return Ok(stop);
@@ -923,6 +945,14 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             }
         }
         Ok(StopCondition::MaxTurns)
+    }
+
+    /// Adds the messages steered in since the last step to the conversation.
+    fn add_steered(&mut self) {
+        for text in self.steer.take() {
+            self.emit(TurnEvent::Steered(text.clone()));
+            self.conversation.push(Message::User(text));
+        }
     }
 
     /// Repairs the arguments of each call that is not valid JSON, where a

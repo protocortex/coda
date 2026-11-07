@@ -26,12 +26,15 @@ use coda_providers::claude_session::{
 };
 use coda_providers::emit::Emit;
 use coda_providers::gate::PermissionGate;
+use coda_providers::steer::SteerHandle;
 use coda_providers::tool_request::{Tool, ToolRequest};
 use serde_json::Value;
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(30);
 const GONE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Well inside the 1.5 seconds `tool-slow` keeps the turn open.
+const STEER_AFTER: Duration = Duration::from_millis(300);
 const CHILD_EXIT_WAIT: Duration = Duration::from_millis(400);
 const CONTROL_FILE: &str = "fake-claude-control.json";
 const REPORT_FILE: &str = "report.json";
@@ -154,6 +157,41 @@ async fn turn(
     .expect("turn did not finish in time")
     .unwrap();
     (outcome, events)
+}
+
+#[tokio::test]
+async fn a_steer_is_written_to_the_child_while_the_turn_runs() {
+    // Arrange
+    let fixture = Fixture::new();
+    let prompts = fixture.cwd.path().join("prompts.txt");
+    let mut control: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.cwd.path().join(CONTROL_FILE)).unwrap())
+            .unwrap();
+    control["prompt_path"] = serde_json::json!(prompts);
+    fs::write(fixture.cwd.path().join(CONTROL_FILE), control.to_string()).unwrap();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+    let handle: SteerHandle = session.steer_handle();
+    let steering = tokio::spawn(async move {
+        tokio::time::sleep(STEER_AFTER).await;
+        handle.steer("and use tabs")
+    });
+
+    // Act
+    let (outcome, _) = turn(&mut session, &gate, "tool-slow").await;
+    let reached = steering.await.unwrap();
+    let deadline = tokio::time::Instant::now() + GONE_TIMEOUT;
+    let mut seen = String::new();
+    while !seen.contains("and use tabs") && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        seen = fs::read_to_string(&prompts).unwrap_or_default();
+    }
+
+    // Assert
+    assert!(reached);
+    assert_eq!(outcome, TurnOutcome::Completed { is_error: false });
+    assert!(seen.contains("tool-slow"), "{seen}");
+    assert!(seen.contains("and use tabs"), "{seen}");
 }
 
 #[tokio::test]
