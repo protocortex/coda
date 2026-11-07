@@ -1968,3 +1968,86 @@ async fn a_steer_after_the_model_turn_ended_is_refused() {
     // Assert
     assert!(late.get("error").is_some(), "{late}");
 }
+
+mod pull_request_link {
+    use coda_core::prompt::ToolCall;
+    use coda_core::turn::TurnEvent;
+
+    use super::StreamedText;
+
+    const OPENED: &str = "https://github.com/o/r/pull/4";
+
+    fn asks(id: &str, tool: &str, command: &str) -> TurnEvent {
+        TurnEvent::Assistant {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: id.to_owned(),
+                name: tool.to_owned(),
+                arguments: serde_json::json!({"command": command}).to_string(),
+            }],
+            reasoning: Vec::new(),
+        }
+    }
+
+    fn finishes(id: &str, text: &str, is_error: bool) -> TurnEvent {
+        TurnEvent::ToolFinished {
+            tool: "bash".to_owned(),
+            call_id: id.to_owned(),
+            text: text.to_owned(),
+            is_error,
+        }
+    }
+
+    #[test]
+    fn a_gh_pr_create_the_model_ran_yields_the_address_it_printed() {
+        // Arrange
+        let mut streamed = StreamedText::default();
+        streamed.opened_pull_request(&asks("c1", "bash", "gh pr create --fill"));
+
+        // Act
+        let found = streamed.opened_pull_request(&finishes("c1", OPENED, false));
+
+        // Assert
+        assert_eq!(found.as_deref(), Some(OPENED));
+    }
+
+    #[test]
+    fn a_failed_gh_pr_create_yields_nothing() {
+        // Arrange
+        let mut streamed = StreamedText::default();
+        streamed.opened_pull_request(&asks("c1", "bash", "gh pr create --fill"));
+
+        // Act
+        let output = format!("a pull request already exists:\n{OPENED}\n\n[exit status 1]");
+        let found = streamed.opened_pull_request(&finishes("c1", &output, false));
+
+        // Assert
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn another_command_that_prints_a_pull_request_address_yields_nothing() {
+        // Arrange
+        let mut streamed = StreamedText::default();
+        streamed.opened_pull_request(&asks("c1", "bash", "gh pr view 4 --json url"));
+
+        // Act
+        let found = streamed.opened_pull_request(&finishes("c1", OPENED, false));
+
+        // Assert
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_gh_pr_create_text_in_another_tool_yields_nothing() {
+        // Arrange
+        let mut streamed = StreamedText::default();
+        streamed.opened_pull_request(&asks("c1", "write", "gh pr create"));
+
+        // Act
+        let found = streamed.opened_pull_request(&finishes("c1", OPENED, false));
+
+        // Assert
+        assert_eq!(found, None);
+    }
+}

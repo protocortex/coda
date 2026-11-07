@@ -132,6 +132,11 @@ pub fn protocol_schema() -> Value {
         &mut methods,
         m::SESSION_WORKTREE,
     );
+    add_method::<m::SessionShipParams, m::SessionShipResult>(
+        &mut generator,
+        &mut methods,
+        m::SESSION_SHIP,
+    );
     add_method::<m::WorktreeCleanParams, m::WorktreeCleanResult>(
         &mut generator,
         &mut methods,

@@ -7,7 +7,7 @@
 //! A session keeps its loop across sends; a send runs on its own task, with
 //! the loop out of the table until the send ends.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::PathBuf;
@@ -44,6 +44,7 @@ use coda_providers::registry::{
     ANTHROPIC_KEY, ModelClient, ModelRegistry, OPENAI_COMPAT_KEY, RegistryError, provider_key,
 };
 use coda_store::{EventRecord, NewQueued, SessionRecord, StoreError};
+use coda_tools::bash::NAME as SHELL_TOOL;
 use coda_tools::bash::{DEFAULT_ENV_ALLOWLIST, allowlisted_env};
 use coda_tools::{Tool, skill};
 use serde_json::{Value, json};
@@ -54,6 +55,7 @@ use tracing::{Instrument, Span, info, warn};
 use crate::checkpoint;
 use crate::gate::{BrokerGate, Brokers};
 use crate::idle_pool::IdlePool;
+use crate::ship::{creates_pull_request, ended_cleanly, printed_pull_request};
 use crate::subscribe::{Hub, HubError};
 use crate::trace::backend_span;
 use crate::turn::{
@@ -1277,6 +1279,8 @@ async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Ro
 struct StreamedText {
     /// What the turn's calls work on, until each call finishes.
     summaries: HashMap<String, Option<String>>,
+    /// Calls of the shell tool that run `gh pr create`, until each finishes.
+    pr_calls: HashSet<String>,
     text: String,
     /// When the oldest unstored chunk was held; `None` while nothing is held.
     since: Option<tokio::time::Instant>,
@@ -1305,6 +1309,13 @@ impl StreamedText {
         }
         let TurnEvent::Text(chunk) = event else {
             self.flush(hub, session, turn).await;
+            if let Some(url) = self.opened_pull_request(&event) {
+                let session = session.clone();
+                let linked = hub
+                    .with_store_mut(move |store| store.link_pull_request(&session, &url))
+                    .await;
+                log_failure(linked);
+            }
             let calls = self.tool_calls(session, turn, &event);
             let context = self.context.take();
             publish_turn_event(hub, session, turn, event, context).await;
@@ -1317,6 +1328,32 @@ impl StreamedText {
         self.text.push_str(&chunk);
         if self.text.len() >= MAX_DELTA_CHUNK_BYTES {
             self.flush(hub, session, turn).await;
+        }
+    }
+
+    /// The address of the pull request a `gh pr create` the model ran has just opened.
+    fn opened_pull_request(&mut self, event: &TurnEvent) -> Option<String> {
+        match event {
+            TurnEvent::Assistant { tool_calls, .. } => {
+                for made in tool_calls.iter().filter(|made| made.name == SHELL_TOOL) {
+                    let command = serde_json::from_str::<Value>(&made.arguments)
+                        .ok()
+                        .and_then(|input| input.get("command")?.as_str().map(str::to_owned));
+                    if command.is_some_and(|command| creates_pull_request(&command)) {
+                        self.pr_calls.insert(made.id.clone());
+                    }
+                }
+                None
+            }
+            TurnEvent::ToolFinished {
+                call_id,
+                is_error,
+                text,
+                ..
+            } if self.pr_calls.remove(call_id) && !is_error => ended_cleanly(text)
+                .then(|| printed_pull_request(text))
+                .flatten(),
+            _ => None,
         }
     }
 

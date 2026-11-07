@@ -143,6 +143,9 @@ pub enum SessionCommand {
     Show(SessionShowArgs),
     /// Put the files back as an earlier turn left them and roll the later turns back.
     Rewind(SessionRewindArgs),
+    /// Commit what a session changed; with --push also push the branch, with --pr also open a
+    /// draft pull request. Nothing runs until you call it.
+    Ship(SessionShipArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -194,6 +197,34 @@ pub struct SessionRewindArgs {
     /// Restore the files only and keep every turn in the conversation.
     #[arg(long)]
     pub keep_conversation: bool,
+    /// Print the result as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is its own option on the command line"
+)]
+pub struct SessionShipArgs {
+    /// The session whose working directory is committed.
+    pub session: String,
+    /// The commit message. Its first line is also the pull request title.
+    #[arg(long)]
+    pub message: String,
+    /// Push the branch to origin after the commit.
+    #[arg(long)]
+    pub push: bool,
+    /// Push, then open a draft pull request with `gh`.
+    #[arg(long)]
+    pub pr: bool,
+    /// The pull request body; say why the change is made.
+    #[arg(long, requires = "pr")]
+    pub body: Option<String>,
+    /// Open the pull request ready for review instead of as a draft.
+    #[arg(long, requires = "pr")]
+    pub ready: bool,
     /// Print the result as JSON.
     #[arg(long)]
     pub json: bool,
@@ -558,6 +589,44 @@ mod tests {
         assert_eq!(run.cwd, Some(PathBuf::from("/x")));
         assert_eq!(run.mode, ModeArg::AcceptEdits);
         assert_eq!((run.max_turns, run.token_cap), (Some(3), Some(100)));
+    }
+
+    #[test]
+    fn a_ship_pull_request_body_needs_the_pr_flag() {
+        // Arrange
+        let with_pr = [
+            "coda",
+            "session",
+            "ship",
+            "s1",
+            "--message",
+            "m",
+            "--pr",
+            "--body",
+            "why",
+        ];
+        let without = [
+            "coda",
+            "session",
+            "ship",
+            "s1",
+            "--message",
+            "m",
+            "--body",
+            "why",
+        ];
+
+        // Act
+        let parsed = Cli::try_parse_from(with_pr);
+        let refused = Cli::try_parse_from(without);
+
+        // Assert
+        let Some(Command::Session(SessionCommand::Ship(ship))) = parsed.unwrap().command else {
+            panic!("expected the session ship command");
+        };
+        assert!(ship.pr);
+        assert!(!ship.push);
+        assert!(refused.is_err());
     }
 
     #[test]

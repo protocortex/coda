@@ -5,14 +5,16 @@
 //! Resume only confirms the session exists and returns it; the client then
 //! replays what it missed with `session.subscribe` and its last sequence number.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 use coda_protocol::methods::{
-    SESSION_CREATE, SessionAttention, SessionCreateParams, SessionCreateResult, SessionListParams,
-    SessionListResult, SessionResumeParams, SessionResumeResult, SessionStatus, SessionSummary,
-    SessionWorktreeParams, SessionWorktreeResult, WORKTREE_REFUSED_CODE, WorktreeCleanParams,
+    SESSION_CREATE, SHIP_REFUSED_CODE, SessionAttention, SessionCreateParams, SessionCreateResult,
+    SessionListParams, SessionListResult, SessionResumeParams, SessionResumeResult,
+    SessionShipParams, SessionStatus, SessionSummary, SessionWorktreeParams, SessionWorktreeResult,
+    WORKTREE_REFUSED_CODE, WorktreeCleanParams,
 };
 use coda_protocol::types::{SessionId, SessionInfo};
 use coda_store::{
@@ -24,6 +26,7 @@ use tracing::{Instrument, error, warn};
 
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
 use crate::receipts;
+use crate::ship::{ShipTools, ship};
 use crate::subscribe::{Hub, HubError};
 use crate::trace::session_span;
 use crate::turn::SESSION_NOT_FOUND;
@@ -294,6 +297,84 @@ fn refused(message: &str) -> ErrorObject {
     error(WORKTREE_REFUSED_CODE, message)
 }
 
+static SHIPPING: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// Holds a session's place among the ships in flight, so two ships of one session never share
+/// a git index. Dropping it frees the session.
+struct ShipClaim(String);
+
+impl ShipClaim {
+    fn take(id: &SessionId) -> Option<Self> {
+        let mut held = SHIPPING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.insert(id.as_str().to_owned())
+            .then(|| Self(id.as_str().to_owned()))
+    }
+}
+
+impl Drop for ShipClaim {
+    fn drop(&mut self) {
+        SHIPPING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Answers `session.ship`: commits what the session changed, and as far as the
+/// request asks pushes and opens a pull request. It refuses while a turn runs,
+/// since the agent may still be writing. A pull request it opens is linked to
+/// the session.
+pub(crate) async fn ship_session(
+    hub: Option<&Arc<Hub>>,
+    tools: ShipTools,
+    running: impl Fn(&SessionId) -> bool,
+    params: Option<Value>,
+) -> HandlerResult {
+    let hub = hub.ok_or_else(unavailable)?;
+    let params: SessionShipParams = parse_params(params)?;
+    let id = params.session_id.clone();
+    let record = hub
+        .with_store({
+            let id = id.clone();
+            move |store| store.load_session(&id)
+        })
+        .await
+        .map_err(failed)?;
+    if running(&id) {
+        return Err(error(
+            SHIP_REFUSED_CODE,
+            "a turn is running; wait for it to end or cancel it first",
+        ));
+    }
+    let Some(_claim) = ShipClaim::take(&id) else {
+        return Err(error(
+            SHIP_REFUSED_CODE,
+            "this session is already being shipped",
+        ));
+    };
+    let cwd = PathBuf::from(record.cwd);
+    let shipped = tokio::task::spawn_blocking(move || ship(&tools, &cwd, &params)).await;
+    let done = match shipped {
+        Ok(Ok(done)) => done,
+        Ok(Err(reason)) => return Err(error(SHIP_REFUSED_CODE, &reason)),
+        Err(e) => {
+            error!(error = %e, "ship task failed");
+            return Err(error(INTERNAL_ERROR, "Internal error"));
+        }
+    };
+    if let Some(url) = done.pull_request.clone() {
+        let linked = hub
+            .with_store_mut(move |store| store.link_pull_request(&id, &url))
+            .await;
+        if let Err(e) = linked {
+            warn!(error = %e, "could not link the pull request to its session");
+        }
+    }
+    to_value(&done)
+}
+
 async fn blocking_worktree<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, crate::worktree::WorktreeError> + Send + 'static,
 ) -> Result<T, ErrorObject> {
@@ -310,7 +391,11 @@ async fn blocking_worktree<T: Send + 'static>(
     }
 }
 
-fn summary(stored: StoredSummary, running: &impl Fn(&SessionId) -> bool) -> SessionSummary {
+fn summary(
+    stored: StoredSummary,
+    pull_requests: Vec<String>,
+    running: &impl Fn(&SessionId) -> bool,
+) -> SessionSummary {
     let status = if running(&stored.record.id) {
         SessionStatus::Running
     } else {
@@ -332,6 +417,7 @@ fn summary(stored: StoredSummary, running: &impl Fn(&SessionId) -> bool) -> Sess
         status,
         attention,
         title: stored.title,
+        pull_requests,
     }
 }
 
@@ -358,10 +444,22 @@ pub(crate) async fn list(
         .unwrap_or(DEFAULT_LIST_LIMIT)
         .min(MAX_LIST_LIMIT);
     let stored = hub
-        .with_store(move |store| store.list_session_summaries(&SessionFilter { cwd }, limit))
+        .with_store(move |store| {
+            store
+                .list_session_summaries(&SessionFilter { cwd }, limit)?
+                .into_iter()
+                .map(|s| {
+                    let linked = store.session_pull_requests(&s.record.id)?;
+                    Ok((s, linked))
+                })
+                .collect::<Result<Vec<_>, StoreError>>()
+        })
         .await
         .map_err(failed)?;
-    let sessions = stored.into_iter().map(|s| summary(s, &running)).collect();
+    let sessions = stored
+        .into_iter()
+        .map(|(s, linked)| summary(s, linked, &running))
+        .collect();
     to_value(&SessionListResult { sessions })
 }
 
@@ -377,7 +475,7 @@ mod tests {
 
     use coda_protocol::methods::WORKTREE_REFUSED_CODE;
 
-    use super::{clean_worktrees, create, ensure_checkout, list, worktree};
+    use super::{clean_worktrees, create, ensure_checkout, list, ship_session, worktree};
     use crate::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
     use crate::worktree::Worktrees;
 
@@ -825,5 +923,114 @@ mod tests {
         assert_eq!(report["applied"], json!(false));
         assert_eq!(report["worktrees"].as_array().unwrap().len(), 1);
         assert!(f.trees.path_for(&SessionId::new(id)).exists());
+    }
+
+    const SHIPPED_PR: &str = "https://github.com/o/r/pull/9";
+
+    fn ship_rig(f: &Fixture) -> crate::ship::ShipTools {
+        use std::os::unix::fs::PermissionsExt;
+        let root = f.repo.parent().unwrap();
+        let remote = root.join("remote.git");
+        std::fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(
+            &f.repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&f.repo, &["checkout", "-q", "-b", "coda/ship"]);
+        git(&f.repo, &["config", "user.name", "t"]);
+        git(&f.repo, &["config", "user.email", "t@t"]);
+        git(&f.repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(f.repo.join("a.txt"), "two\n").unwrap();
+        let script = root.join("gh");
+        std::fs::write(&script, format!("#!/bin/sh\necho '{SHIPPED_PR}'\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::ship::ShipTools::with_gh(script.into_os_string())
+    }
+
+    fn ship_body(id: &str, action: &str) -> Value {
+        json!({"session_id": id, "action": action, "message": "fix: one thing", "body": "why"})
+    }
+
+    #[tokio::test]
+    async fn a_shipped_pull_request_is_linked_to_its_session_and_listed() {
+        // Arrange
+        let f = repo_with_hub();
+        let id = new_session(&f).await;
+        let tools = ship_rig(&f);
+
+        // Act
+        let done = ship_session(
+            Some(&f.hub),
+            tools,
+            |_| false,
+            Some(ship_body(&id, "commit_push_pr")),
+        )
+        .await
+        .unwrap();
+        let listed = list(Some(&f.hub), |_| false, Some(json!({})))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(done["pull_request"], json!(SHIPPED_PR));
+        assert_eq!(listed["sessions"][0]["pull_requests"], json!([SHIPPED_PR]));
+    }
+
+    #[tokio::test]
+    async fn a_session_with_a_running_turn_is_not_shipped() {
+        // Arrange
+        let f = repo_with_hub();
+        let id = new_session(&f).await;
+        let tools = ship_rig(&f);
+
+        // Act
+        let refused = ship_session(
+            Some(&f.hub),
+            tools,
+            |_| true,
+            Some(ship_body(&id, "commit")),
+        )
+        .await
+        .unwrap_err();
+
+        // Assert
+        assert_eq!(refused.code, coda_protocol::methods::SHIP_REFUSED_CODE);
+        assert_ne!(git(&f.repo, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn a_session_already_being_shipped_cannot_be_claimed_again_until_the_first_ends() {
+        // Arrange
+        let id = SessionId::new("claim-test");
+        let first = super::ShipClaim::take(&id);
+
+        // Act
+        let second = super::ShipClaim::take(&id);
+        drop(first);
+        let third = super::ShipClaim::take(&id);
+
+        // Assert
+        assert!(second.is_none());
+        assert!(third.is_some());
+    }
+
+    #[tokio::test]
+    async fn shipping_an_unknown_session_is_session_not_found() {
+        // Arrange
+        let f = repo_with_hub();
+
+        // Act
+        let error = ship_session(
+            Some(&f.hub),
+            crate::ship::ShipTools::default(),
+            |_| false,
+            Some(ship_body("999", "commit")),
+        )
+        .await
+        .unwrap_err();
+
+        // Assert
+        assert_eq!(error.code, crate::turn::SESSION_NOT_FOUND);
     }
 }

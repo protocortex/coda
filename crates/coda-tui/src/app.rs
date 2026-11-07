@@ -1579,6 +1579,7 @@ mod tests {
             status: SessionStatus::Running,
             attention,
             title: Some(title.to_owned()),
+            pull_requests: Vec::new(),
         }
     }
 

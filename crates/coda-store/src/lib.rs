@@ -13,6 +13,7 @@ mod index;
 pub mod migrate;
 mod originals;
 mod pending;
+mod pull_requests;
 mod queue;
 mod readers;
 mod receipts;
@@ -55,7 +56,7 @@ use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 20;
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// Release of this binary, recorded in the database each time it opens it.
 pub const BINARY_RELEASE: &str = env!("CARGO_PKG_VERSION");

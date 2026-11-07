@@ -29,7 +29,7 @@ const GIT_LIMIT: Duration = Duration::from_secs(60);
 const SETUP_LIMIT: Duration = Duration::from_secs(600);
 const OWNER_ONLY_MODE: u32 = 0o700;
 /// Variables that would point git at another repository than the one named.
-const INHERITED_GIT_VARIABLES: [&str; 4] = [
+pub(crate) const INHERITED_GIT_VARIABLES: [&str; 4] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",

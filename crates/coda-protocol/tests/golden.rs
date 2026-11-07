@@ -17,9 +17,10 @@ use coda_protocol::methods::{
     SessionDiffParams, SessionDiffResult, SessionListParams, SessionListResult, SessionQueueParams,
     SessionQueueResult, SessionResumeParams, SessionResumeResult, SessionRewindParams,
     SessionRewindResult, SessionSendParams, SessionSendResult, SessionSetModeParams,
-    SessionSetModeResult, SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams,
-    SessionSubscribeResult, SessionWorktreeParams, SessionWorktreeResult, UsageSummaryParams,
-    UsageSummaryResult, WorktreeCleanParams, WorktreeCleanResult,
+    SessionSetModeResult, SessionSetModelParams, SessionSetModelResult, SessionShipParams,
+    SessionShipResult, SessionSubscribeParams, SessionSubscribeResult, SessionWorktreeParams,
+    SessionWorktreeResult, UsageSummaryParams, UsageSummaryResult, WorktreeCleanParams,
+    WorktreeCleanResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -119,6 +120,8 @@ golden_tests! {
     session_rewind_params_base: "session.rewind.params.base" => SessionRewindParams,
     session_rewind_params_keep: "session.rewind.params.keep" => SessionRewindParams,
     session_rewind_result: "session.rewind.result" => SessionRewindResult,
+    session_ship_params: "session.ship.params" => SessionShipParams,
+    session_ship_result: "session.ship.result" => SessionShipResult,
     session_worktree_params: "session.worktree.params" => SessionWorktreeParams,
     session_worktree_result: "session.worktree.result" => SessionWorktreeResult,
     worktree_clean_params: "worktree.clean.params" => WorktreeCleanParams,
