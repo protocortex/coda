@@ -107,6 +107,8 @@ pub enum CliError {
     ReviewPost(String),
     #[error("review memory: {0}")]
     ReviewMemory(String),
+    #[error("login: {0}")]
+    Login(String),
     #[error("hook: {0}")]
     Hooks(String),
     #[error("the reviewer did not give a usable answer: {0}")]

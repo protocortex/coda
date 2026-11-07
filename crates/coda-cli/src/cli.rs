@@ -85,6 +85,30 @@ pub enum Command {
     /// Check, list and trust agent, skill and command definitions.
     #[command(subcommand)]
     Agents(AgentsCommand),
+    /// Log a backend in through its own CLI (`claude auth login` or `codex login`) in this
+    /// terminal, then check the login again. Coda never sees the login flow or the token.
+    ///
+    /// Exit codes: 0 logged in, 64 bad usage, 70 left logged out or the login failed.
+    Login(LoginArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct LoginArgs {
+    /// The backend to log in.
+    #[arg(value_enum)]
+    pub backend: LoginBackend,
+    /// Run the login command without asking first.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// The backends that have a login of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LoginBackend {
+    /// Claude Code, through `claude auth login`.
+    ClaudeCode,
+    /// Codex, through `codex login`.
+    Codex,
 }
 
 #[derive(Debug, Subcommand)]

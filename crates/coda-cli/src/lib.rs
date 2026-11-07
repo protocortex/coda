@@ -16,6 +16,7 @@ pub mod exit;
 mod grant;
 mod hooks_cmd;
 mod init;
+mod login;
 mod review;
 mod review_context;
 mod review_issues;
@@ -79,6 +80,7 @@ async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<ExitCode, C
     let done = match cli.command {
         Some(Command::Run(args)) => return run::run(ctx, io, force, args).await,
         Some(Command::Doctor(args)) => return doctor::run(ctx, io, args).await,
+        Some(Command::Login(args)) => return login::run(ctx, io, args).await,
         Some(Command::Review(args)) => return review::run(ctx, io, force, args).await,
         Some(Command::Agents(command)) => return agents::run(ctx, io, &command),
         Some(Command::Checkpoints(command)) => return checkpoints_cmd::run(ctx, io, command).await,
