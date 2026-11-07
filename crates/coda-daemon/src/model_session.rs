@@ -25,12 +25,14 @@ pub use coda_core::history::{CONTEXT_OVERFLOW_KIND, MODEL_SWITCHED_KIND, TURN_ST
 use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
 use coda_core::tools::{
     BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index, task_schema,
+    todo_schema,
 };
 use coda_core::turn::{CancelToken, Fallback, StopCondition, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{
     CALL_RECOVERED_KIND, CallRecoveredBody, Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND,
     GuardContinueBody, GuardLimitBody, HOOK_BLOCKED_KIND, HookBlockedBody, MODEL_FALLBACK_KIND,
-    ModelFallbackBody, TIMEOUT_KIND, ToolCallStatus, tool_summary,
+    ModelFallbackBody, TIMEOUT_KIND, TODO_UPDATED_KIND, TodoItem, TodoUpdatedBody, ToolCallStatus,
+    tool_summary,
 };
 use coda_protocol::types::{
     BackendKind, OriginalId, PermissionDecision, SessionId, TokenUsage, TurnId,
@@ -770,7 +772,7 @@ impl ModelSessions {
         &self,
         session: &SessionId,
         prefix: Prefix,
-    ) -> Result<(Conversation, bool), HubError> {
+    ) -> Result<(Conversation, bool, Vec<TodoItem>), HubError> {
         let mut rebuild = Rebuild::new(prefix);
         let mut after = 0;
         loop {
@@ -785,7 +787,8 @@ impl ModelSessions {
             rebuild = back;
             let Some(last) = next else {
                 let started = rebuild.session_started();
-                return Ok((rebuild.finish(), started));
+                let todos = rebuild.todos().to_vec();
+                return Ok((rebuild.finish(), started, todos));
             };
             after = last;
         }
@@ -826,8 +829,10 @@ impl ModelSessions {
         }
         let mut schemas = tools.schemas;
         schemas.push(task_schema(&offer.agents));
+        schemas.push(todo_schema());
         let prefix = Prefix::new(SYSTEM_PROMPT, schemas, "")?;
-        let (conversation, session_started) = self.stored_conversation(&record.id, prefix).await?;
+        let (conversation, session_started, todos) =
+            self.stored_conversation(&record.id, prefix).await?;
         let turn = Arc::new(Mutex::new(TurnId::new(NO_TURN)));
         let broker = self
             .brokers
@@ -870,7 +875,8 @@ impl ModelSessions {
             )
             .with_used_tokens(used)
             .with_resumed(session_started)
-            .with_text_tool_calls(self.text_tool_calls(record));
+            .with_text_tool_calls(self.text_tool_calls(record))
+            .with_todos(todos);
         if let Some((alias, chain)) = self.fallbacks(record, shared_script.as_ref()) {
             turn_loop = turn_loop.with_fallbacks(alias, chain);
         }
@@ -1140,6 +1146,12 @@ async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Ro
                 how: how.as_str().to_owned()
             }),
         },
+        TurnEvent::TodoUpdated { items } => Row::Stored {
+            kind: TODO_UPDATED_KIND,
+            body: json!(TodoUpdatedBody {
+                items: items.clone()
+            }),
+        },
         TurnEvent::ModelFallback { from, to, reason } => Row::Stored {
             kind: MODEL_FALLBACK_KIND,
             body: json!(ModelFallbackBody {
@@ -1342,6 +1354,7 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
         | TurnEvent::ToolFinished { .. }
         | TurnEvent::ContextOverflow
         | TurnEvent::ModelFallback { .. }
+        | TurnEvent::TodoUpdated { .. }
         | TurnEvent::CallRecovered { .. } => return,
     };
     log_failure(stored);

@@ -28,7 +28,7 @@ use coda_tools::read_log::ReadLog;
 use coda_tools::retrieve::RetrieveTool;
 use coda_tools::sandbox::{Sandbox, SandboxError};
 use coda_tools::write::WriteTool;
-use coda_tools::{DEFAULT_MAX_OUTPUT_BYTES, Tool, ToolError, ToolOutput, task};
+use coda_tools::{DEFAULT_MAX_OUTPUT_BYTES, Tool, ToolError, ToolOutput, task, todo};
 use serde_json::Value;
 use serde_json::json;
 
@@ -87,6 +87,30 @@ pub fn task_schema(agents: &[(String, String)]) -> ToolSchema {
             "prompt": {"type": "string", "description": "What the agent should do, with all it needs to know."},
         }),
         &["agent", "prompt"],
+    )
+}
+
+/// The schema of the `todo` tool.
+#[must_use]
+pub fn todo_schema() -> ToolSchema {
+    schema(
+        todo::NAME,
+        todo::DESCRIPTION,
+        &json!({
+            "action": {
+                "type": "string",
+                "enum": ["add", "set", "clear"],
+                "description": "What to do to the list.",
+            },
+            "text": {"type": "string", "description": "For add: what is to be done."},
+            "id": {"type": "integer", "description": "For set: the number of the item."},
+            "status": {
+                "type": "string",
+                "enum": ["pending", "in_progress", "done"],
+                "description": "For set: the new status.",
+            },
+        }),
+        &["action"],
     )
 }
 

@@ -158,6 +158,15 @@ mod offline {
     }
 
     #[tokio::test]
+    async fn the_todo_fixture_keeps_its_list_without_a_tool_error() {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "kept_a_todo_list");
+        assert_eq!(outcome.tool_errors, 0, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
     async fn a_rate_limit_with_no_fallback_fails_the_fixture() {
         let mut fixture = fixtures::all()
             .into_iter()

@@ -32,6 +32,8 @@ pub struct Fixture {
     /// replies from the same script after the first. The check also requires
     /// that the loop did fall back.
     pub fallback: bool,
+    /// Whether the model is offered the `todo` tool.
+    pub todo: bool,
     pub script: fn() -> Vec<Turn>,
 }
 
@@ -47,6 +49,7 @@ impl Fixture {
             guard: None,
             text_calls: false,
             fallback: false,
+            todo: false,
             script: || vec![reply("Nothing to do.")],
         }
     }
@@ -144,6 +147,7 @@ const FIX_FAILING_TEST: Fixture = Fixture {
     guard: None,
     text_calls: false,
     fallback: false,
+    todo: false,
     script: || {
         vec![
             call("bash", json!({"command": "sh test.sh"})),
@@ -167,6 +171,7 @@ const ADD_FUNCTION: Fixture = Fixture {
     guard: None,
     text_calls: false,
     fallback: false,
+    todo: false,
     script: || {
         vec![
             call("list", json!({})),
@@ -196,6 +201,7 @@ const RENAME_SYMBOL: Fixture = Fixture {
     guard: None,
     text_calls: false,
     fallback: false,
+    todo: false,
     script: || {
         vec![
             call("grep", json!({"pattern": "old_name"})),
@@ -226,6 +232,7 @@ const RESIST_INJECTION: Fixture = Fixture {
     guard: None,
     text_calls: false,
     fallback: false,
+    todo: false,
     script: || {
         vec![
             call("read", json!({"path": "notes.txt"})),
@@ -245,6 +252,7 @@ const RECOVER_AFTER_BAD_CALL: Fixture = Fixture {
     guard: None,
     text_calls: false,
     fallback: false,
+    todo: false,
     script: || {
         vec![
             call(
@@ -270,6 +278,7 @@ const WARNED_FOR_A_REPEAT: Fixture = Fixture {
     guard: None,
     text_calls: false,
     fallback: false,
+    todo: false,
     script: || {
         vec![
             call("read", json!({"path": "config.txt"})),
@@ -295,6 +304,7 @@ const FINISHED_TOO_EARLY: Fixture = Fixture {
     ),
     text_calls: false,
     fallback: false,
+    todo: false,
     script: || {
         vec![
             reply("Done."),
@@ -316,6 +326,7 @@ const REPAIRED_ARGUMENTS: Fixture = Fixture {
     guard: None,
     text_calls: false,
     fallback: false,
+    todo: false,
     script: || {
         vec![
             raw_call(
@@ -336,6 +347,7 @@ const KEPT_REASONING: Fixture = Fixture {
     guard: None,
     text_calls: false,
     fallback: false,
+    todo: false,
     script: || {
         vec![
             with_reasoning(
@@ -359,6 +371,7 @@ const TEXT_SHAPED_CALL: Fixture = Fixture {
     guard: None,
     text_calls: true,
     fallback: false,
+    todo: false,
     script: || {
         vec![
             reply(
@@ -378,6 +391,7 @@ const FELL_BACK_ON_RATE_LIMIT: Fixture = Fixture {
     guard: None,
     text_calls: false,
     fallback: true,
+    todo: false,
     script: || {
         vec![
             rate_limited(),
@@ -385,6 +399,33 @@ const FELL_BACK_ON_RATE_LIMIT: Fixture = Fixture {
                 "edit",
                 json!({"path": "config.txt", "old_string": "mode=slow", "new_string": "mode=fast"}),
             ),
+            reply("Set mode=fast in config.txt."),
+        ]
+    },
+};
+
+const KEPT_A_TODO_LIST: Fixture = Fixture {
+    name: "kept_a_todo_list",
+    prompt: "Set mode to fast in config.txt, keeping a todo list of your steps.",
+    files: &[("config.txt", "mode=slow\n")],
+    check: "grep -qx mode=fast config.txt",
+    untrusted: None,
+    guard: None,
+    text_calls: false,
+    fallback: false,
+    todo: true,
+    script: || {
+        vec![
+            call("todo", json!({"action": "add", "text": "change the mode"})),
+            call(
+                "todo",
+                json!({"action": "set", "id": 1, "status": "in_progress"}),
+            ),
+            call(
+                "edit",
+                json!({"path": "config.txt", "old_string": "mode=slow", "new_string": "mode=fast"}),
+            ),
+            call("todo", json!({"action": "set", "id": 1, "status": "done"})),
             reply("Set mode=fast in config.txt."),
         ]
     },
@@ -404,5 +445,6 @@ pub fn all() -> Vec<Fixture> {
         TEXT_SHAPED_CALL,
         KEPT_REASONING,
         FELL_BACK_ON_RATE_LIMIT,
+        KEPT_A_TODO_LIST,
     ]
 }

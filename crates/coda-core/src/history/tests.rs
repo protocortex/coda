@@ -4,7 +4,8 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use coda_protocol::events::{
-    COMPACTION_KIND, MODEL_FALLBACK_KIND, STREAM_DELTA_KIND, TOOL_CALL_KIND,
+    COMPACTION_KIND, MODEL_FALLBACK_KIND, STREAM_DELTA_KIND, TODO_UPDATED_KIND, TOOL_CALL_KIND,
+    TodoStatus,
 };
 use coda_protocol::types::{OriginalId, TurnId};
 use coda_store::StoredEvent;
@@ -476,6 +477,83 @@ fn compaction(summary: &str, replaced: u32) -> (&'static str, Value) {
 
 fn summary_user(summary: &str) -> Message {
     Message::User(crate::compact::summary_message(summary))
+}
+
+fn todos(items: &[(u32, &str, &str)]) -> (&'static str, Value) {
+    let items: Vec<Value> = items
+        .iter()
+        .map(|(id, text, status)| json!({"id": id, "text": text, "status": status}))
+        .collect();
+    (TODO_UPDATED_KIND, json!({ "items": items }))
+}
+
+#[test]
+fn the_last_stored_todo_list_is_the_current_one() {
+    let events = [
+        user("one"),
+        todos(&[(1, "plan", "pending")]),
+        todos(&[(1, "plan", "done"), (2, "build", "pending")]),
+        assistant("first", &[]),
+    ];
+    let mut replay = Rebuild::new(prefix());
+
+    for event in numbered(&events) {
+        replay.apply(&event, &lookup);
+    }
+
+    let list = replay.todos();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].status, TodoStatus::Done);
+    assert_eq!(list[1].text, "build");
+}
+
+#[test]
+fn a_compaction_hands_the_todo_list_stored_before_it_back_to_the_model() {
+    let events = [
+        user("one"),
+        assistant("first", &[]),
+        todos(&[(1, "plan", "done"), (2, "build", "in_progress")]),
+        user("two"),
+        compaction("they planned", 3),
+        assistant("second", &[]),
+    ];
+
+    let messages = replay(&events);
+
+    let Message::User(text) = &messages[0] else {
+        panic!("{messages:?}");
+    };
+    let expected = crate::compact::summary_with_todos(
+        "they planned",
+        &[
+            TodoItem {
+                id: 1,
+                text: "plan".to_owned(),
+                status: TodoStatus::Done,
+            },
+            TodoItem {
+                id: 2,
+                text: "build".to_owned(),
+                status: TodoStatus::InProgress,
+            },
+        ],
+    );
+    assert_eq!(text, &expected);
+    assert!(text.contains("1. [x] plan\n2. [~] build"), "{text}");
+}
+
+#[test]
+fn a_compaction_with_no_todo_list_is_the_plain_summary() {
+    let events = [
+        user("one"),
+        assistant("first", &[]),
+        compaction("s", 2),
+        assistant("second", &[]),
+    ];
+
+    let messages = replay(&events);
+
+    assert_eq!(messages[0], summary_user("s"));
 }
 
 #[test]

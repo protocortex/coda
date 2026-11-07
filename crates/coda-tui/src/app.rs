@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, TodoItem};
 use coda_protocol::methods::{Capabilities, SessionStatus, SessionSummary};
 use coda_protocol::types::{BackendKind, SessionInfo};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -20,6 +20,7 @@ use crate::input::Input;
 use crate::permission::{Overlay, PermissionPrompt};
 use crate::sessions::LinkCommand;
 use crate::status::Status;
+use crate::todos;
 use crate::work::WorkLog;
 
 const TITLE: &str = " coda (/quit to exit) ";
@@ -69,6 +70,8 @@ pub enum LinkEvent {
     Notice(String),
     /// What the daemon said it can do when the link connected.
     Capabilities(Capabilities),
+    /// The model's todo list changed; this is the whole list now.
+    Todos(Vec<TodoItem>),
     /// The daemon has no enabled provider.
     SetupNeeded,
     /// The process was asked to stop, for example by a signal.
@@ -85,6 +88,8 @@ pub struct App {
     link: Option<UnboundedSender<LinkCommand>>,
     turn_running: bool,
     work: WorkLog,
+    /// The model's todo list, drawn above the prompt.
+    todos: Vec<TodoItem>,
     /// When the user asked to stop the turn or last forced it, and whether that was a force.
     stop: Option<(Instant, bool)>,
     /// What the daemon said it can do; unknown until the link reports it.
@@ -109,6 +114,7 @@ impl App {
             link: None,
             turn_running: false,
             work: WorkLog::new(),
+            todos: Vec::new(),
             stop: None,
             capabilities: None,
             setup_shown: false,
@@ -181,6 +187,7 @@ impl App {
             LinkEvent::Permission(prompt) => self.overlay.push(prompt, Instant::now()),
             LinkEvent::SessionStarted(info) => {
                 self.chat.clear();
+                self.todos.clear();
                 self.status.set_session(info.backend, info.model);
                 self.overlay = Overlay::default();
                 self.turn_running = false;
@@ -197,6 +204,7 @@ impl App {
             LinkEvent::Sessions(sessions) => self.show_sessions(&sessions),
             LinkEvent::Notice(text) => self.chat.push_notice(text),
             LinkEvent::Capabilities(capabilities) => self.capabilities = Some(capabilities),
+            LinkEvent::Todos(items) => self.todos = items,
             LinkEvent::SetupNeeded => self.show_setup_guidance(),
             LinkEvent::Quit => self.quit = true,
         }
@@ -449,8 +457,11 @@ impl App {
 
     fn render_at(&self, frame: &mut Frame, now: Instant) {
         let live = self.work_line(now);
-        let [body, live_row, input, connection, status] = Layout::vertical([
+        let todo_lines = todos::lines(&self.todos);
+        let todo_rows = u16::try_from(todo_lines.len()).unwrap_or(u16::MAX);
+        let [body, todo_row, live_row, input, connection, status] = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(todo_rows),
             Constraint::Length(u16::from(live.is_some())),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -461,6 +472,9 @@ impl App {
         let transcript = block.inner(body);
         frame.render_widget(block, body);
         self.chat.render(frame, transcript);
+        if !todo_lines.is_empty() {
+            frame.render_widget(Paragraph::new(todo_lines.join("\n")), todo_row);
+        }
         if let Some(live) = live {
             frame.render_widget(Paragraph::new(live), live_row);
         }
@@ -1712,6 +1726,35 @@ mod tests {
             app.work_line(t0 + Duration::from_secs(2)).as_deref(),
             Some("running ls 2s")
         );
+    }
+
+    fn todo(id: u32, text: &str, status: coda_protocol::events::TodoStatus) -> TodoItem {
+        TodoItem {
+            id,
+            text: text.to_owned(),
+            status,
+        }
+    }
+
+    #[test]
+    fn the_todo_list_is_drawn_above_the_prompt_and_a_new_session_clears_it() {
+        // Arrange
+        use coda_protocol::events::TodoStatus;
+        let mut app = App::new();
+        app.handle_event(LinkEvent::Todos(vec![
+            todo(1, "plan", TodoStatus::Done),
+            todo(2, "build", TodoStatus::InProgress),
+        ]));
+
+        // Act
+        let shown = screen(&app);
+        app.handle_event(LinkEvent::SessionStarted(session("s-2")));
+        let cleared = screen(&app);
+
+        // Assert
+        assert!(shown.contains("[x] plan"), "{shown}");
+        assert!(shown.contains("[~] build"), "{shown}");
+        assert!(!cleared.contains("plan"), "{cleared}");
     }
 
     #[test]

@@ -11,7 +11,8 @@ use coda_protocol::events::{
     APPROVALS_UNAVAILABLE_KIND, APPROVE_KIND, BACKEND_CRASHED_KIND, CALL_RECOVERED_KIND,
     COMPACTION_KIND, DENY_KIND, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, HISTORY_NOT_RESTORED_KIND,
     HOOK_BLOCKED_KIND, MODEL_FALLBACK_KIND, RATE_LIMIT_KIND, RESULT_KIND, STREAM_DELTA_KIND,
-    TIMEOUT_KIND, TOOL_CALL_KIND, TURN_INTERRUPTED_KIND, USAGE_KIND, USAGE_LIMIT_KIND,
+    TIMEOUT_KIND, TODO_UPDATED_KIND, TOOL_CALL_KIND, TURN_INTERRUPTED_KIND, TodoItem,
+    TodoUpdatedBody, USAGE_KIND, USAGE_LIMIT_KIND,
 };
 use coda_protocol::types::{OriginalId, SessionId};
 use coda_providers::model::ReasoningBlock;
@@ -24,7 +25,7 @@ mod transcript;
 
 pub use self::transcript::Transcript;
 
-use crate::compact::{SUMMARY_UNAVAILABLE, summary_message};
+use crate::compact::{SUMMARY_UNAVAILABLE, summary_with_todos};
 use crate::prompt::{Conversation, Message, Prefix, ToolCall};
 use crate::turn::{EMPTY_ARGUMENTS, NO_REPLY, SKIPPED};
 
@@ -209,6 +210,8 @@ pub struct Rebuild {
     unanswered: Vec<String>,
     /// Whether a stored event says a `session_start` hook passed.
     session_started: bool,
+    /// The model's todo list as the events so far left it.
+    todos: Vec<TodoItem>,
 }
 
 impl Rebuild {
@@ -219,7 +222,14 @@ impl Rebuild {
             conversation: Conversation::new(prefix),
             unanswered: Vec::new(),
             session_started: false,
+            todos: Vec::new(),
         }
+    }
+
+    /// The model's todo list as the events applied so far left it.
+    #[must_use]
+    pub fn todos(&self) -> &[TodoItem] {
+        &self.todos
     }
 
     /// Whether the events applied so far include a passed `session_start` hook.
@@ -281,6 +291,11 @@ impl Rebuild {
             }
             CONVERSATION_RESET_KIND => {}
             SESSION_STARTED_KIND => self.session_started = true,
+            TODO_UPDATED_KIND => {
+                if let Some(body) = parse::<TodoUpdatedBody>(event) {
+                    self.todos = body.items;
+                }
+            }
             kind if BOOKKEEPING_KINDS.contains(&kind) => {
                 debug!(seq = event.seq, kind, "skipped a bookkeeping event");
             }
@@ -342,7 +357,7 @@ impl Rebuild {
     fn compaction(&mut self, seq: u64, body: &CompactionBody, lookup: ResultLookup<'_>) {
         let summary =
             resolve(&body.summary, lookup).unwrap_or_else(|| SUMMARY_UNAVAILABLE.to_owned());
-        let message = Message::User(summary_message(&summary));
+        let message = Message::User(summary_with_todos(&summary, &self.todos));
         if !self
             .conversation
             .replace_prefix(body.replaced_messages, message)

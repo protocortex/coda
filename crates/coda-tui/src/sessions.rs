@@ -11,7 +11,8 @@ use coda_config::timing::Timing;
 use coda_protocol::events::{
     CALL_FROM_TEXT, CALL_RECOVERED_KIND, CALL_REPAIRED, CallRecoveredBody, EVENT_NOTIFICATION,
     Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, GuardContinueBody, GuardLimitBody,
-    HOOK_BLOCKED_KIND, HookBlockedBody, MODEL_FALLBACK_KIND, ModelFallbackBody,
+    HOOK_BLOCKED_KIND, HookBlockedBody, MODEL_FALLBACK_KIND, ModelFallbackBody, TODO_UPDATED_KIND,
+    TodoItem, TodoUpdatedBody,
 };
 use coda_protocol::jsonrpc::Notification;
 use coda_protocol::methods::{
@@ -156,6 +157,17 @@ pub fn turn_notice_from_params(params: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Reads a stored `todo_updated` notification as the model's whole todo list;
+/// other kinds give `None`.
+#[must_use]
+pub fn todos_from_params(params: &Value) -> Option<Vec<TodoItem>> {
+    if params.get("kind")?.as_str()? != TODO_UPDATED_KIND {
+        return None;
+    }
+    let body: TodoUpdatedBody = serde_json::from_str(params.get("body")?.as_str()?).ok()?;
+    Some(body.items)
 }
 
 fn backend_names(backends: &[BackendKind]) -> String {
@@ -653,6 +665,8 @@ impl Link {
             EVENT_NOTIFICATION => {
                 if let Some(text) = user_message_from_params(params) {
                     self.tell(LinkEvent::UserMessage(text));
+                } else if let Some(items) = todos_from_params(params) {
+                    self.tell(LinkEvent::Todos(items));
                 } else if let Some(notice) =
                     hook_blocked_from_params(params).or_else(|| turn_notice_from_params(params))
                 {
@@ -937,6 +951,28 @@ mod tests {
 
         // Assert
         assert_eq!(notice, "Switched from fast to steady: HTTP 429 slow down");
+    }
+
+    #[test]
+    fn a_todo_update_becomes_the_whole_list_and_other_kinds_do_not() {
+        // Arrange
+        let items = vec![TodoItem {
+            id: 1,
+            text: "plan".to_owned(),
+            status: coda_protocol::events::TodoStatus::Pending,
+        }];
+        let update = json!({
+            "kind": TODO_UPDATED_KIND,
+            "body": json!(TodoUpdatedBody { items: items.clone() }).to_string()
+        });
+        let other = json!({"kind": "result", "body": "{}"});
+
+        // Act
+        let (read, none) = (todos_from_params(&update), todos_from_params(&other));
+
+        // Assert
+        assert_eq!(read, Some(items));
+        assert_eq!(none, None);
     }
 
     #[test]
