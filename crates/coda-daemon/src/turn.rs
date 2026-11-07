@@ -403,6 +403,14 @@ impl Turns {
             stopping: AtomicBool::new(false),
         });
         turns.models.set_pr_watches(Arc::clone(&turns.pr_watches));
+        if turns.config.models.review.watch.enabled {
+            match std::env::current_exe() {
+                Ok(program) => turns.pr_watches.enable_reviews(program.into_os_string()),
+                Err(error) => {
+                    warn!(%error, "watch reviews are off: the coda program was not found");
+                }
+            }
+        }
         let waking = Arc::downgrade(&turns);
         turns.pr_watches.set_waker(Arc::new(move |session, text| {
             if let Some(turns) = waking.upgrade() {

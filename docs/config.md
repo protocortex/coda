@@ -288,7 +288,17 @@ The entry goes in as the first item of its subsection under `Unreleased`. A miss
 | `enabled` | boolean | `false` | Whether `coda review --hook` reviews the commits about to be pushed (`@{u}..HEAD`) and prints the findings. Off, it exits 0 at once. |
 | `block_on_high` | boolean | `false` | Whether a finding of severity high or critical makes `coda review --hook` exit 23, which stops the push. Off, the findings are only printed. |
 
-The hook reviews the checked-out branch against its upstream (`@{u}..HEAD`), whatever ref the push names, so `git push origin other-branch` reviews the branch you are on. A branch with no upstream has nothing to review and does not stop the push. A review that fails (no backend, a bad answer, a broken config) says so on standard error and does not stop it either, and the script lets every outcome of coda through except exit 23; only a finding can stop a push. The script skips the review when `coda` is not on the `PATH`. The review uses the same settings as `coda review`, so a push waits for a model run, with no time limit of its own. A global `core.hooksPath` makes the hook global: one install covers every repository that uses it, and a remove takes it away from all of them. Starting a review from a pull request watch needs the watch itself (#166) and is tracked in #316.
+The hook reviews the checked-out branch against its upstream (`@{u}..HEAD`), whatever ref the push names, so `git push origin other-branch` reviews the branch you are on. A branch with no upstream has nothing to review and does not stop the push. A review that fails (no backend, a bad answer, a broken config) says so on standard error and does not stop it either, and the script lets every outcome of coda through except exit 23; only a finding can stop a push. The script skips the review when `coda` is not on the `PATH`. The review uses the same settings as `coda review`, so a push waits for a model run, with no time limit of its own. A global `core.hooksPath` makes the hook global: one install covers every repository that uses it, and a remove takes it away from all of them. A pull request watch can start a review too, see [`[review.watch]`](#reviewwatch).
+
+## `[review.watch]`
+
+A pull request watch (`coda session watch`, or the `watch_pr` tool) can start `coda review <pr> --incremental` when the branch gets a new push, and wake the session with what the review printed. It is off until the global config sets it, and the repository's `.coda/review.toml` cannot turn it on.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Whether a watch starts an incremental review after a push. Off, a watch never reviews. |
+
+A push the watch sees after it started starts a review. The commits that were there when the watch started do not. A draft pull request, a merge commit and a commit by a bot never start one, judged by the newest commit of the push and its author, and the watch tries again at each read until a commit it could not read can be read. A push made while the pull request is a draft is reviewed when the draft becomes ready. The review runs `coda review` in the watching session's folder with your own `gh` login and the same settings as `coda review`, so `[review.skip]` and `incremental_min_commits` apply on top, and it stops after 15 minutes. The watch does not read the pull request while the review runs. Whatever the review printed, including a notice that it skipped, is passed to the session as data, cut at 8 KiB. A review that prints nothing wakes nobody. The daemon reads the setting when it starts.
 
 ## `[review.routing]`
 

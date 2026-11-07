@@ -86,6 +86,8 @@ pub struct ReviewConfig {
     pub linked_repos: Vec<String>,
     /// The review before a push, started by the hook `coda hooks install review` writes.
     pub hook: ReviewHook,
+    /// The review a pull request watch starts after a push.
+    pub watch: ReviewWatch,
     /// Files left out of a review.
     pub ignore: ReviewIgnore,
     /// Pull requests that are not reviewed.
@@ -112,6 +114,7 @@ impl Default for ReviewConfig {
             extra_instructions: String::new(),
             linked_repos: Vec::new(),
             hook: ReviewHook::default(),
+            watch: ReviewWatch::default(),
             ignore: ReviewIgnore::default(),
             skip: ReviewSkip::default(),
             routing: ReviewRouting::default(),
@@ -129,6 +132,15 @@ pub struct ReviewHook {
     pub enabled: bool,
     /// Whether a finding of severity high or critical stops the push.
     pub block_on_high: bool,
+}
+
+/// The `[review.watch]` section. It is off until set, and only the global config sets it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ReviewWatch {
+    /// Whether a pull request watch starts `coda review --incremental` after a push. A draft,
+    /// a merge commit and a commit by a bot never start one. Off, a watch never reviews.
+    pub enabled: bool,
 }
 
 /// The `[review.ignore]` section.

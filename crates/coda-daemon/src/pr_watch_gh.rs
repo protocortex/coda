@@ -14,10 +14,12 @@ use std::time::Duration;
 use coda_selfhost::process::run_bounded;
 use serde_json::Value;
 
-use crate::pr_watch::{PrReader, PrState, Snapshot};
+use crate::pr_watch::{HeadKind, PrReader, PrState, Snapshot};
 
 const GH_LIMIT: Duration = Duration::from_secs(60);
-const VIEW_FIELDS: &str = "state,mergeable,comments,reviews";
+const VIEW_FIELDS: &str = "state,mergeable,comments,reviews,headRefOid,isDraft";
+const BOT_ACCOUNT_TYPE: &str = "Bot";
+const BOT_LOGIN_SUFFIX: &str = "[bot]";
 const CHECK_FIELDS: &str = "name,bucket";
 pub(crate) const URL_PREFIX: &str = "https://";
 const BUCKET_FAIL: &str = "fail";
@@ -36,6 +38,8 @@ pub(crate) struct GhReader {
     cwd: PathBuf,
     pr: String,
     login: Mutex<Option<String>>,
+    /// The newest commit looked at and what it is, so a commit that could be read is read once.
+    head: Mutex<Option<(String, HeadKind)>>,
 }
 
 impl GhReader {
@@ -45,6 +49,7 @@ impl GhReader {
             cwd,
             pr,
             login: Mutex::new(None),
+            head: Mutex::new(None),
         }
     }
 
@@ -95,34 +100,60 @@ impl GhReader {
         }
     }
 
+    fn head_kind(&self, head: &str) -> HeadKind {
+        let mut seen = self
+            .head
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((known, kind)) = seen.as_ref()
+            && known == head
+        {
+            return *kind;
+        }
+        let endpoint = format!("repos/{{owner}}/{{repo}}/commits/{head}");
+        let kind = match self.gh(&["api", &endpoint]) {
+            Ok((out, _, true)) => parse_commit(&out),
+            _ => HeadKind::Unknown,
+        };
+        if kind != HeadKind::Unknown {
+            *seen = Some((head.to_owned(), kind));
+        }
+        kind
+    }
+
     fn read_now(&self) -> Result<Snapshot, String> {
         let login = self.own_login()?;
         let (out, err, ok) = self.gh(&["pr", "view", self.pr.as_str(), "--json", VIEW_FIELDS])?;
         if !ok {
             return Err(format!("gh pr view failed: {}", err.trim()));
         }
-        let (state, conflicting, others_comments) = parse_view(&out, &login)?;
-        if state != PrState::Open {
-            return Ok(Snapshot {
-                state,
-                conflicting,
-                failed_checks: Vec::new(),
-                required_passed: false,
-                others_comments,
-            });
+        let view = parse_view(&out, &login)?;
+        let head_kind = if view.head.is_empty() {
+            HeadKind::Unknown
+        } else {
+            self.head_kind(&view.head)
+        };
+        let mut snapshot = Snapshot {
+            state: view.state,
+            conflicting: view.conflicting,
+            failed_checks: Vec::new(),
+            required_passed: false,
+            others_comments: view.others,
+            head: view.head,
+            draft: view.draft,
+            head_kind,
+        };
+        if snapshot.state != PrState::Open {
+            return Ok(snapshot);
         }
         let all = self.checks(false)?;
         let required = self.checks(true)?;
-        Ok(Snapshot {
-            state,
-            conflicting,
-            failed_checks: failed(&all),
-            required_passed: !required.is_empty()
-                && required
-                    .iter()
-                    .all(|(_, bucket)| bucket == BUCKET_PASS || bucket == BUCKET_SKIP),
-            others_comments,
-        })
+        snapshot.failed_checks = failed(&all);
+        snapshot.required_passed = !required.is_empty()
+            && required
+                .iter()
+                .all(|(_, bucket)| bucket == BUCKET_PASS || bucket == BUCKET_SKIP);
+        Ok(snapshot)
     }
 }
 
@@ -158,12 +189,19 @@ pub(crate) fn parse_checks(json: &str) -> Option<Vec<(String, String)>> {
     )
 }
 
-/// The state, whether it conflicts, and the identifiers of the comments and
-/// reviews not written by `own_login`, from the JSON `gh pr view --json` prints.
-pub(crate) fn parse_view(
-    json: &str,
-    own_login: &str,
-) -> Result<(PrState, bool, Vec<String>), String> {
+/// What `gh pr view --json` says about a pull request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct View {
+    pub(crate) state: PrState,
+    pub(crate) conflicting: bool,
+    /// Identifiers of the comments and reviews not written by the watching user.
+    pub(crate) others: Vec<String>,
+    pub(crate) head: String,
+    pub(crate) draft: bool,
+}
+
+/// Reads the JSON `gh pr view --json` prints, leaving out what `own_login` wrote.
+pub(crate) fn parse_view(json: &str, own_login: &str) -> Result<View, String> {
     let view: Value = serde_json::from_str(json).map_err(|e| format!("gh pr view output: {e}"))?;
     let state = match view.get("state").and_then(Value::as_str) {
         Some(STATE_MERGED) => PrState::Merged,
@@ -187,7 +225,43 @@ pub(crate) fn parse_view(
     };
     let mut others = by_others("comments", None);
     others.extend(by_others("reviews", Some(REVIEW_PENDING)));
-    Ok((state, conflicting, others))
+    Ok(View {
+        state,
+        conflicting,
+        others,
+        head: view
+            .get("headRefOid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        draft: view
+            .get("isDraft")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// What a commit is, from the JSON the commits endpoint prints.
+pub(crate) fn parse_commit(json: &str) -> HeadKind {
+    let Ok(commit) = serde_json::from_str::<Value>(json) else {
+        return HeadKind::Unknown;
+    };
+    let Some(parents) = commit.get("parents").and_then(Value::as_array) else {
+        return HeadKind::Unknown;
+    };
+    if parents.len() > 1 {
+        return HeadKind::Merge;
+    }
+    let by_bot = commit.pointer("/author/type").and_then(Value::as_str) == Some(BOT_ACCOUNT_TYPE)
+        || commit
+            .pointer("/author/login")
+            .and_then(Value::as_str)
+            .is_some_and(|login| login.ends_with(BOT_LOGIN_SUFFIX));
+    if by_bot {
+        HeadKind::Bot
+    } else {
+        HeadKind::Normal
+    }
 }
 
 /// Whether `pr` names a pull request by number or by address, so it cannot be read as a flag.
@@ -206,6 +280,8 @@ mod tests {
     const VIEW: &str = r#"{
         "state": "OPEN",
         "mergeable": "CONFLICTING",
+        "headRefOid": "abc",
+        "isDraft": true,
         "comments": [
             {"id": "c1", "author": {"login": "me"}},
             {"id": "c2", "author": {"login": "other"}}
@@ -220,12 +296,14 @@ mod tests {
     #[test]
     fn a_view_gives_the_state_the_conflict_and_only_what_others_wrote() {
         // Arrange and Act
-        let (state, conflicting, others) = parse_view(VIEW, "me").unwrap();
+        let view = parse_view(VIEW, "me").unwrap();
 
         // Assert
-        assert_eq!(state, PrState::Open);
-        assert!(conflicting);
-        assert_eq!(others, ["c2", "r1"]);
+        assert_eq!(view.state, PrState::Open);
+        assert!(view.conflicting);
+        assert_eq!(view.others, ["c2", "r1"]);
+        assert_eq!(view.head, "abc");
+        assert!(view.draft);
     }
 
     #[test]
@@ -235,8 +313,26 @@ mod tests {
         let closed = r#"{"state":"CLOSED"}"#;
 
         // Act and Assert
-        assert_eq!(parse_view(merged, "me").unwrap().0, PrState::Merged);
-        assert_eq!(parse_view(closed, "me").unwrap().0, PrState::Closed);
+        assert_eq!(parse_view(merged, "me").unwrap().state, PrState::Merged);
+        assert_eq!(parse_view(closed, "me").unwrap().state, PrState::Closed);
+    }
+
+    #[test]
+    fn a_commit_is_a_merge_a_bot_a_person_or_unknown() {
+        // Arrange
+        let merge = r#"{"parents":[{"sha":"1"},{"sha":"2"}],"author":{"login":"a","type":"User"}}"#;
+        let bot = r#"{"parents":[{"sha":"1"}],"author":{"login":"x","type":"Bot"}}"#;
+        let bot_login =
+            r#"{"parents":[{"sha":"1"}],"author":{"login":"dependabot[bot]","type":"User"}}"#;
+        let person = r#"{"parents":[{"sha":"1"}],"author":{"login":"a","type":"User"}}"#;
+
+        // Act and Assert
+        assert_eq!(parse_commit(merge), HeadKind::Merge);
+        assert_eq!(parse_commit(bot), HeadKind::Bot);
+        assert_eq!(parse_commit(bot_login), HeadKind::Bot);
+        assert_eq!(parse_commit(person), HeadKind::Normal);
+        assert_eq!(parse_commit("{}"), HeadKind::Unknown);
+        assert_eq!(parse_commit("nope"), HeadKind::Unknown);
     }
 
     #[test]

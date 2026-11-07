@@ -14,8 +14,9 @@ use coda_tools::{Tool, ToolError, ToolOutput};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
-use crate::pr_watch::{POLL_INTERVAL, run};
+use crate::pr_watch::{NoReview, POLL_INTERVAL, run};
 use crate::pr_watch_gh::{GhReader, URL_PREFIX, is_pull_request_reference};
+use crate::pr_watch_review::ReviewRunner;
 
 /// The name the model uses to call the tool.
 pub(crate) const TOOL_NAME: &str = "watch_pr";
@@ -49,6 +50,8 @@ pub(crate) enum WatchError {
 /// The running watches, one task each.
 pub(crate) struct PrWatches {
     waker: OnceLock<Waker>,
+    /// The program that reviews a push, set only when `[review.watch] enabled` is on.
+    review_program: OnceLock<OsString>,
     active: Mutex<BTreeSet<(String, String)>>,
     handle: Option<Handle>,
     gh: OsString,
@@ -64,6 +67,7 @@ impl PrWatches {
     pub(crate) fn with(gh: OsString, interval: Duration) -> Arc<Self> {
         Arc::new(Self {
             waker: OnceLock::new(),
+            review_program: OnceLock::new(),
             active: Mutex::default(),
             handle: Handle::try_current().ok(),
             gh,
@@ -74,6 +78,11 @@ impl PrWatches {
     /// Sets where wake messages go. The first call wins.
     pub(crate) fn set_waker(&self, waker: Waker) {
         let _ = self.waker.set(waker);
+    }
+
+    /// Has every watch review a push with `program review --incremental`. Only the first call counts.
+    pub(crate) fn enable_reviews(&self, program: OsString) {
+        let _ = self.review_program.set(program);
     }
 
     /// The pull requests `session` watches now.
@@ -119,17 +128,24 @@ impl PrWatches {
             active.insert(key.clone());
         }
         let watches = Arc::clone(self);
-        let reader = Arc::new(GhReader::new(self.gh.clone(), cwd, pr.to_owned()));
+        let reader = Arc::new(GhReader::new(self.gh.clone(), cwd.clone(), pr.to_owned()));
         let (id, subject) = (session.clone(), subject_of(pr));
         let interval = self.interval;
+        let reviewer = self
+            .review_program
+            .get()
+            .map(|program| ReviewRunner::new(program.clone(), cwd, pr.to_owned(), subject.clone()));
         handle.spawn(async move {
             let waker = watches.waker.get().cloned();
-            run(&reader, &subject, interval, |text| {
+            let wake = |text| {
                 if let Some(waker) = &waker {
                     waker(id.clone(), text);
                 }
-            })
-            .await;
+            };
+            match &reviewer {
+                Some(reviewer) => run(&reader, Some(reviewer), &subject, interval, wake).await,
+                None => run(&reader, None::<&NoReview>, &subject, interval, wake).await,
+            };
             watches.set().remove(&key);
         });
         Ok(())
@@ -357,5 +373,91 @@ mod tests {
         );
         assert!(matches!(again, Err(ToolError::InvalidInput { .. })));
         assert!(matches!(missing, Err(ToolError::InvalidInput { .. })));
+    }
+
+    const PUSH_GH: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+case "$1" in
+  api) case "$2" in
+         user) echo '{"login":"me"}';;
+         *) echo '{"parents":[{"sha":"1"}],"author":{"login":"a","type":"User"}}';;
+       esac;;
+  pr) case "$2" in
+        view) n=$(cat "$d/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$d/n"
+              case $n in
+                1) echo '{"state":"OPEN","headRefOid":"aaaa"}';;
+                2) echo '{"state":"OPEN","headRefOid":"bbbb"}';;
+                *) echo '{"state":"MERGED","headRefOid":"bbbb"}';;
+              esac;;
+        checks) echo '[]';;
+      esac;;
+esac
+"#;
+
+    fn push_rig(dir: &TempDir) -> OsString {
+        let gh = dir.path().join("gh");
+        fs::write(&gh, PUSH_GH).unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+        let coda = dir.path().join("coda");
+        fs::write(
+            &coda,
+            "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/reviewed\"\necho a finding\n",
+        )
+        .unwrap();
+        fs::set_permissions(&coda, fs::Permissions::from_mode(0o755)).unwrap();
+        gh.into_os_string()
+    }
+
+    async fn watch_to_the_end(watches: &Arc<PrWatches>, dir: &TempDir) -> Vec<String> {
+        let woken = collect(watches);
+        watches
+            .start(&SessionId::new(SESSION), dir.path().to_owned(), "7")
+            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            let mut texts = Vec::new();
+            loop {
+                let (_, text) = woken.recv_timeout(Duration::from_secs(30)).unwrap();
+                let done = text.contains("merged");
+                texts.push(text);
+                if done {
+                    return texts;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn with_reviews_on_a_push_runs_the_incremental_review_and_wakes_with_its_output() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let watches = PrWatches::with(push_rig(&dir), Duration::ZERO);
+        watches.enable_reviews(dir.path().join("coda").into_os_string());
+
+        // Act
+        let texts = watch_to_the_end(&watches, &dir).await;
+
+        // Assert
+        let ran = fs::read_to_string(dir.path().join("reviewed")).unwrap();
+        assert_eq!(ran.trim(), "review 7 --incremental");
+        assert!(
+            texts.iter().any(|text| text.contains("a finding")),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_reviews_off_a_push_runs_no_review() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let watches = PrWatches::with(push_rig(&dir), Duration::ZERO);
+
+        // Act
+        let texts = watch_to_the_end(&watches, &dir).await;
+
+        // Assert
+        assert!(!dir.path().join("reviewed").exists());
+        assert_eq!(texts.len(), 1, "{texts:?}");
     }
 }
