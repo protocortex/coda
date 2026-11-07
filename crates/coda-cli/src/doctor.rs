@@ -3,25 +3,22 @@
 //! `coda doctor`: reports the health of the daemon's files, the database, the
 //! backends and the config, and with `--repair` clears what a dead daemon left.
 
-use std::ffi::OsString;
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
+use clap::ValueEnum;
 use coda_config::config::{Config, ConfigError};
 use coda_daemon::backends::{ClaudeCodeBackend, CodexBackend};
 use coda_daemon::reaper::survey_orphans;
 use coda_daemon::repair::{RepairError, RepairReport, repair};
 use coda_protocol::events::AccountBilling;
 use coda_protocol::methods::DaemonStatusResult;
-use coda_protocol::types::{BackendKind, SessionId};
-use coda_providers::account::{AccountStatus, probe_claude};
+use coda_protocol::types::BackendKind;
+use coda_providers::account::AccountStatus;
 use coda_providers::backend::{AgentBackend, locate, require_enabled};
-use coda_providers::codex_app_server::{AppServerSpec, read_account};
-use coda_providers::codex_exec::SandboxMode;
 use coda_providers::registry::{ANTHROPIC_KEY, FAUX_KEY};
 use coda_store::health::DatabaseRelease;
 use coda_store::{BINARY_RELEASE, SCHEMA_VERSION, health};
@@ -29,10 +26,11 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::autostart::{connect_unchecked, status_of};
-use crate::cli::DoctorArgs;
+use crate::cli::{DoctorArgs, LoginBackend};
 use crate::context::{Context, Io};
 use crate::error::CliError;
 use crate::exit;
+use crate::login::{locate_binary, probe_account};
 use crate::run::pick_backend;
 
 const NAME_WIDTH: usize = 9;
@@ -535,11 +533,6 @@ async fn check_backends(config: Option<Config>) -> Check {
     }
 }
 
-/// How long a login probe may take; it starts the backend's own binary.
-const ACCOUNT_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-const CLAUDE_LOGIN_COMMAND: &str = "claude auth login";
-const CODEX_LOGIN_COMMAND: &str = "codex login";
-
 /// Asks each enabled backend's own binary which login it runs on. Only what the
 /// binary prints is read, and an API key it would bill is a warning.
 async fn check_accounts(config: Option<Config>) -> Check {
@@ -547,50 +540,23 @@ async fn check_accounts(config: Option<Config>) -> Check {
     let Some(config) = config else {
         return Check::warn(NAME, "skipped, the config is not valid");
     };
-    let search_dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect())
-        .unwrap_or_default();
-    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     // Locating runs `--version` and waits on it, so it stays off the runtime.
-    let (claude, codex) = tokio::task::spawn_blocking(move || {
-        let located = |backend: &dyn AgentBackend| {
-            locate(backend, &config, &search_dirs)
-                .ok()
-                .map(|found| found.path)
-        };
-        (located(&ClaudeCodeBackend), located(&CodexBackend))
+    let located = tokio::task::spawn_blocking(move || {
+        LoginBackend::value_variants()
+            .iter()
+            .filter_map(|backend| {
+                locate_binary(*backend, &config)
+                    .ok()
+                    .map(|binary| (*backend, binary))
+            })
+            .collect::<Vec<_>>()
     })
     .await
-    .unwrap_or((None, None));
+    .unwrap_or_default();
     let mut parts = Vec::new();
-    if let Some(binary) = claude {
-        let env = env.clone();
-        let probed =
-            tokio::task::spawn_blocking(move || probe_claude(&binary, &env, ACCOUNT_PROBE_TIMEOUT))
-                .await
-                .unwrap_or_else(|e| Err(format!("the probe did not finish: {e}")));
-        parts.push(describe_account(
-            ClaudeCodeBackend.config_key(),
-            CLAUDE_LOGIN_COMMAND,
-            probed,
-        ));
-    }
-    if let Some(binary) = codex {
-        let spec = AppServerSpec {
-            binary,
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            session_id: SessionId::new("doctor"),
-            sandbox: SandboxMode::default(),
-            ephemeral: true,
-            verified_versions: Vec::new(),
-            parent_env: env,
-        };
-        let probed = read_account(&spec).await.map_err(|e| e.to_string());
-        parts.push(describe_account(
-            CodexBackend.config_key(),
-            CODEX_LOGIN_COMMAND,
-            probed,
-        ));
+    for (backend, binary) in located {
+        let probed = probe_account(backend, binary).await;
+        parts.push(describe_account(backend, probed));
     }
     if parts.is_empty() {
         return Check::ok(NAME, "no enabled backend to ask");
@@ -601,10 +567,10 @@ async fn check_accounts(config: Option<Config>) -> Check {
 }
 
 fn describe_account(
-    key: &str,
-    login_command: &str,
+    backend: LoginBackend,
     probed: Result<AccountStatus, String>,
 ) -> (Status, String) {
+    let key = backend.key();
     match probed {
         Ok(AccountStatus::LoggedIn(account)) => {
             let who = [account.plan.as_deref(), account.email.as_deref()]
@@ -635,7 +601,11 @@ fn describe_account(
         }
         Ok(AccountStatus::LoggedOut) => (
             Status::Warn,
-            format!("{key} is not logged in; run `{login_command}`"),
+            format!(
+                "{key} is not logged in; run `coda login {}`, which runs `{}`",
+                backend.flag_name(),
+                backend.login_text()
+            ),
         ),
         Err(reason) => (Status::Warn, format!("{key} login not checked: {reason}")),
     }
@@ -856,8 +826,7 @@ mod tests {
     #[test]
     fn a_probe_that_failed_is_a_warning_with_the_reason() {
         // Act
-        let (status, text) =
-            describe_account("codex", CODEX_LOGIN_COMMAND, Err("timed out".to_owned()));
+        let (status, text) = describe_account(LoginBackend::Codex, Err("timed out".to_owned()));
 
         // Assert
         assert_eq!(status, Status::Warn);
@@ -867,16 +836,13 @@ mod tests {
     #[test]
     fn an_account_coda_has_no_name_for_is_ok_and_a_codex_logout_names_its_command() {
         // Act
-        let other = describe_account(
-            "codex",
-            CODEX_LOGIN_COMMAND,
-            Ok(account(AccountBilling::Other)),
-        );
-        let out = describe_account("codex", CODEX_LOGIN_COMMAND, Ok(AccountStatus::LoggedOut));
+        let other = describe_account(LoginBackend::Codex, Ok(account(AccountBilling::Other)));
+        let out = describe_account(LoginBackend::Codex, Ok(AccountStatus::LoggedOut));
 
         // Assert
         assert_eq!(other, (Status::Ok, "codex logged in".to_owned()));
         assert_eq!(out.0, Status::Warn);
-        assert!(out.1.contains("`codex login`"));
+        assert!(out.1.contains("`coda login codex`"), "{}", out.1);
+        assert!(out.1.contains("`codex login`"), "{}", out.1);
     }
 }

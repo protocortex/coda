@@ -155,8 +155,9 @@ kill "$(coda status | sed -n 's/^pid: //p')"
 | `coda grant add` | Allow one command in a repository permanently. Flags: `--repo`, `--cwd`, `--tool`. |
 | `coda usage` | Show token usage and savings. `--session` limits it to one session. It asks a running daemon, or reads the database when none runs. |
 | `coda doctor` | Check the socket, lock, orphaned backends, database, schema, database release, config, backends and logins (it asks each enabled backend's own binary, and an API key that would bill API rates is a warning). `--repair` removes a stale socket and kills orphaned backends. `--json` prints JSON. |
+| `coda login <backend>` | Log `claude-code` or `codex` in through its own CLI. It asks, runs `claude auth login` or `codex login` in this terminal with the terminal's streams, then checks the login again; `--yes` skips the question. Coda never sees the login flow or the token and has no login of its own. |
 
-`coda run`, `coda session send`, `coda session rewind`, `coda grant add`, `coda tui` and bare `coda` start a daemon if none is running. `coda daemon restart` starts one too. `coda status`, `coda ping`, `coda usage`, `coda session list`, `coda session show` and `coda doctor` do not start one.
+`coda run`, `coda session send`, `coda session rewind`, `coda grant add`, `coda tui` and bare `coda` start a daemon if none is running. `coda daemon restart` starts one too. `coda status`, `coda ping`, `coda usage`, `coda session list`, `coda session show`, `coda doctor` and `coda login` do not start one.
 
 `coda run` picks its backend from the config. It uses the faux provider if `[providers.faux]` is enabled, and the anthropic provider otherwise. It does not pick `openai_compat`, `claude_code` or `codex`.
 
@@ -184,6 +185,8 @@ Every command accepts `--force`, but it only matters in three cases. `coda revie
 `coda review`: 0 reviewed, or skipped by a rule, or nothing to review; 23 with `--hook`, a finding of severity high or critical remains and `[review.hook] block_on_high` is set; 64 bad usage; 70 the review failed (no reachable backend, the run stopped early, or the reviewer did not answer in the review format twice).
 
 `coda doctor`: 0 healthy, 20 at least one check failed, 21 only warnings, 64 bad usage, 70 the check itself failed.
+
+`coda login`: 0 logged in, 64 bad usage, 70 left logged out or the login failed.
 
 `coda agents lint`: 0 no problems, 22 at least one problem, 64 bad usage, 70 the lint itself failed.
 
