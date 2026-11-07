@@ -76,11 +76,17 @@ const READ_ONLY_BANNED_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "Noteboo
 /// Status Claude Code gives a rate-limit report when the plan limit blocks the turn.
 const REJECTED_STATUS: &str = "rejected";
 /// Parent variables a delegated agent may inherit. Credentials such as
-/// `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, and `CLAUDECODE`, are absent by design.
+/// `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, and `CLAUDECODE`, are absent by design;
+/// a Claude Code session gets more only through `env_passthrough`.
 pub const ENV_ALLOWLIST: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR",
     "TZ",
 ];
+/// Set by Claude Code in the sessions it starts; passing it on would make the child
+/// believe it runs inside another session, so `env_passthrough` cannot name it.
+const NESTED_SESSION_VAR: &str = "CLAUDECODE";
+/// The variable that makes `claude` bill API rates instead of the subscription.
+const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 pub(crate) const READ_CHUNK_BYTES: usize = 16 * 1024;
 /// How long a child whose output ended gets to exit on its own, so its exit code survives.
 pub(crate) const EXIT_GRACE: Duration = Duration::from_millis(500);
@@ -143,8 +149,10 @@ pub struct SessionSpec {
     pub session_id: SessionId,
     /// Claude Code session id to continue with `--resume`.
     pub resume: Option<String>,
-    /// The parent environment; only allowlisted names reach the child.
+    /// The parent environment; only allowlisted names and `env_passthrough` reach the child.
     pub parent_env: Vec<(OsString, OsString)>,
+    /// Names from `env_passthrough` that may reach the child as well.
+    pub env_passthrough: Vec<String>,
     /// Ban the tools that change files or run commands, so the user's own allow
     /// rules cannot let the session change anything.
     pub read_only: bool,
@@ -225,9 +233,17 @@ impl ClaudeSession {
                 .arg(DISALLOWED_TOOLS_FLAG)
                 .args(READ_ONLY_BANNED_TOOLS);
         }
+        if spec.env_passthrough.iter().any(|name| name == API_KEY_VAR)
+            && spec.parent_env.iter().any(|(name, _)| name == API_KEY_VAR)
+        {
+            warn!(
+                session = %spec.session_id,
+                "{API_KEY_VAR} is passed to claude, so this session bills API rates, not your subscription"
+            );
+        }
         command
             .env_clear()
-            .envs(allowlisted(&spec.parent_env))
+            .envs(allowlisted_with(&spec.parent_env, &spec.env_passthrough))
             .current_dir(&spec.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -799,9 +815,23 @@ fn profile_flag_names(profile: ClaudeProfile) -> Vec<String> {
 pub(crate) fn allowlisted(
     parent_env: &[(OsString, OsString)],
 ) -> impl Iterator<Item = (&OsString, &OsString)> {
+    allowlisted_with(parent_env, &[])
+}
+
+/// The allowlisted variables and those named in `passthrough`.
+pub(crate) fn allowlisted_with<'a>(
+    parent_env: &'a [(OsString, OsString)],
+    passthrough: &'a [String],
+) -> impl Iterator<Item = (&'a OsString, &'a OsString)> {
     parent_env
         .iter()
-        .filter(|(name, _)| ENV_ALLOWLIST.iter().any(|allowed| name == allowed))
+        .filter(|(name, _)| {
+            ENV_ALLOWLIST.iter().any(|allowed| name == allowed)
+                || (name != NESTED_SESSION_VAR
+                    && passthrough
+                        .iter()
+                        .any(|listed| name.as_os_str() == listed.as_str()))
+        })
         .map(|(name, value)| (name, value))
 }
 

@@ -76,7 +76,8 @@ skipped. The run is headless use of Claude Code, which the user confirmed
   verifier's cargo, so the run cannot silently bill the API. The daemon also
   starts `claude` with an allowlisted environment (`ENV_ALLOWLIST` in
   `crates/coda-providers/src/claude_session.rs`) that includes `HOME`, which
-  the CLI needs to find its login, and excludes every key.
+  the CLI needs to find its login, and excludes every key unless the user lists
+  it in `env_passthrough`.
 - The scrubber still runs over every transcript and printed line.
 - Claude Code runs its own tool loop. This run therefore exercises coda's
   daemon, permission broker, supervisor and grants, not coda's own tool

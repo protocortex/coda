@@ -16,7 +16,7 @@ use std::time::Duration;
 use coda_protocol::events::AccountBilling;
 use serde_json::Value;
 
-use crate::claude_session::allowlisted;
+use crate::claude_session::allowlisted_with;
 use crate::detect::run_bounded;
 
 /// `apiKeySource` of an `init` frame that has no API key behind the session.
@@ -119,9 +119,10 @@ pub fn parse_codex_account(result: &Value) -> AccountStatus {
 pub fn probe_claude(
     binary: &Path,
     parent_env: &[(OsString, OsString)],
+    passthrough: &[String],
     timeout: Duration,
 ) -> Result<AccountStatus, String> {
-    let env: Vec<(&OsStr, &OsStr)> = allowlisted(parent_env)
+    let env: Vec<(&OsStr, &OsStr)> = allowlisted_with(parent_env, passthrough)
         .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
         .collect();
     // A logged out binary exits non-zero but still prints the JSON, so only the output counts.
@@ -324,7 +325,7 @@ mod tests {
         ));
 
         // Act
-        let status = probe_claude(&path, &[], PATIENT);
+        let status = probe_claude(&path, &[], &[], PATIENT);
 
         // Assert
         assert_eq!(status, Ok(AccountStatus::LoggedOut));
@@ -342,7 +343,7 @@ mod tests {
         ];
 
         // Act
-        let status = probe_claude(&path, &env, PATIENT).unwrap();
+        let status = probe_claude(&path, &env, &[], PATIENT).unwrap();
 
         // Assert
         assert!(matches!(
@@ -355,12 +356,34 @@ mod tests {
     }
 
     #[test]
+    fn a_listed_api_key_reaches_the_probe_and_shows_as_api_billing() {
+        // Arrange
+        let (_dir, path) = script(&format!(
+            "if [ -n \"$ANTHROPIC_API_KEY\" ]; then echo '{API_KEY}'; else echo '{SUBSCRIPTION}'; fi"
+        ));
+        let env = vec![(OsString::from("ANTHROPIC_API_KEY"), OsString::from("x"))];
+        let passthrough = vec!["ANTHROPIC_API_KEY".to_owned()];
+
+        // Act
+        let status = probe_claude(&path, &env, &passthrough, PATIENT).unwrap();
+
+        // Assert
+        assert!(matches!(
+            status,
+            AccountStatus::LoggedIn(Account {
+                billing: AccountBilling::ApiKey,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn a_probe_that_prints_nothing_usable_is_an_error() {
         // Arrange
         let (_dir, path) = script("echo 'unknown command'; exit 1");
 
         // Act
-        let status = probe_claude(&path, &[], PATIENT);
+        let status = probe_claude(&path, &[], &[], PATIENT);
 
         // Assert
         assert!(status.unwrap_err().contains("auth status"));
