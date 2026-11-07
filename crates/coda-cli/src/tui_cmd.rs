@@ -16,6 +16,7 @@ use crate::autostart::ensure_daemon;
 use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
 use crate::error::CliError;
+use crate::login;
 
 /// The boxed future of a TUI run.
 pub type TuiFuture<'a> = Pin<Box<dyn Future<Output = Result<(), TuiError>> + 'a>>;
@@ -43,6 +44,7 @@ pub async fn open(ctx: &Context, io: &mut Io<'_>, force: bool) -> Result<(), Cli
     // The TUI opens its own link; keeping this one would count as an extra client.
     drop(ensure_daemon(ctx, io, force).await?);
     let config = load_config(&ctx.dirs)?;
+    login::offer_logins(io, &config).await?;
     let startup = Startup {
         needs_setup: !config.providers.values().any(|p| p.enabled),
         hooks_configured: !config.hooks.is_empty(),

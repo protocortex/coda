@@ -60,7 +60,7 @@ CODA_LIVE_TESTS=1 cargo nextest run -p coda-providers --test live_probes \
 ```
 
 They use the login of whoever runs them, the unmodified binary, the same cleared
-environment a session gets, the `haiku` model and a turn limit, so the eight tests
+environment a session gets, the `haiku` model and a turn limit, so the tests
 spend about nine short calls. They write no fixture, and they print no token and
 no account value (only the names of the fields of the `initialize` account block).
 Run them one at a time, as above, so they do not hit the plan's rate limit together.
@@ -80,8 +80,17 @@ they found with claude 2.1.296 on 2026-11-08:
 | `interrupt` | answers `success`; the turn then ends with a `result` of subtype `error_during_execution` and `is_error` true |
 | a message sent mid-turn | in a turn that only streams text it queues: the first message gets its own `result` and the second gets another. The manual run under Steer, with a tool still running, gave one `result` for both, so the answer depends on the turn |
 | helper call | `run_structured` returns JSON with a non-empty `title` that fits its schema |
+| login commands | `claude auth login --help` and `codex login --help` answer, and the `auth status` probe and the Codex account read both see the installed login (no quota, no token read) |
 | `--fork-session` | with `--resume <id>` it starts a new session id and the turn works |
 | resume at a message | `claude --help` lists no flag for it (`--resume-session-at`); the probe fails the day one appears |
+
+## Manual check of `coda login`
+
+The browser step needs a person, so no test runs it. After an upgrade of either CLI, log
+out with the vendor CLI, then run `coda login claude-code` or `coda login codex` in a
+terminal. Check that the vendor prompt and browser flow work with coda's hand-over of the
+terminal, and that coda says the backend is logged in afterwards. Then start bare `coda`
+logged out and check that the offer appears before the UI and that answering `n` opens it.
 
 ## Recording again
 

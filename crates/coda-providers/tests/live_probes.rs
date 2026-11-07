@@ -31,9 +31,11 @@ use std::time::Duration;
 use coda_config::config::ClaudeProfile;
 use coda_protocol::events::{AccountBilling, Event};
 use coda_protocol::types::{PermissionDecision, SessionId, TurnId};
-use coda_providers::account::billing_of_api_key_source;
+use coda_providers::account::{AccountStatus, billing_of_api_key_source};
 use coda_providers::claude_helper::{DEFAULT_TIMEOUT, HelperRequest, run_structured};
 use coda_providers::claude_session::{ClaudeSession, ENV_ALLOWLIST, SessionSpec, TurnOutcome};
+use coda_providers::codex_app_server::{AppServerSpec, read_account};
+use coda_providers::codex_exec::SandboxMode;
 use coda_providers::gate::PermissionGate;
 use coda_providers::init_check::InitReport;
 use coda_providers::tool_request::ToolRequest;
@@ -558,4 +560,71 @@ async fn the_helper_call_returns_json_that_fits_its_schema() {
     let title = answer["title"].as_str().expect("no title");
     assert_ne!(title.trim(), "");
     eprintln!("helper title length: {} characters", title.len());
+}
+
+fn find_codex() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("codex"))
+        .find(|candidate| candidate.is_file())
+        .expect("`codex` is not on PATH")
+}
+
+fn help_of(binary: &Path, args: &[&str]) {
+    let help = std::process::Command::new(binary)
+        .args(args)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .output()
+        .expect("could not run the help command");
+    assert!(help.status.success(), "`--help` failed for {args:?}");
+}
+
+/// `coda login` runs `claude auth login` and `codex login`, and `coda doctor` and
+/// the UI start-up offer ask `claude auth status` and the Codex app-server. This
+/// checks that those commands still exist and that the probes read the user's own
+/// login. It does not run a login: the browser step needs the user, so it stays a
+/// manual check, listed in `docs/live-recording.md`.
+#[ignore = "spends no quota; needs CODA_LIVE_TESTS=1"]
+#[tokio::test]
+async fn the_login_commands_exist_and_the_probes_read_the_installed_logins() {
+    if !live() {
+        return;
+    }
+    let claude = find_claude();
+    let codex = find_codex();
+
+    help_of(&claude, &["auth", "login"]);
+    help_of(&codex, &["login"]);
+
+    let claude_status = coda_providers::account::probe_claude(
+        &claude,
+        &std::env::vars_os().collect::<Vec<_>>(),
+        &[],
+        LINE_BOUND,
+    )
+    .expect("the claude probe could not read `auth status`");
+    assert!(
+        matches!(claude_status, AccountStatus::LoggedIn(_)),
+        "claude is not logged in for this probe"
+    );
+
+    let spec = AppServerSpec {
+        binary: codex,
+        cwd: std::env::current_dir().unwrap(),
+        session_id: SessionId::new("live-login"),
+        sandbox: SandboxMode::default(),
+        ephemeral: true,
+        verified_versions: Vec::new(),
+        parent_env: std::env::vars_os().collect(),
+        resume_thread: None,
+    };
+    let codex_status = timeout(LINE_BOUND, read_account(&spec))
+        .await
+        .expect("the codex probe timed out")
+        .expect("the codex probe could not read the account");
+    assert!(
+        matches!(codex_status, AccountStatus::LoggedIn(_)),
+        "codex is not logged in for this probe"
+    );
 }
