@@ -12,7 +12,7 @@ use std::time::Duration;
 use coda_config::config::DEFAULT_MAX_GUARD_CONTINUES;
 use coda_config::hooks::HookEvent;
 use coda_config::loop_guard::LoopGuardConfig;
-use coda_protocol::events::{CALL_FROM_TEXT, CALL_REPAIRED};
+use coda_protocol::events::{CALL_FROM_TEXT, CALL_REPAIRED, TodoItem};
 use coda_protocol::types::{OriginalId, PermissionDecision, SessionId};
 use coda_providers::gate::PermissionGate;
 use coda_providers::model::{
@@ -22,6 +22,7 @@ use coda_providers::model::{
 use coda_providers::tool_request::{Tool as RequestTool, ToolRequest};
 use coda_store::Store;
 use coda_telemetry::attrs::{CODA_SESSION_ID, CODA_TOOL_NAME};
+use coda_tools::todo::{self as todo_tool, TodoList};
 use coda_tools::{Tool, skill as skill_tool, task as task_tool};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -31,7 +32,7 @@ use tracing::{Instrument, info, info_span, warn};
 use crate::budget::TokenBudget;
 use crate::checks::Checks;
 use crate::compact::{
-    self as summary, CompactError, CompactionAck, KEEP_RECENT_MESSAGES, summary_message,
+    self as summary, CompactError, CompactionAck, KEEP_RECENT_MESSAGES, summary_with_todos,
 };
 use crate::economy::{cap_ends, compact};
 use crate::hooks::HookRunner;
@@ -46,6 +47,8 @@ pub(crate) const SKIPPED: &str = "not run: the turn stopped before this call";
 pub(crate) const EMPTY_ARGUMENTS: &str = "{}";
 /// Stored for a send that ended before the model replied, so roles keep alternating.
 pub(crate) const NO_REPLY: &str = "[no reply: the turn stopped early]";
+/// What the model is told when it calls `todo` in a loop that keeps no list.
+const NO_TODOS: &str = "the todo tool is not available here: sub-agents keep no todo list";
 /// What the model is told when it calls `task` in a session that cannot dispatch.
 const NO_TASKS: &str = "the task tool is not available here: sub-agents cannot start sub-agents";
 /// What the model is told about a call whose permission prompt was cancelled.
@@ -201,6 +204,11 @@ pub enum TurnEvent {
     /// A marker, not an event. Whoever reads the channel answers it once every
     /// event sent before it is stored, so the sender can write after them.
     Fence(FenceAck),
+    /// The model's todo list changed. It carries the whole list.
+    TodoUpdated {
+        /// The list after the change.
+        items: Vec<TodoItem>,
+    },
     /// The model failed before it said anything and the send moved to the next
     /// alias in its fallback chain. The same request is sent again, on the new model.
     ModelFallback {
@@ -426,6 +434,8 @@ pub struct TurnLoop<P, G> {
     /// Whether a reply that is one JSON object fitting one tool is a call.
     text_tool_calls: bool,
     chain: Option<Chain<P>>,
+    /// The model's todo list; `None` where `todo` is not offered.
+    todos: Option<Mutex<TodoList>>,
 }
 
 /// How a compaction attempt ended.
@@ -471,6 +481,55 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             max_guard_continues: DEFAULT_MAX_GUARD_CONTINUES,
             text_tool_calls: false,
             chain: None,
+            todos: None,
+        }
+    }
+
+    /// Lets the model keep a todo list with the `todo` tool, starting from
+    /// `items`, the list a stored session had. Left off for a sub-agent.
+    #[must_use]
+    pub fn with_todos(mut self, items: Vec<TodoItem>) -> Self {
+        self.todos = Some(Mutex::new(TodoList::from_items(items)));
+        self
+    }
+
+    /// The todo list as it stands; empty where the tool is not offered.
+    fn todo_items(&self) -> Vec<TodoItem> {
+        self.todos
+            .as_ref()
+            .map(|list| {
+                list.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .items()
+                    .to_vec()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Runs a `todo` call. It asks no permission: the list lives in the session.
+    fn run_todo(&self, call: &ToolCall) -> ToolOutcome {
+        let Some(todos) = &self.todos else {
+            return ToolOutcome::error(NO_TODOS.to_owned());
+        };
+        let op = match parse_arguments(call).and_then(|input| {
+            todo_tool::parse(&input).map_err(|error| ToolOutcome::error(error.to_string()))
+        }) {
+            Ok(op) => op,
+            Err(refusal) => return refusal,
+        };
+        let mut list = todos.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Err(error) = list.apply(op) {
+            return ToolOutcome::error(error.to_string());
+        }
+        self.emit(TurnEvent::TodoUpdated {
+            items: list.items().to_vec(),
+        });
+        ToolOutcome {
+            text: list.render(),
+            is_error: false,
+            usage: None,
+            original: None,
+            raw_digest: None,
         }
     }
 
@@ -991,8 +1050,9 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             }
             None => return Compacted::Cancelled,
         }
+        let carried = summary_with_todos(&made.text, &self.todo_items());
         self.conversation
-            .replace_prefix(replaced, Message::User(summary_message(&made.text)));
+            .replace_prefix(replaced, Message::User(carried));
         info!(
             replaced,
             kept,
@@ -1275,6 +1335,9 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     async fn run_tool_inner(&self, call: &ToolCall) -> ToolOutcome {
         if call.name == task_tool::NAME {
             return self.run_task(call).await;
+        }
+        if call.name == todo_tool::NAME {
+            return self.run_todo(call);
         }
         let Some(tool) = self.tools.tools.get(call.name.as_str()) else {
             return ToolOutcome::error(format!("unknown tool {}", call.name));

@@ -19,6 +19,7 @@ pub mod retrieve;
 pub mod sandbox;
 pub mod skill;
 pub mod task;
+pub mod todo;
 pub mod write;
 
 use std::sync::atomic::AtomicBool;

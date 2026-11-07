@@ -13,8 +13,8 @@ use std::time::Duration;
 use coda_config::hooks::{HookConfig, HookEvent};
 use coda_core::hooks::HookRunner;
 use coda_core::prompt::{Conversation, Prefix};
-use coda_core::tools::{BaseToolsConfig, StoreOriginals, base_tools};
-use coda_core::turn::{Fallback, StopCondition, TurnConfig, TurnEvent, TurnLoop};
+use coda_core::tools::{BaseToolsConfig, StoreOriginals, base_tools, todo_schema};
+use coda_core::turn::{Fallback, StopCondition, TurnConfig, TurnError, TurnEvent, TurnLoop};
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision};
 use coda_providers::faux::FauxProvider;
 use coda_providers::gate::PermissionGate;
@@ -165,7 +165,11 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
         StoreOriginals::new(Arc::clone(&store), session.clone()),
     )
     .unwrap();
-    let prefix = Prefix::new(SYSTEM_PROMPT, tools.schemas, "").unwrap();
+    let mut schemas = tools.schemas;
+    if fixture.todo {
+        schemas.push(todo_schema());
+    }
+    let prefix = Prefix::new(SYSTEM_PROMPT, schemas, "").unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let chain = fallback
@@ -200,6 +204,9 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
     .with_hooks(guard_hooks(fixture))
     .with_text_tool_calls(fixture.text_calls)
     .with_fallbacks(PRIMARY_ALIAS, chain);
+    if fixture.todo {
+        lp = lp.with_todos(Vec::new());
+    }
 
     let sent = lp.send(fixture.prompt).await;
     let (turns, usage_tokens, tool_errors, fallbacks) = count_events(&mut receiver);
@@ -210,17 +217,7 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
         .saved_bytes(Some(&session))
         .unwrap_or_default();
 
-    let (stop, mut failure) = match sent {
-        Ok(StopCondition::EndTurn) => ("end_turn".to_owned(), None),
-        Ok(other) => (
-            other.as_str().to_owned(),
-            Some(format!("the loop stopped with {}", other.as_str())),
-        ),
-        Err(error) => (
-            "error".to_owned(),
-            Some(format!("the loop failed: {error}")),
-        ),
-    };
+    let (stop, mut failure) = stopped(sent);
     if failure.is_none() {
         failure = judge(fixture, &workdir, &requests, fallbacks);
     }
@@ -235,6 +232,21 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
         fallbacks,
         stop,
         failure,
+    }
+}
+
+/// How the send ended, and why that is a failure, if it is one.
+fn stopped(sent: Result<StopCondition, TurnError>) -> (String, Option<String>) {
+    match sent {
+        Ok(StopCondition::EndTurn) => ("end_turn".to_owned(), None),
+        Ok(other) => (
+            other.as_str().to_owned(),
+            Some(format!("the loop stopped with {}", other.as_str())),
+        ),
+        Err(error) => (
+            "error".to_owned(),
+            Some(format!("the loop failed: {error}")),
+        ),
     }
 }
 

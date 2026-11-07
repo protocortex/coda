@@ -143,6 +143,41 @@ pub struct CallRecoveredBody {
     pub how: String,
 }
 
+/// Stored event kind of a change to the model's todo list. The body is a
+/// [`TodoUpdatedBody`] holding the whole list after the change, so the last one
+/// stored is the current list.
+pub const TODO_UPDATED_KIND: &str = "todo_updated";
+
+/// Where an item of the todo list stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    /// Not started.
+    Pending,
+    /// Being worked on.
+    InProgress,
+    /// Finished.
+    Done,
+}
+
+/// One item of the model's todo list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    /// The number the model uses to change the item.
+    pub id: u32,
+    /// What is to be done.
+    pub text: String,
+    /// Where the item stands.
+    pub status: TodoStatus,
+}
+
+/// The body of a stored `todo_updated` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoUpdatedBody {
+    /// The list after the change, in the order the items were added.
+    pub items: Vec<TodoItem>,
+}
+
 /// Stored event kind of a send that moved from one model alias to the next in
 /// its fallback chain after the first failed. The body is a [`ModelFallbackBody`];
 /// clients show it to the user.

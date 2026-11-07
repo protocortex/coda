@@ -12,6 +12,7 @@ pub mod permission;
 pub mod sessions;
 pub mod status;
 pub mod terminal;
+pub mod todos;
 pub mod work;
 
 #[cfg(test)]

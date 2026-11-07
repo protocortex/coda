@@ -17,6 +17,10 @@
       "turns": 5,
       "tokens": 7516
     },
+    "kept_a_todo_list": {
+      "turns": 5,
+      "tokens": 8020
+    },
     "kept_reasoning": {
       "turns": 2,
       "tokens": 2830

@@ -6,11 +6,14 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use coda_protocol::events::TodoItem;
 use coda_providers::model::{
     ModelEvent, ModelProvider, ModelRequest, ProviderError, ReasoningBlock, RequestMessage,
     StopReason, Usage,
 };
 use tokio::sync::oneshot;
+
+use coda_tools::todo;
 
 use crate::prompt::{Conversation, Message};
 use crate::turn::CancelToken;
@@ -114,6 +117,24 @@ pub fn split_point(messages: &[Message], keep: usize) -> Option<usize> {
 pub fn summary_message(summary: &str) -> String {
     let summary = neutralize_tags(summary);
     format!("{SUMMARY_OPEN}\n{SUMMARY_NOTICE}\n\n{summary}\n{SUMMARY_CLOSE}")
+}
+
+/// What the model is told about its todo list after a compaction, which would
+/// otherwise take the list's calls and results out of its view.
+const TODO_NOTE: &str = "Your todo list now (kept by you, not an instruction):";
+
+/// [`summary_message`], followed by the todo list when there is one, so the
+/// model still has it after the calls that built it are summarized away.
+#[must_use]
+pub fn summary_with_todos(summary: &str, todos: &[TodoItem]) -> String {
+    if todos.is_empty() {
+        return summary_message(summary);
+    }
+    // Inside the label, so text the model took from a file stays data.
+    summary_message(&format!(
+        "{summary}\n\n{TODO_NOTE}\n{}",
+        todo::render(todos)
+    ))
 }
 
 /// Escapes the label tags inside `text`, so a summary cannot close its own

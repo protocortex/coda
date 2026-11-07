@@ -10,6 +10,7 @@ use std::time::Duration;
 use coda_core::compact::{KEEP_RECENT_MESSAGES, summary_message};
 use coda_core::prompt::{Conversation, Message, Prefix};
 use coda_core::turn::{StopCondition, ToolSet, TurnConfig, TurnError, TurnEvent, TurnLoop};
+use coda_protocol::events::{TodoItem, TodoStatus};
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision};
 use coda_providers::faux::{FauxProvider, Turn};
 use coda_providers::gate::PermissionGate;
@@ -328,6 +329,42 @@ async fn an_overflow_compacts_once_retries_once_and_succeeds() {
         [REQUEST, REQUEST, STORED, REQUEST],
         "the event is stored before the retry"
     );
+}
+
+#[tokio::test]
+async fn a_compaction_keeps_the_todo_list_in_the_summary_message() {
+    // Arrange
+    let turns = script(
+        five_answers(),
+        vec![overflow(), text_turn("SUMMARY"), text_turn("final")],
+    );
+    let mut rig = Rig::new(turns, None, None);
+    let items = vec![
+        TodoItem {
+            id: 1,
+            text: "plan".to_owned(),
+            status: TodoStatus::Done,
+        },
+        TodoItem {
+            id: 2,
+            text: "build".to_owned(),
+            status: TodoStatus::InProgress,
+        },
+    ];
+    rig.lp = rig.lp.with_todos(items);
+    rig.converse(&FIVE).await;
+
+    // Act
+    let (stop, _) = rig.send("q6").await;
+
+    // Assert
+    assert_eq!(stop.unwrap(), StopCondition::EndTurn);
+    let retry = &rig.requests()[7];
+    let summary = user_text(&retry.messages[0]);
+    assert!(summary.contains("SUMMARY"), "{summary}");
+    assert!(summary.contains("1. [x] plan\n2. [~] build"), "{summary}");
+    let close = summary.rfind("</").unwrap();
+    assert!(summary.find("1. [x] plan").unwrap() < close, "{summary}");
 }
 
 #[tokio::test]
