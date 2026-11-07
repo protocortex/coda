@@ -1153,6 +1153,22 @@ idle_timeout_ms = 1500
     }
 
     #[test]
+    fn review_guidance_defaults_to_500_lines_and_no_extra_instructions() {
+        // Arrange
+        let set = "[review]\nguidance_lines = 0\nextra_instructions = \"Check the locks.\"\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config;
+        let custom = Config::from_toml_str(set).unwrap().config;
+
+        // Assert
+        assert_eq!(default.review.guidance_lines, 500);
+        assert_eq!(default.review.extra_instructions, "");
+        assert_eq!(custom.review.guidance_lines, 0);
+        assert_eq!(custom.review.extra_instructions, "Check the locks.");
+    }
+
+    #[test]
     fn review_ignore_and_skip_default_to_builtin_ignores_and_no_skips() {
         // Arrange and Act
         let review = Config::from_toml_str("").unwrap().config.review;

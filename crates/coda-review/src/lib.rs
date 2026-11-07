@@ -6,6 +6,7 @@
 
 pub mod chunk;
 pub mod diff;
+pub mod guidance;
 pub mod ignore;
 pub mod pack;
 pub mod parse;

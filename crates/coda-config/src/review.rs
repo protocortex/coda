@@ -35,6 +35,10 @@ pub const DEFAULT_VERIFY_THRESHOLD: u8 = 4;
 /// Highest score the verifier gives.
 pub const VERIFY_THRESHOLD_MAX: u8 = 10;
 
+/// Lines of the repository's guidance files that go in the reviewer's prompt when the file
+/// does not say.
+pub const DEFAULT_GUIDANCE_LINES: usize = 500;
+
 /// The `[review]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -53,6 +57,12 @@ pub struct ReviewConfig {
     /// Findings the verifier scores below this, from 0 to 10, are dropped. A score of 0 is
     /// always dropped.
     pub verify_threshold: u8,
+    /// Most lines of the repository's `AGENTS.md`, `CLAUDE.md` and `docs/adr/*.md`, read from
+    /// the default branch, that go in the reviewer's prompt as project rules. Zero leaves
+    /// them out.
+    pub guidance_lines: usize,
+    /// Instructions added to every review's prompt, after the project rules.
+    pub extra_instructions: String,
     /// Files left out of a review.
     pub ignore: ReviewIgnore,
     /// Pull requests that are not reviewed.
@@ -68,6 +78,8 @@ impl Default for ReviewConfig {
             chunk_concurrency: DEFAULT_CHUNK_CONCURRENCY,
             verify: true,
             verify_threshold: DEFAULT_VERIFY_THRESHOLD,
+            guidance_lines: DEFAULT_GUIDANCE_LINES,
+            extra_instructions: String::new(),
             ignore: ReviewIgnore::default(),
             skip: ReviewSkip::default(),
         }

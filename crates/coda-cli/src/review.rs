@@ -24,11 +24,12 @@ use coda_core::turn::StopCondition;
 use coda_protocol::types::{BackendKind, Mode};
 use coda_review::chunk::{Merged, Outcome, merge, plan};
 use coda_review::diff::{FileDiff, git_diff, git_diff_staged, parse_diff, tracked_files};
+use coda_review::guidance;
 use coda_review::pack::{PackOptions, Packed, main_extension};
 use coda_review::parse::{BadShape, Parsed, parse_model_output};
 use coda_review::render::{to_json, to_markdown};
 use coda_review::request::{
-    GH_PR_FIELDS, Part, Role, Target, VerifierRun, assemble, direct_prompt, input_text,
+    Extras, GH_PR_FIELDS, Part, Role, Target, VerifierRun, assemble, direct_prompt, input_text,
     pr_info_from_gh, session_prompt, task_prompt,
 };
 use coda_review::rules::{Rules, default_branch_ref, load};
@@ -61,6 +62,8 @@ const MAX_ATTEMPTS: usize = 2;
 const NO_CAP: usize = usize::MAX;
 const NOTHING_TO_REVIEW: &str = "nothing to review: the change has no lines to look at";
 const NOTHING_LEFT: &str = "nothing to review: every changed file was left out by the review rules";
+const NO_DEFAULT_BRANCH_NOTE: &str =
+    "the repository has no default branch to read project rules from, so none are used";
 const FORCED_NOTE: &str = "a skip rule matched, but --force asks for the review anyway";
 const GH: &str = "gh";
 const HEAD: &str = "HEAD";
@@ -109,13 +112,22 @@ pub async fn run(
         notice(io, args.json, NOTHING_LEFT)?;
         return Ok(ExitCode::SUCCESS);
     }
+    if config.review.guidance_lines > 0 && default_branch_ref(repo).is_none() {
+        writeln!(io.err, "coda: {NO_DEFAULT_BRANCH_NOTE}")?;
+    }
+    let rules_text = read_guidance(&config.review, repo)?;
+    let extras = Extras {
+        guidance: Some(&rules_text),
+        standing: Some(&rules.extra_instructions),
+        run: args.instructions.as_deref(),
+    };
     let inputs: Vec<String> = parts
         .iter()
         .enumerate()
         .map(|(n, part)| {
             input_text(
                 part,
-                args.instructions.as_deref(),
+                &extras,
                 config.review.max_findings,
                 Part::of(n + 1, parts.len()),
             )
@@ -206,6 +218,17 @@ fn load_rules(config: &ReviewConfig, repo: &Path) -> Result<Rules, CliError> {
         None => Rules::compile(config),
     };
     rules.map_err(|e| CliError::ReviewInput(e.to_string()))
+}
+
+/// The project rules of the repository, read from its default branch only. Empty when the
+/// cap is zero or the repository has no default branch to read them from.
+fn read_guidance(config: &ReviewConfig, repo: &Path) -> Result<String, CliError> {
+    let Some(default_ref) = default_branch_ref(repo) else {
+        return Ok(String::new());
+    };
+    guidance::load(repo, &default_ref, config.guidance_lines)
+        .map(|found| found.text)
+        .map_err(|e| CliError::ReviewInput(e.to_string()))
 }
 
 /// Runs `gh` in `repo` and returns what it printed.
