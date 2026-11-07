@@ -5,58 +5,11 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use coda_config::config::Dirs;
-use common::{cli, context, short_dir};
+use common::{LOGGED_IN, calls, cli, context, fake_claude, home_with, short_dir};
 
 const FAILURE: u8 = 70;
-const LOGGED_IN: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}"#;
-const LOGGED_OUT: &str = r#"{"loggedIn":false,"authMethod":"none"}"#;
-
-/// A `claude` stand-in. `auth login` writes a marker file (and exits `login_exit`), and
-/// `auth status` reports a login only once the marker exists, or always when `always_in`.
-fn fake_claude(dir: &Path, login_exit: u8, always_in: bool) -> PathBuf {
-    let marker = dir.join("logged-in");
-    let log = dir.join("calls");
-    let status = if always_in {
-        format!("echo '{LOGGED_IN}'")
-    } else {
-        format!(
-            "if [ -e '{}' ]; then echo '{LOGGED_IN}'; else echo '{LOGGED_OUT}'; exit 1; fi",
-            marker.display()
-        )
-    };
-    let script = format!(
-        "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n--version) echo '2.1.296 (Claude Code)';;\nauth) case \"$2\" in\nlogin) touch '{marker}'; exit {login_exit};;\nstatus) {status};;\nesac;;\nesac\n",
-        log = log.display(),
-        marker = marker.display(),
-    );
-    let path = dir.join("claude");
-    fs::write(&path, script).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
-
-fn calls(dir: &Path) -> Vec<String> {
-    fs::read_to_string(dir.join("calls"))
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_owned)
-        .collect()
-}
-
-fn home_with(claude: &Path) -> tempfile::TempDir {
-    let home = short_dir();
-    let config = format!(
-        "[providers.claude_code]\nenabled = true\nbinary = {:?}\nverified_versions = [\"2.1.296\"]\n",
-        claude.display().to_string()
-    );
-    fs::write(Dirs::from_base(home.path()).config_file(), config).unwrap();
-    home
-}
 
 #[tokio::test]
 async fn a_logged_out_backend_is_logged_in_by_its_own_cli_after_a_yes() {

@@ -6,6 +6,7 @@
     reason = "each test binary uses a different part of this module"
 )]
 
+use std::fs;
 use std::io::{BufRead, Cursor};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -330,4 +331,50 @@ pub async fn next_matching(
     })
     .await
     .expect("the expected notification did not arrive in time")
+}
+
+pub const LOGGED_IN: &str =
+    r#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}"#;
+pub const LOGGED_OUT: &str = r#"{"loggedIn":false,"authMethod":"none"}"#;
+
+/// A `claude` stand-in. `auth login` writes a marker file (and exits `login_exit`), and
+/// `auth status` reports a login only once the marker exists, or always when `always_in`.
+pub fn fake_claude(dir: &Path, login_exit: u8, always_in: bool) -> PathBuf {
+    let marker = dir.join("logged-in");
+    let log = dir.join("calls");
+    let status = if always_in {
+        format!("echo '{LOGGED_IN}'")
+    } else {
+        format!(
+            "if [ -e '{}' ]; then echo '{LOGGED_IN}'; else echo '{LOGGED_OUT}'; exit 1; fi",
+            marker.display()
+        )
+    };
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n--version) echo '2.1.296 (Claude Code)';;\nauth) case \"$2\" in\nlogin) touch '{marker}'; exit {login_exit};;\nstatus) {status};;\nesac;;\nesac\n",
+        log = log.display(),
+        marker = marker.display(),
+    );
+    let path = dir.join("claude");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+pub fn calls(dir: &Path) -> Vec<String> {
+    fs::read_to_string(dir.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+pub fn home_with(claude: &Path) -> tempfile::TempDir {
+    let home = short_dir();
+    let config = format!(
+        "[providers.claude_code]\nenabled = true\nbinary = {:?}\nverified_versions = [\"2.1.296\"]\n",
+        claude.display().to_string()
+    );
+    fs::write(Dirs::from_base(home.path()).config_file(), config).unwrap();
+    home
 }

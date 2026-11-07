@@ -17,7 +17,7 @@ use coda_config::timing::Timing;
 use coda_store::DB_FILE_NAME;
 use coda_tui::Startup;
 use coda_tui::commands::UserCommands;
-use common::{StopDaemon, cli, context, short_dir};
+use common::{StopDaemon, calls, cli, context, fake_claude, home_with, short_dir};
 
 const LAUNCH_MARKER: &str = "tui-launched";
 const COMMANDS_MARKER: &str = "tui-commands";
@@ -338,4 +338,89 @@ async fn a_project_command_is_pending_for_the_tui_until_the_repository_is_truste
         "{before}"
     );
     assert!(after.contains("/deploy: Ships it. (project)"), "{after}");
+}
+
+#[tokio::test]
+async fn the_tui_offers_to_log_a_logged_out_backend_in_and_a_yes_runs_the_vendor_login() {
+    // Arrange
+    let bin = short_dir();
+    let claude = fake_claude(bin.path(), 0, false);
+    let home = home_with(&claude);
+    let _stop = StopDaemon::new(home.path());
+    let mut ctx = context(home.path());
+    ctx.is_tty = true;
+    ctx.launch_tui = record_launch;
+
+    // Act
+    let outcome = cli(&ctx, &["coda"], "y\n").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert!(
+        outcome.out.contains("Run `claude auth login`"),
+        "{}",
+        outcome.out
+    );
+    assert!(calls(bin.path()).contains(&"auth login".to_owned()));
+    assert!(launch_note(home.path()).is_some());
+}
+
+#[tokio::test]
+async fn declining_the_login_offer_still_opens_the_tui() {
+    // Arrange
+    let bin = short_dir();
+    let claude = fake_claude(bin.path(), 0, false);
+    let home = home_with(&claude);
+    let _stop = StopDaemon::new(home.path());
+    let mut ctx = context(home.path());
+    ctx.is_tty = true;
+    ctx.launch_tui = record_launch;
+
+    // Act
+    let outcome = cli(&ctx, &["coda", "tui"], "n\n").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert!(!calls(bin.path()).contains(&"auth login".to_owned()));
+    assert!(launch_note(home.path()).is_some());
+}
+
+#[tokio::test]
+async fn a_failed_login_is_reported_and_the_tui_still_opens() {
+    // Arrange
+    let bin = short_dir();
+    let claude = fake_claude(bin.path(), 1, false);
+    let home = home_with(&claude);
+    let _stop = StopDaemon::new(home.path());
+    let mut ctx = context(home.path());
+    ctx.is_tty = true;
+    ctx.launch_tui = record_launch;
+
+    // Act
+    let outcome = cli(&ctx, &["coda"], "y\n").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert!(outcome.err.contains("exited"), "{}", outcome.err);
+    assert!(launch_note(home.path()).is_some());
+}
+
+#[tokio::test]
+async fn a_logged_in_backend_gets_no_offer() {
+    // Arrange
+    let bin = short_dir();
+    let claude = fake_claude(bin.path(), 0, true);
+    let home = home_with(&claude);
+    let _stop = StopDaemon::new(home.path());
+    let mut ctx = context(home.path());
+    ctx.is_tty = true;
+    ctx.launch_tui = record_launch;
+
+    // Act
+    let outcome = cli(&ctx, &["coda"], "y\n").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert!(!outcome.out.contains("Run `"), "{}", outcome.out);
+    assert!(!calls(bin.path()).contains(&"auth login".to_owned()));
 }
