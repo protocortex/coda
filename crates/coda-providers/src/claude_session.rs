@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coda_protocol::events::{Event, InterruptCause, UsageWindowKind};
-use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
+use coda_protocol::types::{ContextFill, PermissionDecision, RequestId, SessionId, TurnId};
 use rustix::process::{Pid, Signal, kill_process_group};
 use std::pin::pin;
 
@@ -160,6 +160,8 @@ pub struct ClaudeSession {
     backend_session_id: Option<String>,
     /// The window a rejected rate-limit report named, until the turn's result.
     limit_hit: Option<(UsageWindowKind, Option<u64>)>,
+    /// How full the context was, until the usage report it belongs to.
+    context: Option<ContextFill>,
     tool_calls: ToolCalls,
     /// Carries the backend id to watchers the moment it is reported.
     backend_id_tx: watch::Sender<Option<String>>,
@@ -218,6 +220,7 @@ impl ClaudeSession {
             cwd: spec.cwd,
             backend_session_id: None,
             limit_hit: None,
+            context: None,
             backend_id_tx: watch::channel(None).0,
             closed: false,
         })
@@ -383,11 +386,13 @@ impl ClaudeSession {
                 .await;
             }
             Message::Assistant { .. } => {}
+            Message::Context(fill) => self.context = Some(fill),
             Message::Usage(usage) => {
                 emit.emit(Event::Usage {
                     session_id: self.session_id.clone(),
                     turn_id: turn_id.clone(),
                     usage,
+                    context: self.context.take(),
                 })
                 .await;
             }

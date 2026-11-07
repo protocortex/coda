@@ -34,6 +34,7 @@ const REQUEST_LOG: &str = "requests.jsonl";
 const HOME_DIR: &str = "home";
 /// Small enough that a long prompt nears it.
 const SMALL_WINDOW: u32 = 100;
+const LARGE_WINDOW: u32 = 200_000;
 /// The window inside a read of the disk, as fifths of it, where a store call must finish.
 const WINDOW_START_FIFTHS: u32 = 1;
 const WINDOW_END_FIFTHS: u32 = 4;
@@ -1618,6 +1619,53 @@ async fn a_configured_window_compacts_the_conversation_before_the_request_is_sen
         5,
         "three sends, the summary, the send"
     );
+}
+
+#[tokio::test]
+async fn a_usage_event_says_how_full_the_context_of_a_model_with_a_window_is() {
+    // Arrange
+    let mut rig = Rig::custom(
+        Mode::Default,
+        &[text_turn("hello")],
+        true,
+        Some("script-1"),
+        |config| {
+            config.models.insert(
+                "scripted".to_owned(),
+                ModelAlias {
+                    provider: "faux".to_owned(),
+                    model: "script-1".to_owned(),
+                    context_window: Some(LARGE_WINDOW),
+                    fallback: Vec::new(),
+                },
+            );
+        },
+    );
+
+    // Act
+    rig.send("q1").await;
+    rig.wait_for_results(1).await;
+
+    // Assert
+    let usage = rig.bodies("usage").await;
+    assert_eq!(
+        usage[0]["context"],
+        json!({"used_tokens": 11, "window_tokens": LARGE_WINDOW})
+    );
+}
+
+#[tokio::test]
+async fn a_usage_event_of_a_model_with_no_known_window_has_no_context() {
+    // Arrange
+    let mut rig = Rig::new(Mode::Default, &[text_turn("hello")]);
+
+    // Act
+    rig.send("q1").await;
+    rig.wait_for_results(1).await;
+
+    // Assert
+    let usage = rig.bodies("usage").await;
+    assert!(usage[0].get("context").is_none(), "{usage:?}");
 }
 
 #[tokio::test]

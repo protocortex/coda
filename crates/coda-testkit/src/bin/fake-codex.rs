@@ -429,8 +429,10 @@ mod app_server {
     }
 
     fn complete(stream: &mut UnixStream) -> io::Result<()> {
-        let usage =
-            json!({"last": {"inputTokens": 120, "cachedInputTokens": 100, "outputTokens": 30}});
+        let usage = json!({
+            "last": {"inputTokens": 120, "cachedInputTokens": 100, "outputTokens": 30},
+            "modelContextWindow": 258_400
+        });
         notify(
             stream,
             "thread/tokenUsage/updated",

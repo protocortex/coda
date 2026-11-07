@@ -10,7 +10,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{OriginalId, RequestId, SessionId, TokenUsage, TurnId};
+use crate::types::{ContextFill, OriginalId, RequestId, SessionId, TokenUsage, TurnId};
 
 /// Notification method that wraps an [`Event`].
 pub const EVENT_NOTIFICATION: &str = "session.event";
@@ -410,6 +410,9 @@ pub enum Event {
         turn_id: TurnId,
         /// Tokens used.
         usage: TokenUsage,
+        /// How full the context is, when the backend and the model's window are known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<ContextFill>,
     },
     /// Approvals cannot be answered, so risky calls are refused.
     ApprovalsUnavailable {

@@ -22,7 +22,7 @@
 //! and `tool-hang` announces one and never reports it. `tool-flaky` announces a tool and
 //! crashes the first time (the control file's `crash_marker` remembers it), then stalls.
 //! `tool-quick` runs one that succeeds at once and `tool-error` one that fails at once.
-//! `report-usage` reports a rate limit, then finishes with token usage on the result.
+//! `report-usage` reports a rate limit, then finishes with token usage and a context window on the result.
 //! `hit-limit` reports a rejected seven-day limit, then ends the turn with an error.
 //! `stream-long` streams `input_json_delta` and `thinking_delta` lines for longer than
 //! the idle limits the tests use, then finishes.
@@ -329,7 +329,11 @@ fn report_usage(out: &mut impl Write) -> io::Result<()> {
         out,
         &serde_json::json!({"type":"result","is_error":false,"usage":{
             "input_tokens":3,"output_tokens":11,
-            "cache_read_input_tokens":7,"cache_creation_input_tokens":5}}),
+            "cache_read_input_tokens":7,"cache_creation_input_tokens":5,
+            "iterations":[
+                {"input_tokens":2,"cache_read_input_tokens":1,"cache_creation_input_tokens":4},
+                {"input_tokens":1,"cache_read_input_tokens":6,"cache_creation_input_tokens":1}]},
+            "modelUsage":{"fake-model":{"contextWindow":200_000}}}),
     )
 }
 

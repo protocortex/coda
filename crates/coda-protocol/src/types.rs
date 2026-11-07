@@ -115,6 +115,15 @@ pub struct TokenUsage {
     pub cache_write_tokens: u64,
 }
 
+/// How full the model's context is after a model call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ContextFill {
+    /// Tokens the last call held in its context: the input, cached or not.
+    pub used_tokens: u64,
+    /// The most the model's context can hold.
+    pub window_tokens: u32,
+}
+
 /// A session as listed to clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionInfo {

@@ -413,7 +413,7 @@ impl ChildRunner {
             // Nothing rebuilds a child from stored events, so there is nothing to
             // store and the answer is yes.
             TurnEvent::Compaction { ack, .. } => ack.confirm(true),
-            TurnEvent::Text(_) => {}
+            TurnEvent::Text(_) | TurnEvent::Context { .. } => {}
             other => {
                 // A closed channel means nobody is watching the session.
                 let _ = self.factory.events.send(TurnEvent::Child {

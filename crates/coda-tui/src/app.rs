@@ -990,6 +990,7 @@ mod tests {
                 output_tokens: 3,
                 ..TokenUsage::default()
             },
+            context: None,
         }));
 
         // Assert

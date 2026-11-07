@@ -3,7 +3,7 @@
 //! The status line: backend, model and tokens used.
 
 use coda_protocol::events::Event;
-use coda_protocol::types::{BackendKind, TokenUsage};
+use coda_protocol::types::{BackendKind, ContextFill, TokenUsage};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
@@ -12,12 +12,16 @@ const NO_BACKEND: &str = "no backend";
 const NO_MODEL: &str = "no model";
 /// For a backend added to the protocol after this client was built.
 const UNKNOWN_BACKEND: &str = "unknown backend";
+const PERCENT: u128 = 100;
+const THOUSAND: u32 = 1_000;
+const MILLION: u32 = 1_000_000;
 
 #[derive(Debug, Default)]
 pub struct Status {
     backend: Option<BackendKind>,
     model: Option<String>,
     usage: TokenUsage,
+    context: Option<ContextFill>,
 }
 
 impl Status {
@@ -30,6 +34,7 @@ impl Status {
         self.backend = Some(backend);
         self.model = model;
         self.usage = TokenUsage::default();
+        self.context = None;
     }
 
     /// Shows `model` while keeping the backend and the tokens used so far.
@@ -37,11 +42,16 @@ impl Status {
         self.model = model;
     }
 
-    /// Adds the tokens of a usage report to the running total.
+    /// Adds the tokens of a usage report to the running total and keeps how
+    /// full its context was. A report that says nothing about it, such as a
+    /// sub-agent's or a compaction's, leaves the meter as it was.
     pub fn apply(&mut self, event: &Event) {
-        if let Event::Usage { usage, .. } = event {
+        if let Event::Usage { usage, context, .. } = event {
             self.usage.input_tokens = self.usage.input_tokens.saturating_add(usage.input_tokens);
             self.usage.output_tokens = self.usage.output_tokens.saturating_add(usage.output_tokens);
+            if context.is_some() {
+                self.context = *context;
+            }
         }
     }
 
@@ -62,11 +72,39 @@ impl Status {
             "{backend} | {model} | in {} out {}",
             self.usage.input_tokens, self.usage.output_tokens
         );
+        if let Some(meter) = self.context.and_then(meter) {
+            line.push_str(" | ");
+            line.push_str(&meter);
+        }
         if let Some(activity) = activity {
             line.push_str(" | ");
             line.push_str(activity);
         }
         frame.render_widget(Paragraph::new(line), area);
+    }
+}
+
+/// `ctx 41% of 200k`; `None` when the window is zero, which has no share.
+fn meter(fill: ContextFill) -> Option<String> {
+    if fill.window_tokens == 0 {
+        return None;
+    }
+    let window = u128::from(fill.window_tokens);
+    let share = u128::from(fill.used_tokens) * PERCENT / window;
+    Some(format!(
+        "ctx {}% of {}",
+        share.min(PERCENT),
+        window_text(fill.window_tokens)
+    ))
+}
+
+fn window_text(tokens: u32) -> String {
+    if tokens >= MILLION {
+        format!("{}M", tokens / MILLION)
+    } else if tokens >= THOUSAND {
+        format!("{}k", tokens / THOUSAND)
+    } else {
+        tokens.to_string()
     }
 }
 
@@ -90,6 +128,10 @@ mod tests {
     use crate::test_support::screen;
 
     fn usage_event(input: u64, output: u64) -> Event {
+        usage_with_context(input, output, None)
+    }
+
+    fn usage_with_context(input: u64, output: u64, context: Option<ContextFill>) -> Event {
         Event::Usage {
             session_id: SessionId::new("s-1"),
             turn_id: TurnId::new("t-1"),
@@ -98,6 +140,14 @@ mod tests {
                 output_tokens: output,
                 ..TokenUsage::default()
             },
+            context,
+        }
+    }
+
+    fn fill(used_tokens: u64, window_tokens: u32) -> ContextFill {
+        ContextFill {
+            used_tokens,
+            window_tokens,
         }
     }
 
@@ -131,6 +181,109 @@ mod tests {
             draw(&status, 50).trim_end(),
             "claude_code | sonnet | in 120 out 30"
         );
+    }
+
+    #[test]
+    fn the_context_meter_shows_the_share_used_of_the_window() {
+        // Arrange
+        let mut status = Status::new();
+        status.set_session(BackendKind::ClaudeCode, Some("sonnet".to_owned()));
+
+        // Act
+        status.apply(&usage_with_context(3, 4, Some(fill(82_000, 200_000))));
+
+        // Assert
+        assert_eq!(
+            draw(&status, 60).trim_end(),
+            "claude_code | sonnet | in 3 out 4 | ctx 41% of 200k"
+        );
+    }
+
+    #[test]
+    fn a_window_reads_in_thousands_and_millions() {
+        for (window, text) in [
+            (200_000, "200k"),
+            (258_400, "258k"),
+            (1_000_000, "1M"),
+            (1_048_576, "1M"),
+            (8_192, "8k"),
+            (512, "512"),
+        ] {
+            // Arrange
+            let mut status = Status::new();
+
+            // Act
+            status.apply(&usage_with_context(0, 0, Some(fill(0, window))));
+
+            // Assert
+            let expected = format!("in 0 out 0 | ctx 0% of {text}");
+            assert!(draw(&status, 80).contains(&expected), "{window}");
+        }
+    }
+
+    #[test]
+    fn a_full_or_overfull_context_reads_one_hundred_percent() {
+        // Arrange
+        let mut status = Status::new();
+
+        // Act
+        status.apply(&usage_with_context(0, 0, Some(fill(250_000, 200_000))));
+
+        // Assert
+        assert!(draw(&status, 80).contains("ctx 100% of 200k"));
+    }
+
+    #[test]
+    fn the_meter_follows_the_last_report_and_a_report_without_one_leaves_it() {
+        // Arrange
+        let mut status = Status::new();
+        status.apply(&usage_with_context(0, 0, Some(fill(20_000, 200_000))));
+
+        // Act
+        status.apply(&usage_with_context(0, 0, Some(fill(100_000, 200_000))));
+        let later = draw(&status, 80);
+        status.apply(&usage_event(1, 1));
+
+        // Assert
+        assert!(later.contains("ctx 50% of 200k"), "{later}");
+        assert!(draw(&status, 80).contains("ctx 50% of 200k"));
+    }
+
+    #[test]
+    fn a_nearly_full_context_does_not_read_one_hundred_percent() {
+        // Arrange
+        let mut status = Status::new();
+
+        // Act
+        status.apply(&usage_with_context(0, 0, Some(fill(199_900, 200_000))));
+
+        // Assert
+        assert!(draw(&status, 80).contains("ctx 99% of 200k"));
+    }
+
+    #[test]
+    fn a_new_session_starts_without_a_meter() {
+        // Arrange
+        let mut status = Status::new();
+        status.apply(&usage_with_context(0, 0, Some(fill(20_000, 200_000))));
+
+        // Act
+        status.set_session(BackendKind::Faux, None);
+
+        // Assert
+        assert!(!draw(&status, 80).contains("ctx"));
+    }
+
+    #[test]
+    fn a_window_of_zero_shows_no_meter() {
+        // Arrange
+        let mut status = Status::new();
+
+        // Act
+        status.apply(&usage_with_context(0, 0, Some(fill(5, 0))));
+
+        // Assert
+        assert!(!draw(&status, 80).contains("ctx"));
     }
 
     #[test]
