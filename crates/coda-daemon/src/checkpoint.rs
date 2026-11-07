@@ -193,6 +193,25 @@ impl Git<'_> {
     }
 }
 
+/// Copies `from` to `to` and gives the copy the modification time of `from`.
+/// Git calls an entry racily clean when it is as new as its index file, and
+/// then reads the file instead of trusting the stat data. A copy with a newer
+/// time would hide that, and a file edited in the same second, at the same
+/// size, would be snapshotted with its old content.
+///
+/// The copy is created with default permissions, not the source's, so a read-only
+/// index still gives a copy git can write. A copy that cannot be finished is removed.
+fn copy_keeping_time(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut source = fs::File::open(from)?;
+    let modified = source.metadata()?.modified()?;
+    let mut copy = fs::File::create(to)?;
+    let done = std::io::copy(&mut source, &mut copy).and_then(|_| copy.set_modified(modified));
+    if done.is_err() {
+        let _ = fs::remove_file(to);
+    }
+    done
+}
+
 /// A copy of the user's index that is removed when dropped, with the lock file
 /// a killed `git add` leaves beside it. The copy keeps git's stat cache, so
 /// `add -A` rehashes only the files that changed.
@@ -209,8 +228,8 @@ impl ScratchIndex {
         );
         let path = common_dir.join(name);
         if user_index.exists() {
-            fs::copy(user_index, &path).map_err(|source| CheckpointError::Io {
-                path: user_index.to_path_buf(),
+            copy_keeping_time(user_index, &path).map_err(|source| CheckpointError::Io {
+                path: path.clone(),
                 source,
             })?;
         }
@@ -316,6 +335,7 @@ mod tests {
     use super::*;
 
     const REF: &str = "refs/coda/checkpoints/1/1";
+    const OLD_INDEX_AGE: Duration = Duration::from_secs(10);
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -357,6 +377,68 @@ mod tests {
         out.status
             .success()
             .then(|| String::from_utf8(out.stdout).unwrap())
+    }
+
+    fn set_mtime(path: &Path, time: std::time::SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_same_size_edit_made_in_the_tick_git_wrote_the_index_is_still_snapshotted() {
+        // Arrange
+        let dir = repo();
+        git(dir.path(), &["config", "core.trustctime", "false"]);
+        let file = dir.path().join("a.txt");
+        // Git compares times in whole seconds, so the tick must be a second or more ago.
+        let tick = std::time::SystemTime::now() - OLD_INDEX_AGE;
+        set_mtime(&file, tick);
+        git(dir.path(), &["update-index", "--really-refresh"]);
+        fs::write(&file, "two\n").unwrap();
+        set_mtime(&file, tick);
+        set_mtime(&dir.path().join(".git/index"), tick);
+        assert_eq!(
+            git(dir.path(), &["diff-files", "--name-only"]),
+            "a.txt\n",
+            "git itself sees the edit, so the setup is the racy case"
+        );
+
+        // Act
+        snapshot(dir.path(), REF).unwrap();
+
+        // Assert
+        assert_eq!(file_at(dir.path(), REF, "a.txt").as_deref(), Some("two\n"));
+    }
+
+    #[test]
+    fn a_read_only_index_is_snapshotted_and_leaves_no_scratch_copy() {
+        // Arrange
+        let dir = repo();
+        fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        let index = dir.path().join(".git/index");
+        fs::set_permissions(&index, std::os::unix::fs::PermissionsExt::from_mode(0o444)).unwrap();
+
+        // Act
+        let result = snapshot(dir.path(), REF);
+
+        // Assert
+        result.unwrap();
+        assert_eq!(file_at(dir.path(), REF, "a.txt").as_deref(), Some("two\n"));
+        let leftovers = fs::read_dir(dir.path().join(".git"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("checkpoint")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]
