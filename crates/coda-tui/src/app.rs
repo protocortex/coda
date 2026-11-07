@@ -3,6 +3,7 @@
 //! UI state, key handling and rendering.
 
 use std::io::Write;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use coda_config::tui::NotifyMode;
@@ -18,8 +19,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::activity::{self, Stage};
 use crate::chat::Chat;
 use crate::commands::{self, Command, CommandError, Resolved, UserCommands};
-use crate::input::Input;
+use crate::input::{Input, Stashed};
 use crate::notify;
+use crate::paste;
 use crate::permission::{Overlay, PermissionPrompt, sanitize_line};
 use crate::sessions::LinkCommand;
 use crate::status::{Status, mode_name};
@@ -49,6 +51,10 @@ pub const SETUP_GUIDANCE: &str = "No provider is enabled. Run `coda init`, enabl
 /// Closes the connection line after the daemon went away.
 pub const LOST_DAEMON_HINT: &str = "Ctrl+D quits. Run `coda` to start the daemon again.";
 const NO_SESSIONS: &str = "the daemon has no sessions";
+const NO_PASTE_FOLDER: &str = "no session folder yet";
+const CLEARED: &str = "prompt cleared; Ctrl+S brings it back";
+const NOTHING_STASHED: &str = "nothing is stashed";
+const STASHED: &str = "prompt stashed; press Ctrl+S on an empty prompt to bring it back";
 const ALREADY_PLANNING: &str = "the session is already in plan mode";
 const NOT_PLANNING: &str =
     "the session is not in plan mode, so there is no plan to carry out; use /plan first";
@@ -116,6 +122,8 @@ pub struct App {
     connection: ConnectionState,
     chat: Chat,
     input: Input,
+    /// The folder the session works in, once a session has started.
+    cwd: Option<String>,
     status: Status,
     overlay: Overlay,
     link: Option<UnboundedSender<LinkCommand>>,
@@ -152,6 +160,7 @@ impl App {
             connection: ConnectionState::Connecting,
             chat: Chat::new(),
             input: Input::new(),
+            cwd: None,
             status: Status::new(),
             overlay: Overlay::default(),
             link: None,
@@ -253,6 +262,7 @@ impl App {
                 self.status.set_mode(info.mode);
                 self.plan_draft = None;
                 self.plan = None;
+                self.cwd = Some(info.cwd);
                 self.overlay = Overlay::default();
                 self.turn_running = false;
                 self.work.reset();
@@ -405,8 +415,12 @@ impl App {
             self.chat.toggle_fold();
         } else if ctrl && key.code == KeyCode::Char('e') {
             self.chat.toggle_error();
+        } else if ctrl && key.code == KeyCode::Char('s') {
+            self.stash_prompt();
         } else if key.code == KeyCode::Esc {
-            self.input.clear();
+            if self.input.discard() {
+                self.chat.push_notice(CLEARED.to_owned());
+            }
         } else {
             self.handle_prompt_key(key);
         }
@@ -541,7 +555,7 @@ impl App {
         }
         self.turn_running = true;
         if !self.send(LinkCommand::Send(text.to_owned())) {
-            self.input.handle_paste(typed);
+            self.input.restore(typed);
         }
     }
 
@@ -651,7 +665,47 @@ impl App {
     pub fn handle_paste(&mut self, pasted: &str) {
         self.idle_ctrl_c_at = None;
         self.hint = None;
-        self.input.handle_paste(pasted);
+        let large = pasted.len() >= paste::LARGE_PASTE_BYTES;
+        let cleaned = if large {
+            paste::clean_for_file(pasted)
+        } else {
+            paste::clean(pasted)
+        };
+        if cleaned.invisible > 0 {
+            self.chat
+                .push_notice(paste::invisible_warning(cleaned.invisible));
+        }
+        if large {
+            self.keep_large_paste(&cleaned.text, pasted);
+        } else {
+            self.input.insert(&cleaned.text);
+        }
+    }
+
+    /// Writes a large paste to a file under the session's folder and puts a
+    /// pointer to it in the prompt, so the prompt stays small and the agent reads the file.
+    fn keep_large_paste(&mut self, text: &str, pasted: &str) {
+        let saved = match &self.cwd {
+            Some(folder) => paste::save(Path::new(folder), text).map_err(|e| e.to_string()),
+            None => Err(NO_PASTE_FOLDER.to_owned()),
+        };
+        match saved {
+            Ok(relative) => self.input.insert(&paste::reference(&relative, text.len())),
+            Err(why) => {
+                self.chat.push_notice(format!(
+                    "could not keep the large paste in a file ({why}); it stays in the prompt"
+                ));
+                self.input.insert(&paste::clean(pasted).text);
+            }
+        }
+    }
+
+    fn stash_prompt(&mut self) {
+        match self.input.stash_toggle() {
+            Stashed::Saved => self.chat.push_notice(STASHED.to_owned()),
+            Stashed::Nothing => self.chat.push_notice(NOTHING_STASHED.to_owned()),
+            Stashed::Restored => {}
+        }
     }
 
     pub fn render(&self, frame: &mut Frame) {
@@ -666,7 +720,7 @@ impl App {
             Constraint::Min(1),
             Constraint::Length(todo_rows),
             Constraint::Length(u16::from(live.is_some())),
-            Constraint::Length(1),
+            Constraint::Length(self.input.rows(frame.area().width)),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -681,7 +735,7 @@ impl App {
         if let Some(live) = live {
             frame.render_widget(Paragraph::new(live), live_row);
         }
-        self.input.render(frame, input);
+        self.input.render(frame, input, !self.overlay.is_active());
         frame.render_widget(Paragraph::new(self.connection_text(now)), connection);
         let activity = self.activity(now);
         self.status.render_with(frame, status, activity.as_deref());
@@ -1713,6 +1767,206 @@ mod tests {
         app.handle_event(plan_delta("t-1", "one"));
         app.handle_event(result_of("t-1", false));
         (app, commands)
+    }
+
+    /// An app whose session works in `folder`.
+    fn working_in(folder: &std::path::Path) -> (App, UnboundedReceiver<LinkCommand>) {
+        let (mut app, commands) = linked();
+        let mut info = session("s-1");
+        info.cwd = folder.to_string_lossy().into_owned();
+        app.handle_event(LinkEvent::SessionStarted(info));
+        (app, commands)
+    }
+
+    fn key_with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        key(code, modifiers, KeyEventKind::Press)
+    }
+
+    #[test]
+    fn a_paste_with_lines_fills_the_prompt_across_rows_and_only_enter_sends_it() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+
+        // Act
+        app.handle_paste("first\nsecond\n");
+        let shown = wide_screen(&app);
+        let before_enter = sent(&mut commands);
+        app.handle_key(press(KeyCode::Enter));
+
+        // Assert
+        assert!(shown.contains("> first"), "{shown}");
+        assert!(shown.contains("  second"), "{shown}");
+        assert_eq!(before_enter, Vec::<LinkCommand>::new());
+        assert_eq!(
+            sent(&mut commands),
+            vec![LinkCommand::Send("first\nsecond".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_paste_with_invisible_characters_drops_them_and_warns() {
+        // Arrange
+        let (mut app, _commands) = linked();
+
+        // Act
+        app.handle_paste("ig\u{200b}nore\u{202e}");
+        let shown = wide_screen(&app);
+
+        // Assert
+        assert_eq!(app.input.text(), "ignore");
+        assert!(shown.contains("removed 2 invisible characters"), "{shown}");
+    }
+
+    #[test]
+    fn a_large_paste_is_kept_in_a_file_the_prompt_points_to() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _commands) = working_in(dir.path());
+        let big = "x".repeat(paste::LARGE_PASTE_BYTES);
+
+        // Act
+        app.handle_paste(&big);
+
+        // Assert
+        let shown = app.input.text().to_owned();
+        assert!(
+            shown.starts_with("[pasted text of 32 KiB, saved at .coda/pastes/"),
+            "{shown}"
+        );
+        let relative = shown
+            .split("saved at ")
+            .nth(1)
+            .and_then(|rest| rest.split(':').next())
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(relative)).unwrap(),
+            big
+        );
+    }
+
+    #[test]
+    fn a_paste_just_under_the_limit_stays_in_the_prompt() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _commands) = working_in(dir.path());
+        let almost = "y".repeat(paste::LARGE_PASTE_BYTES - 1);
+
+        // Act
+        app.handle_paste(&almost);
+
+        // Assert
+        assert_eq!(app.input.text(), almost);
+        assert!(!dir.path().join(".coda").exists());
+    }
+
+    #[test]
+    fn a_large_paste_that_cannot_be_kept_stays_in_the_prompt_with_a_warning() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        let big = "x".repeat(paste::LARGE_PASTE_BYTES);
+
+        // Act
+        app.handle_paste(&big);
+
+        // Assert
+        assert_eq!(app.input.text(), big);
+        let shown = crate::test_support::screen(120, 24, |frame| app.render(frame));
+        assert!(shown.contains("could not keep the large paste"), "{shown}");
+    }
+
+    #[test]
+    fn the_size_limit_counts_the_paste_as_it_came_and_the_file_keeps_its_tabs() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _commands) = working_in(dir.path());
+        let tabs = "\tx".repeat(paste::LARGE_PASTE_BYTES / 2 - 1);
+
+        // Act
+        app.handle_paste(&tabs);
+        let small = app.input.text().to_owned();
+        app.input.clear();
+        app.handle_paste(&format!("{tabs}\tyy"));
+
+        // Assert
+        assert_eq!(small, tabs.replace('\t', "    "));
+        assert!(
+            app.input.text().starts_with("[pasted text of "),
+            "{}",
+            app.input.text()
+        );
+        let relative = app
+            .input
+            .text()
+            .split("saved at ")
+            .nth(1)
+            .and_then(|rest| rest.split(':').next())
+            .unwrap()
+            .to_owned();
+        let kept = std::fs::read_to_string(dir.path().join(relative)).unwrap();
+        assert!(kept.starts_with("\tx\tx"), "{}", &kept[..20]);
+    }
+
+    #[test]
+    fn escape_clears_the_prompt_but_keeps_the_draft_in_the_stash() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        app.handle_paste("a long draft");
+
+        // Act
+        app.handle_key(press(KeyCode::Esc));
+        let cleared = (app.input.text().to_owned(), wide_screen(&app));
+        app.handle_key(key_with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        // Assert
+        assert_eq!(cleared.0, "");
+        assert!(cleared.1.contains("Ctrl+S brings it back"), "{}", cleared.1);
+        assert_eq!(app.input.text(), "a long draft");
+    }
+
+    #[test]
+    fn control_s_with_nothing_to_stash_says_so() {
+        // Arrange
+        let (mut app, _commands) = linked();
+
+        // Act
+        app.handle_key(key_with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let shown = wide_screen(&app);
+
+        // Assert
+        assert!(shown.contains("nothing is stashed"), "{shown}");
+    }
+
+    #[test]
+    fn control_s_stashes_the_prompt_and_brings_it_back_on_an_empty_line() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        app.handle_paste("half a thought");
+
+        // Act
+        app.handle_key(key_with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let stashed = (app.input.text().to_owned(), wide_screen(&app));
+        app.handle_key(key_with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        // Assert
+        assert_eq!(stashed.0, "");
+        assert!(stashed.1.contains("prompt stashed"), "{}", stashed.1);
+        assert_eq!(app.input.text(), "half a thought");
+    }
+
+    #[test]
+    fn the_prompt_grows_with_its_lines_and_leaves_the_transcript_the_rest() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        app.handle_paste("one\ntwo\nthree");
+
+        // Act
+        let shown = crate::test_support::screen(40, 12, |frame| app.render(frame));
+
+        // Assert
+        let rows: Vec<&str> = shown.lines().collect();
+        assert!(rows[rows.len() - 5].starts_with("> one"), "{shown}");
+        assert!(rows[rows.len() - 4].starts_with("  two"), "{shown}");
+        assert!(rows[rows.len() - 3].starts_with("  three"), "{shown}");
     }
 
     #[test]
