@@ -233,3 +233,33 @@ async fn server_shutdown_surfaces_disconnected() {
         "got {result:?}"
     );
 }
+
+#[tokio::test]
+async fn connect_keeps_the_capabilities_the_daemon_reported() {
+    // Arrange
+    let daemon = TestDaemon::start(None);
+
+    // Act
+    let client = within(Client::connect(&daemon.socket, timing()))
+        .await
+        .unwrap();
+
+    // Assert
+    assert!(client.capabilities().force_cancel);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn an_unchecked_connection_assumes_no_capabilities() {
+    // Arrange
+    let daemon = TestDaemon::start(None);
+
+    // Act
+    let client = within(Client::connect_unchecked(&daemon.socket, timing()))
+        .await
+        .unwrap();
+
+    // Assert
+    assert!(!client.capabilities().force_cancel);
+    daemon.stop().await;
+}

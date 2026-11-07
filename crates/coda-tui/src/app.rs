@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use coda_protocol::events::Event;
-use coda_protocol::methods::{SessionStatus, SessionSummary};
+use coda_protocol::methods::{Capabilities, SessionStatus, SessionSummary};
 use coda_protocol::types::{BackendKind, SessionInfo};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -67,6 +67,8 @@ pub enum LinkEvent {
     Sessions(Vec<SessionSummary>),
     /// Something the user should read, such as a failed request.
     Notice(String),
+    /// What the daemon said it can do when the link connected.
+    Capabilities(Capabilities),
     /// The daemon has no enabled provider.
     SetupNeeded,
     /// The process was asked to stop, for example by a signal.
@@ -83,8 +85,10 @@ pub struct App {
     link: Option<UnboundedSender<LinkCommand>>,
     turn_running: bool,
     work: WorkLog,
-    /// When the user asked to stop the turn, and whether they forced it.
+    /// When the user asked to stop the turn or last forced it, and whether that was a force.
     stop: Option<(Instant, bool)>,
+    /// What the daemon said it can do; unknown until the link reports it.
+    capabilities: Option<Capabilities>,
     setup_shown: bool,
     user_commands: UserCommands,
     quit: bool,
@@ -106,6 +110,7 @@ impl App {
             turn_running: false,
             work: WorkLog::new(),
             stop: None,
+            capabilities: None,
             setup_shown: false,
             user_commands: UserCommands::default(),
             quit: false,
@@ -191,6 +196,7 @@ impl App {
             LinkEvent::UserMessage(text) => self.chat.push_user(text),
             LinkEvent::Sessions(sessions) => self.show_sessions(&sessions),
             LinkEvent::Notice(text) => self.chat.push_notice(text),
+            LinkEvent::Capabilities(capabilities) => self.capabilities = Some(capabilities),
             LinkEvent::SetupNeeded => self.show_setup_guidance(),
             LinkEvent::Quit => self.quit = true,
         }
@@ -303,18 +309,22 @@ impl App {
     /// Asks the daemon to cancel the turn. Once a stop has gone unanswered for
     /// [`activity::STOP_TIMEOUT`], the next press forces it.
     fn stop_turn(&mut self, now: Instant) {
-        let offered = self.stop.is_some_and(|(asked, forced)| {
-            activity::stage(asked, forced, now) == Stage::NotResponding
-        });
+        let offered = self.can_force()
+            && self.stop.is_some_and(|(asked, forced)| {
+                activity::stage(asked, forced, now) == Stage::NotResponding
+            });
         if offered {
-            if let Some((asked, _)) = self.stop {
-                self.stop = Some((asked, true));
-            }
+            self.stop = Some((now, true));
             self.send(LinkCommand::ForceCancel);
         } else {
             self.stop.get_or_insert((now, false));
             self.send(LinkCommand::Cancel);
         }
+    }
+
+    /// Whether a forced stop is worth offering. Assumed until the daemon says it is not.
+    fn can_force(&self) -> bool {
+        self.capabilities.is_none_or(|known| known.force_cancel)
     }
 
     /// What the status line says about the running turn.
@@ -323,7 +333,12 @@ impl App {
             return None;
         }
         let began = self.work.began().unwrap_or(now);
-        Some(activity::status_text(began, self.stop, now))
+        Some(activity::status_text(
+            began,
+            self.stop,
+            self.can_force(),
+            now,
+        ))
     }
 
     fn handle_prompt_key(&mut self, key: KeyEvent) {
@@ -497,7 +512,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use coda_protocol::events::ToolCallStatus;
-    use coda_protocol::methods::{SessionStatus, SessionSummary};
+    use coda_protocol::methods::{Capabilities, SessionStatus, SessionSummary};
     use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -1789,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn a_press_after_the_force_cancels_again_and_never_forces_twice() {
+    fn a_press_right_after_the_force_cancels_again_without_forcing() {
         // Arrange
         let t0 = Instant::now();
         let (mut app, mut commands) = working(t0);
@@ -1798,10 +1813,58 @@ mod tests {
         sent(&mut commands);
 
         // Act
-        app.handle_key_at(ctrl_c(), t0 + 2 * activity::STOP_TIMEOUT);
+        app.handle_key_at(
+            ctrl_c(),
+            t0 + activity::STOP_TIMEOUT + Duration::from_secs(1),
+        );
 
         // Assert
         assert_eq!(sent(&mut commands), vec![LinkCommand::Cancel]);
+    }
+
+    #[test]
+    fn a_force_that_did_not_end_the_turn_is_offered_and_sent_again() {
+        // Arrange
+        let t0 = Instant::now();
+        let (mut app, mut commands) = working(t0);
+        app.handle_key_at(ctrl_c(), t0);
+        let forced_at = t0 + activity::STOP_TIMEOUT;
+        app.handle_key_at(ctrl_c(), forced_at);
+        sent(&mut commands);
+        let again_at = forced_at + activity::STOP_TIMEOUT;
+
+        // Act
+        let offered = wide_screen_at(&app, again_at);
+        app.handle_key_at(ctrl_c(), again_at);
+
+        // Assert
+        assert!(
+            offered.contains("press Ctrl+C again to force stop"),
+            "{offered}"
+        );
+        assert_eq!(sent(&mut commands), vec![LinkCommand::ForceCancel]);
+    }
+
+    #[test]
+    fn a_daemon_that_cannot_force_never_gets_a_force_or_an_offer() {
+        // Arrange
+        let t0 = Instant::now();
+        let (mut app, mut commands) = working(t0);
+        app.handle_event_at(LinkEvent::Capabilities(Capabilities::default()), t0);
+        app.handle_key_at(ctrl_c(), t0);
+
+        // Act
+        let late = t0 + activity::STOP_TIMEOUT;
+        let shown = wide_screen_at(&app, late);
+        app.handle_key_at(ctrl_c(), late);
+
+        // Assert
+        assert!(shown.contains("not responding"), "{shown}");
+        assert!(!shown.contains("force stop"), "{shown}");
+        assert_eq!(
+            sent(&mut commands),
+            vec![LinkCommand::Cancel, LinkCommand::Cancel]
+        );
     }
 
     #[test]

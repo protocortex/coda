@@ -614,6 +614,9 @@ impl Turns {
     /// Cancels like [`Self::cancel`], then kills the backend's process group at
     /// once instead of waiting for it to answer the cancel. For a stop that did not take.
     pub async fn force_cancel(&self, session: &SessionId) -> bool {
+        if !self.running().contains_key(session) {
+            return self.models.force_cancel(session);
+        }
         let cancelled = self.cancel(session);
         if cancelled {
             let path = pidfile_path(&self.config.pidfile_dir, session);

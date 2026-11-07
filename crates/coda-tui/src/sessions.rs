@@ -252,6 +252,7 @@ pub async fn run_link(
         }
     };
     let _ = events.send(LinkEvent::Connected);
+    let _ = events.send(LinkEvent::Capabilities(client.capabilities()));
     let mut link = Link::new(client, config, events);
     link.check_setup().await;
     link.start().await;

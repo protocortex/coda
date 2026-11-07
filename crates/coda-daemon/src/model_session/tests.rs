@@ -15,7 +15,7 @@ use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::{EnvReader, MAX_IDLE_LOOPS, ModelSessions};
+use super::{EnvReader, ForceGate, MAX_IDLE_LOOPS, ModelSessions, TURN_STOPPED_KIND, lock};
 use crate::dispatch::Dispatcher;
 use crate::gate::Brokers;
 use crate::state::DaemonState;
@@ -701,6 +701,107 @@ async fn a_cancel_while_the_send_is_starting_cancels_the_loop_once_it_is_armed()
     // Assert
     assert!(cancelled);
     assert!(token.is_cancelled());
+}
+
+/// A turn whose send never ends and ignores the cancel, as one stuck where a cancel cannot reach.
+async fn stuck_turn(rig: &Rig) -> TurnId {
+    let models = &rig.turns.models;
+    let slot = models.reserve(&rig.session).unwrap();
+    let turn = Turns::begin(&rig.hub, &rig.session, "go").await.unwrap();
+    slot.arm((CancelToken::default(), turn.clone()));
+    models.drive(
+        slot,
+        turn.clone(),
+        tracing::Span::none(),
+        std::future::pending(),
+    );
+    turn
+}
+
+#[tokio::test]
+async fn a_forced_cancel_ends_a_turn_that_ignores_the_cancel() {
+    // Arrange
+    let rig = Rig::new(Mode::Default, &[]);
+    stuck_turn(&rig).await;
+    let models = &rig.turns.models;
+
+    // Act
+    let plain = models.cancel(&rig.session);
+    let still_running = models.is_running(&rig.session);
+    let forced = models.force_cancel(&rig.session);
+    rig.wait_until_idle().await;
+    rig.wait_for_results(1).await;
+
+    // Assert
+    assert!(plain);
+    assert!(still_running);
+    assert!(forced);
+    assert_eq!(rig.bodies("result").await[0]["is_error"], false);
+    assert_eq!(
+        rig.bodies(TURN_STOPPED_KIND).await[0]["condition"],
+        "cancelled"
+    );
+    assert!(lock(&models.forces).is_empty());
+}
+
+#[tokio::test]
+async fn session_cancel_with_force_ends_a_stuck_model_turn() {
+    // Arrange
+    let mut rig = Rig::new(Mode::Default, &[]);
+    stuck_turn(&rig).await;
+
+    // Act
+    let response = rig
+        .call(
+            "session.cancel",
+            json!({"session_id": rig.session, "force": true}),
+        )
+        .await;
+    rig.wait_until_idle().await;
+    rig.wait_for_results(1).await;
+
+    // Assert
+    assert_eq!(response["result"]["cancelled"], true);
+    assert_eq!(rig.bodies("result").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_forced_cancel_with_no_turn_reports_nothing_cancelled() {
+    // Arrange
+    let rig = Rig::new(Mode::Default, &[]);
+
+    // Act
+    let forced = rig.turns.models.force_cancel(&rig.session);
+
+    // Assert
+    assert!(!forced);
+}
+
+#[test]
+fn a_force_before_the_send_has_its_outcome_takes_the_turn_from_it() {
+    // Arrange
+    let gate = ForceGate::new();
+
+    // Act
+    gate.force();
+    let kept = gate.shut();
+
+    // Assert
+    assert!(!kept);
+}
+
+#[test]
+fn a_force_after_the_send_has_its_outcome_is_ignored() {
+    // Arrange
+    let gate = ForceGate::new();
+
+    // Act
+    let kept = gate.shut();
+    gate.force();
+
+    // Assert
+    assert!(kept);
+    assert!(gate.shut());
 }
 
 #[tokio::test]
