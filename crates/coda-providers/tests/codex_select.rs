@@ -55,6 +55,7 @@ impl Fixture {
             cwd: self.cwd.path().to_path_buf(),
             session_id: SessionId::new("s-1"),
             resume: None,
+            persist_threads: false,
             sandbox,
             verified_versions: verified.iter().map(|v| (*v).to_owned()).collect(),
             binary_verified: verified.contains(&FAKE_VERSION),

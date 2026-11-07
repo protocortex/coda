@@ -686,6 +686,7 @@ async fn record_app_server(out: &Path, name: &str, run: AppServerRun) {
                 session_id: SessionId::new("live"),
                 sandbox: SandboxMode::ReadOnly,
                 ephemeral: true,
+                resume_thread: None,
                 verified_versions: Vec::new(),
                 parent_env: parent_env(),
             },

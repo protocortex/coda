@@ -38,6 +38,8 @@
 //! sent with approval requests, `reject_turn_start` refuses `turn/start`, `hang_after_cancel` parks after a `cancel` answer,
 //! and `ignore_interrupt` makes the app-server park on `turn/interrupt`. A `stall` turn also
 //! ends, completed, when it gets `turn/steer`, which it records under `steer_params`.
+//! `thread/resume` records its params under `thread_resume` and answers with the thread it
+//! was given, or refuses when `reject_resume` is set.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -383,6 +385,17 @@ mod app_server {
         }
     }
 
+    fn resume_reply(id: &Value, params: &Value) -> Value {
+        if control_value("reject_resume").is_some() {
+            return json!({"id": id, "error": {"code": -32000, "message": "no such thread"}});
+        }
+        let version = control_value("version")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| SERVER_VERSION.to_owned());
+        let thread = json!({"id": params["threadId"], "cliVersion": version});
+        json!({"id": id, "result": {"thread": thread}})
+    }
+
     pub fn serve(args: &[String]) -> io::Result<()> {
         write_report(args, "")?;
         if control_value("exit_early").is_some() {
@@ -423,6 +436,10 @@ mod app_server {
                         &mut stream,
                         &json!({"id": id, "result": {"thread": thread}}),
                     )?;
+                }
+                "thread/resume" => {
+                    update_report("thread_resume", params)?;
+                    send(&mut stream, &resume_reply(&id, params))?;
                 }
                 "account/read" => {
                     let reads = read_report("account_reads").as_u64().unwrap_or(0) + 1;

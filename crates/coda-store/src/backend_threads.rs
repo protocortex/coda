@@ -39,6 +39,32 @@ impl Store {
         Ok(())
     }
 
+    /// Records `native_ref` only when `session` has no ref on `backend` yet, and
+    /// leaves a stored one alone. Returns whether it recorded the ref.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the write fails, including a
+    /// `session` that does not exist.
+    pub fn record_backend_thread_if_absent(
+        &mut self,
+        session: &SessionId,
+        backend: BackendKind,
+        native_ref: &str,
+    ) -> Result<bool, StoreError> {
+        let Some(row) = session_row_id(session) else {
+            return Err(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows));
+        };
+        let inserted = self.connection().execute(
+            "INSERT INTO backend_threads \
+                 (session_id, backend, native_ref, status) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (session_id, backend) DO NOTHING",
+            params![row, encode_enum(&backend)?, native_ref, STATUS_ACTIVE],
+        )?;
+        Ok(inserted > 0)
+    }
+
     /// Forgets the ref of `session` on `backend`, so its next turn starts a new
     /// conversation. A ref that was never recorded is not an error.
     ///

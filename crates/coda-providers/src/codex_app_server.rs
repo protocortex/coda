@@ -172,6 +172,10 @@ pub struct AppServerSpec {
     pub sandbox: SandboxMode,
     /// Whether the thread is kept out of Codex's saved history.
     pub ephemeral: bool,
+    /// A saved thread to pick up with `thread/resume` instead of starting one.
+    /// Only a thread that is not ephemeral can be resumed, so this is ignored for
+    /// an ephemeral spec. A server that refuses the resume gets a new thread.
+    pub resume_thread: Option<String>,
     /// Server versions known to behave; any other one raises a drift warning.
     pub verified_versions: Vec<String>,
     /// The parent environment; only allowlisted names reach the child.
@@ -290,12 +294,16 @@ fn reply_for(allowed: bool, params: &Value) -> Reply {
     }
 }
 
+const THREAD_START: &str = "thread/start";
+const THREAD_RESUME: &str = "thread/resume";
+
 /// What a started server hands to the session.
 struct Started {
     stream: UnixStream,
     reader: FrameReader,
     version: String,
     thread_id: String,
+    resumed: bool,
     account: Option<AccountStatus>,
 }
 
@@ -314,6 +322,17 @@ struct PlanLimits {
     stopped: bool,
 }
 
+/// Whether Codex keeps the session's thread, and where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadKeep {
+    /// Kept out of Codex's saved history, so a later start cannot resume it.
+    Ephemeral,
+    /// New, and saved by Codex.
+    Saved,
+    /// A saved thread that `thread/resume` picked up, so it holds the earlier conversation.
+    Resumed,
+}
+
 /// A Codex thread served by one `codex app-server` process.
 #[derive(Debug)]
 pub struct CodexAppServerSession {
@@ -328,6 +347,7 @@ pub struct CodexAppServerSession {
     session_id: SessionId,
     cwd: PathBuf,
     thread_id: String,
+    keep: ThreadKeep,
     server_version: String,
     drift: Option<String>,
     next_id: u64,
@@ -377,6 +397,7 @@ impl CodexAppServerSession {
             reader,
             version,
             thread_id,
+            resumed,
             account,
         } = match handshake {
             Ok(result) => result?,
@@ -401,6 +422,11 @@ impl CodexAppServerSession {
             session_id: spec.session_id,
             cwd: spec.cwd,
             thread_id,
+            keep: match (spec.ephemeral, resumed) {
+                (true, _) => ThreadKeep::Ephemeral,
+                (false, false) => ThreadKeep::Saved,
+                (false, true) => ThreadKeep::Resumed,
+            },
             server_version: version,
             drift,
             next_id: 0,
@@ -421,25 +447,51 @@ impl CodexAppServerSession {
         child: &mut Child,
     ) -> Result<Started, AppServerError> {
         let (mut stream, mut reader, mut next_id) = open(socket, child).await?;
-        let thread = json!({
-            "cwd": spec.cwd,
-            "sandbox": spec.sandbox.as_arg(),
-            "approvalPolicy": APPROVAL_POLICY,
-            "ephemeral": spec.ephemeral,
-        });
-        let result = request(
-            &mut stream,
-            &mut reader,
-            &mut next_id,
-            "thread/start",
-            thread,
-        )
-        .await?;
+        let mut resumed = false;
+        let mut result = None;
+        if let (Some(saved), false) = (&spec.resume_thread, spec.ephemeral) {
+            let params = json!({
+                "threadId": saved,
+                "cwd": spec.cwd,
+                "sandbox": spec.sandbox.as_arg(),
+                "approvalPolicy": APPROVAL_POLICY,
+                "excludeTurns": true,
+            });
+            match request(
+                &mut stream,
+                &mut reader,
+                &mut next_id,
+                THREAD_RESUME,
+                params,
+            )
+            .await
+            {
+                Ok(answer) => {
+                    resumed = true;
+                    result = Some((answer, THREAD_RESUME));
+                }
+                Err(AppServerError::Rejected { .. }) => {
+                    warn!("Codex did not accept the saved thread; starting a new one");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let (result, method) = if let Some(found) = result {
+            found
+        } else {
+            let thread = json!({
+                "cwd": spec.cwd,
+                "sandbox": spec.sandbox.as_arg(),
+                "approvalPolicy": APPROVAL_POLICY,
+                "ephemeral": spec.ephemeral,
+            });
+            let answer =
+                request(&mut stream, &mut reader, &mut next_id, THREAD_START, thread).await?;
+            (answer, THREAD_START)
+        };
         let thread_id = result["thread"]["id"]
             .as_str()
-            .ok_or(AppServerError::Rejected {
-                method: "thread/start",
-            })?
+            .ok_or(AppServerError::Rejected { method })?
             .to_owned();
         let version = server_version(&result);
         // A server that refuses the read still serves turns; only the billing report is lost.
@@ -461,6 +513,7 @@ impl CodexAppServerSession {
             reader,
             version,
             thread_id,
+            resumed,
             account,
         })
     }
@@ -488,6 +541,19 @@ impl CodexAppServerSession {
     #[must_use]
     pub fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+
+    /// Whether the thread is a saved one that `thread/resume` picked up, so it
+    /// already holds the earlier conversation.
+    #[must_use]
+    pub fn resumed(&self) -> bool {
+        self.keep == ThreadKeep::Resumed
+    }
+
+    /// The thread id a later start can resume: only a thread that Codex keeps.
+    #[must_use]
+    pub fn resumable_thread_id(&self) -> Option<&str> {
+        (self.keep != ThreadKeep::Ephemeral).then_some(self.thread_id.as_str())
     }
 
     /// The version the server reported; empty when it reported none.

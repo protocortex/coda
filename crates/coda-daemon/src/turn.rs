@@ -48,7 +48,8 @@ use tracing::{Instrument, info, warn};
 
 use crate::backends::{
     AgentSession, CodexStart, SessionStart, StartError, claude_env_passthrough, claude_profile,
-    pidfile_path, resolve_codex_off_worker, start_claude_session, start_codex_session,
+    codex_persists_threads, pidfile_path, resolve_codex_off_worker, start_claude_session,
+    start_codex_session,
 };
 mod diff;
 mod drive;
@@ -527,6 +528,7 @@ impl Turns {
             CODEX_BACKEND_NAME
         };
         let mut child = self.start_child(&record, false).await?;
+        self.note_started_thread(&record, &child).await;
         let seed = self.rewind_seed(&record).await;
         let turn = match Self::begin_for(&self.hub, &session_id, &shown, request.as_deref()).await {
             Ok(turn) => turn,
@@ -823,13 +825,13 @@ impl Turns {
         if let Some(id) = self.backend_ids().get(&record.id).cloned() {
             return Some(id);
         }
-        if record.backend != BackendKind::ClaudeCode {
+        if !self.stores_backend_id(record) {
             return None;
         }
-        let session = record.id.clone();
+        let (session, backend) = (record.id.clone(), record.backend);
         let stored = self
             .hub
-            .with_store(move |store| store.active_backend_ref(&session, BackendKind::ClaudeCode))
+            .with_store(move |store| store.active_backend_ref(&session, backend))
             .await;
         stored.unwrap_or_else(|error| {
             warn!(session = %record.id, %error, "could not read the stored backend id");
@@ -837,18 +839,83 @@ impl Turns {
         })
     }
 
+    /// Whether the conversation id of `record`'s backend survives a restart: a
+    /// Claude Code session's always does, and a Codex app-server thread's only
+    /// when `persist_threads` lets Codex keep it.
+    fn stores_backend_id(&self, record: &SessionRecord) -> bool {
+        match record.backend {
+            BackendKind::ClaudeCode => true,
+            BackendKind::CodexAppServer => codex_persists_threads(&self.config.models),
+            _ => false,
+        }
+    }
+
+    /// Keeps the conversation id `child` reports, within `limit` when a stalled
+    /// store must not hold the session.
+    async fn save_named_id(
+        &self,
+        record: &SessionRecord,
+        child: &AgentSession,
+        limit: Option<Duration>,
+    ) {
+        let Some(backend_id) = child.session_id_from_backend() else {
+            return;
+        };
+        let saved = within(limit, self.remember_backend_id(record, backend_id)).await;
+        if saved.is_none() {
+            warn!(session = %record.id, "the store did not answer; the backend id was not saved");
+        }
+    }
+
+    /// Settles what is stored of a Codex app-server thread right after its server
+    /// started. With `persist_threads` off, an id kept from an earlier run is
+    /// dropped, because the turns since then ran on threads Codex did not keep and
+    /// resuming the old one would lose them. With it on, a session that has no
+    /// stored thread gets this one, so a restart before the server stops cleanly can
+    /// resume it. A stored thread stays until a turn has run on its replacement, so
+    /// a refused resume that came from a passing fault does not lose it.
+    async fn note_started_thread(&self, record: &SessionRecord, child: &AgentSession) {
+        if record.backend != BackendKind::CodexAppServer {
+            return;
+        }
+        let (session, backend) = (record.id.clone(), record.backend);
+        let outcome = if codex_persists_threads(&self.config.models) {
+            let Some(backend_id) = child.session_id_from_backend() else {
+                return;
+            };
+            if self.backend_ids().get(&record.id).map(String::as_str) == Some(backend_id) {
+                return;
+            }
+            let backend_id = backend_id.to_owned();
+            self.hub
+                .with_store_mut(move |store| {
+                    store.record_backend_thread_if_absent(&session, backend, &backend_id)
+                })
+                .await
+                .map(drop)
+        } else {
+            self.hub
+                .with_store_mut(move |store| store.forget_backend_thread(&session, backend))
+                .await
+        };
+        if let Err(error) = outcome {
+            warn!(session = %record.id, %error, "could not settle the stored Codex thread");
+        }
+    }
+
     /// Keeps the id the backend reported, in memory and, for Claude, in the store.
     pub(super) async fn remember_backend_id(&self, record: &SessionRecord, backend_id: &str) {
         self.backend_ids()
             .insert(record.id.clone(), backend_id.to_owned());
-        if record.backend != BackendKind::ClaudeCode {
+        if !self.stores_backend_id(record) {
             return;
         }
-        let (session, backend_id) = (record.id.clone(), backend_id.to_owned());
+        let (session, backend, backend_id) =
+            (record.id.clone(), record.backend, backend_id.to_owned());
         let stored = self
             .hub
             .with_store_mut(move |store| {
-                store.record_backend_thread(&session, BackendKind::ClaudeCode, &backend_id)
+                store.record_backend_thread(&session, backend, &backend_id)
             })
             .await;
         if let Err(error) = stored {
@@ -1010,16 +1077,12 @@ impl Turns {
             && child.is_reusable();
         if keep {
             info!(session = %session, turn = %turn, step = "cleanup", "keeping the backend for the next turn");
+            self.save_named_id(&record, &child, limit).await;
             self.park(&session, child).await;
         } else {
             info!(session = %session, turn = %turn, step = "cleanup", "stopping the backend");
             stop(&mut child, &session).await;
-            if let Some(backend_id) = child.session_id_from_backend() {
-                let saved = within(limit, self.remember_backend_id(&record, backend_id)).await;
-                if saved.is_none() {
-                    warn!(session = %session, "the store did not answer; the backend id was not saved");
-                }
-            }
+            self.save_named_id(&record, &child, limit).await;
         }
         let store_failures = settle_events(&session, emit, &mut publisher, limit).await;
         self.queues().remove(&session);

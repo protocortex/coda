@@ -234,6 +234,10 @@ pub struct ProviderConfig {
     pub sandbox: Option<String>,
     /// Allows a `sandbox` wider than read-only.
     pub allow_wider_sandbox: bool,
+    /// Lets a Codex app-server keep its thread in Codex's own saved history, so
+    /// a restarted daemon resumes the thread instead of replaying a text seed.
+    /// Off by default, which keeps the thread out of Codex's history; `codex` only.
+    pub persist_threads: bool,
     /// Output token limit of a model request; the built-in limit when unset.
     pub max_output_tokens: Option<u32>,
     /// Tokens the model may spend thinking before it answers; the request asks
@@ -264,6 +268,7 @@ impl Default for ProviderConfig {
             model: None,
             sandbox: None,
             allow_wider_sandbox: false,
+            persist_threads: false,
             max_output_tokens: None,
             thinking_budget_tokens: None,
             max_tokens_field: MaxTokensField::default(),
@@ -930,6 +935,21 @@ mod tests {
 
     fn parse(s: &str) -> Parsed {
         Config::from_toml_str(s).expect("valid config")
+    }
+
+    #[test]
+    fn kept_codex_threads_are_off_until_the_provider_turns_them_on() {
+        // Arrange
+        let on = "[providers.codex]\nenabled = true\npersist_threads = true\n";
+
+        // Act
+        let default = Config::from_toml_str("[providers.codex]\nenabled = true\n").unwrap();
+        let set = Config::from_toml_str(on).unwrap();
+
+        // Assert
+        assert!(!default.config.providers["codex"].persist_threads);
+        assert!(set.config.providers["codex"].persist_threads);
+        assert_eq!(set.unknown_keys, Vec::<String>::new());
     }
 
     #[test]
