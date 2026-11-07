@@ -813,3 +813,44 @@ async fn a_repository_with_no_default_branch_says_that_no_project_rules_are_used
     let (before, _) = prompts.split_once(DATA_MARKER).expect(&prompts);
     assert!(!before.contains("RULE-FROM-MAIN"), "{prompts}");
 }
+
+#[tokio::test]
+async fn posting_needs_a_pull_request_to_post_to() {
+    // Arrange
+    let rig = rig(&[]);
+
+    // Act
+    let outcome = review(&rig, &["--post", "--yes", "topic"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::from(FAILURE), "{}", outcome.err);
+    assert!(outcome.err.contains("pull request"), "{}", outcome.err);
+}
+
+#[tokio::test]
+async fn posting_without_yes_and_without_a_terminal_is_refused_before_any_work() {
+    // Arrange
+    let rig = rig(&[]);
+
+    // Act
+    let outcome = review(&rig, &["--post", "42"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::from(FAILURE), "{}", outcome.err);
+    assert!(outcome.err.contains("--yes"), "{}", outcome.err);
+    assert!(outcome.out.is_empty(), "{}", outcome.out);
+}
+
+#[tokio::test]
+async fn yes_without_post_and_post_with_staged_are_usage_errors() {
+    // Arrange
+    let rig = rig(&[]);
+
+    // Act
+    let yes = review(&rig, &["--yes"]).await;
+    let staged = review(&rig, &["--post", "--staged"]).await;
+
+    // Assert
+    assert_eq!(yes.code, ExitCode::from(USAGE), "{}", yes.err);
+    assert_eq!(staged.code, ExitCode::from(USAGE), "{}", staged.err);
+}

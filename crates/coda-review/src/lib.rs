@@ -10,6 +10,7 @@ pub mod guidance;
 pub mod ignore;
 pub mod pack;
 pub mod parse;
+pub mod post;
 pub mod render;
 pub mod request;
 pub mod rules;

@@ -124,6 +124,39 @@ fn verdict_note(f: &Finding) -> String {
     }
 }
 
+/// One finding as a markdown block, the same as in the full review.
+#[must_use]
+pub fn finding_markdown(f: &Finding) -> String {
+    let mut out = String::new();
+    write_finding(&mut out, f);
+    out
+}
+
+/// The partial banner and the files that were clipped or left out, as markdown. Empty when
+/// the review saw everything.
+#[must_use]
+pub fn coverage_notes_markdown(review: &Review) -> String {
+    let mut out = String::new();
+    if review.run.partial {
+        out.push_str(PARTIAL_BANNER);
+        out.push_str("\n\n");
+    }
+    write_files(&mut out, "Clipped", &review.coverage.clipped);
+    write_files(&mut out, "Left out", &review.coverage.left_out);
+    out
+}
+
+/// The risk, the effort and the summary of `review`, as markdown.
+#[must_use]
+pub fn overview_markdown(review: &Review) -> String {
+    format!(
+        "Risk: {}. Effort: {} of {MAX_EFFORT}.\n\n{}\n\n",
+        review.risk.as_str(),
+        review.effort,
+        prose(&review.summary),
+    )
+}
+
 fn write_finding(out: &mut String, f: &Finding) {
     let _ = write!(
         out,
