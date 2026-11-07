@@ -6,6 +6,7 @@ pub mod activity;
 pub mod app;
 pub mod chat;
 pub mod commands;
+pub mod completion;
 pub mod errors;
 pub mod input;
 pub mod logs;
