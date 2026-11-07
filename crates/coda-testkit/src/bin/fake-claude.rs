@@ -20,6 +20,7 @@
 //! stays silent for `TOOL_SLOW`, then reports the `tool_result` and finishes,
 //! and `tool-hang` announces one and never reports it. `tool-flaky` announces a tool and
 //! crashes the first time (the control file's `crash_marker` remembers it), then stalls.
+//! `tool-quick` runs one that succeeds at once and `tool-error` one that fails at once.
 //! `report-usage` reports a rate limit, then finishes with token usage on the result.
 //! `hit-limit` reports a rejected seven-day limit, then ends the turn with an error.
 //! `stream-long` streams `input_json_delta` and `thinking_delta` lines for longer than
@@ -75,6 +76,8 @@ const TOOL_SLOW_TRIGGER: &str = "tool-slow";
 const TOOL_HANG_TRIGGER: &str = "tool-hang";
 const TOOL_FLAKY_TRIGGER: &str = "tool-flaky";
 const STREAM_LONG_TRIGGER: &str = "stream-long";
+const TOOL_QUICK_TRIGGER: &str = "tool-quick";
+const TOOL_ERROR_TRIGGER: &str = "tool-error";
 const REPORT_USAGE_TRIGGER: &str = "report-usage";
 const HIT_LIMIT_TRIGGER: &str = "hit-limit";
 const STREAM_STEP: Duration = Duration::from_millis(100);
@@ -240,6 +243,9 @@ fn run_turn(
     if user_line.contains(STREAM_LONG_TRIGGER) {
         return stream_long(out);
     }
+    if user_line.contains(TOOL_QUICK_TRIGGER) || user_line.contains(TOOL_ERROR_TRIGGER) {
+        return run_quick_tool(user_line.contains(TOOL_ERROR_TRIGGER), out);
+    }
     if user_line.contains(REPORT_USAGE_TRIGGER) {
         return report_usage(out);
     }
@@ -344,6 +350,21 @@ fn stream_long(out: &mut impl Write) -> io::Result<()> {
     emit(
         out,
         &serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"ran"}]}}),
+    )?;
+    emit(out, &serde_json::json!({"type":"result","is_error":false}))
+}
+
+/// A tool Claude Code runs without asking, reported at once as done or as failed.
+fn run_quick_tool(is_error: bool, out: &mut impl Write) -> io::Result<()> {
+    emit(
+        out,
+        &serde_json::json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":TOOL_USE_ID,"name":"Bash","input":{"command":"ls"}}]}}),
+    )?;
+    emit(
+        out,
+        &serde_json::json!({"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":TOOL_USE_ID,"content":"x","is_error":is_error}]}}),
     )?;
     emit(out, &serde_json::json!({"type":"result","is_error":false}))
 }

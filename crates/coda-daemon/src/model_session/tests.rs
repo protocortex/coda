@@ -997,6 +997,57 @@ async fn a_gate_that_errors_never_runs_the_tool() {
 }
 
 #[tokio::test]
+async fn each_tool_call_of_the_loop_sends_a_start_and_a_finish_event() {
+    // Arrange
+    let calls = tool_turn(&[
+        ("c1", "write", json!({"path": "made.txt", "content": "x\n"})),
+        ("c2", "read", json!({"path": "missing.txt"})),
+        ("c3", "list", json!({})),
+    ]);
+    let mut rig = Rig::new(Mode::AcceptEdits, &[calls, text_turn("done")]);
+
+    // Act
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let seen: Vec<(String, String, Option<String>, String)> = rig
+        .bodies("tool_call")
+        .await
+        .iter()
+        .map(|b| {
+            let text = |key: &str| b[key].as_str().map(str::to_owned);
+            (
+                text("id").unwrap(),
+                text("name").unwrap(),
+                text("summary"),
+                text("status").unwrap(),
+            )
+        })
+        .collect();
+    let row = |id: &str, name: &str, summary: Option<&str>, status: &str| {
+        (
+            id.to_owned(),
+            name.to_owned(),
+            summary.map(str::to_owned),
+            status.to_owned(),
+        )
+    };
+    assert_eq!(
+        seen,
+        vec![
+            row("c1", "write", Some("made.txt"), "started"),
+            row("c2", "read", Some("missing.txt"), "started"),
+            row("c3", "list", None, "started"),
+            row("c1", "write", Some("made.txt"), "succeeded"),
+            row("c2", "read", Some("missing.txt"), "failed"),
+            row("c3", "list", None, "succeeded"),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn an_answer_naming_another_session_is_refused_and_leaves_the_request_open() {
     // Arrange
     let calls = tool_turn(&[("c1", "bash", json!({"command": "touch ran.txt"}))]);

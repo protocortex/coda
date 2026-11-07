@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use coda_protocol::events::{Event, InterruptCause};
+use coda_protocol::events::{Event, InterruptCause, ToolCallStatus};
 use coda_protocol::methods::{
     AgentRunParams, AgentRunResult, Capabilities, DaemonBackendsParams, DaemonBackendsResult,
     DaemonShutdownParams, DaemonShutdownResult, DaemonStatusParams, DaemonStatusResult,
@@ -140,6 +140,8 @@ golden_tests! {
     event_rate_limit_minimal: "event.rate_limit.minimal" => Event,
     event_usage_limit: "event.usage_limit" => Event,
     event_usage_limit_minimal: "event.usage_limit.minimal" => Event,
+    event_tool_call: "event.tool_call" => Event,
+    event_tool_call_minimal: "event.tool_call.minimal" => Event,
 }
 
 #[test]
@@ -269,6 +271,27 @@ fn an_interrupt_with_a_cause_from_a_newer_peer_still_decodes() {
         event,
         Event::TurnInterrupted {
             cause: Some(InterruptCause::Unknown),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_tool_call_status_from_a_newer_peer_still_decodes() {
+    // Arrange
+    let future = json!({
+        "type": "tool_call", "session_id": "s-1", "turn_id": "t-1", "id": "c-1",
+        "name": "Bash", "status": "status_added_by_a_newer_peer",
+    });
+
+    // Act
+    let event: Event = serde_json::from_value(future).unwrap();
+
+    // Assert
+    assert!(matches!(
+        event,
+        Event::ToolCall {
+            status: ToolCallStatus::Unknown,
             ..
         }
     ));

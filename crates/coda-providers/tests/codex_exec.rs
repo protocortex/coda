@@ -9,7 +9,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, ToolCallStatus};
 use coda_protocol::types::{PermissionDecision, SessionId, TokenUsage, TurnId};
 use coda_providers::claude_code::Diagnostic;
 use coda_providers::claude_session::{CancelHandle, ENV_ALLOWLIST, TurnOutcome};
@@ -521,4 +521,61 @@ fn the_live_exec_transcript_replays_two_turns_of_one_thread() {
         ]
     );
     assert_eq!(parser.diagnostics(), []);
+}
+
+fn tool_call(status: ToolCallStatus) -> Event {
+    Event::ToolCall {
+        session_id: SessionId::new("s-1"),
+        turn_id: TurnId::new("t-1"),
+        id: "item_7".to_owned(),
+        name: "Bash".to_owned(),
+        summary: Some("ls".to_owned()),
+        status,
+    }
+}
+
+fn tool_calls(events: &[Event]) -> Vec<Event> {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::ToolCall { .. }))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_command_sends_a_start_and_a_finish_event() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = fixture.session();
+
+    // Act
+    let (_, events) = turn(&mut session, "tool-quick").await;
+
+    // Assert
+    assert_eq!(
+        tool_calls(&events),
+        vec![
+            tool_call(ToolCallStatus::Started),
+            tool_call(ToolCallStatus::Succeeded)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_command_that_ends_failed_finishes_as_failed() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = fixture.session();
+
+    // Act
+    let (_, events) = turn(&mut session, "tool-error").await;
+
+    // Assert
+    assert_eq!(
+        tool_calls(&events),
+        vec![
+            tool_call(ToolCallStatus::Started),
+            tool_call(ToolCallStatus::Failed)
+        ]
+    );
 }

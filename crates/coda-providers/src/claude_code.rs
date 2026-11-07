@@ -9,6 +9,7 @@ use coda_protocol::types::{PermissionDecision, TokenUsage};
 use serde_json::{Value, json};
 
 use crate::jsonl::{DiagnosticLog, Framed, LineFramer, bounded};
+use crate::tool_call::{CallInfo, claude_call};
 use crate::tool_request::{Tool, ToolRequest};
 
 const CAN_USE_TOOL: &str = "can_use_tool";
@@ -39,11 +40,17 @@ pub enum Message {
     ToolStarted {
         /// Claude Code's id for the call.
         id: String,
+        /// The tool's name, such as `Bash`.
+        name: String,
+        /// What the call works on, when its input says.
+        summary: Option<String>,
     },
     /// A tool call finished and its result went back to the model.
     ToolFinished {
         /// The id the call started with.
         id: String,
+        /// Whether the result was marked as an error.
+        failed: bool,
     },
     /// The turn finished.
     Result {
@@ -262,11 +269,9 @@ fn text_delta(value: &Value) -> Option<String> {
 
 /// The tool calls an assistant message starts and a user message finishes.
 fn tool_markers(value: &Value) -> Vec<Message> {
-    let (block_type, id_key, make): (_, _, fn(String) -> Message) = match value["type"].as_str() {
-        Some("assistant") => ("tool_use", "id", |id| Message::ToolStarted { id }),
-        Some("user") => ("tool_result", "tool_use_id", |id| Message::ToolFinished {
-            id,
-        }),
+    let (block_type, started) = match value["type"].as_str() {
+        Some("assistant") => ("tool_use", true),
+        Some("user") => ("tool_result", false),
         _ => return Vec::new(),
     };
     value["message"]["content"]
@@ -274,8 +279,21 @@ fn tool_markers(value: &Value) -> Vec<Message> {
         .into_iter()
         .flatten()
         .filter(|block| block["type"] == block_type)
-        .filter_map(|block| block[id_key].as_str())
-        .map(|id| make(id.to_owned()))
+        .filter_map(|block| {
+            if started {
+                let CallInfo { name, summary } = claude_call(block);
+                Some(Message::ToolStarted {
+                    id: block["id"].as_str()?.to_owned(),
+                    name,
+                    summary,
+                })
+            } else {
+                Some(Message::ToolFinished {
+                    id: block["tool_use_id"].as_str()?.to_owned(),
+                    failed: block["is_error"].as_bool().unwrap_or(false),
+                })
+            }
+        })
         .collect()
 }
 
@@ -716,9 +734,8 @@ mod tests {
     fn a_tool_use_starts_a_tool_and_its_result_finishes_it() {
         // Arrange
         let mut parser = StreamParser::new();
-        let started = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}"#;
-        let finished =
-            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#;
+        let started = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls -la\nmore"}}]}}"#;
+        let finished = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true}]}}"#;
 
         // Act
         let messages = feed_lines(&mut parser, &[started, finished]);
@@ -731,10 +748,13 @@ mod tests {
                     text: String::new()
                 },
                 Message::ToolStarted {
-                    id: "t1".to_owned()
+                    id: "t1".to_owned(),
+                    name: "Bash".to_owned(),
+                    summary: Some("ls -la".to_owned()),
                 },
                 Message::ToolFinished {
-                    id: "t1".to_owned()
+                    id: "t1".to_owned(),
+                    failed: true,
                 },
             ]
         );

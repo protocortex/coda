@@ -51,6 +51,28 @@ fn the_synthetic_allow_transcript_replays_a_completed_turn() {
 }
 
 #[test]
+fn the_live_readonly_transcript_names_its_tool_call_and_finishes_it() {
+    // Arrange
+    let transcript = fixtures::load("live-readonly.jsonl").unwrap();
+
+    // Act
+    let (messages, _) = parse(&transcript);
+
+    // Assert
+    let started = Message::ToolStarted {
+        id: "toolu_2".to_owned(),
+        name: "Bash".to_owned(),
+        summary: Some("echo hello".to_owned()),
+    };
+    let finished = Message::ToolFinished {
+        id: "toolu_2".to_owned(),
+        failed: false,
+    };
+    assert!(messages.contains(&started));
+    assert!(messages.contains(&finished));
+}
+
+#[test]
 fn the_synthetic_deny_transcript_replays_the_denial_text() {
     // Arrange
     let transcript = fixtures::load("synthetic-deny.jsonl").unwrap();

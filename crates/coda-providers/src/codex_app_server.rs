@@ -45,6 +45,7 @@ use crate::claude_session::{
 use crate::codex_exec::{SandboxMode, SpawnHook};
 use crate::emit::Emit;
 use crate::gate::PermissionGate;
+use crate::tool_call::{ToolCalls, codex_call, codex_failed};
 use crate::tool_request::{Tool, ToolRequest};
 use crate::websocket::{
     FrameReader, Incoming, MAX_HEAD_BYTES, WsError, close_frame, parse_upgrade_response,
@@ -288,6 +289,7 @@ pub struct CodexAppServerSession {
     drift: Option<String>,
     next_id: u64,
     items: HashMap<String, Item>,
+    tool_calls: ToolCalls,
     /// The server's id for the turn in flight, which `turn/interrupt` names.
     server_turn: Option<String>,
     /// Whether the server accepted the last `turn/start`.
@@ -342,6 +344,7 @@ impl CodexAppServerSession {
             reader,
             socket_dir,
             cancel: Arc::new(watch::channel(false).0),
+            tool_calls: ToolCalls::new(spec.session_id.clone()),
             session_id: spec.session_id,
             cwd: spec.cwd,
             thread_id,
@@ -451,6 +454,7 @@ impl CodexAppServerSession {
         }
         self.queued.clear();
         self.items.clear();
+        self.tool_calls.clear();
         self.server_turn = None;
         self.turn_accepted = false;
         if *self.cancel.borrow() {
@@ -466,7 +470,7 @@ impl CodexAppServerSession {
         };
         match result {
             Ok(Some(outcome)) => Ok(outcome),
-            Ok(None) => self.crashed(emit).await,
+            Ok(None) => self.crashed(turn_id, emit).await,
             Err(error) => {
                 let _ = self.stop().await;
                 Err(error)
@@ -596,6 +600,11 @@ impl CodexAppServerSession {
                         .contains(&params["item"]["type"].as_str().unwrap_or_default())
                     {
                         gate.tool_started(id);
+                        if let Some(info) = codex_call(&params["item"])
+                            && let Some(event) = self.tool_calls.started(turn_id, id, info)
+                        {
+                            emit.emit(event).await;
+                        }
                     }
                     if self.items.len() < MAX_TRACKED_ITEMS {
                         self.items
@@ -607,6 +616,10 @@ impl CodexAppServerSession {
                 if let Some(id) = params["item"]["id"].as_str() {
                     self.items.remove(id);
                     gate.tool_finished(id);
+                    let failed = codex_failed(&params["item"]);
+                    if let Some(event) = self.tool_calls.finished(turn_id, id, failed) {
+                        emit.emit(event).await;
+                    }
                 }
             }
             "thread/tokenUsage/updated" => add_usage(usage, &params["tokenUsage"]["last"]),
@@ -859,17 +872,27 @@ impl CodexAppServerSession {
         turn_id: &TurnId,
         emit: &mut impl Emit,
     ) -> Result<TurnOutcome, AppServerError> {
+        for event in self.tool_calls.fail_open(turn_id) {
+            emit.emit(event).await;
+        }
         emit.emit(self.interrupted_event(turn_id)).await;
         self.interrupt(None).await?;
         self.cancel.send_replace(false);
         Ok(TurnOutcome::Cancelled)
     }
 
-    async fn crashed(&mut self, emit: &mut impl Emit) -> Result<TurnOutcome, AppServerError> {
+    async fn crashed(
+        &mut self,
+        turn_id: &TurnId,
+        emit: &mut impl Emit,
+    ) -> Result<TurnOutcome, AppServerError> {
         let exit_code = self
             .stop_after(EXIT_GRACE)
             .await?
             .and_then(|status| status.code());
+        for event in self.tool_calls.fail_open(turn_id) {
+            emit.emit(event).await;
+        }
         emit.emit(Event::BackendCrashed {
             session_id: self.session_id.clone(),
             exit_code,
@@ -1141,6 +1164,30 @@ mod tests {
                 cache_write_tokens: 0,
             })
         );
+    }
+
+    #[test]
+    fn the_live_command_item_is_a_bash_call_that_finishes_without_failing() {
+        // Arrange
+        let received = live_received();
+        let item_of = |method: &str| {
+            received
+                .iter()
+                .find(|m| {
+                    m["method"] == method && m["params"]["item"]["type"] == "commandExecution"
+                })
+                .map(|m| m["params"]["item"].clone())
+                .expect("the transcript holds a command item")
+        };
+
+        // Act
+        let started = codex_call(&item_of("item/started")).unwrap();
+        let failed = codex_failed(&item_of("item/completed"));
+
+        // Assert
+        assert_eq!(started.name, "Bash");
+        assert_eq!(started.summary.as_deref(), Some("touch hello.txt"));
+        assert!(!failed);
     }
 
     #[test]
