@@ -47,6 +47,12 @@ pub const SESSION_DIFF: &str = "session.diff";
 pub const SESSION_WORKTREE: &str = "session.worktree";
 /// Commits the changes of a session, and on request pushes the branch and opens a pull request.
 pub const SESSION_SHIP: &str = "session.ship";
+/// Adds a scheduled prompt.
+pub const SCHEDULE_ADD: &str = "schedule.add";
+/// Lists the scheduled prompts.
+pub const SCHEDULE_LIST: &str = "schedule.list";
+/// Removes a scheduled prompt.
+pub const SCHEDULE_REMOVE: &str = "schedule.remove";
 /// Starts a watch of a pull request that wakes the session on news.
 pub const SESSION_WATCH_PR: &str = "session.watch_pr";
 /// Reports, and with `apply` removes, the git worktrees coda made that are no longer needed.
@@ -92,6 +98,9 @@ pub const METHODS: &[&str] = &[
     SESSION_WORKTREE,
     SESSION_SHIP,
     SESSION_WATCH_PR,
+    SCHEDULE_ADD,
+    SCHEDULE_LIST,
+    SCHEDULE_REMOVE,
     WORKTREE_CLEAN,
     CHECKPOINTS_PRUNE,
     PERMISSION_RESPOND,
@@ -579,6 +588,151 @@ pub struct SessionWatchPrResult {
     pub watching: Vec<String>,
 }
 
+/// Error code of a [`SCHEDULE_ADD`] the daemon refused, with the reason as the message.
+pub const SCHEDULE_REFUSED_CODE: i64 = -32013;
+
+/// The fewest seconds between two runs of an interval schedule.
+pub const MIN_SCHEDULE_INTERVAL_SECS: u64 = 60;
+
+/// Most scheduled prompts the daemon keeps.
+pub const MAX_SCHEDULES: usize = 50;
+
+/// A day of the week.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Weekday {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
+impl Weekday {
+    /// Every day, Monday first.
+    pub const ALL: [Weekday; 7] = [
+        Weekday::Mon,
+        Weekday::Tue,
+        Weekday::Wed,
+        Weekday::Thu,
+        Weekday::Fri,
+        Weekday::Sat,
+        Weekday::Sun,
+    ];
+
+    /// Position in the week, Monday as 0.
+    #[must_use]
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|day| *day == self).unwrap_or(0)
+    }
+}
+
+/// When a scheduled prompt runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScheduleSpec {
+    /// Once, at a time given in milliseconds since the Unix epoch.
+    Once { at: i64 },
+    /// Again and again, this many seconds apart; at least [`MIN_SCHEDULE_INTERVAL_SECS`].
+    Interval { every_secs: u64 },
+    /// At a time of day in UTC, on the listed weekdays, or every day when none is listed.
+    Daily {
+        /// Minutes after midnight UTC, from 0 to 1439.
+        minute_of_day: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        weekdays: Vec<Weekday>,
+    },
+}
+
+/// Where a scheduled prompt goes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScheduleTarget {
+    /// Into a session that exists.
+    Session { session_id: SessionId },
+    /// Into a new session made for each run.
+    NewSession {
+        backend: BackendKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Absolute path of the working directory.
+        cwd: String,
+        #[serde(default)]
+        mode: Mode,
+    },
+}
+
+/// Where a scheduled prompt is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleState {
+    /// Waiting for its next run.
+    Idle,
+    /// A run has started and has not finished.
+    Running,
+    /// A one-time prompt that has run.
+    Done,
+}
+
+/// Parameters of [`SCHEDULE_ADD`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleAddParams {
+    pub spec: ScheduleSpec,
+    pub target: ScheduleTarget,
+    /// The prompt sent at each run.
+    pub text: String,
+}
+
+/// One scheduled prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleInfo {
+    pub id: u64,
+    pub spec: ScheduleSpec,
+    pub target: ScheduleTarget,
+    pub text: String,
+    pub state: ScheduleState,
+    /// When it runs next, in milliseconds since the Unix epoch; none once a one-time prompt ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<i64>,
+    /// When it last started, in milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<i64>,
+    /// How many runs have started.
+    pub runs: u64,
+    pub created_at: i64,
+}
+
+/// Result of [`SCHEDULE_ADD`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleAddResult {
+    pub schedule: ScheduleInfo,
+}
+
+/// Parameters of [`SCHEDULE_LIST`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleListParams {}
+
+/// Result of [`SCHEDULE_LIST`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleListResult {
+    pub schedules: Vec<ScheduleInfo>,
+}
+
+/// Parameters of [`SCHEDULE_REMOVE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleRemoveParams {
+    pub id: u64,
+}
+
+/// Result of [`SCHEDULE_REMOVE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleRemoveResult {
+    /// Whether a scheduled prompt with that id existed.
+    pub removed: bool,
+}
+
 /// Parameters of [`WORKTREE_CLEAN`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorktreeCleanParams {
@@ -1032,6 +1186,9 @@ mod tests {
             (SESSION_WORKTREE, "session.worktree"),
             (SESSION_SHIP, "session.ship"),
             (SESSION_WATCH_PR, "session.watch_pr"),
+            (SCHEDULE_ADD, "schedule.add"),
+            (SCHEDULE_LIST, "schedule.list"),
+            (SCHEDULE_REMOVE, "schedule.remove"),
             (WORKTREE_CLEAN, "worktree.clean"),
             (CHECKPOINTS_PRUNE, "checkpoints.prune"),
             (PERMISSION_RESPOND, "permission.respond"),

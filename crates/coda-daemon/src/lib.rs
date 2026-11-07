@@ -23,6 +23,7 @@ mod receipts;
 pub mod recover;
 pub mod registry;
 pub mod repair;
+mod schedule_rpc;
 pub mod server;
 pub mod session_rpc;
 mod ship;

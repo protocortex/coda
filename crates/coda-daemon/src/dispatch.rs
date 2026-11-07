@@ -19,11 +19,11 @@ use coda_protocol::jsonrpc::{
 use coda_protocol::methods::{
     AGENT_RUN, CHECKPOINTS_PRUNE, Capabilities, DAEMON_BACKENDS, DAEMON_PING, DAEMON_SHUTDOWN,
     DAEMON_STATUS, DaemonShutdownResult, GRANT_ADD, INITIALIZE, InitializeParams, InitializeResult,
-    PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult, SESSION_CANCEL, SESSION_CLOSE,
-    SESSION_CREATE, SESSION_DIFF, SESSION_LIST, SESSION_QUEUE, SESSION_RESUME,
-    SESSION_RESUME_AT_RESET, SESSION_REWIND, SESSION_SEND, SESSION_SET_MODE, SESSION_SET_MODEL,
-    SESSION_SHIP, SESSION_SUBSCRIBE, SESSION_WATCH_PR, SESSION_WORKTREE, SessionSubscribeParams,
-    SessionSubscribeResult, USAGE_SUMMARY, WORKTREE_CLEAN,
+    PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult, SCHEDULE_ADD, SCHEDULE_LIST, SCHEDULE_REMOVE,
+    SESSION_CANCEL, SESSION_CLOSE, SESSION_CREATE, SESSION_DIFF, SESSION_LIST, SESSION_QUEUE,
+    SESSION_RESUME, SESSION_RESUME_AT_RESET, SESSION_REWIND, SESSION_SEND, SESSION_SET_MODE,
+    SESSION_SET_MODEL, SESSION_SHIP, SESSION_SUBSCRIBE, SESSION_WATCH_PR, SESSION_WORKTREE,
+    SessionSubscribeParams, SessionSubscribeResult, USAGE_SUMMARY, WORKTREE_CLEAN,
 };
 use coda_protocol::types::SessionId;
 use serde::de::DeserializeOwned;
@@ -33,6 +33,7 @@ use tracing::{Instrument, error};
 use crate::checkpoints_rpc;
 use crate::grants_rpc;
 use crate::registry;
+use crate::schedule_rpc;
 use crate::session_rpc;
 use crate::ship::ShipTools;
 use crate::state::{ClientGuard, DaemonState};
@@ -201,6 +202,9 @@ impl Dispatcher {
                 )
                 .await
             }
+            SCHEDULE_ADD => schedule_rpc::add(self.hub.as_ref(), params).await,
+            SCHEDULE_LIST => schedule_rpc::list(self.hub.as_ref()).await,
+            SCHEDULE_REMOVE => schedule_rpc::remove(self.hub.as_ref(), params).await,
             SESSION_WATCH_PR => {
                 let watches = self.turns.as_ref().map(|turns| turns.pr_watches());
                 session_rpc::watch_pr(self.hub.as_ref(), watches, params).await
