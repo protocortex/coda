@@ -82,6 +82,7 @@ impl Rig {
             text: text.to_owned(),
             max_turns: None,
             token_cap: None,
+            mode: coda_protocol::methods::SendMode::Start,
         };
         turns.send(params).await.unwrap();
     }

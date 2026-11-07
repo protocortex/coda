@@ -13,6 +13,7 @@ mod index;
 pub mod migrate;
 mod originals;
 mod pending;
+mod queue;
 mod readers;
 mod review_memory;
 mod rollback;
@@ -29,6 +30,7 @@ pub use grants::{Grant, GrantKey};
 pub use index::{IndexStatus, IndexedFileState, Symbol};
 pub use originals::{MAX_ORIGINAL_BYTES, MAX_SESSION_ORIGINAL_BYTES};
 pub use pending::{NewPending, PendingPermission};
+pub use queue::{MAX_QUEUED_MESSAGES, MAX_QUEUED_TEXT_BYTES, NewQueued, QueuedMessage};
 pub use readers::{RepoIndex, SessionOriginals};
 pub use review_memory::{FindingStatus, MemoryFinding, ReviewRunRecord, StoredFinding};
 pub use savings::SavingRecord;
@@ -51,7 +53,7 @@ use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// Release of this binary, recorded in the database each time it opens it.
 pub const BINARY_RELEASE: &str = env!("CARGO_PKG_VERSION");
@@ -108,6 +110,10 @@ pub enum StoreError {
     DuplicateAppend { session: SessionId, seq: u64 },
     #[error("session {session} already has another writer")]
     WriterBusy { session: SessionId },
+    #[error("session {session} already has {limit} queued messages")]
+    QueueFull { session: SessionId, limit: usize },
+    #[error("a queued message may hold at most {limit} bytes")]
+    QueuedTextTooLarge { limit: usize },
     #[error("pending permission {request} does not exist")]
     PendingNotFound { request: RequestId },
     #[error("pending permission {request} is already resolved")]

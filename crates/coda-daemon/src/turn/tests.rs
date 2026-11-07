@@ -71,6 +71,7 @@ fn relaxed() -> Timing {
 mod checkpoints;
 mod diff;
 mod mode;
+mod queue;
 mod restarts;
 mod resume;
 mod rewind;
@@ -1013,7 +1014,7 @@ async fn a_panicking_turn_task_does_not_leave_the_session_busy() {
     let busy = rig.send("hello").await;
 
     // Act
-    let task = super::spawn_guarded(slot, async { panic!("simulated turn failure") });
+    let task = super::spawn_guarded(slot, async { panic!("simulated turn failure") }, || {});
     let joined = task.await;
     let again = rig.send("hello").await;
 

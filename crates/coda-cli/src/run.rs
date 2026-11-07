@@ -23,7 +23,7 @@ use coda_protocol::events::{
 use coda_protocol::methods::{
     AGENT_RUN, AgentRunParams, AgentRunResult, PERMISSION_RESPOND, PermissionRequestParams,
     PermissionRespondParams, PermissionRespondResult, SESSION_CANCEL, SESSION_CREATE, SESSION_SEND,
-    SESSION_WORKTREE, SessionCancelParams, SessionCancelResult, SessionCreateParams,
+    SESSION_WORKTREE, SendMode, SessionCancelParams, SessionCancelResult, SessionCreateParams,
     SessionCreateResult, SessionSendParams, SessionSendResult, SessionWorktreeParams,
     SessionWorktreeResult, WORKTREE_REQUEST_TIMEOUT_SECS,
 };
@@ -276,6 +276,7 @@ pub(crate) async fn send_and_follow(
                 text: prompt,
                 max_turns,
                 token_cap,
+                mode: SendMode::Start,
             };
             client
                 .request::<_, SessionSendResult>(SESSION_SEND, &params)
@@ -847,6 +848,7 @@ mod tests {
             text: "hello".to_owned(),
             max_turns: None,
             token_cap: None,
+            mode: SendMode::Start,
         }
     }
 

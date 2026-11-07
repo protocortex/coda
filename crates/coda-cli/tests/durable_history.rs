@@ -66,6 +66,7 @@ async fn send(client: &Client, session: &SessionId, text: &str) {
         text: text.to_owned(),
         max_turns: None,
         token_cap: None,
+        mode: coda_protocol::methods::SendMode::Start,
     };
     let _: Value = client.request(SESSION_SEND, &params).await.unwrap();
 }

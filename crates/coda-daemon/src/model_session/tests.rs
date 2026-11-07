@@ -1825,3 +1825,56 @@ async fn a_permission_request_is_stored_after_the_text_and_reply_before_it_with_
     assert_eq!(replies, 2, "{kinds:?}");
     assert!(before.contains(&"stream_delta"), "{kinds:?}");
 }
+
+#[tokio::test]
+async fn a_message_queued_during_a_model_turn_starts_when_the_turn_ends() {
+    // Arrange
+    let calls = tool_turn(&[("c1", "bash", json!({"command": "true"}))]);
+    let mut rig = Rig::new(Mode::Default, &[calls, text_turn("one"), text_turn("two")]);
+    rig.send("first").await;
+    let request = rig.wait_for_pending().await;
+    let params = json!({"session_id": rig.session, "text": "second", "mode": "queue"});
+
+    // Act
+    let queued = rig.call("session.send", params).await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_for_results(2).await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert_eq!(queued["result"]["queued"], true, "{queued}");
+    let texts: Vec<_> = rig
+        .bodies("user_message")
+        .await
+        .iter()
+        .map(|b| b["text"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(texts, ["first", "second"]);
+}
+
+#[tokio::test]
+async fn a_cancelled_model_turn_holds_the_queue() {
+    // Arrange
+    let calls = tool_turn(&[("c1", "bash", json!({"command": "true"}))]);
+    let mut rig = Rig::new(Mode::Default, &[calls, text_turn("two")]);
+    rig.send("first").await;
+    rig.wait_for_pending().await;
+    let params = json!({"session_id": rig.session, "text": "second", "mode": "queue"});
+    rig.call("session.send", params).await;
+
+    // Act
+    rig.call("session.cancel", json!({"session_id": rig.session}))
+        .await;
+    rig.wait_for_results(1).await;
+    rig.wait_until_idle().await;
+    let held = rig
+        .call(
+            "session.queue",
+            json!({"session_id": rig.session, "action": "list"}),
+        )
+        .await;
+
+    // Assert
+    assert_eq!(held["result"]["messages"][0]["text"], "second");
+    assert_eq!(rig.bodies("user_message").await.len(), 1);
+}

@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use coda_agents::{Catalog, SkillTool};
@@ -316,7 +316,12 @@ pub struct ModelSessions {
     carried: Mutex<Dropped>,
     /// What the runners of the sessions' `task` calls share.
     children: Arc<task::ChildEnv>,
+    /// Called with a session whose turn ended cleanly, once the session is free.
+    on_clean_end: OnceLock<CleanEnd>,
 }
+
+/// What runs after a turn ends cleanly and frees its session.
+pub(crate) type CleanEnd = Arc<dyn Fn(SessionId) + Send + Sync>;
 
 impl ModelSessions {
     /// Sessions that read API keys through `key_reader` and keep only the
@@ -363,7 +368,13 @@ impl ModelSessions {
             loops: IdlePool::new(MAX_IDLE_LOOPS),
             carried: Mutex::default(),
             children,
+            on_clean_end: OnceLock::new(),
         })
+    }
+
+    /// Sets what runs after a turn ends cleanly. Only the first call counts.
+    pub(crate) fn set_on_clean_end(&self, after: CleanEnd) {
+        let _ = self.on_clean_end.set(after);
     }
 
     /// The agent definitions a session in `cwd` may run.
@@ -438,19 +449,25 @@ impl ModelSessions {
         slot: Slot,
         turn: TurnId,
         span: Span,
-        work: impl Future<Output = ()> + Send + 'static,
+        work: impl Future<Output = bool> + Send + 'static,
     ) {
         let gate = Arc::clone(&slot.gate);
         let sessions = Arc::clone(self);
         tokio::spawn(
             async move {
-                tokio::select! {
+                let clean = tokio::select! {
                     biased;
                     () = gate.wake.notified() => {
                         warn!(session = %slot.session, turn = %turn, "the turn did not stop; giving up on it");
                         sessions.end_forced(&slot.session, &turn).await;
+                        false
                     }
-                    () = work => {}
+                    clean = work => clean,
+                };
+                let session = slot.session.clone();
+                drop(slot);
+                if let (true, Some(after)) = (clean, sessions.on_clean_end.get()) {
+                    after(session);
                 }
             }
             .instrument(span),
@@ -976,7 +993,7 @@ impl ModelSessions {
         turn: TurnId,
         text: String,
         gate: Arc<ForceGate>,
-    ) {
+    ) -> bool {
         let ModelLoop {
             turn_loop, events, ..
         } = &mut model_loop;
@@ -1001,6 +1018,7 @@ impl ModelSessions {
             // The forced end is recorded by the task that holds this future.
             std::future::pending::<()>().await;
         }
+        let clean = matches!(outcome, Ok(StopCondition::EndTurn));
         while let Ok(event) = events.try_recv() {
             streamed.publish(&self.hub, &session, &turn, event).await;
         }
@@ -1020,6 +1038,7 @@ impl ModelSessions {
         }
         close_turn(&self.hub, &session, &turn, failed).await;
         self.keep_loop(session, model_loop);
+        clean
     }
 }
 
