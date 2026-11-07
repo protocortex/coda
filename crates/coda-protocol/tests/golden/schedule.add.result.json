@@ -1,0 +1,1 @@
+{"schedule":{"id":3,"spec":{"kind":"interval","every_secs":3600},"target":{"kind":"session","session_id":"s-1"},"text":"check the build","state":"idle","next_run_at":1700000000000,"last_run_at":1699996400000,"runs":4,"created_at":1699000000000}}

@@ -26,8 +26,19 @@ fn add_method<P: JsonSchema, R: JsonSchema>(
     methods.insert(name.to_owned(), json!({"params": params, "result": result}));
 }
 
-/// The methods that commit, push and watch pull requests.
+/// The methods that commit, push, watch pull requests and schedule prompts.
 fn add_pull_request_methods(generator: &mut SchemaGenerator, methods: &mut Map<String, Value>) {
+    add_method::<m::ScheduleAddParams, m::ScheduleAddResult>(generator, methods, m::SCHEDULE_ADD);
+    add_method::<m::ScheduleListParams, m::ScheduleListResult>(
+        generator,
+        methods,
+        m::SCHEDULE_LIST,
+    );
+    add_method::<m::ScheduleRemoveParams, m::ScheduleRemoveResult>(
+        generator,
+        methods,
+        m::SCHEDULE_REMOVE,
+    );
     add_method::<m::SessionShipParams, m::SessionShipResult>(generator, methods, m::SESSION_SHIP);
     add_method::<m::SessionWatchPrParams, m::SessionWatchPrResult>(
         generator,

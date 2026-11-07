@@ -1,0 +1,1 @@
+{"spec":{"kind":"daily","minute_of_day":540,"weekdays":["mon","fri"]},"target":{"kind":"new_session","backend":"claude_code","model":"opus","cwd":"/work/repo","mode":"plan"},"text":"summarize the open issues"}
