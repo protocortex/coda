@@ -804,6 +804,7 @@ mod tests {
             status: SessionStatus::Idle,
             attention: SessionAttention::None,
             title: None,
+            pull_requests: Vec::new(),
         }
     }
 

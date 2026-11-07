@@ -283,6 +283,7 @@ mod tests {
             status,
             attention,
             title: title.map(str::to_owned),
+            pull_requests: Vec::new(),
         }
     }
 

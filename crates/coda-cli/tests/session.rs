@@ -313,3 +313,61 @@ async fn a_refused_rewind_fails_the_command_with_the_reason() {
     );
     assert!(rewound.err.contains("snapshot"), "{}", rewound.err);
 }
+
+#[tokio::test]
+async fn ship_commits_the_session_changes_with_the_given_message() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one")]);
+    std::fs::remove_dir(rig.work.path().join(".git")).unwrap();
+    run_git(&rig, &["init", "-q"]);
+    run_git(&rig, &["config", "user.name", "t"]);
+    run_git(&rig, &["config", "user.email", "t@t"]);
+    run_git(&rig, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(rig.work.path().join("a.txt"), "a\n").unwrap();
+    run_git(&rig, &["add", "."]);
+    run_git(&rig, &["commit", "-q", "-m", "first"]);
+    let id = rig.start_session().await;
+    std::fs::write(rig.work.path().join("b.txt"), "b\n").unwrap();
+
+    // Act
+    let shipped = rig
+        .coda(&["session", "ship", &id, "--message", "feat: add b", "--json"])
+        .await;
+
+    // Assert
+    assert_eq!(shipped.code, ExitCode::SUCCESS, "{}", shipped.err);
+    let result: Value = serde_json::from_str(&shipped.out).unwrap();
+    assert_eq!(result["pushed"], false);
+    let log = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%s"])
+        .current_dir(rig.work.path())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(log.stdout).unwrap().trim(), "feat: add b");
+}
+
+#[tokio::test]
+async fn ship_with_nothing_changed_fails_the_command_with_the_reason() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one")]);
+    std::fs::remove_dir(rig.work.path().join(".git")).unwrap();
+    run_git(&rig, &["init", "-q"]);
+    std::fs::write(rig.work.path().join("a.txt"), "a\n").unwrap();
+    run_git(&rig, &["add", "."]);
+    run_git(&rig, &["commit", "-q", "-m", "first"]);
+    let id = rig.start_session().await;
+
+    // Act
+    let shipped = rig
+        .coda(&["session", "ship", &id, "--message", "feat: nothing"])
+        .await;
+
+    // Assert
+    assert_eq!(
+        shipped.code,
+        ExitCode::from(EXIT_FAILURE),
+        "{}",
+        shipped.out
+    );
+    assert!(shipped.err.contains("nothing to commit"), "{}", shipped.err);
+}

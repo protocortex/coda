@@ -43,6 +43,8 @@ pub const SESSION_REWIND: &str = "session.rewind";
 pub const SESSION_DIFF: &str = "session.diff";
 /// Moves a session that has not started into a git worktree made for it.
 pub const SESSION_WORKTREE: &str = "session.worktree";
+/// Commits the changes of a session, and on request pushes the branch and opens a pull request.
+pub const SESSION_SHIP: &str = "session.ship";
 /// Reports, and with `apply` removes, the git worktrees coda made that are no longer needed.
 pub const WORKTREE_CLEAN: &str = "worktree.clean";
 /// Reports, and with `apply` removes, old checkpoint refs.
@@ -83,6 +85,7 @@ pub const METHODS: &[&str] = &[
     SESSION_REWIND,
     SESSION_DIFF,
     SESSION_WORKTREE,
+    SESSION_SHIP,
     WORKTREE_CLEAN,
     CHECKPOINTS_PRUNE,
     PERMISSION_RESPOND,
@@ -478,6 +481,58 @@ pub struct SessionWorktreeResult {
     pub branch: String,
 }
 
+/// Error code of a [`SESSION_SHIP`] the daemon refused or that a git or `gh`
+/// step failed, with the reason as the message. Steps that ran before the
+/// failure are not undone.
+pub const SHIP_REFUSED_CODE: i64 = -32011;
+
+/// How far [`SESSION_SHIP`] goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShipAction {
+    /// Commit only.
+    Commit,
+    /// Commit, then push the branch to `origin`.
+    CommitPush,
+    /// Commit, push, then open a draft pull request with `gh`.
+    CommitPushPr,
+}
+
+/// How long a client should wait for [`SESSION_SHIP`]: commit hooks, a push and
+/// `gh` each have their own limit inside the daemon.
+pub const SHIP_REQUEST_TIMEOUT_SECS: u64 = 900;
+
+/// Parameters of [`SESSION_SHIP`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionShipParams {
+    /// The session whose working directory is shipped.
+    pub session_id: SessionId,
+    /// How far to go.
+    pub action: ShipAction,
+    /// The commit message. Its first line is also the pull request title.
+    pub message: String,
+    /// The pull request body, which should say why the change is made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Open the pull request ready for review instead of as a draft.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ready: bool,
+}
+
+/// Result of [`SESSION_SHIP`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionShipResult {
+    /// The new commit.
+    pub commit: String,
+    /// The branch that was committed to.
+    pub branch: String,
+    /// Whether the branch was pushed.
+    pub pushed: bool,
+    /// The address of the pull request that was opened, when the action asked for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<String>,
+}
+
 /// Parameters of [`WORKTREE_CLEAN`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorktreeCleanParams {
@@ -686,6 +741,9 @@ pub struct SessionSummary {
     /// that has not started has none. Absent from daemons that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Pull requests the session opened, newest first. Absent from daemons that predate it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pull_requests: Vec<String>,
 }
 
 /// Result of [`SESSION_LIST`], newest session first.
@@ -926,6 +984,7 @@ mod tests {
             (SESSION_REWIND, "session.rewind"),
             (SESSION_DIFF, "session.diff"),
             (SESSION_WORKTREE, "session.worktree"),
+            (SESSION_SHIP, "session.ship"),
             (WORKTREE_CLEAN, "worktree.clean"),
             (CHECKPOINTS_PRUNE, "checkpoints.prune"),
             (PERMISSION_RESPOND, "permission.respond"),

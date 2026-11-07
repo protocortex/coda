@@ -21,8 +21,9 @@ use coda_protocol::methods::{
     DAEMON_STATUS, DaemonShutdownResult, GRANT_ADD, INITIALIZE, InitializeParams, InitializeResult,
     PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult, SESSION_CANCEL, SESSION_CLOSE,
     SESSION_CREATE, SESSION_DIFF, SESSION_LIST, SESSION_QUEUE, SESSION_RESUME, SESSION_REWIND,
-    SESSION_SEND, SESSION_SET_MODE, SESSION_SET_MODEL, SESSION_SUBSCRIBE, SESSION_WORKTREE,
-    SessionSubscribeParams, SessionSubscribeResult, USAGE_SUMMARY, WORKTREE_CLEAN,
+    SESSION_SEND, SESSION_SET_MODE, SESSION_SET_MODEL, SESSION_SHIP, SESSION_SUBSCRIBE,
+    SESSION_WORKTREE, SessionSubscribeParams, SessionSubscribeResult, USAGE_SUMMARY,
+    WORKTREE_CLEAN,
 };
 use coda_protocol::types::SessionId;
 use serde::de::DeserializeOwned;
@@ -33,6 +34,7 @@ use crate::checkpoints_rpc;
 use crate::grants_rpc;
 use crate::registry;
 use crate::session_rpc;
+use crate::ship::ShipTools;
 use crate::state::{ClientGuard, DaemonState};
 use crate::subscribe::{Connection, Hub, HubError, Outbox};
 use crate::trace::{request_span, session_span};
@@ -198,6 +200,13 @@ impl Dispatcher {
                     params,
                 )
                 .await
+            }
+            SESSION_SHIP => {
+                let turns = self.turns.clone();
+                let running =
+                    move |id: &SessionId| turns.as_ref().is_some_and(|t| t.is_running(id));
+                session_rpc::ship_session(self.hub.as_ref(), ShipTools::default(), running, params)
+                    .await
             }
             WORKTREE_CLEAN => {
                 let turns = self.turns.clone();

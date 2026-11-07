@@ -7,13 +7,16 @@
 //! or not a daemon runs.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use coda_core::history::{ASSISTANT_MESSAGE_KIND, USER_MESSAGE_KIND};
 use std::collections::HashSet;
 
 use coda_protocol::methods::{
-    SESSION_LIST, SESSION_REWIND, SESSION_SEND, SendMode, SessionListParams, SessionListResult,
-    SessionRewindParams, SessionRewindResult, SessionSendParams, SessionSendResult, SessionSummary,
+    SESSION_LIST, SESSION_REWIND, SESSION_SEND, SESSION_SHIP, SHIP_REQUEST_TIMEOUT_SECS, SendMode,
+    SessionListParams, SessionListResult, SessionRewindParams, SessionRewindResult,
+    SessionSendParams, SessionSendResult, SessionShipParams, SessionShipResult, SessionSummary,
+    ShipAction,
 };
 use coda_protocol::types::{SessionId, TurnId};
 use coda_store::{DB_FILE_NAME, Store, StoreError, StoredEvent};
@@ -21,7 +24,8 @@ use serde_json::{Value, json};
 
 use crate::autostart::{connect_unchecked, ensure_daemon};
 use crate::cli::{
-    SessionCommand, SessionListArgs, SessionRewindArgs, SessionSendArgs, SessionShowArgs,
+    SessionCommand, SessionListArgs, SessionRewindArgs, SessionSendArgs, SessionShipArgs,
+    SessionShowArgs,
 };
 use crate::context::{Context, Io};
 use crate::error::CliError;
@@ -57,6 +61,7 @@ pub async fn run(
         SessionCommand::Rewind(args) => rewind(ctx, io, force, args)
             .await
             .map(|()| ExitCode::SUCCESS),
+        SessionCommand::Ship(args) => ship(ctx, io, force, args).await.map(|()| ExitCode::SUCCESS),
     }
 }
 
@@ -102,6 +107,48 @@ async fn rewind(
     Ok(())
 }
 
+async fn ship(
+    ctx: &Context,
+    io: &mut Io<'_>,
+    force: bool,
+    args: SessionShipArgs,
+) -> Result<(), CliError> {
+    let client = ensure_daemon(ctx, io, force).await?;
+    let action = if args.pr {
+        ShipAction::CommitPushPr
+    } else if args.push {
+        ShipAction::CommitPush
+    } else {
+        ShipAction::Commit
+    };
+    let params = SessionShipParams {
+        session_id: SessionId::new(args.session),
+        action,
+        message: args.message,
+        body: args.body,
+        ready: args.ready,
+    };
+    let done: SessionShipResult = client
+        .request_within(
+            Duration::from_secs(SHIP_REQUEST_TIMEOUT_SECS),
+            SESSION_SHIP,
+            &params,
+        )
+        .await?;
+    if args.json {
+        writeln!(io.out, "{}", serde_json::to_string(&done)?)?;
+        return Ok(());
+    }
+    writeln!(io.out, "committed {} on {}", done.commit, done.branch)?;
+    if done.pushed {
+        writeln!(io.out, "pushed {} to origin", done.branch)?;
+    }
+    if let Some(url) = &done.pull_request {
+        writeln!(io.out, "{url}")?;
+    }
+    Ok(())
+}
+
 async fn list(ctx: &Context, io: &mut Io<'_>, args: SessionListArgs) -> Result<(), CliError> {
     let client = connect_unchecked(ctx).await?;
     let cwd = args.cwd.map(|dir| ctx.cwd.join(dir).display().to_string());
@@ -129,7 +176,12 @@ fn list_line(session: &SessionSummary) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_default();
-    format!("{}  {status}  {backend}  {}", session.id, session.cwd)
+    let mut line = format!("{}  {status}  {backend}  {}", session.id, session.cwd);
+    for url in &session.pull_requests {
+        line.push_str("  ");
+        line.push_str(url);
+    }
+    line
 }
 
 async fn send(
