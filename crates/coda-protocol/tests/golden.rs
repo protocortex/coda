@@ -271,6 +271,7 @@ fn usage_summary_result_without_savings_reads_as_zero_saved() {
     // Assert
     assert_eq!(result.saved_bytes, 0);
     assert_eq!(result.usage.input_tokens, 100);
+    assert_eq!(result.limits, []);
 }
 
 #[test]

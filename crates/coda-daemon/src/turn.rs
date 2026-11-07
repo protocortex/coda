@@ -1434,6 +1434,8 @@ pub(crate) async fn store_event(
             turn: turn.clone(),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
         };
         hub.with_store_mut(move |store| store.record_usage(&record))
             .await?;
