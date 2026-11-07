@@ -176,6 +176,16 @@ mod offline {
     }
 
     #[tokio::test]
+    async fn the_parallel_read_fixture_answers_three_reads_from_one_reply_without_error() {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "read_files_in_parallel");
+        assert_eq!(outcome.tool_errors, 0, "{outcome:?}");
+        assert_eq!(outcome.turns, 3, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
     async fn a_rate_limit_with_no_fallback_fails_the_fixture() {
         let mut fixture = fixtures::all()
             .into_iter()

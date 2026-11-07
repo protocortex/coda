@@ -451,6 +451,50 @@ const KEPT_A_TODO_LIST: Fixture = Fixture {
     },
 };
 
+const READ_FILES_IN_PARALLEL: Fixture = Fixture {
+    name: "read_files_in_parallel",
+    prompt: "Set mode to fast in every .conf file in the workspace.",
+    files: &[
+        ("a.conf", "mode=slow\n"),
+        ("b.conf", "mode=slow\n"),
+        ("c.conf", "mode=slow\n"),
+    ],
+    check: "grep -qx mode=fast a.conf && grep -qx mode=fast b.conf && grep -qx mode=fast c.conf",
+    untrusted: None,
+    guard: None,
+    text_calls: false,
+    fallback: false,
+    todo: false,
+    ask: false,
+    script: || {
+        vec![
+            calls(&[
+                ("call_1", "read", json!({"path": "a.conf"})),
+                ("call_2", "read", json!({"path": "b.conf"})),
+                ("call_3", "read", json!({"path": "c.conf"})),
+            ]),
+            calls(&[
+                (
+                    "call_4",
+                    "edit",
+                    json!({"path": "a.conf", "old_string": "mode=slow", "new_string": "mode=fast"}),
+                ),
+                (
+                    "call_5",
+                    "edit",
+                    json!({"path": "b.conf", "old_string": "mode=slow", "new_string": "mode=fast"}),
+                ),
+                (
+                    "call_6",
+                    "edit",
+                    json!({"path": "c.conf", "old_string": "mode=slow", "new_string": "mode=fast"}),
+                ),
+            ]),
+            reply("Set mode=fast in all three files."),
+        ]
+    },
+};
+
 const ASKED_THE_USER: Fixture = Fixture {
     name: "asked_the_user",
     prompt: "Set mode in config.txt to the value the user prefers. Ask them which it is.",
@@ -493,5 +537,6 @@ pub fn all() -> Vec<Fixture> {
         FELL_BACK_ON_RATE_LIMIT,
         KEPT_A_TODO_LIST,
         ASKED_THE_USER,
+        READ_FILES_IN_PARALLEL,
     ]
 }

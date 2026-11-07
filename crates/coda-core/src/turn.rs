@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use coda_config::config::DEFAULT_MAX_GUARD_CONTINUES;
+use coda_config::config::{DEFAULT_MAX_GUARD_CONTINUES, DEFAULT_MAX_PARALLEL_TOOLS};
 use coda_config::hooks::HookEvent;
 use coda_config::loop_guard::LoopGuardConfig;
 use coda_protocol::events::{CALL_FROM_TEXT, CALL_REPAIRED, TodoItem};
@@ -27,7 +27,8 @@ use coda_tools::todo::{self as todo_tool, TodoList};
 use coda_tools::{Tool, skill as skill_tool, task as task_tool};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, Semaphore, oneshot};
+use tokio::task::{JoinError, JoinHandle};
 use tracing::{Instrument, info, info_span, warn};
 
 use crate::budget::TokenBudget;
@@ -42,6 +43,8 @@ use crate::prompt::{Conversation, Message, ToolCall};
 use crate::repair;
 use crate::task::{TaskRequest, TaskRunner};
 
+/// What the model is told about a call that got no run slot.
+const NO_SLOT: &str = "not run: no slot was free to run the call";
 /// What the model is told about a call that never ran because the turn stopped.
 pub(crate) const SKIPPED: &str = "not run: the turn stopped before this call";
 /// Arguments assumed for a call that streamed none, as no-argument tools do.
@@ -440,6 +443,8 @@ pub struct TurnLoop<P, G> {
     guard: LoopGuard,
     /// Most continues an `end_turn` hook may force in one send.
     max_guard_continues: u32,
+    /// Most read-only calls from one reply that run at the same time.
+    max_parallel_tools: usize,
     /// Whether a reply that is one JSON object fitting one tool is a call.
     text_tool_calls: bool,
     chain: Option<Chain<P>>,
@@ -490,6 +495,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             resumed: false,
             guard: LoopGuard::new(LoopGuardConfig::default()),
             max_guard_continues: DEFAULT_MAX_GUARD_CONTINUES,
+            max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS as usize,
             text_tool_calls: false,
             chain: None,
             todos: None,
@@ -673,6 +679,14 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     #[must_use]
     pub fn with_max_guard_continues(mut self, max: u32) -> Self {
         self.max_guard_continues = max;
+        self
+    }
+
+    /// Sets how many read-only calls from one reply may run at the same time.
+    /// With 1 every call runs in turn; 0 is treated as 1.
+    #[must_use]
+    pub fn with_max_parallel_tools(mut self, max: usize) -> Self {
+        self.max_parallel_tools = max.max(1);
         self
     }
 
@@ -1244,16 +1258,30 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         let mut stop = None;
         let last_change = calls.iter().rposition(|call| Checks::follows(&call.name));
         let mut changed: Vec<PathBuf> = Vec::new();
-        for (index, call) in calls.into_iter().enumerate() {
+        let mut ready: HashMap<usize, ToolOutcome> = HashMap::new();
+        for (index, call) in calls.iter().enumerate() {
+            if stop.is_none() && !ready.contains_key(&index) {
+                let end = self.read_only_run_end(&calls, index);
+                if end - index > 1 && self.max_parallel_tools > 1 {
+                    let outcomes = self.run_read_only_group(&calls[index..end]).await;
+                    ready.extend((index..end).zip(outcomes));
+                }
+            }
             let mut outcome = if stop.is_some() {
-                ToolOutcome::error(SKIPPED.to_owned())
+                // A call of the group that already ran keeps its real result.
+                ready
+                    .remove(&index)
+                    .unwrap_or_else(|| ToolOutcome::error(SKIPPED.to_owned()))
             } else {
-                let outcome = self.run_tool(&call).await;
-                self.judge_repeats(&call, outcome, &mut stop)
+                let outcome = match ready.remove(&index) {
+                    Some(outcome) => outcome,
+                    None => self.run_tool(call).await,
+                };
+                self.judge_repeats(call, outcome, &mut stop)
             };
             if stop.is_none() && !self.checks.is_empty() && Checks::follows(&call.name) {
                 if !outcome.is_error {
-                    changed.extend(self.changed_paths(&call));
+                    changed.extend(self.changed_paths(call));
                 }
                 // One check per reply, after the last change in it, so the
                 // model hears about the files as they stand together.
@@ -1272,7 +1300,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                 is_error: outcome.is_error,
             });
             self.conversation.push(Message::ToolResult {
-                call_id: call.id,
+                call_id: call.id.clone(),
                 text: outcome.text,
                 is_error: outcome.is_error,
             });
@@ -1281,6 +1309,76 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             }
         }
         stop
+    }
+
+    /// Whether `call` names a tool that only reads, so it may overlap others.
+    fn is_read_only(&self, call: &ToolCall) -> bool {
+        self.tools
+            .tools
+            .get(call.name.as_str())
+            .is_some_and(|tool| tool.read_only())
+    }
+
+    /// Where the run of read-only calls that starts at `start` ends.
+    fn read_only_run_end(&self, calls: &[ToolCall], start: usize) -> usize {
+        calls[start..]
+            .iter()
+            .take_while(|call| self.is_read_only(call))
+            .count()
+            + start
+    }
+
+    /// Runs read-only calls at the same time, at most `max_parallel_tools` at
+    /// once. Permission prompts and `pre_tool` hooks come one call at a time in
+    /// call order first, `post_tool` hooks one at a time in call order after.
+    /// The outcomes are in call order.
+    async fn run_read_only_group(&self, calls: &[ToolCall]) -> Vec<ToolOutcome> {
+        let mut authorized = Vec::with_capacity(calls.len());
+        for call in calls {
+            if self.cancel.is_cancelled() {
+                authorized.push(Err(ToolOutcome::error(PROMPT_CANCELLED.to_owned())));
+                continue;
+            }
+            let span = self.tool_span(call);
+            authorized.push(self.authorize(call).instrument(span).await);
+        }
+        let slots = Arc::new(Semaphore::new(self.max_parallel_tools));
+        let mut running = Vec::with_capacity(calls.len());
+        for item in authorized {
+            running.push(match item {
+                Err(refusal) => Running::Refused(refusal),
+                Ok(_) if self.cancel.is_cancelled() => {
+                    Running::Refused(ToolOutcome::error(PROMPT_CANCELLED.to_owned()))
+                }
+                Ok(work) => match Arc::clone(&slots).acquire_owned().await {
+                    Ok(slot) => Running::Started(tokio::task::spawn_blocking(move || {
+                        let outcome = work.run();
+                        drop(slot);
+                        outcome
+                    })),
+                    Err(_) => Running::Refused(ToolOutcome::error(NO_SLOT.to_owned())),
+                },
+            });
+        }
+        let mut outcomes = Vec::with_capacity(calls.len());
+        for (call, item) in calls.iter().zip(running) {
+            outcomes.push(match item {
+                Running::Refused(refusal) => refusal,
+                Running::Started(handle) => {
+                    let outcome = Self::finished(call, handle.await);
+                    self.after_tool_hooks(call, outcome)
+                        .instrument(self.tool_span(call))
+                        .await
+                }
+            });
+        }
+        outcomes
+    }
+
+    fn finished(call: &ToolCall, joined: Result<ToolOutcome, JoinError>) -> ToolOutcome {
+        joined.unwrap_or_else(|error| {
+            ToolOutcome::error(format!("the {} tool crashed: {error}", call.name))
+        })
     }
 
     /// The files a call to a file-changing tool names.
@@ -1350,13 +1448,18 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         }
     }
 
-    async fn run_tool(&self, call: &ToolCall) -> ToolOutcome {
-        let span = info_span!(
+    fn tool_span(&self, call: &ToolCall) -> tracing::Span {
+        info_span!(
             TOOL_CALL_SPAN,
             { CODA_SESSION_ID } = %self.config.session,
             { CODA_TOOL_NAME } = call.name.as_str(),
-        );
-        self.run_tool_inner(call).instrument(span).await
+        )
+    }
+
+    async fn run_tool(&self, call: &ToolCall) -> ToolOutcome {
+        self.run_tool_inner(call)
+            .instrument(self.tool_span(call))
+            .await
     }
 
     /// Runs the sub-agent a `task` call names. Dispatching asks no permission:
@@ -1401,47 +1504,59 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         if call.name == ask_tool::NAME {
             return self.run_ask(call).await;
         }
+        let work = match self.authorize(call).await {
+            Ok(work) => work,
+            Err(refusal) => return refusal,
+        };
+        let outcome = Self::finished(call, tokio::task::spawn_blocking(move || work.run()).await);
+        self.after_tool_hooks(call, outcome).await
+    }
+
+    /// Checks the arguments, asks permission and runs the `pre_tool` hooks. The
+    /// work to run when the call may go ahead, or the result to give the model
+    /// when it may not.
+    async fn authorize(&self, call: &ToolCall) -> Result<ToolWork, ToolOutcome> {
         let Some(tool) = self.tools.tools.get(call.name.as_str()) else {
-            return ToolOutcome::error(format!("unknown tool {}", call.name));
+            return Err(ToolOutcome::error(format!("unknown tool {}", call.name)));
         };
         let input = match parse_arguments(call) {
             Ok(input) => input,
-            Err(refusal) => return self.with_schema(call, refusal),
+            Err(refusal) => return Err(self.with_schema(call, refusal)),
         };
         let request = tool_request(&call.name, &input, &self.config.cwd);
         let decision = tokio::select! {
-            decision = self.gate.request(&request) => decision,
+            biased;
             () = self.cancel.cancelled() => {
                 info!(tool = %call.name, "permission prompt cancelled");
-                return ToolOutcome::error(PROMPT_CANCELLED.to_owned());
+                return Err(ToolOutcome::error(PROMPT_CANCELLED.to_owned()));
             }
+            decision = self.gate.request(&request) => decision,
         };
         if decision == PermissionDecision::Deny {
             info!(tool = %call.name, "tool call denied");
-            return ToolOutcome::error(format!("permission to run {} was denied", call.name));
+            return Err(ToolOutcome::error(format!(
+                "permission to run {} was denied",
+                call.name
+            )));
         }
         // After the permission answer, so a hook only sees calls that would run.
         let hooked = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => return Err(ToolOutcome::error(HOOK_CANCELLED.to_owned())),
             hooked = self.hooks.pre_tool(&self.config.session, &self.config.cwd, &call.name, &input) => hooked,
-            () = self.cancel.cancelled() => return ToolOutcome::error(HOOK_CANCELLED.to_owned()),
         };
         if let Err(blocked) = hooked {
             info!(tool = %call.name, %blocked, "tool call blocked by a hook");
-            return ToolOutcome::error(blocked.to_string());
+            return Err(ToolOutcome::error(blocked.to_string()));
         }
-        let work = ToolWork {
+        Ok(ToolWork {
             tool: Arc::clone(tool),
             input,
             cancel: self.cancel.flag(),
             store: Arc::clone(&self.store),
             session: self.config.session.clone(),
             threshold: self.config.compact_threshold_bytes,
-        };
-        let outcome = match tokio::task::spawn_blocking(move || work.run()).await {
-            Ok(outcome) => outcome,
-            Err(error) => ToolOutcome::error(format!("the {} tool crashed: {error}", call.name)),
-        };
-        self.after_tool_hooks(call, outcome).await
+        })
     }
 
     /// Runs the `post_tool` hooks. A blocking one that fails keeps the result
@@ -1567,6 +1682,12 @@ fn parse_arguments(call: &ToolCall) -> Result<Value, ToolOutcome> {
             call.name
         ))
     })
+}
+
+/// A call of a read-only group: refused before it ran, or running.
+enum Running {
+    Refused(ToolOutcome),
+    Started(JoinHandle<ToolOutcome>),
 }
 
 /// A tool call ready to run off the async threads.

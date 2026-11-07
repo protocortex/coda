@@ -18,6 +18,7 @@ checks the result by running a command in a temporary workspace. They live in
 | `fell_back_on_rate_limit` | the first model is rate limited before it says anything; the loop moves to its fallback model, which edits the file |
 | `kept_a_todo_list` | an edit made while the model keeps a todo list with the `todo` tool, which adds its schema to every request and costs tokens in the baseline |
 | `asked_the_user` | the model asks which mode the user prefers, the offline user picks the first option, and the model edits to match |
+| `read_files_in_parallel` | three reads in one reply, which run at the same time, then three edits in one reply, which run in order and one at a time |
 | `finished_too_early` | the model says it is done before it edits; an `end_turn` guard sends it back, then it edits |
 
 ## Offline run

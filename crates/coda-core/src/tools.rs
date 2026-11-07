@@ -307,6 +307,10 @@ impl<T: Tool> Tool for RefreshAfterEdit<T> {
         self.edit.shrinkable()
     }
 
+    fn read_only(&self) -> bool {
+        self.edit.read_only()
+    }
+
     fn call(&self, input: &Value) -> Result<ToolOutput, ToolError> {
         let output = self.edit.call(input)?;
         refresh_index(&self.store, &self.root);

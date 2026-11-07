@@ -50,6 +50,10 @@ impl ReadTool {
 }
 
 impl Tool for ReadTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         NAME
     }

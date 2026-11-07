@@ -29,6 +29,10 @@
       "turns": 2,
       "tokens": 2830
     },
+    "read_files_in_parallel": {
+      "turns": 3,
+      "tokens": 4306
+    },
     "recover_after_bad_call": {
       "turns": 4,
       "tokens": 5701

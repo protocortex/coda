@@ -29,6 +29,9 @@ const DEFAULT_MAX_TURNS: u32 = 50;
 const DEFAULT_TOKEN_CAP: u64 = 1_000_000;
 /// Times an `end_turn` hook may send the model back to work in one send.
 pub const DEFAULT_MAX_GUARD_CONTINUES: u32 = 2;
+/// Read-only tool calls from one reply that may run at the same time.
+pub const DEFAULT_MAX_PARALLEL_TOOLS: u32 = 4;
+const MAX_PARALLEL_TOOLS_KEY: &str = "max_parallel_tools";
 
 /// Environment variable that moves the config and data root.
 pub const CODA_HOME_VAR: &str = "CODA_HOME";
@@ -269,6 +272,8 @@ pub struct Config {
     pub token_cap: u64,
     /// Most times an `end_turn` hook may send the model back to work in one send.
     pub max_guard_continues: u32,
+    /// Most read-only tool calls from one model reply that run at the same time.
+    pub max_parallel_tools: u32,
     /// Backends by name.
     pub providers: BTreeMap<String, ProviderConfig>,
     /// Model aliases by name.
@@ -296,6 +301,7 @@ impl Default for Config {
             max_turns: DEFAULT_MAX_TURNS,
             token_cap: DEFAULT_TOKEN_CAP,
             max_guard_continues: DEFAULT_MAX_GUARD_CONTINUES,
+            max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
             telemetry: TelemetryConfig::default(),
@@ -345,6 +351,7 @@ impl Config {
         config.check_checks()?;
         config.check_review()?;
         config.check_loop_guard()?;
+        config.check_parallel_tools()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -532,6 +539,16 @@ impl Config {
             return Err(ConfigError::InvalidValue {
                 path: format!("{REVIEW_KEY}.{CHUNK_CONCURRENCY_KEY}"),
                 allowed: "a whole number of chunks above 0".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn check_parallel_tools(&self) -> Result<(), ConfigError> {
+        if self.max_parallel_tools == 0 {
+            return Err(ConfigError::InvalidValue {
+                path: MAX_PARALLEL_TOOLS_KEY.to_owned(),
+                allowed: "a whole number of tool calls above 0".to_owned(),
             });
         }
         Ok(())
@@ -753,6 +770,22 @@ mod tests {
         // Assert
         assert!(on.providers["openai_compat"].text_tool_calls);
         assert!(!off.providers["openai_compat"].text_tool_calls);
+    }
+
+    #[test]
+    fn the_parallel_tool_limit_defaults_to_four_and_rejects_zero() {
+        // Arrange
+        let set = "max_parallel_tools = 2";
+
+        // Act
+        let read = parse(set).config;
+        let unset = parse("").config;
+        let zero = Config::from_toml_str("max_parallel_tools = 0");
+
+        // Assert
+        assert_eq!(read.max_parallel_tools, 2);
+        assert_eq!(unset.max_parallel_tools, 4);
+        assert!(matches!(zero, Err(ConfigError::InvalidValue { .. })));
     }
 
     #[test]
