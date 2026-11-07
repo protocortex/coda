@@ -141,7 +141,8 @@ const REF_BREAK: char = '\u{200b}';
 /// `text` that goes in a pull request body, made safe: it cannot open a tag, a heading or a
 /// mention, name an issue (`#12`, `owner/repo#12`) that the merge would close, or make a link
 /// or an image.
-fn body_text(text: &str) -> String {
+#[must_use]
+pub fn body_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {

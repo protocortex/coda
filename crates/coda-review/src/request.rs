@@ -26,6 +26,8 @@ pub const VERIFIER_AGENT: &str = "verifier";
 pub const TESTER_AGENT: &str = "tester";
 /// The name of the built-in agent that drafts descriptions.
 pub const DESCRIBER_AGENT: &str = "describer";
+/// The name of the built-in agent that drafts changelog entries.
+pub const SCRIBE_AGENT: &str = "scribe";
 
 /// Which agent a run is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +40,8 @@ pub enum Role {
     Tester,
     /// Drafts a description of the change.
     Describer,
+    /// Drafts one changelog entry for the change.
+    Scribe,
 }
 
 impl Role {
@@ -49,6 +53,7 @@ impl Role {
             Self::Verifier => VERIFIER_AGENT,
             Self::Tester => TESTER_AGENT,
             Self::Describer => DESCRIBER_AGENT,
+            Self::Scribe => SCRIBE_AGENT,
         }
     }
 
@@ -60,6 +65,7 @@ impl Role {
             Self::Verifier => verdicts_object(text),
             Self::Tester => text.trim(),
             Self::Describer => last_object_with(text, &["title", "summary"]),
+            Self::Scribe => last_object_with(text, &["section", "entry"]),
         }
     }
 }
@@ -373,6 +379,12 @@ pub fn task_prompt(role: Role, input_path: &str, retry_hint: Option<&str>) -> St
             "Run the commands listed in the file {input_path}, once each and in order, from the \
              repository root. Read it first. Change no file."
         ),
+        Role::Scribe => format!(
+            "Write the changelog entry for the change described in the file {input_path}. Read it \
+             all first, in as many `read` calls as it takes. It holds the reply format, the commit \
+             messages and the diff. You may read other files of the repository to see what the \
+             changed code is for."
+        ),
         Role::Describer => format!(
             "Describe the change described in the file {input_path}. Read it all first, in as \
              many `read` calls as it takes. It holds the reply format and the diff. You may read \
@@ -408,6 +420,10 @@ pub fn direct_prompt(role: Role, input: &str, retry_hint: Option<&str>) -> Strin
         }
         Role::Tester => "Run the commands below, once each and in order.",
         Role::Describer => "Describe the change below. It holds the reply format and the diff.",
+        Role::Scribe => {
+            "Write the changelog entry for the change below. It holds the reply format, the commit \
+             messages and the diff."
+        }
     };
     let mut prompt = format!(
         "{what} You may read other files of the repository to check how the changed code is \

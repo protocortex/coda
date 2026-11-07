@@ -27,6 +27,7 @@ const NO_NEWLINE: char = '\\';
 const PATH_SPLIT_EXTRA: usize = 5;
 const NUL: char = '\0';
 const STAGED_FLAG: &str = "--cached";
+const DETACHED_HEAD_NAME: &str = "HEAD";
 const QUOTE: char = '"';
 const QUOTED_NEW_START: &str = " \"b/";
 const OCTAL_DIGITS: u32 = 3;
@@ -404,6 +405,45 @@ fn run_diff(repo_dir: &Path, selection: &str) -> Result<String, GitError> {
     )
 }
 
+/// The messages of the commits `head` has that `base` lacks, newest first, at most `most`.
+///
+/// # Errors
+/// Returns [`GitError`] for a revision that looks like an option or a git failure.
+pub fn commit_messages(
+    repo_dir: &Path,
+    base: &str,
+    head: &str,
+    most: usize,
+) -> Result<Vec<String>, GitError> {
+    for rev in [base, head] {
+        if rev.is_empty() || rev.starts_with('-') || rev.contains("..") {
+            return Err(GitError::BadRevision(rev.to_owned()));
+        }
+    }
+    let limit = format!("--max-count={most}");
+    let range = format!("{base}..{head}");
+    let text = run_git(
+        repo_dir,
+        &["log", "--no-color", &limit, "--format=%B%x00", &range, "--"],
+    )?;
+    Ok(text
+        .split(NUL)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The name of the branch that is checked out, or `None` for a detached head.
+///
+/// # Errors
+/// Returns [`GitError`] when git fails.
+pub fn current_branch(repo_dir: &Path) -> Result<Option<String>, GitError> {
+    let name = run_git(repo_dir, &["rev-parse", "--abbrev-ref", DETACHED_HEAD_NAME])?;
+    let name = name.trim();
+    Ok((!name.is_empty() && name != DETACHED_HEAD_NAME).then(|| name.to_owned()))
+}
+
 /// Lists the files git tracks in `repo_dir`.
 ///
 /// # Errors
@@ -703,5 +743,45 @@ diff --git a/a b/a
         let files = parse_diff(&text);
         assert_eq!(files.len(), 1, "{text}");
         assert_eq!(files[0].path, "a.txt");
+    }
+
+    #[test]
+    fn commit_messages_are_those_of_the_branch_newest_first_and_capped() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git_in(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("a.txt"), "one\n").unwrap();
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-q", "-m", "base"]);
+        git_in(p, &["checkout", "-q", "-b", "topic"]);
+        for name in ["first", "second", "third"] {
+            git_in(
+                p,
+                &[
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    name,
+                    "-m",
+                    "more text",
+                ],
+            );
+        }
+
+        // Act
+        let all = commit_messages(p, "main", "topic", 10).unwrap();
+        let capped = commit_messages(p, "main", "topic", 2).unwrap();
+        let bad = commit_messages(p, "--all", "topic", 2).unwrap_err();
+
+        // Assert
+        assert_eq!(all.len(), 3);
+        assert!(all[0].starts_with("third\n\nmore text"), "{}", all[0]);
+        assert_eq!(capped.len(), 2);
+        assert!(matches!(bad, GitError::BadRevision(_)));
+        assert_eq!(current_branch(p).unwrap().as_deref(), Some("topic"));
+        git_in(p, &["checkout", "-q", "--detach"]);
+        assert_eq!(current_branch(p).unwrap(), None);
     }
 }

@@ -50,6 +50,12 @@ pub enum Command {
     ///
     /// Exit codes: 0 drafted or nothing to describe, 64 bad usage, 70 it failed.
     Describe(DescribeArgs),
+    /// Propose one entry for the Unreleased section of the changelog and show the diff; the
+    /// file is written only with `--write` and your confirmation, and never committed.
+    ///
+    /// Exit codes: 0 proposed, written, or the branch already has its entry; 64 bad usage;
+    /// 70 it failed.
+    Changelog(ChangelogArgs),
     /// Write or remove the git hooks that start a review.
     #[command(subcommand)]
     Hooks(HooksCommand),
@@ -345,6 +351,41 @@ pub struct ReviewArgs {
     /// reports to the prompt, as untrusted data. Needs a model-API backend.
     #[arg(long)]
     pub run_checks: bool,
+}
+
+#[derive(Debug, Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is its own option on the command line"
+)]
+pub struct ChangelogArgs {
+    /// A pull request number or URL, a branch, or a range such as `main...topic`.
+    /// Without one, the current branch is used against the default branch.
+    pub target: Option<String>,
+    /// Use the staged changes instead.
+    #[arg(long, conflicts_with = "target")]
+    pub staged: bool,
+    /// The changelog file, relative to the working directory.
+    #[arg(long, value_name = "PATH", default_value = "CHANGELOG.md")]
+    pub file: PathBuf,
+    /// Extra instructions for the scribe.
+    #[arg(long)]
+    pub instructions: Option<String>,
+    /// Print the proposal as JSON instead of text.
+    #[arg(long)]
+    pub json: bool,
+    /// The backend that runs the scribe. By default the one `coda run` uses.
+    #[arg(long, value_enum)]
+    pub backend: Option<BackendArg>,
+    /// Working directory.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// Write the entry to the file after a preview you confirm. It never commits.
+    #[arg(long)]
+    pub write: bool,
+    /// Write without asking. Needed when standard input is not a terminal.
+    #[arg(long, requires = "write")]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]

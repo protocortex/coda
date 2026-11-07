@@ -601,6 +601,145 @@ async fn describe_apply_needs_a_pull_request_and_stops_before_any_model_call() {
     assert_eq!(rig.requests().len(), 0);
 }
 
+const CHANGELOG: &str = "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Old.\n\n## [0.1.0]\n";
+
+async fn changelog(rig: &FauxRig, flags: &[&str]) -> Outcome {
+    let cwd = rig.work.path().display().to_string();
+    let mut args = vec!["coda", "changelog", "--cwd", &cwd];
+    args.extend_from_slice(flags);
+    cli(&rig.ctx, &args, "").await
+}
+
+fn scribe_turns(answer: &str) -> Vec<Value> {
+    let hand_off = tool_turn(
+        "task",
+        &json!({"agent": "scribe", "prompt": "Write the entry."}),
+    );
+    vec![hand_off, text_turn(answer), text_turn("done")]
+}
+
+#[tokio::test]
+async fn changelog_shows_the_entry_and_writes_nothing_without_the_flag() {
+    // Arrange
+    let rig = rig(&scribe_turns(
+        r#"{"section": "Fixed", "entry": "a.txt has four lines."}"#,
+    ));
+    let file = rig.work.path().join("CHANGELOG.md");
+    std::fs::write(&file, CHANGELOG).unwrap();
+
+    // Act
+    let outcome = changelog(&rig, &[]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert!(outcome.out.contains("Section: Fixed"), "{}", outcome.out);
+    assert!(
+        outcome
+            .out
+            .contains("+- a.txt has four lines. <!-- coda:changelog:topic -->"),
+        "{}",
+        outcome.out
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), CHANGELOG);
+}
+
+#[tokio::test]
+async fn changelog_write_lands_in_the_section_and_a_second_run_adds_nothing() {
+    // Arrange
+    let rig = rig(&scribe_turns(
+        r#"{"section": "Fixed", "entry": "a.txt has four lines."}"#,
+    ));
+    let file = rig.work.path().join("CHANGELOG.md");
+    std::fs::write(&file, CHANGELOG).unwrap();
+
+    // Act
+    let first = changelog(&rig, &["--write", "--yes"]).await;
+    let written = std::fs::read_to_string(&file).unwrap();
+    let calls = rig.requests().len();
+    let second = changelog(&rig, &["--write", "--yes"]).await;
+
+    // Assert
+    assert_eq!(first.code, ExitCode::SUCCESS, "{}", first.err);
+    assert!(
+        written.contains("### Added\n\n- Old.\n\n### Fixed\n\n- a.txt has four lines. <!--"),
+        "{written}"
+    );
+    assert_eq!(second.code, ExitCode::SUCCESS, "{}", second.err);
+    assert!(
+        second.out.contains("already has an entry"),
+        "{}",
+        second.out
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+    assert_eq!(
+        rig.requests().len(),
+        calls,
+        "the second run made no model call"
+    );
+}
+
+#[tokio::test]
+async fn changelog_refuses_a_missing_file_or_a_file_without_unreleased_before_any_model_call() {
+    // Arrange
+    let rig = rig(&[]);
+    let file = rig.work.path().join("CHANGELOG.md");
+
+    // Act
+    let missing = changelog(&rig, &[]).await;
+    std::fs::write(&file, "# Changelog\n\n## [0.1.0]\n").unwrap();
+    let no_heading = changelog(&rig, &[]).await;
+
+    // Assert
+    assert_eq!(missing.code, ExitCode::from(FAILURE), "{}", missing.err);
+    assert!(missing.err.contains("cannot read"), "{}", missing.err);
+    assert_eq!(
+        no_heading.code,
+        ExitCode::from(FAILURE),
+        "{}",
+        no_heading.err
+    );
+    assert!(
+        no_heading.err.contains("[Unreleased]"),
+        "{}",
+        no_heading.err
+    );
+    assert_eq!(rig.requests().len(), 0);
+}
+
+#[tokio::test]
+async fn changelog_with_an_unusable_answer_writes_nothing() {
+    // Arrange
+    let rig = rig(&scribe_turns("I think it is a fix."));
+    let file = rig.work.path().join("CHANGELOG.md");
+    std::fs::write(&file, CHANGELOG).unwrap();
+
+    // Act
+    let outcome = changelog(&rig, &["--write", "--yes"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::from(FAILURE), "{}", outcome.err);
+    assert!(
+        outcome.err.contains("nothing was written"),
+        "{}",
+        outcome.err
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), CHANGELOG);
+}
+
+#[tokio::test]
+async fn changelog_write_needs_yes_when_nobody_can_be_asked() {
+    // Arrange
+    let rig = rig(&[]);
+
+    // Act
+    let outcome = changelog(&rig, &["--write"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::from(FAILURE), "{}", outcome.err);
+    assert!(outcome.err.contains("--yes"), "{}", outcome.err);
+    assert_eq!(rig.requests().len(), 0);
+}
+
 #[tokio::test]
 async fn staged_cannot_be_combined_with_a_target() {
     // Arrange

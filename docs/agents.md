@@ -83,18 +83,19 @@ Hooks load only from the user's `config.toml`, as `[[hooks]]` entries. See [docs
 
 ## Built-in agents
 
-Six agents ship in the binary. They are ordinary agent files that are checked by the same lint as yours, and `coda agents list` shows them as `built-in`.
+Seven agents ship in the binary. They are ordinary agent files that are checked by the same lint as yours, and `coda agents list` shows them as `built-in`.
 
 | Agent | Tier | Tools | Use |
 | --- | --- | --- | --- |
 | `explore` | `fast` | `code_outline`, `code_read_range`, `code_search`, `code_symbol`, `grep`, `read`, `retrieve` | Finds where something is and how it works. Reports `path:line` places. |
 | `reviewer` | `standard` | the same read-only tools | Reviews code and replies with a JSON report of classified findings (see [The result](#the-result)). |
 | `verifier` | `standard` | the same read-only tools | Checks findings that another reviewer reported against the diff and the code, and replies with a score from 0 to 10 and a one-line reason for each. `coda review` uses it (see [docs/config.md](config.md#coda-review)). |
+| `scribe` | `fast` | the same read-only tools | Writes one changelog entry for a change and picks its section. `coda changelog` uses it (see [docs/config.md](config.md#coda-changelog)). |
 | `describer` | `fast` | the same read-only tools | Writes a draft title, summary and per-file notes for a change, and suggests labels from a list it is given. `coda describe` uses it (see [docs/config.md](config.md#coda-describe)). |
 | `implementer` | `standard` | the read-only tools, `edit` and `bash` | Makes one clear change, runs the build or tests that cover it, and reports what it changed. |
 | `tester` | `fast` | `bash`, `code_read_range`, `grep`, `read`, `retrieve` | Runs the tests or checks it is given and reports passes and failures. It has no `edit` tool, but `bash` can still change files; its prompt tells it to run and report, not to change files. |
 
-`describer`, `explore`, `reviewer` and `verifier` have no `bash` and no `edit`, so they cannot change anything. `tester` has no `edit` tool, but its `bash` can change files, so it is not read-only: every command it runs goes through the permission broker (see [Dispatch](#dispatch-the-task-tool)), and the user can refuse it.
+`describer`, `explore`, `reviewer`, `scribe` and `verifier` have no `bash` and no `edit`, so they cannot change anything. `tester` has no `edit` tool, but its `bash` can change files, so it is not read-only: every command it runs goes through the permission broker (see [Dispatch](#dispatch-the-task-tool)), and the user can refuse it.
 
 To change one, write a file with the same name. A user file in `<CODA_HOME>/agents/` replaces the built-in one entirely and may give it other tools. A project file in `.coda/agents/` replaces its description and prompt once the repository is trusted, but can only narrow its tools and keeps the tier and effort of the definition below it. Asking for other tools, another tier or another effort is not an error, but the request is ignored and `coda agents lint` reports it, naming the file and the field. An untrusted project file changes nothing: the built-in or user agent runs as it is.
 
