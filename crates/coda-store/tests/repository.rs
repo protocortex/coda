@@ -522,10 +522,10 @@ fn usage_is_recorded_and_summed_per_session_and_overall() {
     let (_dir, mut store) = open_store();
     let (one, turn_one) = session_with_turn(&mut store, "/a");
     let (two, turn_two) = session_with_turn(&mut store, "/b");
-    for (session, turn, input, output) in [
-        (&one, &turn_one, 100, 10),
-        (&one, &turn_one, 50, 5),
-        (&two, &turn_two, 7, 3),
+    for (session, turn, input, output, cache_read, cache_write) in [
+        (&one, &turn_one, 100, 10, 1_000, 40),
+        (&one, &turn_one, 50, 5, 500, 0),
+        (&two, &turn_two, 7, 3, 20, 2),
     ] {
         store
             .record_usage(&UsageRecord {
@@ -533,6 +533,8 @@ fn usage_is_recorded_and_summed_per_session_and_overall() {
                 turn: turn.clone(),
                 input_tokens: input,
                 output_tokens: output,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: cache_write,
             })
             .unwrap();
     }
@@ -546,14 +548,18 @@ fn usage_is_recorded_and_summed_per_session_and_overall() {
         for_one,
         UsageSummary {
             input_tokens: 150,
-            output_tokens: 15
+            output_tokens: 15,
+            cache_read_tokens: 1_500,
+            cache_write_tokens: 40
         }
     );
     assert_eq!(
         overall,
         UsageSummary {
             input_tokens: 157,
-            output_tokens: 18
+            output_tokens: 18,
+            cache_read_tokens: 1_520,
+            cache_write_tokens: 42
         }
     );
 }
@@ -583,6 +589,8 @@ fn recording_usage_for_a_nonexistent_turn_is_turn_not_found() {
             turn: TurnId::new("5"),
             input_tokens: 1,
             output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         })
         .unwrap_err();
 

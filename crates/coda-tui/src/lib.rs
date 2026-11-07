@@ -10,6 +10,7 @@ pub mod completion;
 pub mod diffview;
 pub mod errors;
 pub mod input;
+pub mod limits;
 pub mod logs;
 pub mod notify;
 pub mod paste;
