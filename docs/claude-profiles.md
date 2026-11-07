@@ -40,3 +40,25 @@ that is there anyway, and for `lean` also for any tool outside its list. The
 warning names what was found and goes to the daemon's log (a `warn` line, message
 `init check`). It does not stop the session. `full` is never
 checked.
+
+## Helper calls
+
+`coda_providers::claude_helper::run_structured` makes one cheap call of the
+installed `claude` for short jobs such as a session title, a commit message or a
+branch name. It sends the prompt on standard input and returns the
+`structured_output` of the JSON result, which `claude` checks against the schema
+the caller gives. The call is `claude -p --output-format json --json-schema <schema>`
+with no tools (`--tools ""`), no settings (`--setting-sources ""`), no MCP servers,
+no skills, no saved session and a one line system prompt. It runs in an empty
+temporary folder, removed afterwards, so no `CLAUDE.md` joins the prompt, and stops
+after 180 seconds. It gets the same environment as a session, including the names
+in `env_passthrough`. On claude 2.1.296 with the `haiku` model it sent about 1.1k
+prompt tokens; without the system prompt and the settings flag it sent 6.7k.
+It keeps at most 1 MiB of output. The call ends with an error when the binary
+cannot start, when it runs past the timeout or prints more than that, when it
+exits with a failure, when it prints something that is not a JSON result, when the
+result says `is_error` (the error then carries the first 200 characters of
+Claude Code's own message, such as "Not logged in"), or when the result has no
+structured output. When the call ends, however it ends, Coda stops the child and
+everything it started. Nothing in Coda calls it yet; storing a title needs a `title` column on sessions,
+which is a separate change.

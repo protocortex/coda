@@ -60,8 +60,8 @@ CODA_LIVE_TESTS=1 cargo nextest run -p coda-providers --test live_probes \
 ```
 
 They use the login of whoever runs them, the unmodified binary, the same cleared
-environment a session gets, the `haiku` model and a turn limit, so the seven tests
-spend about eight short calls. They write no fixture, and they print no token and
+environment a session gets, the `haiku` model and a turn limit, so the eight tests
+spend about nine short calls. They write no fixture, and they print no token and
 no account value (only the names of the fields of the `initialize` account block).
 Run them one at a time, as above, so they do not hit the plan's rate limit together.
 Each call starts a real session, so `claude` keeps a transcript of it under
@@ -79,6 +79,7 @@ they found with claude 2.1.296 on 2026-11-08:
 | `set_permission_mode`, `set_model` | both answer `success` with no turn running |
 | `interrupt` | answers `success`; the turn then ends with a `result` of subtype `error_during_execution` and `is_error` true |
 | a message sent mid-turn | in a turn that only streams text it queues: the first message gets its own `result` and the second gets another. The manual run under Steer, with a tool still running, gave one `result` for both, so the answer depends on the turn |
+| helper call | `run_structured` returns JSON with a non-empty `title` that fits its schema |
 | `--fork-session` | with `--resume <id>` it starts a new session id and the turn works |
 | resume at a message | `claude --help` lists no flag for it (`--resume-session-at`); the probe fails the day one appears |
 
