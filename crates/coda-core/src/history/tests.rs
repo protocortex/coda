@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use super::*;
 use crate::compact::SUMMARY_UNAVAILABLE;
 use crate::prompt::{Message, Prefix, ToolCall};
+use coda_providers::model::ReasoningBlock;
 
 #[derive(Clone, Default)]
 struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -566,4 +567,30 @@ fn a_guard_continue_replays_as_the_user_message_it_was_and_a_guard_limit_is_skip
         ])
     );
     assert_eq!(logs, "");
+}
+
+#[test]
+fn reasoning_that_cannot_be_restored_still_leaves_its_message_so_counts_stay_aligned() {
+    // Arrange
+    let block = ReasoningBlock::Thinking {
+        text: "plan".to_owned(),
+        signature: Some("sig".to_owned()),
+    };
+    let kept = OriginalId::new(json!([block]).to_string());
+    let gone = OriginalId::new(GONE);
+    let reply = |reasoning: &OriginalId| {
+        (
+            ASSISTANT_MESSAGE_KIND,
+            assistant_body_with_reasoning("done", &[], Some(reasoning)),
+        )
+    };
+
+    // Act
+    let restored = replay(&[user("go"), reply(&kept)]);
+    let lost = replay(&[user("go"), reply(&gone)]);
+
+    // Assert
+    assert_eq!(restored[1], Message::Reasoning(vec![block]));
+    assert_eq!(lost[1], Message::Reasoning(Vec::new()));
+    assert_eq!(lost.len(), restored.len());
 }

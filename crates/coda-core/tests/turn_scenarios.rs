@@ -232,6 +232,7 @@ fn assert_valid_history(messages: &[Message]) {
                 }
                 open = !tool_calls.is_empty();
             }
+            Message::Reasoning(_) => {}
             Message::ToolResult { .. } => panic!("stray tool result at {index}"),
         }
         index += 1;

@@ -14,6 +14,7 @@ use coda_protocol::events::{
     TOOL_CALL_KIND, TURN_INTERRUPTED_KIND, USAGE_KIND, USAGE_LIMIT_KIND,
 };
 use coda_protocol::types::{OriginalId, SessionId};
+use coda_providers::model::ReasoningBlock;
 use coda_store::{Store, StoreError, StoredEvent};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -105,6 +106,9 @@ struct AssistantBody {
     text: String,
     #[serde(default)]
     tool_calls: Vec<CallBody>,
+    /// Where the reply's reasoning blocks were kept, as JSON.
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +134,18 @@ struct ToolFinishedBody {
 /// arguments were kept under, when they could be kept.
 #[must_use]
 pub fn assistant_body(text: &str, calls: &[(&ToolCall, Option<OriginalId>)]) -> Value {
+    assistant_body_with_reasoning(text, calls, None)
+}
+
+/// [`assistant_body`] for a reply that came with reasoning, kept in the
+/// session's originals under `reasoning` apart from the event log, as the call
+/// arguments are.
+#[must_use]
+pub fn assistant_body_with_reasoning(
+    text: &str,
+    calls: &[(&ToolCall, Option<OriginalId>)],
+    reasoning: Option<&OriginalId>,
+) -> Value {
     let calls: Vec<Value> = calls
         .iter()
         .map(|(call, arguments)| {
@@ -140,7 +156,11 @@ pub fn assistant_body(text: &str, calls: &[(&ToolCall, Option<OriginalId>)]) -> 
             })
         })
         .collect();
-    json!({ "text": text, "tool_calls": calls })
+    let mut body = json!({ "text": text, "tool_calls": calls });
+    if let Some(reasoning) = reasoning {
+        body["reasoning"] = json!(reasoning.as_str());
+    }
+    body
 }
 
 /// The body stored for a finished tool call. `original` names where the
@@ -269,6 +289,14 @@ impl Rebuild {
 
     fn assistant(&mut self, body: AssistantBody, lookup: ResultLookup<'_>) {
         self.answer_unanswered();
+        // A reply that had reasoning leaves a message even when the reasoning is
+        // gone, so a compaction that counted it still replaces the same messages.
+        if let Some(id) = body.reasoning {
+            let blocks: Vec<ReasoningBlock> = resolve(&id, lookup)
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+            self.conversation.push(Message::Reasoning(blocks));
+        }
         let tool_calls: Vec<ToolCall> = body
             .tool_calls
             .into_iter()

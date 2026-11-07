@@ -16,8 +16,8 @@ use coda_protocol::events::{CALL_FROM_TEXT, CALL_REPAIRED};
 use coda_protocol::types::{OriginalId, PermissionDecision, SessionId};
 use coda_providers::gate::PermissionGate;
 use coda_providers::model::{
-    ModelEvent, ModelProvider, ModelRequest, ProviderError, RequestMessage, RequestToolCall,
-    StopReason, ToolSchema as ModelToolSchema, Usage,
+    ModelEvent, ModelProvider, ModelRequest, ProviderError, ReasoningBlock, RequestMessage,
+    RequestToolCall, StopReason, ToolSchema as ModelToolSchema, Usage,
 };
 use coda_providers::tool_request::{Tool as RequestTool, ToolRequest};
 use coda_store::Store;
@@ -142,6 +142,9 @@ pub enum TurnEvent {
         text: String,
         /// The calls it made.
         tool_calls: Vec<ToolCall>,
+        /// The reasoning that came with the reply, kept as the model gave it.
+        /// It is not part of `text`.
+        reasoning: Vec<ReasoningBlock>,
     },
     /// A model call finished and used these tokens.
     Usage(Usage),
@@ -600,6 +603,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                 Vec::new()
             };
             let mut text = reply.text;
+            let reasoning = reply.reasoning;
             let answer = text.clone();
             self.repair_calls(&mut calls);
             if calls.is_empty()
@@ -616,7 +620,11 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             self.emit(TurnEvent::Assistant {
                 text: text.clone(),
                 tool_calls: calls.clone(),
+                reasoning: reasoning.clone(),
             });
+            if !reasoning.is_empty() {
+                self.conversation.push(Message::Reasoning(reasoning));
+            }
             self.conversation.push(Message::Assistant {
                 text,
                 tool_calls: calls.clone(),
@@ -932,6 +940,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         };
         Ok(Streamed::Reply(Reply {
             text: std::mem::take(&mut draft.text),
+            reasoning: std::mem::take(&mut draft.reasoning),
             calls: std::mem::take(&mut draft.calls),
             stop,
         }))
@@ -955,6 +964,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                     call.arguments.push_str(&fragment);
                 }
             }
+            ModelEvent::Reasoning { block } => reply.reasoning.push(block),
             ModelEvent::Usage(usage) => reply.usage = Some(usage),
             ModelEvent::Stop { reason } => return Some(reason),
         }
@@ -1220,12 +1230,14 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
 #[derive(Default)]
 struct Draft {
     text: String,
+    reasoning: Vec<ReasoningBlock>,
     calls: Vec<ToolCall>,
     usage: Option<Usage>,
 }
 
 struct Reply {
     text: String,
+    reasoning: Vec<ReasoningBlock>,
     calls: Vec<ToolCall>,
     stop: StopReason,
 }
@@ -1392,6 +1404,7 @@ fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
 fn request_message(message: &Message) -> RequestMessage {
     match message {
         Message::User(text) => RequestMessage::User(text.clone()),
+        Message::Reasoning(blocks) => RequestMessage::Reasoning(blocks.clone()),
         Message::Assistant { text, tool_calls } => RequestMessage::Assistant {
             text: text.clone(),
             tool_calls: tool_calls
@@ -2115,6 +2128,7 @@ mod tests {
                     }
                     open = !tool_calls.is_empty();
                 }
+                Message::Reasoning(_) => {}
                 Message::ToolResult { .. } => panic!("stray tool result at {index}"),
             }
             index += 1;

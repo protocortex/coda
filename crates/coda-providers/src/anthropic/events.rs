@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use super::classify_stream_error;
-use crate::model::{ModelEvent, ProviderError, StopReason, Usage};
+use crate::model::{ModelEvent, ProviderError, ReasoningBlock, StopReason, Usage};
 
 /// Arguments of a tool call that sent none, so they still parse as JSON.
 const EMPTY_ARGUMENTS: &str = "{}";
@@ -27,6 +27,13 @@ struct ToolBlock {
     has_arguments: bool,
 }
 
+/// A thinking block being read: its text and signature arrive as deltas.
+#[derive(Debug, Default)]
+struct ThinkingBlock {
+    text: String,
+    signature: String,
+}
+
 /// Turns one response's stream events into model events.
 #[derive(Debug, Default)]
 pub struct EventMapper {
@@ -35,6 +42,7 @@ pub struct EventMapper {
     output_tokens: u64,
     stop_reason: Option<StopReason>,
     tools: HashMap<u64, ToolBlock>,
+    thinking: HashMap<u64, ThinkingBlock>,
 }
 
 fn fatal(message: impl Into<String>) -> ProviderError {
@@ -117,6 +125,21 @@ impl EventMapper {
                     });
                 }
             }
+            Some("thinking") => {
+                let thinking = ThinkingBlock {
+                    text: block["thinking"].as_str().unwrap_or_default().to_owned(),
+                    signature: block["signature"].as_str().unwrap_or_default().to_owned(),
+                };
+                self.thinking
+                    .insert(event["index"].as_u64().unwrap_or_default(), thinking);
+            }
+            Some("redacted_thinking") => {
+                step.events.push(ModelEvent::Reasoning {
+                    block: ReasoningBlock::Redacted {
+                        data: block["data"].as_str().unwrap_or_default().to_owned(),
+                    },
+                });
+            }
             Some("tool_use") => {
                 let call_id = block["id"].as_str().unwrap_or_default().to_owned();
                 let name = block["name"].as_str().unwrap_or_default().to_owned();
@@ -142,6 +165,20 @@ impl EventMapper {
                 let text = delta["text"].as_str().unwrap_or_default().to_owned();
                 step.events.push(ModelEvent::TextDelta { text });
             }
+            Some(kind @ ("thinking_delta" | "signature_delta")) => {
+                let index = event["index"].as_u64().unwrap_or_default();
+                if let Some(block) = self.thinking.get_mut(&index) {
+                    if kind == "thinking_delta" {
+                        block
+                            .text
+                            .push_str(delta["thinking"].as_str().unwrap_or_default());
+                    } else {
+                        block
+                            .signature
+                            .push_str(delta["signature"].as_str().unwrap_or_default());
+                    }
+                }
+            }
             Some("input_json_delta") => {
                 let fragment = delta["partial_json"].as_str().unwrap_or_default();
                 let tool = self
@@ -161,6 +198,14 @@ impl EventMapper {
 
     fn block_stop(&mut self, event: &Value, step: &mut Step) {
         let index = event["index"].as_u64().unwrap_or_default();
+        if let Some(block) = self.thinking.remove(&index) {
+            step.events.push(ModelEvent::Reasoning {
+                block: ReasoningBlock::Thinking {
+                    text: block.text,
+                    signature: Some(block.signature).filter(|signature| !signature.is_empty()),
+                },
+            });
+        }
         if let Some(tool) = self.tools.remove(&index).filter(|tool| !tool.has_arguments) {
             step.events.push(ModelEvent::ToolCallArgumentsDelta {
                 call_id: tool.call_id,

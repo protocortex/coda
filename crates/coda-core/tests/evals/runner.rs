@@ -90,6 +90,9 @@ fn request_bytes(request: &ModelRequest) -> u64 {
         .iter()
         .map(|message| match message {
             RequestMessage::User(text) | RequestMessage::ToolResult { text, .. } => text.len(),
+            RequestMessage::Reasoning(blocks) => {
+                blocks.iter().map(|block| format!("{block:?}").len()).sum()
+            }
             RequestMessage::Assistant { text, tool_calls } => {
                 text.len()
                     + tool_calls

@@ -6,13 +6,16 @@ use serde_json::Value;
 
 use super::is_context_overflow;
 use crate::http::{fatal, retryable};
-use crate::model::{ModelEvent, ProviderError, StopReason, Usage};
+use crate::model::{ModelEvent, ProviderError, ReasoningBlock, StopReason, Usage};
+use crate::think::{Piece, ThinkSplitter};
 
 const DONE_MARKER: &str = "[DONE]";
 /// Arguments of a tool call that sent none, so they still parse as JSON.
 const EMPTY_ARGUMENTS: &str = "{}";
 pub const MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
 pub const MAX_TOOL_CALLS: usize = 128;
+/// The delta fields in which servers send the model's reasoning.
+const REASONING_FIELDS: [&str; 2] = ["reasoning_content", "reasoning"];
 /// Error kinds by which a server marks a failure worth retrying.
 const RETRYABLE_ERROR_KINDS: [&str; 2] = ["server_error", "rate_limit"];
 
@@ -39,6 +42,10 @@ pub struct EventMapper {
     usage: Option<Usage>,
     stop_reason: Option<StopReason>,
     tools: Vec<ToolCall>,
+    /// Splits `<think>` tags out of the text of servers that print them there.
+    think: ThinkSplitter,
+    /// The reasoning so far, from the fields and from the tags.
+    reasoning: String,
 }
 
 fn parse_stop_reason(reason: &str) -> Result<StopReason, ProviderError> {
@@ -89,10 +96,16 @@ impl EventMapper {
 
     fn choice(&mut self, choice: &Value, step: &mut Step) -> Result<(), ProviderError> {
         let delta = &choice["delta"];
+        // A server that sends the text in both fields means it once, not twice.
+        let field = REASONING_FIELDS
+            .iter()
+            .find_map(|field| delta[field].as_str());
+        if let Some(text) = field {
+            self.reasoning.push_str(text);
+        }
         if let Some(text) = delta["content"].as_str().filter(|text| !text.is_empty()) {
-            step.events.push(ModelEvent::TextDelta {
-                text: text.to_owned(),
-            });
+            let pieces = self.think.push(text);
+            self.deliver(pieces, step);
         }
         for call in delta["tool_calls"].as_array().into_iter().flatten() {
             self.tool_call(call, step)?;
@@ -101,6 +114,15 @@ impl EventMapper {
             self.stop_reason = Some(parse_stop_reason(reason)?);
         }
         Ok(())
+    }
+
+    fn deliver(&mut self, pieces: Vec<Piece>, step: &mut Step) {
+        for piece in pieces {
+            match piece {
+                Piece::Text(text) => step.events.push(ModelEvent::TextDelta { text }),
+                Piece::Reasoning(text) => self.reasoning.push_str(&text),
+            }
+        }
     }
 
     /// The call a fragment continues: the one with its id, else the one at
@@ -180,6 +202,16 @@ impl EventMapper {
 
     fn finish(&mut self) -> Result<Step, ProviderError> {
         let mut step = Step::default();
+        let pieces = self.think.finish();
+        self.deliver(pieces, &mut step);
+        if !self.reasoning.is_empty() {
+            step.events.push(ModelEvent::Reasoning {
+                block: ReasoningBlock::Thinking {
+                    text: std::mem::take(&mut self.reasoning),
+                    signature: None,
+                },
+            });
+        }
         let reason = match self
             .stop_reason
             .ok_or_else(|| fatal("the server ended the response without a finish reason"))?

@@ -10,7 +10,8 @@ use coda_providers::anthropic::request::{RequestSettings, ToolSchema, build_body
 use coda_providers::anthropic::sse::{MAX_EVENT_BYTES, SseError, SseParser};
 use coda_providers::anthropic::{Timing, classify_status};
 use coda_providers::model::{
-    ModelEvent, ModelRequest, ProviderError, RequestMessage, RequestToolCall, StopReason, Usage,
+    ModelEvent, ModelRequest, ProviderError, ReasoningBlock, RequestMessage, RequestToolCall,
+    StopReason, Usage,
 };
 use serde_json::json;
 
@@ -756,4 +757,157 @@ fn appending_a_message_leaves_earlier_message_bytes_unchanged() {
     assert_eq!(before["messages"][0], after["messages"][0]);
     assert_eq!(before["messages"][1]["role"], "assistant");
     assert_eq!(before["messages"][1], after["messages"][1]);
+}
+
+#[test]
+fn thinking_blocks_become_reasoning_events_with_their_signature_and_never_text() {
+    // Arrange
+    let stream = message_start(10, 0, 0)
+        + &block_start(
+            0,
+            &json!({"type": "thinking", "thinking": "", "signature": ""}),
+        )
+        + &delta(0, &json!({"type": "thinking_delta", "thinking": "let me "}))
+        + &delta(0, &json!({"type": "thinking_delta", "thinking": "think"}))
+        + &delta(0, &json!({"type": "signature_delta", "signature": "sig-1"}))
+        + &frame(&json!({"type": "content_block_stop", "index": 0}))
+        + &block_start(1, &json!({"type": "redacted_thinking", "data": "opaque"}))
+        + &frame(&json!({"type": "content_block_stop", "index": 1}))
+        + &block_start(2, &json!({"type": "text", "text": ""}))
+        + &delta(2, &json!({"type": "text_delta", "text": "answer"}))
+        + &frame(&json!({"type": "content_block_stop", "index": 2}))
+        + &message_end("end_turn", 20);
+
+    // Act
+    let (events, result, _) = run(&stream);
+
+    // Assert
+    assert_eq!(result, Ok(true));
+    assert_eq!(
+        events,
+        vec![
+            ModelEvent::Reasoning {
+                block: ReasoningBlock::Thinking {
+                    text: "let me think".to_owned(),
+                    signature: Some("sig-1".to_owned()),
+                }
+            },
+            ModelEvent::Reasoning {
+                block: ReasoningBlock::Redacted {
+                    data: "opaque".to_owned()
+                }
+            },
+            ModelEvent::TextDelta {
+                text: "answer".to_owned()
+            },
+            ModelEvent::Usage(Usage {
+                input_tokens: 10,
+                output_tokens: 20
+            }),
+            ModelEvent::Stop {
+                reason: StopReason::EndTurn
+            },
+        ]
+    );
+}
+
+#[test]
+fn reasoning_goes_back_unchanged_before_the_text_and_calls_of_its_reply() {
+    // Arrange
+    let thinking = ReasoningBlock::Thinking {
+        text: "plan".to_owned(),
+        signature: Some("sig-1".to_owned()),
+    };
+    let redacted = ReasoningBlock::Redacted {
+        data: "opaque".to_owned(),
+    };
+    let request = ModelRequest {
+        messages: vec![
+            RequestMessage::User("go".to_owned()),
+            RequestMessage::Reasoning(vec![thinking, redacted]),
+            RequestMessage::Assistant {
+                text: "reading".to_owned(),
+                tool_calls: vec![RequestToolCall {
+                    id: "c1".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: "{}".to_owned(),
+                }],
+            },
+        ],
+        ..ModelRequest::default()
+    };
+
+    // Act
+    let body = build_body(&settings("", Vec::new()), &request);
+
+    // Assert
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!([
+            {"type": "thinking", "thinking": "plan", "signature": "sig-1"},
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "text", "text": "reading"},
+            {"type": "tool_use", "id": "c1", "name": "read", "input": {}},
+        ])
+    );
+}
+
+#[test]
+fn reasoning_without_a_signature_or_without_a_reply_to_join_is_left_out() {
+    // Arrange
+    let unsigned = ReasoningBlock::Thinking {
+        text: "from another provider".to_owned(),
+        signature: None,
+    };
+    let request = ModelRequest {
+        messages: vec![
+            RequestMessage::Reasoning(vec![unsigned.clone()]),
+            RequestMessage::Assistant {
+                text: "hi".to_owned(),
+                tool_calls: Vec::new(),
+            },
+            RequestMessage::Reasoning(vec![unsigned]),
+            RequestMessage::User("next".to_owned()),
+        ],
+        ..ModelRequest::default()
+    };
+
+    // Act
+    let body = build_body(&settings("", Vec::new()), &request);
+
+    // Assert
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "user", "content": "next"},
+        ])
+    );
+}
+
+#[test]
+fn a_request_without_reasoning_is_byte_identical_to_before() {
+    // Arrange
+    let request = ModelRequest {
+        messages: vec![
+            RequestMessage::User("go".to_owned()),
+            RequestMessage::Assistant {
+                text: "ok".to_owned(),
+                tool_calls: Vec::new(),
+            },
+        ],
+        ..ModelRequest::default()
+    };
+
+    // Act
+    let body = build_body(&settings("sys", vec![tool("read")]), &request);
+
+    // Assert
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        ])
+    );
 }
