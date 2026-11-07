@@ -3,6 +3,7 @@
 //! The prompt a session sends: a byte-stable prefix and an append-only
 //! message history.
 
+use coda_providers::model::ReasoningBlock;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -130,6 +131,9 @@ pub struct ToolCall {
 pub enum Message {
     /// What the user said.
     User(String),
+    /// The reasoning that came with the reply right after it. It is never answer
+    /// text, and a provider that does not take reasoning back leaves it out.
+    Reasoning(Vec<ReasoningBlock>),
     /// What the model answered, with the tool calls it made.
     Assistant {
         /// The answer text.

@@ -201,6 +201,7 @@ impl ModelProvider for FauxProvider {
 fn message_json(message: &RequestMessage) -> Value {
     match message {
         RequestMessage::User(text) => json!({ "role": "user", "text": text }),
+        RequestMessage::Reasoning(blocks) => json!({ "role": "reasoning", "blocks": blocks }),
         RequestMessage::Assistant { text, tool_calls } => json!({
             "role": "assistant",
             "text": text,

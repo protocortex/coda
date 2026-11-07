@@ -7,7 +7,8 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use coda_providers::model::{
-    ModelEvent, ModelProvider, ModelRequest, ProviderError, RequestMessage, StopReason, Usage,
+    ModelEvent, ModelProvider, ModelRequest, ProviderError, ReasoningBlock, RequestMessage,
+    StopReason, Usage,
 };
 use tokio::sync::oneshot;
 
@@ -97,7 +98,11 @@ impl CompactionAck {
 #[must_use]
 pub fn split_point(messages: &[Message], keep: usize) -> Option<usize> {
     let mut split = messages.len().saturating_sub(keep);
-    while split > 0 && matches!(messages.get(split), Some(Message::ToolResult { .. })) {
+    // A reply keeps the reasoning that came with it, as well as its results.
+    while split > 0
+        && (matches!(messages.get(split), Some(Message::ToolResult { .. }))
+            || matches!(messages.get(split - 1), Some(Message::Reasoning(_))))
+    {
         split -= 1;
     }
     (split > 0).then_some(split)
@@ -142,6 +147,7 @@ pub(crate) fn request_bytes(conversation: &Conversation) -> usize {
         .iter()
         .map(|message| match message {
             Message::User(text) | Message::ToolResult { text, .. } => text.len(),
+            Message::Reasoning(blocks) => blocks.iter().map(reasoning_bytes).sum(),
             Message::Assistant { text, tool_calls } => {
                 text.len()
                     + tool_calls
@@ -152,6 +158,15 @@ pub(crate) fn request_bytes(conversation: &Conversation) -> usize {
         })
         .sum();
     conversation.prefix().bytes().len() + messages
+}
+
+fn reasoning_bytes(block: &ReasoningBlock) -> usize {
+    match block {
+        ReasoningBlock::Thinking { text, signature } => {
+            text.len() + signature.as_ref().map_or(0, String::len)
+        }
+        ReasoningBlock::Redacted { data } => data.len(),
+    }
 }
 
 /// The request size, in bytes, from which a request is compacted ahead
@@ -181,6 +196,8 @@ pub(crate) fn render(messages: &[Message]) -> String {
     for message in messages {
         match message {
             Message::User(body) => lines.push(format!("user: {body}")),
+            // The summary is of what was said and done, not of how the model got there.
+            Message::Reasoning(_) => {}
             Message::Assistant { text, tool_calls } => {
                 if !text.is_empty() {
                     lines.push(format!("assistant: {text}"));

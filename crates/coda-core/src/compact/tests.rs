@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::prompt::{Message, ToolCall};
+use coda_providers::model::ReasoningBlock;
 
 #[test]
 fn the_summary_message_labels_the_text_as_derived_data() {
@@ -133,6 +134,22 @@ fn the_split_never_separates_a_tool_call_from_its_results() {
                 reply(),
             ],
             4,
+            Some(1),
+        ),
+        (
+            "a split on a reply moves back before its reasoning",
+            vec![
+                user(),
+                Message::Reasoning(vec![ReasoningBlock::Redacted {
+                    data: "x".to_owned(),
+                }]),
+                calls(&["c1"]),
+                result("c1"),
+                reply(),
+                user(),
+                reply(),
+            ],
+            5,
             Some(1),
         ),
         (

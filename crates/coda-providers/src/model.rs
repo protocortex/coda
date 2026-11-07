@@ -33,11 +33,35 @@ pub struct RequestToolCall {
     pub arguments: String,
 }
 
+/// A block of the model's own reasoning. A provider that requires reasoning to
+/// come back with the next request gets these blocks unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReasoningBlock {
+    /// Reasoning text. A signature, where the provider gives one, vouches for
+    /// the text and must be sent back with it.
+    Thinking {
+        /// The reasoning.
+        text: String,
+        /// The provider's signature of the text; `None` where it gives none.
+        #[serde(default)]
+        signature: Option<String>,
+    },
+    /// Reasoning the provider withheld from the stream, kept as it sent it.
+    Redacted {
+        /// The provider's opaque data.
+        data: String,
+    },
+}
+
 /// One entry of the conversation history sent with a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestMessage {
     /// What the user said.
     User(String),
+    /// The reasoning that came with the reply that follows. A provider that
+    /// does not take reasoning back leaves it out.
+    Reasoning(Vec<ReasoningBlock>),
     /// What the model answered, with the tool calls it made.
     Assistant {
         /// The answer text.
@@ -129,6 +153,11 @@ pub enum ModelEvent {
         call_id: String,
         /// The raw JSON text piece; only the concatenation is valid JSON.
         fragment: String,
+    },
+    /// A block of the model's reasoning, complete. It is not answer text.
+    Reasoning {
+        /// The block.
+        block: ReasoningBlock,
     },
     /// Token usage so far.
     Usage(Usage),

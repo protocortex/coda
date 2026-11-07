@@ -4,7 +4,7 @@
 
 use serde_json::{Value, json};
 
-use crate::model::{ModelRequest, RequestMessage, RequestToolCall};
+use crate::model::{ModelRequest, ReasoningBlock, RequestMessage, RequestToolCall};
 
 pub use crate::model::ToolSchema;
 
@@ -73,14 +73,18 @@ pub fn build_body(settings: &RequestSettings, request: &ModelRequest) -> Value {
 fn encode_messages(messages: &[RequestMessage]) -> Vec<Value> {
     let mut encoded: Vec<Value> = Vec::with_capacity(messages.len());
     let mut last_was_result = false;
+    let mut reasoning: &[ReasoningBlock] = &[];
     for message in messages {
+        let held = std::mem::take(&mut reasoning);
         match message {
+            RequestMessage::Reasoning(blocks) => reasoning = blocks,
             RequestMessage::User(text) => {
                 encoded.push(json!({"role": "user", "content": text}));
                 last_was_result = false;
             }
             RequestMessage::Assistant { text, tool_calls } => {
-                let mut content = Vec::with_capacity(tool_calls.len() + 1);
+                let mut content = Vec::with_capacity(tool_calls.len() + held.len() + 1);
+                content.extend(held.iter().filter_map(encode_reasoning));
                 if !text.is_empty() {
                     content.push(json!({"type": "text", "text": text}));
                 }
@@ -110,6 +114,23 @@ fn encode_messages(messages: &[RequestMessage]) -> Vec<Value> {
         }
     }
     encoded
+}
+
+/// A reasoning block as the API wants it back. A thinking block with no
+/// signature did not come from this API, which rejects it, so it is left out.
+fn encode_reasoning(block: &ReasoningBlock) -> Option<Value> {
+    match block {
+        ReasoningBlock::Thinking {
+            text,
+            signature: Some(signature),
+        } => Some(json!({"type": "thinking", "thinking": text, "signature": signature})),
+        ReasoningBlock::Thinking {
+            signature: None, ..
+        } => None,
+        ReasoningBlock::Redacted { data } => {
+            Some(json!({"type": "redacted_thinking", "data": data}))
+        }
+    }
 }
 
 /// The API needs an object for `input`; arguments the model wrote as invalid

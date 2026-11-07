@@ -1336,6 +1336,7 @@ async fn a_store_user_is_not_blocked_while_the_index_walk_runs() {
 
 mod catalog;
 mod hooks;
+mod reasoning;
 mod skills;
 mod switch;
 mod task;

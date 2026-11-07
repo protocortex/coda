@@ -4,7 +4,7 @@
 //! model for the offline run, and a command that decides whether the task is done.
 
 use coda_providers::faux::Turn;
-use coda_providers::model::{ModelEvent, StopReason, Usage};
+use coda_providers::model::{ModelEvent, ReasoningBlock, StopReason, Usage};
 use serde_json::{Value, json};
 
 /// Tokens the scripted model claims for each reply. Cost is measured from the
@@ -80,6 +80,20 @@ fn calls(calls: &[(&str, &str, Value)]) -> Turn {
         events,
         error: None,
     }
+}
+
+/// `turn` with a signed thinking block before everything else it says.
+fn with_reasoning(mut turn: Turn, text: &str) -> Turn {
+    turn.events.insert(
+        0,
+        ModelEvent::Reasoning {
+            block: ReasoningBlock::Thinking {
+                text: text.to_owned(),
+                signature: Some("sig-1".to_owned()),
+            },
+        },
+    );
+    turn
 }
 
 /// A call whose arguments are sent as written, valid JSON or not.
@@ -290,6 +304,28 @@ const REPAIRED_ARGUMENTS: Fixture = Fixture {
     },
 };
 
+const KEPT_REASONING: Fixture = Fixture {
+    name: "kept_reasoning",
+    prompt: "Set mode to fast in config.txt.",
+    files: &[("config.txt", "mode=slow\n")],
+    check: "grep -qx mode=fast config.txt",
+    untrusted: None,
+    guard: None,
+    text_calls: false,
+    script: || {
+        vec![
+            with_reasoning(
+                call(
+                    "edit",
+                    json!({"path": "config.txt", "old_string": "mode=slow", "new_string": "mode=fast"}),
+                ),
+                "The edit tool can change the one line.",
+            ),
+            reply("Set mode=fast in config.txt."),
+        ]
+    },
+};
+
 const TEXT_SHAPED_CALL: Fixture = Fixture {
     name: "text_shaped_call",
     prompt: "Set mode to fast in config.txt.",
@@ -320,5 +356,6 @@ pub fn all() -> Vec<Fixture> {
         FINISHED_TOO_EARLY,
         REPAIRED_ARGUMENTS,
         TEXT_SHAPED_CALL,
+        KEPT_REASONING,
     ]
 }

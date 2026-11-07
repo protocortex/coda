@@ -6,7 +6,7 @@ use coda_config::config::MaxTokensField;
 use serde_json::{Value, json};
 
 use crate::anthropic::request::RequestSettings;
-use crate::model::{ModelRequest, RequestMessage, RequestToolCall, ToolSchema};
+use crate::model::{ModelRequest, ReasoningBlock, RequestMessage, RequestToolCall, ToolSchema};
 
 /// Chat completions has no error flag on a tool message, so a failed call is
 /// marked in its text.
@@ -53,7 +53,7 @@ pub fn build_body(settings: &RequestSettings, wire: WireOptions, request: &Model
     if !system.is_empty() {
         messages.push(json!({"role": "system", "content": system}));
     }
-    messages.extend(request.messages.iter().map(encode_message));
+    encode_messages(&request.messages, &mut messages);
     let mut body = json!({
         "model": settings.model,
         "stream": true,
@@ -71,6 +71,42 @@ pub fn build_body(settings: &RequestSettings, wire: WireOptions, request: &Model
     body
 }
 
+/// The request field that carries reasoning back to a server that wants it.
+const REASONING_FIELD: &str = "reasoning_content";
+
+/// Encodes the history. Reasoning goes back only on a reply that made tool
+/// calls: that is where servers that take it need it, and some refuse it on a
+/// reply that made none. Blocks with a signature came from another API and are
+/// left out.
+fn encode_messages(history: &[RequestMessage], messages: &mut Vec<Value>) {
+    let mut reasoning: &[ReasoningBlock] = &[];
+    for message in history {
+        let held = std::mem::take(&mut reasoning);
+        if let RequestMessage::Reasoning(blocks) = message {
+            reasoning = blocks;
+            continue;
+        }
+        let mut encoded = encode_message(message);
+        if matches!(message, RequestMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty())
+        {
+            let text: String = held
+                .iter()
+                .filter_map(|block| match block {
+                    ReasoningBlock::Thinking {
+                        text,
+                        signature: None,
+                    } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !text.is_empty() {
+                encoded[REASONING_FIELD] = json!(text);
+            }
+        }
+        messages.push(encoded);
+    }
+}
+
 fn encode_tool(tool: &ToolSchema) -> Value {
     json!({"type": "function", "function": {
         "name": tool.name,
@@ -81,6 +117,7 @@ fn encode_tool(tool: &ToolSchema) -> Value {
 
 fn encode_message(message: &RequestMessage) -> Value {
     match message {
+        RequestMessage::Reasoning(_) => unreachable!("reasoning is folded into the reply after it"),
         RequestMessage::User(text) => json!({"role": "user", "content": text}),
         RequestMessage::Assistant { text, tool_calls } => {
             let mut encoded = json!({"role": "assistant", "content": text});

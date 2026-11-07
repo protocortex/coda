@@ -17,8 +17,8 @@ use coda_agents::{Catalog, SkillTool};
 use coda_config::config::{Config, Dirs, ProviderConfig};
 use coda_core::broker::BrokerError;
 use coda_core::history::{
-    ASSISTANT_MESSAGE_KIND, Rebuild, SESSION_STARTED_KIND, TOOL_FINISHED_KIND, assistant_body,
-    empty_text_id, tool_finished_body,
+    ASSISTANT_MESSAGE_KIND, Rebuild, SESSION_STARTED_KIND, TOOL_FINISHED_KIND,
+    assistant_body_with_reasoning, empty_text_id, tool_finished_body,
 };
 pub use coda_core::history::{CONTEXT_OVERFLOW_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND};
 use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
@@ -931,14 +931,26 @@ enum Row {
 /// event is named, so a new one has to be placed here before the daemon builds.
 async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Row {
     match event {
-        TurnEvent::Assistant { text, tool_calls } => {
+        TurnEvent::Assistant {
+            text,
+            tool_calls,
+            reasoning,
+        } => {
             let mut kept = Vec::with_capacity(tool_calls.len());
             for call in tool_calls {
                 kept.push((call, keep_original(hub, session, &call.arguments).await));
             }
+            // A reply that had reasoning always says so, even when the reasoning
+            // could not be kept, so a rebuilt history counts the same messages.
+            let reasoning = if reasoning.is_empty() {
+                None
+            } else {
+                let kept = keep_original(hub, session, &json!(reasoning).to_string()).await;
+                Some(kept.unwrap_or_else(empty_text_id))
+            };
             Row::Stored {
                 kind: ASSISTANT_MESSAGE_KIND,
-                body: assistant_body(text, &kept),
+                body: assistant_body_with_reasoning(text, &kept, reasoning.as_ref()),
             }
         }
         TurnEvent::ToolFinished {
@@ -1171,7 +1183,7 @@ async fn keep_original(hub: &Arc<Hub>, session: &SessionId, text: &str) -> Optio
     {
         Ok(original) => Some(original),
         Err(e) => {
-            warn!(session = %session, error = %e, "could not keep the text of a tool call");
+            warn!(session = %session, error = %e, "could not keep text in the originals");
             None
         }
     }

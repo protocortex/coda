@@ -7,8 +7,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use coda_core::history::{
-    ASSISTANT_MESSAGE_KIND, TOOL_FINISHED_KIND, USER_MESSAGE_KIND, assistant_body, empty_text_id,
-    rebuild, tool_finished_body,
+    ASSISTANT_MESSAGE_KIND, TOOL_FINISHED_KIND, USER_MESSAGE_KIND, assistant_body_with_reasoning,
+    empty_text_id, rebuild, tool_finished_body,
 };
 use coda_core::prompt::{Conversation, Message, Prefix};
 use coda_core::turn::{StopCondition, ToolSet, TurnConfig, TurnEvent, TurnLoop};
@@ -18,7 +18,7 @@ use coda_providers::anthropic::request::{RequestSettings, build_body as anthropi
 use coda_providers::faux::{FauxProvider, Turn};
 use coda_providers::gate::PermissionGate;
 use coda_providers::model::{
-    ModelEvent, ModelProvider, ModelRequest, ModelStream, ProviderError, StopReason,
+    ModelEvent, ModelProvider, ModelRequest, ModelStream, ProviderError, ReasoningBlock, StopReason,
 };
 use coda_providers::openai_compat::request::{WireOptions, build_body as openai_body};
 use coda_providers::tool_request::ToolRequest;
@@ -151,12 +151,18 @@ impl Rig {
         }
         for event in seen {
             match event {
-                TurnEvent::Assistant { text, tool_calls } => {
+                TurnEvent::Assistant {
+                    text,
+                    tool_calls,
+                    reasoning,
+                } => {
                     let kept: Vec<_> = tool_calls
                         .iter()
                         .map(|call| (call, Some(self.keep(call.arguments.clone()))))
                         .collect();
-                    let body = assistant_body(&text, &kept);
+                    let reasoning =
+                        (!reasoning.is_empty()).then(|| self.keep(json!(reasoning).to_string()));
+                    let body = assistant_body_with_reasoning(&text, &kept, reasoning.as_ref());
                     self.store(ASSISTANT_MESSAGE_KIND, &body);
                 }
                 TurnEvent::ToolFinished {
@@ -232,6 +238,32 @@ fn config(session: SessionId) -> TurnConfig {
         token_limit: 1_000_000,
         compact_threshold_bytes: 1024,
     }
+}
+
+#[tokio::test]
+async fn replayed_reasoning_comes_back_before_its_reply_exactly_as_the_live_loop_held_it() {
+    // Arrange
+    let thinking = ReasoningBlock::Thinking {
+        text: "call it".to_owned(),
+        signature: Some("sig".to_owned()),
+    };
+    let mut call = tool_turn(&[("c1", "{}")]);
+    call.events.insert(
+        0,
+        ModelEvent::Reasoning {
+            block: thinking.clone(),
+        },
+    );
+    let mut rig = Rig::new(vec![call, text_turn("done")]);
+
+    // Act
+    rig.send("go").await;
+
+    // Assert
+    let live = rig.turn_loop.conversation().messages().to_vec();
+    assert_eq!(live[1], Message::Reasoning(vec![thinking]));
+    assert_eq!(live.len(), 5, "{live:?}");
+    assert_eq!(rig.replayed(), live);
 }
 
 #[tokio::test]

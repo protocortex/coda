@@ -14,8 +14,8 @@ use coda_providers::anthropic::Timing;
 use coda_providers::anthropic::provider::IDLE_CHECK_INTERVAL;
 use coda_providers::anthropic::request::{RequestSettings, ToolSchema};
 use coda_providers::model::{
-    Clock, ModelEvent, ModelProvider, ModelRequest, ProviderError, RequestMessage, RequestToolCall,
-    Sleeper, StopReason, Usage,
+    Clock, ModelEvent, ModelProvider, ModelRequest, ProviderError, ReasoningBlock, RequestMessage,
+    RequestToolCall, Sleeper, StopReason, Usage,
 };
 use coda_providers::openai_compat::classify_status;
 use coda_providers::openai_compat::provider::{OpenAiCompatOptions, OpenAiCompatProvider};
@@ -1151,4 +1151,131 @@ async fn a_hand_written_stream_in_the_servers_usual_shape_replays_to_the_expecte
 #[ignore = "needs a stream recorded from a real server under CODA_LIVE_TESTS; no recording exists yet"]
 async fn a_recorded_real_stream_replays_to_the_expected_events() {
     unimplemented!("parked until a real stream is recorded");
+}
+
+fn reasoning(text: &str) -> ModelEvent {
+    ModelEvent::Reasoning {
+        block: ReasoningBlock::Thinking {
+            text: text.to_owned(),
+            signature: None,
+        },
+    }
+}
+
+#[tokio::test]
+async fn reasoning_fields_and_think_tags_are_kept_out_of_the_answer_text() {
+    let cases: Vec<(&str, String, Vec<ModelEvent>)> = vec![
+        (
+            "the reasoning_content field",
+            chunk(&json!({"reasoning_content": "hm"}), None)
+                + &chunk(&json!({"reasoning_content": "m"}), None)
+                + &chunk(&json!({"content": "Hi"}), None)
+                + &chunk(&json!({}), Some("stop"))
+                + &usage_chunk()
+                + DONE,
+            vec![
+                text("Hi"),
+                reasoning("hmm"),
+                usage(3, 2),
+                stop(StopReason::EndTurn),
+            ],
+        ),
+        (
+            "the reasoning field",
+            chunk(&json!({"reasoning": "ok"}), None)
+                + &chunk(&json!({"content": "Hi"}), None)
+                + &chunk(&json!({}), Some("stop"))
+                + &usage_chunk()
+                + DONE,
+            vec![
+                text("Hi"),
+                reasoning("ok"),
+                usage(3, 2),
+                stop(StopReason::EndTurn),
+            ],
+        ),
+        (
+            "think tags cut across three chunks",
+            text_stream(&["<th", "ink>plan", "</thi", "nk>Done"]),
+            vec![
+                text("Done"),
+                reasoning("plan"),
+                usage(3, 2),
+                stop(StopReason::EndTurn),
+            ],
+        ),
+        (
+            "text that only looks like a tag is kept",
+            text_stream(&["a <think> b"]),
+            vec![text("a <think> b"), usage(3, 2), stop(StopReason::EndTurn)],
+        ),
+        (
+            "a stream with no reasoning has no reasoning event",
+            text_stream(&["plain"]),
+            vec![text("plain"), usage(3, 2), stop(StopReason::EndTurn)],
+        ),
+    ];
+    for (name, body, expected) in cases {
+        // Arrange
+        let mock = start(vec![sse(&body)]);
+
+        // Act
+        let (collected, _) = run(&mock).await;
+
+        // Assert
+        assert_eq!(collected.error, None, "{name}");
+        assert_eq!(collected.events, expected, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn reasoning_goes_back_only_on_a_reply_that_made_tool_calls() {
+    // Arrange
+    let mock = start(vec![sse(&text_stream(&["ok"]))]);
+    let (provider, _sleeper, _clock) = provider(&mock);
+    let thought = ReasoningBlock::Thinking {
+        text: "plan".to_owned(),
+        signature: None,
+    };
+    let signed = ReasoningBlock::Thinking {
+        text: "other api".to_owned(),
+        signature: Some("sig".to_owned()),
+    };
+    let call = RequestToolCall {
+        id: "c1".to_owned(),
+        name: "read".to_owned(),
+        arguments: "{}".to_owned(),
+    };
+    let request = ModelRequest {
+        messages: vec![
+            RequestMessage::User("go".to_owned()),
+            RequestMessage::Reasoning(vec![thought.clone(), signed]),
+            RequestMessage::Assistant {
+                text: String::new(),
+                tool_calls: vec![call],
+            },
+            RequestMessage::Reasoning(vec![thought]),
+            RequestMessage::Assistant {
+                text: "done".to_owned(),
+                tool_calls: Vec::new(),
+            },
+        ],
+        ..ModelRequest::default()
+    };
+
+    // Act
+    let collected = collect(&provider, request, WAIT).await;
+
+    // Assert
+    assert_eq!(collected.error, None);
+    let requests = mock.requests.lock().expect("lock");
+    let messages = requests[0].body["messages"].as_array().expect("messages");
+    let assistants: Vec<&Value> = messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 2);
+    assert_eq!(assistants[0]["reasoning_content"], "plan");
+    assert_eq!(assistants[1].get("reasoning_content"), None);
+    assert!(messages.iter().all(|message| !message.is_null()));
 }

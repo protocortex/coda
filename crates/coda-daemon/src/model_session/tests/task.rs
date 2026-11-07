@@ -911,6 +911,7 @@ async fn a_reply_a_tool_result_and_a_context_overflow_are_the_events_that_become
         TurnEvent::Assistant {
             text: "hi".to_owned(),
             tool_calls: Vec::new(),
+            reasoning: Vec::new(),
         },
         TurnEvent::ToolFinished {
             tool: "read".to_owned(),

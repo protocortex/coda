@@ -22,6 +22,7 @@ pub mod policy;
 pub mod registry;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod think;
 mod tool_call;
 pub mod tool_request;
 mod websocket;
