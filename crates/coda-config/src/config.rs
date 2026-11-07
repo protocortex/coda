@@ -12,6 +12,9 @@ use crate::checkpoints::{
     CHECKPOINTS_KEY, CheckpointsConfig, KEEP_DAYS_KEY, KEEP_TURNS_KEY, PRUNE_KEY, REWIND_DAYS_KEY,
 };
 use crate::checks::CheckConfig;
+use crate::describe::{
+    DESCRIBE_KEY, DescribeConfig, LABEL_NAME_KEY, LABEL_USE_WHEN_KEY, LABELS_KEY,
+};
 use crate::hooks::{HookConfig, MAX_TIMEOUT_MS};
 use crate::loop_guard::{
     LOOP_GUARD_KEY, LoopGuardConfig, MIN_WARN_AFTER, STOP_AFTER_KEY, WARN_AFTER_KEY,
@@ -306,6 +309,8 @@ pub struct Config {
     pub worktree: WorktreeConfig,
     /// When old checkpoint refs are removed.
     pub checkpoints: CheckpointsConfig,
+    /// Labels `coda describe --labels` may suggest.
+    pub describe: DescribeConfig,
 }
 
 impl Default for Config {
@@ -328,6 +333,7 @@ impl Default for Config {
             tui: TuiConfig::default(),
             worktree: WorktreeConfig::default(),
             checkpoints: CheckpointsConfig::default(),
+            describe: DescribeConfig::default(),
         }
     }
 }
@@ -367,6 +373,7 @@ impl Config {
         config.check_hooks()?;
         config.check_checks()?;
         config.check_review()?;
+        config.check_describe()?;
         config.check_loop_guard()?;
         config.check_parallel_tools()?;
         config.check_worktree()?;
@@ -525,6 +532,34 @@ impl Config {
                     });
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn check_describe(&self) -> Result<(), ConfigError> {
+        let mut seen: Vec<String> = Vec::new();
+        for (index, rule) in self.describe.labels.iter().enumerate() {
+            let path = |key: &str| format!("{DESCRIBE_KEY}.{LABELS_KEY}.{index}.{key}");
+            if rule.name.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    path: path(LABEL_NAME_KEY),
+                    allowed: "a label name that is not empty".to_owned(),
+                });
+            }
+            if rule.use_when.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    path: path(LABEL_USE_WHEN_KEY),
+                    allowed: "a line that says when the label fits".to_owned(),
+                });
+            }
+            let name = rule.name.trim().to_lowercase();
+            if seen.contains(&name) {
+                return Err(ConfigError::InvalidValue {
+                    path: path(LABEL_NAME_KEY),
+                    allowed: format!("a name not used before, and `{}` is", rule.name),
+                });
+            }
+            seen.push(name);
         }
         Ok(())
     }
@@ -1268,6 +1303,44 @@ idle_timeout_ms = 1500
         assert_eq!(custom.review.routing.rules.len(), 2);
         assert_eq!(custom.review.routing.rules[0].max_hunks, Some(3));
         assert_eq!(custom.review.routing.rules[1].model, "strong");
+    }
+
+    #[test]
+    fn describe_labels_are_read_and_a_blank_or_repeated_one_is_rejected() {
+        // Arrange
+        let set = "[[describe.labels]]\nname = \"bug\"\nuse_when = \"the change fixes a defect\"\n";
+        let no_name = "[[describe.labels]]\nname = \" \"\nuse_when = \"x\"\n";
+        let no_line = "[[describe.labels]]\nname = \"bug\"\nuse_when = \"\"\n";
+        let twice = "[[describe.labels]]\nname = \"Bug\"\nuse_when = \"x\"\n\
+            [[describe.labels]]\nname = \"bug\"\nuse_when = \"y\"\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config;
+        let custom = Config::from_toml_str(set).unwrap().config;
+        let errors = [no_name, no_line, twice].map(|text| Config::from_toml_str(text).unwrap_err());
+
+        // Assert
+        assert_eq!(default.describe.labels, []);
+        assert_eq!(custom.describe.labels[0].name, "bug");
+        assert_eq!(
+            custom.describe.labels[0].use_when,
+            "the change fixes a defect"
+        );
+        let paths: Vec<&str> = errors
+            .iter()
+            .map(|e| match e {
+                ConfigError::InvalidValue { path, .. } => path.as_str(),
+                other => panic!("{other}"),
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "describe.labels.0.name",
+                "describe.labels.0.use_when",
+                "describe.labels.1.name"
+            ]
+        );
     }
 
     #[test]

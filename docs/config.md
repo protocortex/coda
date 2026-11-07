@@ -231,6 +231,34 @@ For a pull request target, `coda review` remembers each run in the database: the
 
 When a review ends, standard error shows a one-line report: backend, model, wall time, parts, whether a part moved to another backend (with the lines of the moves), the verifier's backend, and the tokens the backends reported, only when they reported any (the total covers the runs that did). The same report is added as one line of JSON to `review-runs.jsonl` in the data directory (`~/.config/coda/data` unless `CODA_HOME` says otherwise), with the time as `at` in seconds since the epoch, `partial`, `findings` and `context_files` and `checks_run`. The line holds counts and names only: no diff, finding or file text. A review that fails writes no line, and a file that cannot be written is a note on standard error.
 
+## `[describe]`
+
+The labels `coda describe --labels` may suggest. Only the global config sets them.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `labels` | array of tables | none | Each has `name` (the label as the repository spells it) and `use_when` (one line that says when it fits, which the model reads). Neither may be empty, and a name may not repeat, ignoring case. |
+
+```toml
+[[describe.labels]]
+name = "bug"
+use_when = "the change fixes a defect"
+```
+
+A label that is not in this list is never suggested, and one that the repository does not have is left out too.
+
+## `coda describe`
+
+`coda describe [<target>]` reads a change the way `coda review` does (a pull request number or URL, a branch, a range, `--staged`, or the current branch against the default branch), has the built-in `describer` agent look at it, and prints a draft: a title of one line and at most 100 characters, a summary, and a note for each file that matters. It writes nothing unless you pass `--apply`. The ignore rules of `[review.ignore]` apply, and a change that does not fit `[review] diff_budget_chars` is described from its first part only, which standard error says. The agent's text is checked: a note on a file the change does not have is dropped, and an answer that is not the format asked for is asked for again once. The diff is marked as untrusted data in the prompt. On a model-API backend the packed diff goes through `.coda/review/describe-<pid>.txt`, removed when the command ends.
+
+| Flag | Meaning |
+| --- | --- |
+| `coda describe --staged`, `--instructions <text>`, `--json`, `--backend <name>`, `--cwd <dir>` | As for `coda review`. |
+| `coda describe --labels` | Also suggest labels. They come from `[[describe.labels]]` and must exist in the repository (read with `gh label list`); a label the model names that is not on that list is dropped and counted on standard error. |
+| `coda describe --apply` | Needs a pull request target. After a preview and a `y` (or with `--yes`, which is required when standard input is not a terminal), puts the draft in the pull request's body and adds the suggested labels. |
+
+`coda describe --apply` puts the draft in the body as a block between `<!-- coda:describe:start -->` and `<!-- coda:describe:end -->`. The text above and below the block is not touched. A rerun replaces only what is between the markers, or adds the block after your text when there is none, and the model's text cannot open a tag, a heading or a mention, name an issue (`#12` and `owner/repo#12` get an invisible space, so merging cannot close one) or make a link or an image with `[text](url)`; a bare URL still becomes a link, so read the preview. A body that has one marker and not the other is left alone, with an error. `--apply` never removes a label, never changes the title and adds a label only when `--labels` is given and the pull request lacks it. It writes with one `gh pr edit`, so the body and the labels change together or not at all. A label with a comma or a quote in its name is never suggested, since `gh` splits and quotes that text. For a pull request URL, the labels are read from the repository of that URL. Without `--apply` nothing is written to GitHub or to a file, and the preview and the question go to standard error. It runs only `gh`, as your own login.
+
 ## `[review.hook]`
 
 `coda hooks install review` writes a pre-push hook (in the hooks directory git uses, so a `core.hooksPath` is honored) that runs `coda review --hook`, and `coda hooks remove review` deletes it. Coda refuses to overwrite or delete a pre-push hook it did not write. The hook script does nothing, and nothing is reviewed, until the global config sets `enabled`; the repository's `.coda/review.toml` cannot turn it on.
