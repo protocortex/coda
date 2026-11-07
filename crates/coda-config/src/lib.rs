@@ -5,6 +5,7 @@
 pub mod checkpoints;
 pub mod checks;
 pub mod config;
+pub mod daemon;
 pub mod describe;
 pub mod hooks;
 pub mod loop_guard;

@@ -12,6 +12,7 @@ use crate::checkpoints::{
     CHECKPOINTS_KEY, CheckpointsConfig, KEEP_DAYS_KEY, KEEP_TURNS_KEY, PRUNE_KEY, REWIND_DAYS_KEY,
 };
 use crate::checks::CheckConfig;
+use crate::daemon::DaemonConfig;
 use crate::describe::{
     DESCRIBE_KEY, DescribeConfig, LABEL_NAME_KEY, LABEL_USE_WHEN_KEY, LABELS_KEY,
 };
@@ -334,6 +335,8 @@ pub struct Config {
     pub loop_guard: LoopGuardConfig,
     /// Settings of the terminal UI.
     pub tui: TuiConfig,
+    /// How the daemon treats work a restart cut short.
+    pub daemon: DaemonConfig,
     /// Where session worktrees go and what runs in a new one.
     pub worktree: WorktreeConfig,
     /// When old checkpoint refs are removed.
@@ -360,6 +363,7 @@ impl Default for Config {
             review: ReviewConfig::default(),
             loop_guard: LoopGuardConfig::default(),
             tui: TuiConfig::default(),
+            daemon: DaemonConfig::default(),
             worktree: WorktreeConfig::default(),
             checkpoints: CheckpointsConfig::default(),
             describe: DescribeConfig::default(),
@@ -926,6 +930,21 @@ mod tests {
 
     fn parse(s: &str) -> Parsed {
         Config::from_toml_str(s).expect("valid config")
+    }
+
+    #[test]
+    fn continuing_after_a_restart_is_off_until_the_daemon_table_turns_it_on() {
+        // Arrange
+        let on = "[daemon]\ncontinue_after_restart = true\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config.daemon;
+        let set = Config::from_toml_str(on).unwrap();
+
+        // Assert
+        assert!(!default.continue_after_restart);
+        assert!(set.config.daemon.continue_after_restart);
+        assert_eq!(set.unknown_keys, Vec::<String>::new());
     }
 
     #[test]

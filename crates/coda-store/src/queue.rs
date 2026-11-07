@@ -118,6 +118,49 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// How many turns of `session` began with a user message of exactly `text`
+    /// within the last `window_ms` milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the query fails.
+    pub fn recent_user_messages(
+        &self,
+        session: &SessionId,
+        text: &str,
+        window_ms: i64,
+    ) -> Result<u32, StoreError> {
+        let Some(row) = session_row_id(session) else {
+            return Ok(0);
+        };
+        let since = self.clock.now_ms().saturating_sub(window_ms);
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM events e JOIN turns t ON t.id = e.turn_id \
+             WHERE t.session_id = ?1 AND e.kind = 'user_message' \
+             AND json_extract(e.body, '$.text') = ?2 AND e.at >= ?3",
+            params![row, text, since],
+            |r| r.get::<_, u32>(0),
+        )?;
+        Ok(count)
+    }
+
+    /// The sessions that hold a waiting message of exactly `text`, oldest session first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the query fails.
+    pub fn sessions_waiting_with(&self, text: &str) -> Result<Vec<SessionId>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT session_id FROM queued_messages WHERE text = ?1 ORDER BY session_id",
+        )?;
+        let rows = stmt.query_map([text], |r| r.get::<_, i64>(0))?;
+        let ids = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(ids
+            .into_iter()
+            .map(|id| SessionId::new(id.to_string()))
+            .collect())
+    }
+
     /// Removes one waiting message. Returns whether it was there, so a second
     /// removal, or one for another session's message, is not an error.
     ///

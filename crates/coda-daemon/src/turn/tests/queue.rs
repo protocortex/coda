@@ -194,3 +194,34 @@ async fn a_plain_send_to_a_held_session_releases_the_queue_behind_it() {
     rig.respond(&last, "allow_once").await;
     rig.wait_until_idle().await;
 }
+
+#[tokio::test]
+async fn a_continuation_queued_at_startup_starts_when_asked() {
+    // Arrange
+    let mut rig = Rig::new(relaxed(), Vec::new());
+    let id = rig.session.clone();
+    rig.hub
+        .with_store_mut(move |store| {
+            store.enqueue_message(
+                &id,
+                coda_store::NewQueued {
+                    text: "carry on",
+                    max_turns: None,
+                    token_cap: None,
+                },
+            )
+        })
+        .await
+        .unwrap();
+
+    // Act
+    rig.turns
+        .start_continuations(std::slice::from_ref(&rig.session));
+
+    // Assert
+    wait_for_user_messages(&rig, 1).await;
+    assert_eq!(user_messages(&rig).await, ["carry on"]);
+    let request = rig.wait_for_pending().await;
+    rig.respond(&request, "allow_once").await;
+    rig.wait_until_idle().await;
+}

@@ -162,6 +162,12 @@ Each value is an integer number of milliseconds. A key left out keeps its defaul
 
 A different argument or a changed result starts the count again, so a poll whose output changes never trips the guard. The count also starts again with each new message you send. Identical calls in one reply count one by one. The same thresholds apply to sub-agents.
 
+## `[daemon]`
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `continue_after_restart` | boolean | `false` | When the daemon starts and finds a turn that a restart cut short, queue a fixed message for that session and start it once the daemon is up. The message tells the agent that the daemon restarted and to check whether its last state-changing action (a file edit, a command, a commit, a push) took effect before repeating it, then to carry on. The session resumes its backend conversation through the stored backend session id. A turn that was waiting for a permission prompt is not continued, since nobody answered the prompt. A session that already has waiting messages keeps them and gets no continuation. A session gets at most 3 continuations in 5 minutes, so a crash loop does not keep restarting the same work. The message shows in the transcript as a user message. |
+
 ## `[tui]`
 
 | Key | Type | Default | Notes |
@@ -442,6 +448,9 @@ token_cap = 500000
 [loop_guard]
 warn_after = 3
 stop_after = 5
+
+[daemon]
+continue_after_restart = true
 
 [tui]
 notify = "osc777"

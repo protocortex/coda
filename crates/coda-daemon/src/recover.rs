@@ -5,9 +5,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use coda_protocol::events::{Event, InterruptCause};
+use coda_protocol::events::{Event, InterruptCause, TIMEOUT_KIND};
 use coda_protocol::types::{SessionId, TurnId};
-use coda_store::{LogEventKind, Store};
+use coda_store::{LogEventKind, NewQueued, Store};
 use tracing::{info, warn};
 
 use crate::reaper::{ReapReport, expire_requests, reap};
@@ -17,11 +17,23 @@ use crate::turn::{log_event, store_event};
 /// Stored event kind of a turn that a restart cut short.
 const INTERRUPTED_KIND: &str = "turn_interrupted";
 
+/// What the agent is told when it resumes a turn the restart cut short.
+pub const CONTINUE_PROMPT: &str = "The daemon restarted while you were working, and your last turn was cut short. Before you repeat any action that changes state (a file edit, a command, a commit, a push), check whether it already took effect. Then carry on with the task.";
+
+/// Most continuations one session gets inside [`CONTINUE_WINDOW_MS`], so a
+/// crash loop does not keep restarting the same work.
+pub const MAX_CONTINUATIONS: u32 = 3;
+
+/// The span, in milliseconds, over which [`MAX_CONTINUATIONS`] counts.
+pub const CONTINUE_WINDOW_MS: i64 = 5 * 60 * 1000;
+
 /// What a startup recovery did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     /// Turns that were still running when the previous daemon died.
     pub interrupted: u32,
+    /// Sessions that now hold a queued continuation, ready to start.
+    pub continued: Vec<SessionId>,
     /// Orphaned backends and permission requests cleaned up.
     pub reaped: ReapReport,
 }
@@ -31,40 +43,127 @@ pub struct RecoveryReport {
 /// while holding the instance lock, so no live daemon owns what it finds.
 /// A second run finds nothing left to do.
 pub async fn recover(pidfile_dir: &Path, hub: &Arc<Hub>) -> RecoveryReport {
+    recover_and_continue(pidfile_dir, hub, false).await
+}
+
+/// [`recover`], and with `continue_after_restart` it also queues
+/// [`CONTINUE_PROMPT`] for each turn the restart cut short. The caller starts
+/// the sessions in [`RecoveryReport::continued`] once its turns are ready. A turn
+/// that waited on a permission prompt is not continued, since the user never
+/// answered it, and a session already holding waiting messages keeps them.
+pub async fn recover_and_continue(
+    pidfile_dir: &Path,
+    hub: &Arc<Hub>,
+    continue_after_restart: bool,
+) -> RecoveryReport {
     info!(step = "interrupt_turns", "interrupting turns left running");
-    let interrupted = interrupt_turns(hub).await;
+    let (interrupted, mut continued) = interrupt_turns(hub, continue_after_restart).await;
+    if continue_after_restart {
+        continued.extend(stranded_continuations(hub, &continued).await);
+    }
     let reaped = reap(pidfile_dir, hub).await;
     RecoveryReport {
         interrupted,
+        continued,
         reaped,
     }
 }
 
-async fn interrupt_turns(hub: &Arc<Hub>) -> u32 {
+async fn interrupt_turns(hub: &Arc<Hub>, continue_after_restart: bool) -> (u32, Vec<SessionId>) {
     let running = match hub.with_store(Store::unfinished_turns).await {
         Ok(running) => running,
         Err(e) => {
             warn!(error = %e, "could not list the turns left running");
-            return 0;
+            return (0, Vec::new());
         }
     };
     let mut interrupted = 0;
+    let mut continued = Vec::new();
     for (session, turn) in running {
         match interrupt_turn(hub, &session, &turn).await {
-            Ok(()) => interrupted += 1,
+            Ok(waited_on_prompt) => {
+                interrupted += 1;
+                if continue_after_restart
+                    && !waited_on_prompt
+                    && queue_continuation(hub, &session).await
+                {
+                    continued.push(session);
+                }
+            }
             Err(e) => {
                 warn!(session = %session, turn = %turn, error = %e, "could not interrupt a turn");
             }
         }
     }
-    interrupted
+    (interrupted, continued)
+}
+
+/// Sessions that still hold a continuation from an earlier start that died
+/// before it ran, or could not run, and that are not already in `known`.
+async fn stranded_continuations(hub: &Arc<Hub>, known: &[SessionId]) -> Vec<SessionId> {
+    let waiting = hub
+        .with_store(|store| store.sessions_waiting_with(CONTINUE_PROMPT))
+        .await;
+    let waiting = match waiting {
+        Ok(waiting) => waiting,
+        Err(e) => {
+            warn!(error = %e, "could not look for continuations left in the queue");
+            return Vec::new();
+        }
+    };
+    let mut stranded = Vec::new();
+    for session in waiting {
+        if known.contains(&session) {
+            continue;
+        }
+        let id = session.clone();
+        let used = hub
+            .with_store(move |store| {
+                store.recent_user_messages(&id, CONTINUE_PROMPT, CONTINUE_WINDOW_MS)
+            })
+            .await;
+        if used.is_ok_and(|used| used < MAX_CONTINUATIONS) {
+            stranded.push(session);
+        }
+    }
+    stranded
+}
+
+/// Queues the continuation unless the session already used its share of them
+/// or holds messages of its own. Returns whether it queued one.
+async fn queue_continuation(hub: &Arc<Hub>, session: &SessionId) -> bool {
+    let id = session.clone();
+    let queued = hub
+        .with_store_mut(move |store| {
+            let used = store.recent_user_messages(&id, CONTINUE_PROMPT, CONTINUE_WINDOW_MS)?;
+            if used >= MAX_CONTINUATIONS || !store.queued_messages(&id)?.is_empty() {
+                return Ok(false);
+            }
+            store.enqueue_message(
+                &id,
+                NewQueued {
+                    text: CONTINUE_PROMPT,
+                    max_turns: None,
+                    token_cap: None,
+                },
+            )?;
+            Ok(true)
+        })
+        .await;
+    match queued {
+        Ok(queued) => queued,
+        Err(e) => {
+            warn!(session = %session, error = %e, "could not queue a continuation");
+            false
+        }
+    }
 }
 
 async fn interrupt_turn(
     hub: &Arc<Hub>,
     session: &SessionId,
     turn: &TurnId,
-) -> Result<(), HubError> {
+) -> Result<bool, HubError> {
     let (id, turn_id) = (session.clone(), turn.clone());
     // A start that died between the event and the end leaves the event behind.
     let marked = hub
@@ -83,6 +182,12 @@ async fn interrupt_turn(
     // The prompts the turn was waiting on can never be answered now.
     let id = session.clone();
     let open = hub.with_store(move |store| store.list_pending(&id)).await?;
+    // A start that died after it resolved the prompts finds none open, but the
+    // timeout events it stored still show that the turn waited on one.
+    let (id, turn_id) = (session.clone(), turn.clone());
+    let expired_before = hub
+        .with_store(move |store| store.turn_has_event(&id, &turn_id, TIMEOUT_KIND))
+        .await?;
     expire_requests(hub, session, turn, &open).await?;
     let (id, turn_id) = (session.clone(), turn.clone());
     hub.with_store_mut(move |store| {
@@ -90,7 +195,8 @@ async fn interrupt_turn(
         store.record_log_event(&log_event(LogEventKind::Error, &id, &turn_id))?;
         store.end_turn(&id, &turn_id)
     })
-    .await
+    .await?;
+    Ok(!open.is_empty() || expired_before)
 }
 
 #[cfg(all(test, unix))]
@@ -101,7 +207,7 @@ mod tests {
     use coda_store::{EventRecord, NewPending, NewSession, Store};
     use tempfile::TempDir;
 
-    use super::recover;
+    use super::{CONTINUE_PROMPT, MAX_CONTINUATIONS, recover, recover_and_continue};
     use crate::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
 
     struct Rig {
@@ -271,5 +377,191 @@ mod tests {
         assert_eq!(placed, [("turn_interrupted", &turn), ("timeout", &turn)]);
         assert_eq!(report.interrupted, 1);
         assert_eq!((next.as_str(), open.len()), ("2", 0));
+    }
+
+    async fn queued(rig: &Rig) -> Vec<String> {
+        let id = rig.session.clone();
+        rig.hub
+            .with_store(move |store| store.queued_messages(&id))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.text)
+            .collect()
+    }
+
+    async fn begin(rig: &Rig) {
+        let id = rig.session.clone();
+        rig.hub
+            .with_store_mut(move |store| store.begin_turn(&id))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cut_short_turn_gets_a_queued_continuation_when_asked() {
+        // Arrange
+        let rig = Rig::new();
+        begin(&rig).await;
+
+        // Act
+        let report = recover_and_continue(&rig.dir.path().join("run"), &rig.hub, true).await;
+
+        // Assert
+        assert_eq!(report.continued, std::slice::from_ref(&rig.session));
+        assert_eq!(queued(&rig).await, [CONTINUE_PROMPT]);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_queued_unless_asked() {
+        // Arrange
+        let rig = Rig::new();
+        begin(&rig).await;
+
+        // Act
+        let report = recover_and_continue(&rig.dir.path().join("run"), &rig.hub, false).await;
+
+        // Assert
+        assert_eq!(report.continued, Vec::<SessionId>::new());
+        assert_eq!(queued(&rig).await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_waited_on_a_prompt_is_not_continued() {
+        // Arrange
+        let rig = Rig::new();
+        let id = rig.session.clone();
+        let pending = NewPending {
+            session: id.clone(),
+            tool: "bash".to_owned(),
+            repo_path: "/work".to_owned(),
+            command: "ls".to_owned(),
+            agent: None,
+            reason: None,
+        };
+        rig.hub
+            .with_store_mut(move |store| {
+                store.begin_turn(&id)?;
+                store.add_pending(&pending)
+            })
+            .await
+            .unwrap();
+
+        // Act
+        let report = recover_and_continue(&rig.dir.path().join("run"), &rig.hub, true).await;
+
+        // Assert
+        assert_eq!(report.interrupted, 1);
+        assert_eq!(report.continued, Vec::<SessionId>::new());
+        assert_eq!(queued(&rig).await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_session_past_its_continuations_gets_no_more() {
+        // Arrange
+        let rig = Rig::new();
+        let id = rig.session.clone();
+        rig.hub
+            .with_store_mut(move |store| {
+                for _ in 0..MAX_CONTINUATIONS {
+                    let turn = store.begin_turn(&id)?;
+                    let record = EventRecord {
+                        kind: "user_message".to_owned(),
+                        body: serde_json::json!({ "text": CONTINUE_PROMPT }).to_string(),
+                    };
+                    store.append_event(&id, &turn, &record)?;
+                    store.end_turn(&id, &turn)?;
+                }
+                store.begin_turn(&id)
+            })
+            .await
+            .unwrap();
+
+        // Act
+        let report = recover_and_continue(&rig.dir.path().join("run"), &rig.hub, true).await;
+
+        // Assert
+        assert_eq!(report.interrupted, 1);
+        assert_eq!(report.continued, Vec::<SessionId>::new());
+    }
+
+    #[tokio::test]
+    async fn waiting_messages_keep_their_place_over_a_continuation() {
+        // Arrange
+        let rig = Rig::new();
+        begin(&rig).await;
+        let id = rig.session.clone();
+        rig.hub
+            .with_store_mut(move |store| {
+                store.enqueue_message(
+                    &id,
+                    coda_store::NewQueued {
+                        text: "mine",
+                        max_turns: None,
+                        token_cap: None,
+                    },
+                )
+            })
+            .await
+            .unwrap();
+
+        // Act
+        let report = recover_and_continue(&rig.dir.path().join("run"), &rig.hub, true).await;
+
+        // Assert
+        assert_eq!(report.continued, Vec::<SessionId>::new());
+        assert_eq!(queued(&rig).await, ["mine"]);
+    }
+
+    #[tokio::test]
+    async fn a_continuation_left_in_the_queue_is_started_again() {
+        // Arrange
+        let rig = Rig::new();
+        let id = rig.session.clone();
+        rig.hub
+            .with_store_mut(move |store| {
+                store.enqueue_message(
+                    &id,
+                    coda_store::NewQueued {
+                        text: CONTINUE_PROMPT,
+                        max_turns: None,
+                        token_cap: None,
+                    },
+                )
+            })
+            .await
+            .unwrap();
+
+        // Act
+        let report = recover_and_continue(&rig.dir.path().join("run"), &rig.hub, true).await;
+
+        // Assert
+        assert_eq!(report.continued, std::slice::from_ref(&rig.session));
+        assert_eq!(queued(&rig).await, [CONTINUE_PROMPT]);
+    }
+
+    #[tokio::test]
+    async fn a_turn_whose_prompts_expired_in_an_earlier_start_is_not_continued() {
+        // Arrange
+        let rig = Rig::new();
+        let id = rig.session.clone();
+        rig.hub
+            .with_store_mut(move |store| {
+                let turn = store.begin_turn(&id)?;
+                let record = EventRecord {
+                    kind: coda_protocol::events::TIMEOUT_KIND.to_owned(),
+                    body: "{}".to_owned(),
+                };
+                store.append_event(&id, &turn, &record)
+            })
+            .await
+            .unwrap();
+
+        // Act
+        let report = recover_and_continue(&rig.dir.path().join("run"), &rig.hub, true).await;
+
+        // Assert
+        assert_eq!(report.interrupted, 1);
+        assert_eq!(report.continued, Vec::<SessionId>::new());
     }
 }

@@ -35,6 +35,70 @@ fn open() -> (TempDir, Store, SessionId) {
 }
 
 #[test]
+fn recent_user_messages_count_only_those_inside_the_window() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let clock = std::sync::Arc::new(ManualClock::default());
+    let mut store = Store::open_with_clock(&dir.path().join("data"), clock.clone()).unwrap();
+    let session = new_session(&mut store);
+    let say = |store: &mut Store| {
+        let turn = store.begin_turn(&session).unwrap();
+        let record = coda_store::EventRecord {
+            kind: "user_message".to_owned(),
+            body: serde_json::json!({ "text": "again" }).to_string(),
+        };
+        store.append_event(&session, &turn, &record).unwrap();
+        store.end_turn(&session, &turn).unwrap();
+    };
+    say(&mut store);
+    clock.advance(WINDOW + 1);
+    say(&mut store);
+
+    // Act
+    let inside = store
+        .recent_user_messages(&session, "again", WINDOW)
+        .unwrap();
+    let other = store
+        .recent_user_messages(&session, "other", WINDOW)
+        .unwrap();
+
+    // Assert
+    assert_eq!((inside, other), (1, 0));
+}
+
+#[test]
+fn sessions_waiting_with_a_text_are_listed_once() {
+    // Arrange
+    let (_dir, mut store, session) = open();
+    store.enqueue_message(&session, plain("go")).unwrap();
+    store.enqueue_message(&session, plain("go")).unwrap();
+    store.enqueue_message(&session, plain("other")).unwrap();
+
+    // Act
+    let found = store.sessions_waiting_with("go").unwrap();
+
+    // Assert
+    assert_eq!(found, [session]);
+}
+
+#[derive(Debug, Default)]
+struct ManualClock(std::sync::atomic::AtomicI64);
+
+impl ManualClock {
+    fn advance(&self, ms: i64) {
+        self.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl coda_store::Clock for ManualClock {
+    fn now_ms(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+const WINDOW: i64 = 1_000;
+
+#[test]
 fn messages_come_back_oldest_first() {
     // Arrange
     let (_dir, mut store, session) = open();
