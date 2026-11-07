@@ -143,6 +143,9 @@ pub enum SessionCommand {
     Show(SessionShowArgs),
     /// Put the files back as an earlier turn left them and roll the later turns back.
     Rewind(SessionRewindArgs),
+    /// Start a new session from a turn of a Claude Code or Codex session. The fork
+    /// shares the folder and is told the earlier turns when you first send to it.
+    Fork(SessionForkArgs),
     /// Commit what a session changed; with --push also push the branch, with --pr also open a
     /// draft pull request. Nothing runs until you call it.
     Ship(SessionShipArgs),
@@ -183,6 +186,18 @@ pub struct WorktreeCleanArgs {
     #[arg(long)]
     pub apply: bool,
     /// Print the report as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionForkArgs {
+    /// The session to fork.
+    pub session: String,
+    /// The last turn the fork keeps; the latest turn that is not rolled back when omitted.
+    #[arg(long)]
+    pub turn: Option<String>,
+    /// Print the result as JSON.
     #[arg(long)]
     pub json: bool,
 }

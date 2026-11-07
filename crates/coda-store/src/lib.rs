@@ -7,6 +7,7 @@ mod checkpoints;
 mod decisions;
 mod event_log;
 mod events;
+mod forks;
 mod grants;
 pub mod health;
 mod index;
@@ -30,6 +31,7 @@ pub use checkpoints::TurnCheckpoint;
 pub use decisions::{NewDecision, StoredDecision};
 pub use event_log::{LogEvent, LogEventKind, LogScope, MAX_LOG_ID};
 pub use events::{EventRecord, StoredEvent};
+pub use forks::SessionFork;
 pub use grants::{Grant, GrantKey};
 pub use index::{IndexStatus, IndexedFileState, Symbol};
 pub use originals::{MAX_ORIGINAL_BYTES, MAX_SESSION_ORIGINAL_BYTES};
@@ -60,7 +62,7 @@ use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// Release of this binary, recorded in the database each time it opens it.
 pub const BINARY_RELEASE: &str = env!("CARGO_PKG_VERSION");
@@ -115,6 +117,8 @@ pub enum StoreError {
     WorktreeRefused { session: SessionId },
     #[error("turn {turn} does not exist in session {session}")]
     TurnNotFound { session: SessionId, turn: TurnId },
+    #[error("turn {turn} of session {session} is rolled back")]
+    TurnRolledBack { session: SessionId, turn: TurnId },
     #[error("event {seq} already exists in session {session}")]
     DuplicateAppend { session: SessionId, seq: u64 },
     #[error("session {session} already has another writer")]

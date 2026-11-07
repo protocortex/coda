@@ -221,18 +221,21 @@ impl Turns {
     }
 
     /// The earlier conversation as text for a Claude Code turn that starts a new
-    /// conversation after a rewind; `None` when there is nothing to carry.
+    /// conversation after a rewind or as the first turn of a fork; `None` when
+    /// there is nothing to carry.
     pub(super) async fn rewind_seed(&self, record: &SessionRecord) -> Option<String> {
         if record.backend != BackendKind::ClaudeCode || self.resume_id(record).await.is_some() {
             return None;
         }
         let id = record.id.clone();
-        let rewound = self
+        let told = self
             .hub
-            .with_store(move |store| Ok(!store.rolled_back_turns(&id)?.is_empty()))
+            .with_store(move |store| {
+                Ok(!store.rolled_back_turns(&id)?.is_empty() || store.fork_of(&id)?.is_some())
+            })
             .await
             .unwrap_or(false);
-        if !rewound {
+        if !told {
             return None;
         }
         match self.carried(&record.id, None).await {

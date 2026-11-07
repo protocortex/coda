@@ -6,7 +6,7 @@
 //! Only what the user said and what streamed back is kept: an agent's tool work
 //! is not stored in a form that could be replayed.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use coda_protocol::events::{GUARD_CONTINUE_KIND, STREAM_DELTA_KIND};
 use coda_protocol::types::{SessionId, TurnId};
@@ -64,6 +64,16 @@ pub struct Transcript {
     budget: usize,
     trimmed: bool,
     skipped_turn: Option<TurnId>,
+    /// How an ancestor of a fork is read; `None` reads a session as it is.
+    frozen: Option<Frozen>,
+}
+
+/// The state of a fork's ancestor when the fork was made.
+struct Frozen {
+    /// The newest turn that counts, as a number; 0 when the id is not a number,
+    /// so a bad id keeps nothing.
+    ceiling: u64,
+    rolled_back: HashSet<TurnId>,
 }
 
 impl Transcript {
@@ -76,7 +86,24 @@ impl Transcript {
             budget,
             trimmed: false,
             skipped_turn: None,
+            frozen: None,
         }
+    }
+
+    /// Reads the sessions applied next as they were when a fork was made: turns
+    /// after `last` are left out, and so are the turns in `rolled_back`, whatever
+    /// the session has rolled back since. Turn ids grow with time, so a later
+    /// turn has a larger number.
+    pub fn freeze_at(&mut self, last: &TurnId, rolled_back: HashSet<TurnId>) {
+        self.frozen = Some(Frozen {
+            ceiling: last.as_str().parse().unwrap_or(0),
+            rolled_back,
+        });
+    }
+
+    /// Reads the sessions applied next as they are now.
+    pub fn thaw(&mut self) {
+        self.frozen = None;
     }
 
     /// Leaves out the events of `turn`, such as the one the transcript is built for.
@@ -99,7 +126,10 @@ impl Transcript {
         after: u64,
     ) -> Result<Option<u64>, StoreError> {
         let page = store.load_events(session, after, super::PAGE_SIZE)?;
-        let rolled_back = store.rolled_back_turns(session)?;
+        let rolled_back = match &self.frozen {
+            Some(frozen) => frozen.rolled_back.clone(),
+            None => store.rolled_back_turns(session)?,
+        };
         for event in page.iter().filter(|e| !rolled_back.contains(&e.turn)) {
             self.apply(event);
         }
@@ -109,6 +139,16 @@ impl Transcript {
     /// Applies one event; kinds that are not part of the conversation are skipped.
     pub fn apply(&mut self, event: &StoredEvent) {
         if self.skipped_turn.as_ref() == Some(&event.turn) {
+            return;
+        }
+        let after_ceiling = self.frozen.as_ref().is_some_and(|frozen| {
+            event
+                .turn
+                .as_str()
+                .parse::<u64>()
+                .map_or(true, |turn| turn > frozen.ceiling)
+        });
+        if after_ceiling {
             return;
         }
         let speaker = match event.kind.as_str() {
@@ -349,5 +389,29 @@ mod tests {
         // Assert
         assert!(!text.contains("\\n"), "{text}");
         assert!(text.contains("ok"));
+    }
+
+    #[test]
+    fn turns_after_the_ceiling_are_left_out_until_it_is_lifted() {
+        // Arrange
+        let mut later = said(2, USER_MESSAGE_KIND, "later");
+        later.turn = TurnId::new("2");
+        let early = said(1, USER_MESSAGE_KIND, "early");
+        let mut transcript = Transcript::new(1000);
+
+        // Act
+        transcript.freeze_at(&TurnId::new("1"), HashSet::new());
+        transcript.apply(&early);
+        transcript.apply(&later);
+        transcript.thaw();
+        let mut own = said(3, USER_MESSAGE_KIND, "own");
+        own.turn = TurnId::new("3");
+        transcript.apply(&own);
+
+        // Assert
+        let text = transcript.render().unwrap();
+        assert!(text.contains("early"), "{text}");
+        assert!(!text.contains("later"), "{text}");
+        assert!(text.contains("own"), "{text}");
     }
 }
