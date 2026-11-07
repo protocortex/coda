@@ -21,6 +21,8 @@ use common::{
 use serde_json::json;
 
 const TOOL: &str = "canned";
+const TOUCH: &str = "/usr/bin/touch";
+const BARE_NAME: &str = "guard-by-name";
 
 struct World {
     scratch: Scratch,
@@ -259,11 +261,17 @@ async fn a_bare_program_name_is_found_on_the_path_the_hook_was_given() {
     // Arrange
     let w = World::new();
     let mark = w.out("found");
-    w.scratch
-        .script("guard-by-name", &format!("touch {}", mark.display()));
+    // A link to an installed program, not a script written a moment ago: the
+    // first run of a new file can take longer than the hook's time limit when
+    // many processes start at once.
+    std::os::unix::fs::symlink(TOUCH, w.out(BARE_NAME)).unwrap();
     let path = format!("{}:/usr/bin:/bin", w.scratch.dir.path().display());
     let env = vec![(OsString::from("PATH"), OsString::from(path))];
-    let runner = HookRunner::new(&[hook(HookEvent::PreTool, &["guard-by-name"], true)], env);
+    let mark_arg = mark.to_str().unwrap();
+    let runner = HookRunner::new(
+        &[hook(HookEvent::PreTool, &[BARE_NAME, mark_arg], true)],
+        env,
+    );
 
     // Act
     let outcome = runner.pre_tool(&w.session, &w.cwd, TOOL, &json!({})).await;
