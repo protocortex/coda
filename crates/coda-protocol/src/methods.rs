@@ -33,6 +33,8 @@ pub const SESSION_RESUME: &str = "session.resume";
 pub const SESSION_CLOSE: &str = "session.close";
 /// Restores the files and rolls back the conversation to the end of an earlier turn.
 pub const SESSION_REWIND: &str = "session.rewind";
+/// Reports the files one turn changed, and with `patch` the unified diff.
+pub const SESSION_DIFF: &str = "session.diff";
 /// Moves a session that has not started into a git worktree made for it.
 pub const SESSION_WORKTREE: &str = "session.worktree";
 /// Reports, and with `apply` removes, the git worktrees coda made that are no longer needed.
@@ -72,6 +74,7 @@ pub const METHODS: &[&str] = &[
     SESSION_LIST,
     SESSION_CLOSE,
     SESSION_REWIND,
+    SESSION_DIFF,
     SESSION_WORKTREE,
     WORKTREE_CLEAN,
     CHECKPOINTS_PRUNE,
@@ -133,6 +136,9 @@ pub struct Capabilities {
     /// The daemon serves `session.set_mode`.
     #[serde(default)]
     pub set_mode: bool,
+    /// The daemon serves `session.diff`.
+    #[serde(default)]
+    pub diff: bool,
 }
 
 /// Result of [`INITIALIZE`].
@@ -279,6 +285,54 @@ pub struct SessionRewindResult {
     /// `git restore --source <ref>`. Absent when the files were not restored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_as: Option<String>,
+}
+
+/// Error code of a [`SESSION_DIFF`] the daemon refused, with the reason as the
+/// message: no snapshot of that turn, or a folder that is not a git repository.
+pub const DIFF_REFUSED_CODE: i64 = -32010;
+
+/// Parameters of [`SESSION_DIFF`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionDiffParams {
+    /// Session to read. It must have no turn running.
+    pub session_id: SessionId,
+    /// The turn to report. Omit it for the latest turn that has a snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    /// Also return the unified diff, not only the list of files.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub patch: bool,
+}
+
+/// One file a turn changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DiffFile {
+    /// Path from the top of the repository.
+    pub path: String,
+    /// Lines added; zero for a binary file.
+    pub added: u64,
+    /// Lines removed; zero for a binary file.
+    pub deleted: u64,
+    /// Whether git sees the file as binary and counts no lines.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary: bool,
+}
+
+/// Result of [`SESSION_DIFF`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionDiffResult {
+    /// The turn the files belong to.
+    pub turn_id: TurnId,
+    /// The files the turn changed itself. Files that only came in with a pull,
+    /// merge or rebase during the turn are left out. At most one thousand are
+    /// listed.
+    pub files: Vec<DiffFile>,
+    /// The unified diff of those files; empty unless `patch` was asked for.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub patch: String,
+    /// Whether the list of files or the diff was cut for size.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// Error code of a [`SESSION_WORKTREE`] the daemon refused, with the reason as
@@ -747,6 +801,7 @@ mod tests {
             (SESSION_LIST, "session.list"),
             (SESSION_CLOSE, "session.close"),
             (SESSION_REWIND, "session.rewind"),
+            (SESSION_DIFF, "session.diff"),
             (SESSION_WORKTREE, "session.worktree"),
             (WORKTREE_CLEAN, "worktree.clean"),
             (CHECKPOINTS_PRUNE, "checkpoints.prune"),

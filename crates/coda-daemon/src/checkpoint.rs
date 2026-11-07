@@ -197,15 +197,25 @@ fn not_a_repository(error: CheckpointError) -> CheckpointError {
 }
 
 /// Runs git in `cwd` until `deadline`.
-struct Git<'a> {
+pub(crate) struct Git<'a> {
     cwd: &'a Path,
     deadline: Instant,
+}
+
+impl<'a> Git<'a> {
+    pub(crate) fn new(cwd: &'a Path, deadline: Instant) -> Self {
+        Self { cwd, deadline }
+    }
 }
 
 impl Git<'_> {
     /// Runs `git args`, with `index` as the index when given, and returns its
     /// standard output.
-    fn git(&self, index: Option<&Path>, args: &[&str]) -> Result<String, CheckpointError> {
+    pub(crate) fn git(
+        &self,
+        index: Option<&Path>,
+        args: &[&str],
+    ) -> Result<String, CheckpointError> {
         let mut command = Command::new("git");
         command
             .args(args)

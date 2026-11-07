@@ -4,6 +4,7 @@
 
 pub mod backends;
 mod checkpoint;
+mod checkpoint_diff;
 mod checkpoint_prune;
 mod checkpoints_rpc;
 pub mod dispatch;
