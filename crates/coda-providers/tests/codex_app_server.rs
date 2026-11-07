@@ -115,12 +115,22 @@ impl Fixture {
             session_id: SessionId::new("s-1"),
             sandbox: SandboxMode::default(),
             ephemeral: true,
+            resume_thread: None,
             verified_versions: verified.iter().map(|v| (*v).to_owned()).collect(),
             parent_env: parent_env
                 .iter()
                 .map(|(k, v)| (OsString::from(k), OsString::from(v)))
                 .collect(),
         }
+    }
+
+    async fn start_persisted(&self, resume: &str) -> Result<CodexAppServerSession, AppServerError> {
+        let mut spec = self.spec(&["0.0.0-fake"], &[]);
+        spec.ephemeral = false;
+        spec.resume_thread = Some(resume.to_owned());
+        tokio::time::timeout(TURN_TIMEOUT, CodexAppServerSession::start(spec, None))
+            .await
+            .expect("start did not finish in time")
     }
 
     async fn session(&self) -> CodexAppServerSession {
@@ -753,6 +763,58 @@ async fn a_server_close_is_answered_with_a_close_frame() {
     // Assert
     assert_eq!(outcome, TurnOutcome::Crashed { exit_code: Some(0) });
     assert_eq!(fixture.report()["close_reply"], true);
+}
+
+#[tokio::test]
+async fn a_saved_thread_is_resumed_instead_of_started() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+
+    // Act
+    let session = fixture.start_persisted("saved-thread").await.unwrap();
+
+    // Assert
+    let report = fixture.report();
+    assert!(session.resumed());
+    assert_eq!(session.thread_id(), "saved-thread");
+    assert_eq!(report["thread_resume"]["threadId"], "saved-thread");
+    assert_eq!(report["thread_resume"]["excludeTurns"], true);
+    assert_eq!(report["thread_resume"]["sandbox"], "read-only");
+    assert_eq!(
+        report["thread_resume"]["cwd"],
+        fixture.cwd.path().to_string_lossy().as_ref()
+    );
+    assert!(report["thread_start"].is_null(), "{report}");
+}
+
+#[tokio::test]
+async fn a_refused_resume_starts_a_new_thread_that_is_kept() {
+    // Arrange
+    let fixture = Fixture::new(&json!({"reject_resume": true}));
+
+    // Act
+    let session = fixture.start_persisted("gone").await.unwrap();
+
+    // Assert
+    let report = fixture.report();
+    assert!(!session.resumed());
+    assert_eq!(session.thread_id(), "fake-thread-1");
+    assert_eq!(report["thread_start"]["ephemeral"], false);
+}
+
+#[tokio::test]
+async fn an_ephemeral_thread_ignores_a_saved_id() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut spec = fixture.spec(&["0.0.0-fake"], &[]);
+    spec.resume_thread = Some("saved-thread".to_owned());
+
+    // Act
+    let session = CodexAppServerSession::start(spec, None).await.unwrap();
+
+    // Assert
+    assert!(!session.resumed());
+    assert!(fixture.report()["thread_resume"].is_null());
 }
 
 #[tokio::test]

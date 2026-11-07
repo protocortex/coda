@@ -25,8 +25,6 @@ use crate::steer::SteerHandle;
 
 pub use crate::codex_exec::{SandboxMode, SpawnHook};
 
-/// Coda keeps its own history, so the app-server thread stays out of Codex's.
-const EPHEMERAL_THREAD: bool = true;
 /// Said when a new thread could not be given the conversation so far.
 const NOT_RESTORED_REASON: &str =
     "the earlier conversation could not be read, so this turn starts a new Codex thread without it";
@@ -125,8 +123,12 @@ pub struct CodexLaunch {
     pub cwd: PathBuf,
     /// The coda session the events belong to.
     pub session_id: SessionId,
-    /// Codex thread id the exec fallback continues; the app-server starts a new thread.
+    /// Codex thread id to continue: the exec fallback runs it, and the app-server
+    /// resumes it when `persist_threads` is set. Otherwise the app-server starts a new thread.
     pub resume: Option<String>,
+    /// Whether the app-server keeps its thread in Codex's saved history, which is
+    /// what lets a later start resume it.
+    pub persist_threads: bool,
     /// Sandbox the app-server thread runs under; the fallback is always read-only.
     pub sandbox: SandboxMode,
     /// App-server versions known to behave; any other one falls back to exec.
@@ -184,17 +186,26 @@ impl CodexSession {
             cwd: launch.cwd.clone(),
             session_id: launch.session_id.clone(),
             sandbox: launch.sandbox,
-            ephemeral: EPHEMERAL_THREAD,
+            ephemeral: !launch.persist_threads,
+            resume_thread: launch.resume.clone(),
             verified_versions: launch.verified_versions.clone(),
             parent_env: launch.parent_env.clone(),
         };
         match CodexAppServerSession::start(spec, on_spawn.clone()).await {
-            Ok(server) if server.drift_warning().is_none() => Ok(Self {
-                active: Active::AppServer(Box::new(server)),
-                session_id: launch.session_id,
-                notice: None,
-                carried: launch.carried,
-            }),
+            Ok(server) if server.drift_warning().is_none() => {
+                // A resumed thread already holds the conversation, so the text seed would repeat it.
+                let carried = if server.resumed() {
+                    Carried::Nothing
+                } else {
+                    launch.carried
+                };
+                Ok(Self {
+                    active: Active::AppServer(Box::new(server)),
+                    session_id: launch.session_id,
+                    notice: None,
+                    carried,
+                })
+            }
             Ok(mut server) => {
                 let version = server.server_version().to_owned();
                 server.shutdown().await?;
@@ -293,11 +304,12 @@ impl CodexSession {
         }
     }
 
-    /// The thread id a later exec session can resume, once known.
+    /// The thread id a later session can resume, once known. An app-server
+    /// thread has one only when Codex keeps it.
     #[must_use]
     pub fn session_id_from_backend(&self) -> Option<&str> {
         match &self.active {
-            Active::AppServer(_) => None,
+            Active::AppServer(server) => server.resumable_thread_id(),
             Active::Exec(exec) => exec.session_id_from_backend(),
         }
     }

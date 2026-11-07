@@ -197,6 +197,15 @@ pub async fn start_claude_session(start: SessionStart) -> Result<ClaudeSession, 
     Ok(session)
 }
 
+/// Whether `[providers.codex] persist_threads` is on.
+#[must_use]
+pub fn codex_persists_threads(config: &Config) -> bool {
+    config
+        .providers
+        .get(CODEX_CONFIG_KEY)
+        .is_some_and(|section| section.persist_threads)
+}
+
 /// What a Codex session runs with, resolved from the `providers.codex` config.
 #[derive(Debug, Clone)]
 pub struct CodexSettings {
@@ -205,6 +214,8 @@ pub struct CodexSettings {
     pub verified_versions: Vec<String>,
     /// Whether the binary's own `--version` is on the verified list.
     pub binary_verified: bool,
+    /// Whether the app-server keeps its thread so a restart can resume it.
+    pub persist_threads: bool,
 }
 
 /// Finds the Codex binary and the sandbox its sessions run under; `--version`
@@ -233,6 +244,7 @@ pub fn resolve_codex(
         sandbox,
         verified_versions,
         binary_verified: binary.verified,
+        persist_threads: section.persist_threads,
     })
 }
 
@@ -287,6 +299,7 @@ pub async fn start_codex_session(start: CodexStart) -> Result<CodexSession, Star
         cwd: start.cwd,
         session_id: start.session_id,
         resume: start.resume,
+        persist_threads: start.settings.persist_threads,
         sandbox: start.settings.sandbox,
         verified_versions: start.settings.verified_versions,
         binary_verified: start.settings.binary_verified,

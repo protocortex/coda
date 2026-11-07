@@ -104,6 +104,7 @@ pub(crate) async fn probe_account(
                 session_id: SessionId::new(PROBE_SESSION),
                 sandbox: SandboxMode::default(),
                 ephemeral: true,
+                resume_thread: None,
                 verified_versions: Vec::new(),
                 parent_env: env,
             };

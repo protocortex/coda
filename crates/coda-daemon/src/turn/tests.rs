@@ -69,6 +69,7 @@ fn relaxed() -> Timing {
 }
 
 mod checkpoints;
+mod codex_resume;
 mod diff;
 mod idempotent;
 mod mode;
