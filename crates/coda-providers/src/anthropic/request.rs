@@ -19,6 +19,8 @@ pub struct RequestSettings {
     pub system: String,
     /// The tools on offer; omitted when empty.
     pub tools: Vec<ToolSchema>,
+    /// Tokens the model may think with; thinking is not requested when `None`.
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 fn ephemeral() -> Value {
@@ -49,6 +51,9 @@ pub fn build_body(settings: &RequestSettings, request: &ModelRequest) -> Value {
         "stream": true,
         "messages": encode_messages(&request.messages),
     });
+    if let Some(budget_tokens) = settings.thinking_budget_tokens {
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget_tokens});
+    }
     if !system.is_empty() {
         body["system"] = json!([{
             "type": "text",

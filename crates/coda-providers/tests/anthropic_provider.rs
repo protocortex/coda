@@ -324,6 +324,7 @@ fn settings() -> RequestSettings {
     RequestSettings {
         model: "test-model".to_owned(),
         max_tokens: 64,
+        thinking_budget_tokens: None,
         system: "be brief".to_owned(),
         tools: vec![
             ToolSchema {

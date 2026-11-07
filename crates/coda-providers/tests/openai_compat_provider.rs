@@ -301,6 +301,7 @@ fn options(base_url: String) -> OpenAiCompatOptions {
         settings: RequestSettings {
             model: "test-model".to_owned(),
             max_tokens: 64,
+            thinking_budget_tokens: None,
             system: "be brief".to_owned(),
             tools: vec![ToolSchema {
                 name: "read".to_owned(),

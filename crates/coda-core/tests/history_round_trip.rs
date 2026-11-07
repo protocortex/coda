@@ -429,6 +429,7 @@ async fn a_replayed_history_is_valid_for_both_wire_formats() {
     let settings = RequestSettings {
         model: "m".to_owned(),
         max_tokens: 64,
+        thinking_budget_tokens: None,
         system: String::new(),
         tools: Vec::new(),
     };
