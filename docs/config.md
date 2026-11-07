@@ -360,6 +360,19 @@ If a worktree folder is removed and the session is resumed or sent to again, the
 
 A worktree can be removed when a pull request is merged that ended at the commit the branch is at now (found with `gh pr list`; without `gh` or a login this never applies, and new commits after the merge keep the worktree), when its branch has no commits past the default branch, or when its session has been idle for `idle_days`. Coda keeps a worktree that has uncommitted changes (untracked files count), one whose session has a running turn or was active in the last hour, and one that git does not list as a worktree of the recorded repository at the folder coda made for that session. Files that `.gitignore` excludes are in no commit, so after `clean_command` runs, a worktree that still holds any (an `.env` file, a build folder the command did not clear) is kept and the report names some of them. Removal uses `git worktree remove` without `--force`, and coda checks again, holding the worktree lock, that no turn started. Coda deletes the branch only when the pull request is merged or the branch adds nothing, so an idle worktree's commits stay on their branch and the session can bring the folder back. A user's own worktrees and branches are never removed, even inside the managed folder. Folders in the managed folder that no session owns are listed as unknown, with their sizes, and are never touched. The default branch is `origin/HEAD`, else `main`, else `master`.
 
+## `[checkpoints.prune]`
+
+Every checkpoint (see [Checkpoints](../README.md#checkpoints)) is a commit that a git ref under `refs/coda/checkpoints/<session>/` keeps alive, so its files stay in the repository's object store until the ref goes. `coda checkpoints prune` lists the refs that can go, with an estimate of the space each session's refs hold alone, and changes nothing. `coda checkpoints prune --apply` removes them, and it only works while `enabled` is `true`. Pruning is off by default and nothing runs on its own. Keys come from this file only.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Whether `coda checkpoints prune --apply` may remove anything. The report is always available. |
+| `keep_days` | integer | `30` | A turn checkpoint older than this many days can be removed. Must not be zero. |
+| `keep_turns` | integer | `50` | A session keeps only its newest this many turn checkpoints. Must not be zero. |
+| `rewind_days` | integer | `7` | The safety save a rewind makes (`pre-rewind-*`) can be removed after this many days. Must not be zero. |
+
+The `base` ref and a session's newest live turn checkpoint always stay. A turn that a rewind rolled back leaves the count and goes after `keep_days`. Pruning only touches refs this database recorded on its turns, because another database that shares the repository can hold refs under the same session number; a rewind save is not recorded, so a session whose number also holds an unrecorded ref keeps its rewind saves. A ref with any other name stays too, and so does every ref of a session with a running turn. Only the refs of sessions this daemon stores are looked at; for a session that works in a coda worktree, the repository of that worktree is used. Pruning only removes refs. It forgets a removed ref on its turn, so a rewind to that turn says it has no snapshot, and it does not run `git gc`: git collects the objects on its own schedule, or when you run `git gc` and expire the reflog yourself. The size in the report is what only the listed refs keep alive, so two sessions that share files each count them.
+
 ## `[checks.<extension>]`
 
 A check is a command coda runs after the model changes a file, so the model sees what it broke in the same tool result and can fix it at once. It runs in model-API sessions (`anthropic`, `openai_compat`, `faux`) after a successful `edit`, `write` or `multi_edit`, for files with the extension named in the table, for example `[checks.rs]`. The extension has no dot and is matched without regard to case. Nothing runs for an extension with no table, and there are no checks unless you add them. Checks come from this file only. A project file or a definition file cannot add one.
@@ -395,6 +408,12 @@ notify = "osc777"
 [worktree]
 dir = "/home/me/coda-worktrees"
 setup = ["npm", "install"]
+
+[checkpoints.prune]
+enabled = true
+keep_days = 14
+keep_turns = 20
+rewind_days = 3
 
 [worktree.cleanup]
 enabled = true

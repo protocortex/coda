@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::checkpoints::{
+    CHECKPOINTS_KEY, CheckpointsConfig, KEEP_DAYS_KEY, KEEP_TURNS_KEY, PRUNE_KEY, REWIND_DAYS_KEY,
+};
 use crate::checks::CheckConfig;
 use crate::hooks::{HookConfig, MAX_TIMEOUT_MS};
 use crate::loop_guard::{
@@ -301,6 +304,8 @@ pub struct Config {
     pub tui: TuiConfig,
     /// Where session worktrees go and what runs in a new one.
     pub worktree: WorktreeConfig,
+    /// When old checkpoint refs are removed.
+    pub checkpoints: CheckpointsConfig,
 }
 
 impl Default for Config {
@@ -322,6 +327,7 @@ impl Default for Config {
             loop_guard: LoopGuardConfig::default(),
             tui: TuiConfig::default(),
             worktree: WorktreeConfig::default(),
+            checkpoints: CheckpointsConfig::default(),
         }
     }
 }
@@ -364,6 +370,7 @@ impl Config {
         config.check_loop_guard()?;
         config.check_parallel_tools()?;
         config.check_worktree()?;
+        config.check_checkpoints()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -629,6 +636,23 @@ impl Config {
                 path: format!("{WORKTREE_KEY}.{CLEANUP_KEY}.{CLEAN_COMMAND_KEY}"),
                 allowed: "a program name first, then its arguments".to_owned(),
             });
+        }
+        Ok(())
+    }
+
+    fn check_checkpoints(&self) -> Result<(), ConfigError> {
+        let prune = &self.checkpoints.prune;
+        for (key, value) in [
+            (KEEP_DAYS_KEY, prune.keep_days),
+            (KEEP_TURNS_KEY, prune.keep_turns),
+            (REWIND_DAYS_KEY, prune.rewind_days),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{CHECKPOINTS_KEY}.{PRUNE_KEY}.{key}"),
+                    allowed: "a whole number above 0".to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -1458,6 +1482,46 @@ bots = true
         for (text, key) in cases {
             // Act
             let err = Config::from_toml_str(text).unwrap_err();
+
+            // Assert
+            assert!(err.to_string().contains(key), "{err}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_pruning_is_off_by_default_and_read_from_the_file() {
+        // Arrange
+        let text = "[checkpoints.prune]\nenabled = true\nkeep_days = 10\nkeep_turns = 5\nrewind_days = 2\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config.checkpoints.prune;
+        let read = Config::from_toml_str(text)
+            .unwrap()
+            .config
+            .checkpoints
+            .prune;
+
+        // Assert
+        assert!(!default.enabled);
+        assert_eq!(
+            (default.keep_days, default.keep_turns, default.rewind_days),
+            (30, 50, 7)
+        );
+        assert!(read.enabled);
+        assert_eq!(
+            (read.keep_days, read.keep_turns, read.rewind_days),
+            (10, 5, 2)
+        );
+    }
+
+    #[test]
+    fn a_zero_pruning_limit_is_rejected_naming_the_key() {
+        for key in ["keep_days", "keep_turns", "rewind_days"] {
+            // Arrange
+            let text = format!("[checkpoints.prune]\n{key} = 0\n");
+
+            // Act
+            let err = Config::from_toml_str(&text).unwrap_err();
 
             // Assert
             assert!(err.to_string().contains(key), "{err}");

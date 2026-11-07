@@ -2,6 +2,7 @@
 
 //! Parsing and defaults for coda's `config.toml`, plus injectable timing.
 
+pub mod checkpoints;
 pub mod checks;
 pub mod config;
 pub mod hooks;

@@ -72,7 +72,8 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
         .with_hub(Arc::clone(&hub))
         .with_state(state.clone())
         .with_turns(Arc::clone(&turns))
-        .with_worktrees(worktrees);
+        .with_worktrees(worktrees)
+        .with_checkpoint_pruning(config.checkpoints.prune.clone());
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signal)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(CliError::Signal)?;
     info!("step 5: serving");

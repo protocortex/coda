@@ -68,7 +68,12 @@ pub(crate) enum CheckpointError {
 
 /// The ref of a session's baseline (`base`) or of one of its turns.
 pub(crate) fn ref_name(session: &str, label: &str) -> String {
-    format!("{REF_PREFIX}/{session}/{label}")
+    format!("{}{label}", ref_prefix(session))
+}
+
+/// What every ref of `session` starts with.
+pub(crate) fn ref_prefix(session: &str) -> String {
+    format!("{REF_PREFIX}/{session}/")
 }
 
 /// Snapshots the working tree of the repository holding `cwd` under `reference`:

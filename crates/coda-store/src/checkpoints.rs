@@ -56,6 +56,30 @@ impl Store {
         )
     }
 
+    /// Forgets the given refs on every turn row that names them, and returns how
+    /// many rows changed. Used after the refs are removed from git, so a rewind
+    /// to those turns says they have no snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when an update fails.
+    pub fn clear_checkpoint_refs(&mut self, refs: &[String]) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        let mut changed = 0;
+        for reference in refs {
+            changed += tx.execute(
+                "UPDATE turns SET checkpoint_before = NULL WHERE checkpoint_before = ?1",
+                [reference],
+            )?;
+            changed += tx.execute(
+                "UPDATE turns SET checkpoint_after = NULL WHERE checkpoint_after = ?1",
+                [reference],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     /// The checkpoints of every turn of `session`, oldest first.
     ///
     /// # Errors

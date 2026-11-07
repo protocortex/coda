@@ -13,9 +13,7 @@ use crate::autostart::connect_unchecked;
 use crate::cli::{WorktreeCleanArgs, WorktreeCommand};
 use crate::context::{Context, Io};
 use crate::error::CliError;
-
-const KIB: u64 = 1024;
-const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+use crate::size::human;
 
 /// Runs a `coda worktree` command against the running daemon; none is started.
 ///
@@ -58,7 +56,7 @@ fn print(io: &mut Io<'_>, result: &WorktreeCleanResult) -> Result<(), CliError> 
             io.out,
             "{}  {action}  {}  {}  {}",
             found.session_id,
-            size(found.bytes),
+            human(found.bytes),
             found.path,
             found.reason
         )?;
@@ -70,7 +68,7 @@ fn print(io: &mut Io<'_>, result: &WorktreeCleanResult) -> Result<(), CliError> 
         writeln!(
             io.out,
             "unknown folder, never removed  {}  {}",
-            size(folder.bytes),
+            human(folder.bytes),
             folder.path
         )?;
     }
@@ -86,36 +84,4 @@ fn print(io: &mut Io<'_>, result: &WorktreeCleanResult) -> Result<(), CliError> 
         )?;
     }
     Ok(())
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "a size shown to one decimal place"
-)]
-fn size(bytes: u64) -> String {
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= KIB as f64 && unit + 1 < UNITS.len() {
-        value /= KIB as f64;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::size;
-
-    #[test]
-    fn sizes_are_shown_in_the_largest_whole_unit() {
-        // Act
-        let shown: Vec<_> = [0, 1023, 1024, 1536, 5 * 1024 * 1024].map(size).into();
-
-        // Assert
-        assert_eq!(shown, ["0 B", "1023 B", "1.0 KiB", "1.5 KiB", "5.0 MiB"]);
-    }
 }

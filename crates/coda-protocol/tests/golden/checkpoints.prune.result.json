@@ -1,0 +1,1 @@
+{"applied":false,"sessions":[{"session_id":"s-1","kept":3,"refs":[{"reference":"refs/coda/checkpoints/s-1/4","reason":"beyond the newest 50 turns","removed":false}],"bytes":2048},{"session_id":"s-2","kept":0,"refs":[],"bytes":0,"note":"a turn is running"}]}

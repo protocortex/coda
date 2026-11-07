@@ -54,6 +54,9 @@ pub enum Command {
     /// 0, 64 for bad usage, or 70 when they fail.
     #[command(subcommand)]
     Session(SessionCommand),
+    /// Report and prune the old checkpoints that coda keeps as git refs.
+    #[command(subcommand)]
+    Checkpoints(CheckpointsCommand),
     /// Report and clean up the worktrees coda made for sessions.
     #[command(subcommand)]
     Worktree(WorktreeCommand),
@@ -105,6 +108,24 @@ pub enum SessionCommand {
     Show(SessionShowArgs),
     /// Put the files back as an earlier turn left them and roll the later turns back.
     Rewind(SessionRewindArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CheckpointsCommand {
+    /// List the checkpoint refs that can go and about how much space they hold;
+    /// with --apply, remove them.
+    Prune(CheckpointsPruneArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CheckpointsPruneArgs {
+    /// Remove what the report lists. Needs `[checkpoints.prune] enabled = true`.
+    /// Without it nothing changes.
+    #[arg(long)]
+    pub apply: bool,
+    /// Print the report as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]
