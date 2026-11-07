@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use coda_config::tui::NotifyMode;
 use coda_protocol::events::{Event, InterruptCause, TodoItem};
-use coda_protocol::methods::{Capabilities, SessionSummary};
-use coda_protocol::types::{BackendKind, Mode, SessionInfo, TurnId};
+use coda_protocol::methods::{Capabilities, SessionDiffResult, SessionSummary};
+use coda_protocol::types::{BackendKind, Mode, SessionId, SessionInfo, TurnId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -20,6 +20,7 @@ use crate::activity::{self, Stage};
 use crate::chat::Chat;
 use crate::commands::{self, Command, CommandError, Resolved, UserCommands};
 use crate::completion;
+use crate::diffview::{self, DiffView};
 use crate::input::{Input, Stashed};
 use crate::notify;
 use crate::paste;
@@ -61,6 +62,8 @@ const CLEARED: &str = "prompt cleared; Ctrl+S brings it back";
 const NOTHING_STASHED: &str = "nothing is stashed";
 const STASHED: &str = "prompt stashed; press Ctrl+S on an empty prompt to bring it back";
 const ALREADY_PLANNING: &str = "the session is already in plan mode";
+const NO_DIFF: &str = "this daemon cannot show a diff";
+const NO_CHANGES: &str = "the last turn changed no files";
 const NOT_PLANNING: &str =
     "the session is not in plan mode, so there is no plan to carry out; use /plan first";
 const NO_PLAN: &str = "there is no plan to save yet; ask the agent for one in plan mode first";
@@ -103,6 +106,16 @@ pub enum LinkEvent {
     UserMessage(String),
     /// The daemon's sessions, answering `/sessions`.
     Sessions(Vec<SessionSummary>),
+    /// The files the turn that just ended changed.
+    TurnChanges {
+        session: SessionId,
+        changes: SessionDiffResult,
+    },
+    /// The diff of the last turn, answering `/diff`.
+    Diff {
+        session: SessionId,
+        diff: SessionDiffResult,
+    },
     /// Something the user should read, such as a failed request.
     Notice(String),
     /// What the daemon said it can do when the link connected.
@@ -129,6 +142,10 @@ pub struct App {
     input: Input,
     /// The session picker, while it is open.
     picker: Option<Picker>,
+    /// The diff of the last turn, while it is open.
+    diff_view: Option<DiffView>,
+    /// The session the UI follows, once one has started.
+    session: Option<SessionId>,
     /// The folder the session works in, once a session has started.
     cwd: Option<String>,
     status: Status,
@@ -168,6 +185,8 @@ impl App {
             chat: Chat::new(),
             input: Input::new(),
             picker: None,
+            diff_view: None,
+            session: None,
             cwd: None,
             status: Status::new(),
             overlay: Overlay::default(),
@@ -271,6 +290,8 @@ impl App {
                 self.plan_draft = None;
                 self.plan = None;
                 self.cwd = Some(info.cwd);
+                self.session = Some(info.id);
+                self.diff_view = None;
                 self.overlay = Overlay::default();
                 self.turn_running = false;
                 self.work.reset();
@@ -294,6 +315,13 @@ impl App {
             }
             LinkEvent::UserMessage(text) => self.chat.push_user(text),
             LinkEvent::Sessions(sessions) => self.open_picker(&sessions),
+            LinkEvent::TurnChanges { session, changes } if self.is_current(&session) => {
+                self.chat.push_notice(changes_line(&changes));
+            }
+            LinkEvent::Diff { session, diff } if self.is_current(&session) => {
+                self.open_diff(&diff);
+            }
+            LinkEvent::TurnChanges { .. } | LinkEvent::Diff { .. } => {}
             LinkEvent::Notice(text) => self.chat.push_notice(text),
             LinkEvent::Capabilities(capabilities) => self.capabilities = Some(capabilities),
             LinkEvent::Todos(items) => self.todos = items,
@@ -344,6 +372,9 @@ impl App {
                         NOTIFY_FINISHED
                     };
                     self.notify_user(NOTIFY_TITLE, body.to_owned());
+                    if self.capabilities.is_some_and(|known| known.diff) {
+                        self.send(LinkCommand::TurnChanges);
+                    }
                 }
                 self.turn_running = false;
             }
@@ -404,6 +435,9 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') && self.diff_view.take().is_some() {
+            return;
+        }
         if ctrl && key.code == KeyCode::Char('c') {
             self.interrupt(now);
             return;
@@ -413,6 +447,10 @@ impl App {
         if self.overlay.is_active() {
             if let Some(answer) = self.overlay.handle_key(key, now) {
                 self.send(LinkCommand::Respond(answer));
+            }
+        } else if let Some(view) = self.diff_view.as_mut() {
+            if view.handle_key(key) == diffview::Action::Close {
+                self.diff_view = None;
             }
         } else if ctrl && key.code == KeyCode::Char('k') {
             self.toggle_picker();
@@ -599,6 +637,11 @@ impl App {
     fn run_command(&mut self, command: Command) {
         let link_command = match command {
             Command::Sessions => LinkCommand::ListSessions,
+            Command::Diff if self.capabilities.is_some_and(|known| !known.diff) => {
+                self.chat.push_notice(NO_DIFF.to_owned());
+                return;
+            }
+            Command::Diff => LinkCommand::Diff,
             Command::New => LinkCommand::New,
             Command::Resume(id) => LinkCommand::Resume(id),
             Command::Model(alias) => LinkCommand::SetModel(alias),
@@ -682,6 +725,22 @@ impl App {
         }
     }
 
+    /// Whether an answer about `session` belongs to the session the UI follows.
+    fn is_current(&self, session: &SessionId) -> bool {
+        self.session
+            .as_ref()
+            .is_none_or(|current| current == session)
+    }
+
+    /// Opens the diff view, or says the turn changed nothing.
+    fn open_diff(&mut self, diff: &SessionDiffResult) {
+        if diff.files.is_empty() {
+            self.chat.push_notice(NO_CHANGES.to_owned());
+        } else {
+            self.diff_view = Some(DiffView::new(diff));
+        }
+    }
+
     /// Closes the picker, or asks the daemon for the sessions to open it on.
     fn toggle_picker(&mut self) {
         if self.picker.take().is_none() {
@@ -690,7 +749,7 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, pasted: &str) {
-        if self.picker.is_some() {
+        if self.picker.is_some() || self.diff_view.is_some() {
             return;
         }
         self.idle_ctrl_c_at = None;
@@ -808,6 +867,13 @@ impl App {
         if let Some(open) = self.picker.as_ref().filter(|_| !self.overlay.is_active()) {
             open.render(frame, frame.area());
         }
+        if let Some(view) = self
+            .diff_view
+            .as_ref()
+            .filter(|_| !self.overlay.is_active())
+        {
+            view.render(frame, frame.area());
+        }
     }
 
     fn connection_text(&self, now: Instant) -> String {
@@ -829,6 +895,20 @@ impl App {
     }
 }
 
+/// The line that follows a turn that changed files: how many, and how much.
+fn changes_line(changes: &SessionDiffResult) -> String {
+    let count = changes.files.len();
+    let added: u64 = changes.files.iter().map(|file| file.added).sum();
+    let deleted: u64 = changes.files.iter().map(|file| file.deleted).sum();
+    let more = if changes.truncated { "+" } else { "" };
+    let noun = if count == 1 && !changes.truncated {
+        "file"
+    } else {
+        "files"
+    };
+    format!("changed {count}{more} {noun} +{added} -{deleted} (/diff)")
+}
+
 impl Default for App {
     fn default() -> Self {
         Self::new()
@@ -842,7 +922,9 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use coda_protocol::events::ToolCallStatus;
-    use coda_protocol::methods::{Capabilities, SessionAttention, SessionStatus, SessionSummary};
+    use coda_protocol::methods::{
+        Capabilities, DiffFile, SessionAttention, SessionStatus, SessionSummary,
+    };
     use coda_protocol::types::{
         Mode, PermissionDecision, RequestId, SessionId, TokenUsage, TurnId,
     };
@@ -1636,6 +1718,231 @@ mod tests {
             matches!(sent.as_slice(), [LinkCommand::Respond(_)]),
             "{sent:?}"
         );
+    }
+
+    fn changes(files: &[(&str, u64, u64)], patch: &str, truncated: bool) -> SessionDiffResult {
+        SessionDiffResult {
+            turn_id: TurnId::new("t-1"),
+            files: files
+                .iter()
+                .map(|(path, added, deleted)| DiffFile {
+                    path: (*path).to_owned(),
+                    added: *added,
+                    deleted: *deleted,
+                    binary: false,
+                })
+                .collect(),
+            patch: patch.to_owned(),
+            truncated,
+        }
+    }
+
+    fn turn_changes_event(changes: SessionDiffResult) -> LinkEvent {
+        LinkEvent::TurnChanges {
+            session: SessionId::new("s-1"),
+            changes,
+        }
+    }
+
+    fn diff_event(diff: SessionDiffResult) -> LinkEvent {
+        LinkEvent::Diff {
+            session: SessionId::new("s-1"),
+            diff,
+        }
+    }
+
+    fn can_diff() -> Capabilities {
+        Capabilities {
+            diff: true,
+            ..Capabilities::default()
+        }
+    }
+
+    #[test]
+    fn a_turn_that_ends_asks_what_it_changed_when_the_daemon_can_say() {
+        // Arrange
+        let (mut app, mut commands) = armed();
+        app.handle_event(LinkEvent::Capabilities(can_diff()));
+        type_line(&mut app, "go");
+        sent(&mut commands);
+
+        // Act
+        app.handle_event(result_event(false));
+
+        // Assert
+        assert_eq!(sent(&mut commands), vec![LinkCommand::TurnChanges]);
+    }
+
+    #[test]
+    fn a_turn_that_ends_asks_nothing_of_a_daemon_that_cannot_diff_or_has_not_said() {
+        // Arrange
+        let (mut old, mut old_commands) = armed();
+        old.handle_event(LinkEvent::Capabilities(Capabilities::default()));
+        type_line(&mut old, "go");
+        let (mut unknown, mut unknown_commands) = armed();
+        type_line(&mut unknown, "go");
+        sent(&mut old_commands);
+        sent(&mut unknown_commands);
+
+        // Act
+        old.handle_event(result_event(false));
+        unknown.handle_event(result_event(false));
+
+        // Assert
+        assert_eq!(sent(&mut old_commands), Vec::<LinkCommand>::new());
+        assert_eq!(sent(&mut unknown_commands), Vec::<LinkCommand>::new());
+    }
+
+    #[test]
+    fn a_replayed_turn_end_asks_nothing() {
+        // Arrange
+        let (mut app, mut commands) = armed();
+        app.handle_event(LinkEvent::Capabilities(can_diff()));
+
+        // Act
+        app.handle_event(result_event(false));
+
+        // Assert
+        assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+    }
+
+    #[test]
+    fn the_files_a_turn_changed_are_counted_in_a_line_that_points_to_diff() {
+        // Arrange
+        let mut app = App::new();
+
+        // Act
+        app.handle_event(turn_changes_event(changes(
+            &[("a.rs", 10, 2), ("b.rs", 3, 1)],
+            "",
+            false,
+        )));
+
+        // Assert
+        let shown = tall_screen(&app);
+        assert!(shown.contains("changed 2 files +13 -3 (/diff)"), "{shown}");
+    }
+
+    #[test]
+    fn one_file_reads_as_a_file_and_a_cut_list_as_at_least_that_many() {
+        // Act
+        let one = changes_line(&changes(&[("a.rs", 1, 0)], "", false));
+        let cut = changes_line(&changes(&[("a.rs", 1, 0), ("b.rs", 1, 0)], "", true));
+
+        // Assert
+        assert_eq!(one, "changed 1 file +1 -0 (/diff)");
+        assert_eq!(cut, "changed 2+ files +2 -0 (/diff)");
+    }
+
+    #[test]
+    fn diff_asks_the_daemon_and_the_answer_opens_the_view_over_the_transcript() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        app.handle_event(LinkEvent::Capabilities(can_diff()));
+        app.handle_event(LinkEvent::UserMessage("hello again".to_owned()));
+
+        // Act
+        type_line(&mut app, "/diff");
+        let asked = sent(&mut commands);
+        app.handle_event(diff_event(changes(
+            &[("a.txt", 1, 1)],
+            "diff --git a/a.txt b/a.txt\n-one\n+two\n",
+            false,
+        )));
+        let shown = tall_screen(&app);
+
+        // Assert
+        assert_eq!(asked, vec![LinkCommand::Diff]);
+        assert!(shown.contains("Turn changes: 1 file +1 -1"), "{shown}");
+        assert!(shown.contains("+two"), "{shown}");
+    }
+
+    #[test]
+    fn a_diff_of_a_turn_that_changed_nothing_says_so_and_opens_no_view() {
+        // Arrange
+        let mut app = App::new();
+
+        // Act
+        app.handle_event(diff_event(changes(&[], "", false)));
+
+        // Assert
+        let shown = tall_screen(&app);
+        assert!(shown.contains("the last turn changed no files"), "{shown}");
+        assert!(!shown.contains("Turn changes"), "{shown}");
+    }
+
+    #[test]
+    fn diff_against_a_daemon_that_cannot_says_so_and_sends_nothing() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        app.handle_event(LinkEvent::Capabilities(Capabilities::default()));
+
+        // Act
+        type_line(&mut app, "/diff");
+
+        // Assert
+        assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+        assert!(tall_screen(&app).contains("cannot show a diff"));
+    }
+
+    #[test]
+    fn keys_go_to_the_open_diff_and_escape_closes_it_without_touching_the_prompt() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        app.handle_paste("half a thought");
+        app.handle_event(diff_event(changes(&[("a.txt", 1, 0)], "+x\n", false)));
+
+        // Act
+        app.handle_key(press(KeyCode::Char('j')));
+        app.handle_paste("pasted into the void");
+        let open = tall_screen(&app);
+        app.handle_key(press(KeyCode::Esc));
+        let closed = tall_screen(&app);
+
+        // Assert
+        assert!(open.contains("Turn changes"), "{open}");
+        assert!(!closed.contains("Turn changes"), "{closed}");
+        assert_eq!(app.input.text(), "half a thought");
+        assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+    }
+
+    #[test]
+    fn an_answer_about_another_session_is_dropped_and_a_new_session_closes_the_view() {
+        // Arrange
+        let mut app = App::new();
+        app.handle_event(LinkEvent::SessionStarted(session("s-2")));
+
+        // Act
+        app.handle_event(turn_changes_event(changes(&[("a.rs", 1, 0)], "", false)));
+        app.handle_event(diff_event(changes(&[("a.rs", 1, 0)], "+x\n", false)));
+        let stale = tall_screen(&app);
+        app.handle_event(LinkEvent::Diff {
+            session: SessionId::new("s-2"),
+            diff: changes(&[("a.rs", 1, 0)], "+x\n", false),
+        });
+        let open = tall_screen(&app);
+        app.handle_event(LinkEvent::SessionStarted(session("s-3")));
+        let closed = tall_screen(&app);
+
+        // Assert
+        assert!(!stale.contains("changed 1 file"), "{stale}");
+        assert!(!stale.contains("Turn changes"), "{stale}");
+        assert!(open.contains("Turn changes"), "{open}");
+        assert!(!closed.contains("Turn changes"), "{closed}");
+    }
+
+    #[test]
+    fn control_c_closes_the_open_diff_instead_of_arming_the_quit() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        app.handle_event(diff_event(changes(&[("a.txt", 1, 0)], "+x\n", false)));
+
+        // Act
+        app.handle_key(key_with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        // Assert
+        assert!(!tall_screen(&app).contains("Turn changes"));
+        assert!(!app.should_quit());
     }
 
     fn type_line_keys(app: &mut App, text: &str) {

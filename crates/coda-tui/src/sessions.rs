@@ -18,17 +18,18 @@ use coda_protocol::jsonrpc::Notification;
 use coda_protocol::methods::{
     DAEMON_BACKENDS, DAEMON_PING, DAEMON_STATUS, DaemonBackendsParams, DaemonBackendsResult,
     DaemonStatusParams, DaemonStatusResult, PERMISSION_RESPOND, PermissionRespondParams,
-    PermissionRespondResult, PingParams, PingResult, SESSION_CANCEL, SESSION_CREATE, SESSION_LIST,
-    SESSION_RESUME, SESSION_SEND, SESSION_SET_MODE, SESSION_SET_MODEL, SessionCancelParams,
-    SessionCancelResult, SessionCreateParams, SessionCreateResult, SessionListParams,
-    SessionListResult, SessionResumeParams, SessionResumeResult, SessionSendParams,
-    SessionSendResult, SessionSetModeParams, SessionSetModeResult, SessionSetModelParams,
-    SessionSetModelResult, SessionSummary,
+    PermissionRespondResult, PingParams, PingResult, SESSION_CANCEL, SESSION_CREATE, SESSION_DIFF,
+    SESSION_LIST, SESSION_RESUME, SESSION_SEND, SESSION_SET_MODE, SESSION_SET_MODEL,
+    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
+    SessionDiffParams, SessionDiffResult, SessionListParams, SessionListResult,
+    SessionResumeParams, SessionResumeResult, SessionSendParams, SessionSendResult,
+    SessionSetModeParams, SessionSetModeResult, SessionSetModelParams, SessionSetModelResult,
+    SessionSummary,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId, SessionInfo};
 use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::app::LinkEvent;
 use crate::permission::{PermissionAnswer, PermissionPrompt, sanitize_line};
@@ -81,6 +82,10 @@ pub enum LinkCommand {
     SetModel(String),
     /// Change the mode of the current session, then send `then` when given.
     SetMode { mode: Mode, then: Option<String> },
+    /// Read what the last turn changed and open it.
+    Diff,
+    /// Read how many files the last turn changed, for the line after the turn.
+    TurnChanges,
     /// Show the backends the daemon offers.
     ListBackends,
     /// Start a new session on the named backend.
@@ -540,6 +545,11 @@ impl Link {
                 .map_err(|e| ("list the sessions", e)),
             LinkCommand::SetModel(alias) => self.set_model(alias).await,
             LinkCommand::SetMode { mode, then } => self.set_mode(mode, then).await,
+            LinkCommand::Diff => self.diff().await,
+            LinkCommand::TurnChanges => {
+                self.turn_changes().await;
+                Ok(())
+            }
             LinkCommand::ListBackends => self.list_backends().await,
             LinkCommand::SwitchBackend(name) => self.switch_backend(&name).await,
             // `run_link` ends the link on this before it gets here.
@@ -638,6 +648,47 @@ impl Link {
             started_turn: wanted_turn && sent.is_ok(),
         });
         sent
+    }
+
+    async fn read_diff(
+        &self,
+        patch: bool,
+    ) -> Result<Option<(SessionId, SessionDiffResult)>, ClientError> {
+        let Some(session_id) = self.current() else {
+            return Ok(None);
+        };
+        let params = SessionDiffParams {
+            session_id: session_id.clone(),
+            turn_id: None,
+            patch,
+        };
+        let result = self.client.request(SESSION_DIFF, &params).await?;
+        Ok(Some((session_id, result)))
+    }
+
+    async fn diff(&self) -> Result<(), (&'static str, ClientError)> {
+        match self
+            .read_diff(true)
+            .await
+            .map_err(|e| ("read the diff", e))?
+        {
+            Some((session, diff)) => self.tell(LinkEvent::Diff { session, diff }),
+            None => self.notice("there is no session to read a diff of".to_owned()),
+        }
+        Ok(())
+    }
+
+    /// Reads the files the turn that just ended changed. A turn that left no
+    /// snapshot, or a folder that is not a repository, is the ordinary case and
+    /// says nothing.
+    async fn turn_changes(&self) {
+        match self.read_diff(false).await {
+            Ok(Some((session, changes))) if !changes.files.is_empty() => {
+                self.tell(LinkEvent::TurnChanges { session, changes });
+            }
+            Ok(_) => {}
+            Err(error) => debug!(%error, "could not read what the turn changed"),
+        }
     }
 
     fn current(&self) -> Option<SessionId> {

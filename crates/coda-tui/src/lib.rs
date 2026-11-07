@@ -7,6 +7,7 @@ pub mod app;
 pub mod chat;
 pub mod commands;
 pub mod completion;
+pub mod diffview;
 pub mod errors;
 pub mod input;
 pub mod logs;

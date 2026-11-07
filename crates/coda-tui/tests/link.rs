@@ -231,6 +231,22 @@ async fn resuming_an_unknown_session_and_stale_answers_show_notices() {
     assert!(stale.contains("answer the permission request"), "{stale}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_diff_the_daemon_cannot_give_shows_a_notice_and_a_quiet_summary_shows_nothing() {
+    // Arrange
+    let rig = Rig::start();
+    let mut link = rig.link();
+    link.started().await;
+
+    // Act
+    link.commands.send(LinkCommand::TurnChanges).unwrap();
+    link.commands.send(LinkCommand::Diff).unwrap();
+    let notice = link.notice().await;
+
+    // Assert
+    assert!(notice.contains("could not read the diff"), "{notice}");
+}
+
 /// A stored session of this process's working directory, with one user message.
 fn seed_session(store: &mut Store, text: &str) -> SessionId {
     let cwd = std::env::current_dir()
