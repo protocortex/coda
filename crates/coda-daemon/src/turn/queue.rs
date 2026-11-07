@@ -103,6 +103,14 @@ impl Turns {
         })
     }
 
+    /// Starts the waiting message of each of `sessions`, for the continuations
+    /// that recovery queued at startup.
+    pub fn start_continuations(self: &Arc<Self>, sessions: &[SessionId]) {
+        for session in sessions {
+            Arc::clone(self).start_next_queued(session.clone());
+        }
+    }
+
     /// Starts the next waiting message of `session` on its own task, once the
     /// caller is done with the session. A busy session keeps its messages: the
     /// turn that runs will start them when it ends.
