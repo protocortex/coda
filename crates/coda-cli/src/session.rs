@@ -13,10 +13,11 @@ use coda_core::history::{ASSISTANT_MESSAGE_KIND, USER_MESSAGE_KIND};
 use std::collections::HashSet;
 
 use coda_protocol::methods::{
-    SESSION_LIST, SESSION_REWIND, SESSION_SEND, SESSION_SHIP, SESSION_WATCH_PR,
-    SHIP_REQUEST_TIMEOUT_SECS, SendMode, SessionListParams, SessionListResult, SessionRewindParams,
-    SessionRewindResult, SessionSendParams, SessionSendResult, SessionShipParams,
-    SessionShipResult, SessionSummary, SessionWatchPrParams, SessionWatchPrResult, ShipAction,
+    SESSION_FORK, SESSION_LIST, SESSION_REWIND, SESSION_SEND, SESSION_SHIP, SESSION_WATCH_PR,
+    SHIP_REQUEST_TIMEOUT_SECS, SendMode, SessionForkParams, SessionForkResult, SessionListParams,
+    SessionListResult, SessionRewindParams, SessionRewindResult, SessionSendParams,
+    SessionSendResult, SessionShipParams, SessionShipResult, SessionSummary, SessionWatchPrParams,
+    SessionWatchPrResult, ShipAction,
 };
 use coda_protocol::types::{SessionId, TurnId};
 use coda_store::{DB_FILE_NAME, Store, StoreError, StoredEvent};
@@ -24,8 +25,8 @@ use serde_json::{Value, json};
 
 use crate::autostart::{connect_unchecked, ensure_daemon};
 use crate::cli::{
-    SessionCommand, SessionListArgs, SessionRewindArgs, SessionSendArgs, SessionShipArgs,
-    SessionShowArgs, SessionWatchArgs,
+    SessionCommand, SessionForkArgs, SessionListArgs, SessionRewindArgs, SessionSendArgs,
+    SessionShipArgs, SessionShowArgs, SessionWatchArgs,
 };
 use crate::context::{Context, Io};
 use crate::error::CliError;
@@ -61,11 +62,36 @@ pub async fn run(
         SessionCommand::Rewind(args) => rewind(ctx, io, force, args)
             .await
             .map(|()| ExitCode::SUCCESS),
+        SessionCommand::Fork(args) => fork(ctx, io, force, args).await.map(|()| ExitCode::SUCCESS),
         SessionCommand::Ship(args) => ship(ctx, io, force, args).await.map(|()| ExitCode::SUCCESS),
         SessionCommand::Watch(args) => watch(ctx, io, force, args)
             .await
             .map(|()| ExitCode::SUCCESS),
     }
+}
+
+async fn fork(
+    ctx: &Context,
+    io: &mut Io<'_>,
+    force: bool,
+    args: SessionForkArgs,
+) -> Result<(), CliError> {
+    let client = ensure_daemon(ctx, io, force).await?;
+    let params = SessionForkParams {
+        session_id: SessionId::new(args.session),
+        turn_id: args.turn.map(TurnId::new),
+    };
+    let done: SessionForkResult = client.request(SESSION_FORK, &params).await?;
+    if args.json {
+        writeln!(io.out, "{}", serde_json::to_string(&done)?)?;
+    } else {
+        writeln!(
+            io.out,
+            "forked session {} at turn {} as session {}",
+            done.parent_session_id, done.source_turn, done.session.id
+        )?;
+    }
+    Ok(())
 }
 
 async fn rewind(

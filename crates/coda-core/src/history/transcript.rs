@@ -64,6 +64,8 @@ pub struct Transcript {
     budget: usize,
     trimmed: bool,
     skipped_turn: Option<TurnId>,
+    /// The newest turn that counts; later turns are left out.
+    ceiling: Option<u64>,
 }
 
 impl Transcript {
@@ -76,7 +78,15 @@ impl Transcript {
             budget,
             trimmed: false,
             skipped_turn: None,
+            ceiling: None,
         }
+    }
+
+    /// Leaves out the events of turns after `turn`, which names a turn of the
+    /// session being read; `None` lifts the limit. Turn ids grow with time, so
+    /// a later turn has a larger number.
+    pub fn up_to_turn(&mut self, turn: Option<TurnId>) {
+        self.ceiling = turn.and_then(|turn| turn.as_str().parse().ok());
     }
 
     /// Leaves out the events of `turn`, such as the one the transcript is built for.
@@ -109,6 +119,13 @@ impl Transcript {
     /// Applies one event; kinds that are not part of the conversation are skipped.
     pub fn apply(&mut self, event: &StoredEvent) {
         if self.skipped_turn.as_ref() == Some(&event.turn) {
+            return;
+        }
+        let after_ceiling = self
+            .ceiling
+            .zip(event.turn.as_str().parse::<u64>().ok())
+            .is_some_and(|(ceiling, turn)| turn > ceiling);
+        if after_ceiling {
             return;
         }
         let speaker = match event.kind.as_str() {
@@ -349,5 +366,29 @@ mod tests {
         // Assert
         assert!(!text.contains("\\n"), "{text}");
         assert!(text.contains("ok"));
+    }
+
+    #[test]
+    fn turns_after_the_ceiling_are_left_out_until_it_is_lifted() {
+        // Arrange
+        let mut later = said(2, USER_MESSAGE_KIND, "later");
+        later.turn = TurnId::new("2");
+        let early = said(1, USER_MESSAGE_KIND, "early");
+        let mut transcript = Transcript::new(1000);
+
+        // Act
+        transcript.up_to_turn(Some(TurnId::new("1")));
+        transcript.apply(&early);
+        transcript.apply(&later);
+        transcript.up_to_turn(None);
+        let mut own = said(3, USER_MESSAGE_KIND, "own");
+        own.turn = TurnId::new("3");
+        transcript.apply(&own);
+
+        // Assert
+        let text = transcript.render().unwrap();
+        assert!(text.contains("early"), "{text}");
+        assert!(!text.contains("later"), "{text}");
+        assert!(text.contains("own"), "{text}");
     }
 }

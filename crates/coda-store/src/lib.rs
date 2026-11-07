@@ -7,6 +7,7 @@ mod checkpoints;
 mod decisions;
 mod event_log;
 mod events;
+mod forks;
 mod grants;
 pub mod health;
 mod index;
@@ -28,6 +29,7 @@ pub use checkpoints::TurnCheckpoint;
 pub use decisions::{NewDecision, StoredDecision};
 pub use event_log::{LogEvent, LogEventKind, LogScope, MAX_LOG_ID};
 pub use events::{EventRecord, StoredEvent};
+pub use forks::SessionFork;
 pub use grants::{Grant, GrantKey};
 pub use index::{IndexStatus, IndexedFileState, Symbol};
 pub use originals::{MAX_ORIGINAL_BYTES, MAX_SESSION_ORIGINAL_BYTES};
@@ -56,7 +58,7 @@ use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// Release of this binary, recorded in the database each time it opens it.
 pub const BINARY_RELEASE: &str = env!("CARGO_PKG_VERSION");

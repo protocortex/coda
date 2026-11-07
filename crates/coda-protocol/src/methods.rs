@@ -41,6 +41,8 @@ pub const SESSION_RESUME: &str = "session.resume";
 pub const SESSION_CLOSE: &str = "session.close";
 /// Restores the files and rolls back the conversation to the end of an earlier turn.
 pub const SESSION_REWIND: &str = "session.rewind";
+/// Starts a new session from a turn of an existing one.
+pub const SESSION_FORK: &str = "session.fork";
 /// Reports the files one turn changed, and with `patch` the unified diff.
 pub const SESSION_DIFF: &str = "session.diff";
 /// Moves a session that has not started into a git worktree made for it.
@@ -88,6 +90,7 @@ pub const METHODS: &[&str] = &[
     SESSION_LIST,
     SESSION_CLOSE,
     SESSION_REWIND,
+    SESSION_FORK,
     SESSION_DIFF,
     SESSION_WORKTREE,
     SESSION_SHIP,
@@ -174,6 +177,9 @@ pub struct Capabilities {
     /// The daemon serves `session.resume_at_reset`.
     #[serde(default)]
     pub resume_at_reset: bool,
+    /// The daemon serves `session.fork` for sessions on Claude Code and Codex.
+    #[serde(default)]
+    pub fork: bool,
 }
 
 /// Result of [`INITIALIZE`].
@@ -433,6 +439,30 @@ pub struct SessionRewindResult {
     /// `git restore --source <ref>`. Absent when the files were not restored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_as: Option<String>,
+}
+
+/// Parameters of [`SESSION_FORK`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionForkParams {
+    /// Session to fork. Its backend must be Claude Code or Codex. A turn may be
+    /// running in it: the fork keeps what the turns up to `turn_id` said.
+    pub session_id: SessionId,
+    /// The last turn the fork keeps. Omit it for the latest turn that is not
+    /// rolled back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+}
+
+/// Result of [`SESSION_FORK`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionForkResult {
+    /// The new session. It has the backend, model, folder and mode of the parent,
+    /// shares its folder, and starts its backend conversation on its first send.
+    pub session: SessionInfo,
+    /// The session that was forked.
+    pub parent_session_id: SessionId,
+    /// The last turn of the parent that the fork keeps.
+    pub source_turn: TurnId,
 }
 
 /// Error code of a [`SESSION_DIFF`] the daemon refused, with the reason as the

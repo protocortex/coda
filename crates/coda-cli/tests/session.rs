@@ -401,3 +401,21 @@ async fn watch_refuses_an_unknown_session() {
         watched.out
     );
 }
+
+#[tokio::test]
+async fn forking_a_model_api_session_fails_with_the_reason() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one")]);
+    let id = rig.start_session().await;
+
+    // Act
+    let forked = rig.coda(&["session", "fork", &id]).await;
+
+    // Assert
+    assert_eq!(forked.code, ExitCode::from(EXIT_FAILURE), "{}", forked.out);
+    assert!(
+        forked.err.contains("Claude Code or Codex"),
+        "{}",
+        forked.err
+    );
+}
