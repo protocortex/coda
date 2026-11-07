@@ -49,6 +49,39 @@ asks it to write a file and fails if the file exists. `codex_app_server_approval
 fails if the file it asks Codex to create exists after the approval is denied. They run with
 the others under the same switch, and the Claude one writes no fixture.
 
+## Live probes after an upgrade
+
+`crates/coda-providers/tests/live_probes.rs` holds opt-in probes of the installed
+`claude`. Run them after every `claude` upgrade:
+
+```sh
+CODA_LIVE_TESTS=1 cargo nextest run -p coda-providers --test live_probes \
+  --run-ignored only --test-threads 1
+```
+
+They use the login of whoever runs them, the unmodified binary, the same cleared
+environment a session gets, the `haiku` model and a turn limit, so the seven tests
+spend about eight short calls. They write no fixture, and they print no token and
+no account value (only the names of the fields of the `initialize` account block).
+Run them one at a time, as above, so they do not hit the plan's rate limit together.
+Each call starts a real session, so `claude` keeps a transcript of it under
+`~/.claude/projects`, and `coda usage --history` counts it. A probe fails before it
+spends more if the session would bill API rates instead of the plan.
+Every test is `#[ignore]` and needs `CODA_LIVE_TESTS=1`; CI never runs them. What
+they found with claude 2.1.296 on 2026-11-08:
+
+| Probe | Result |
+| --- | --- |
+| prompt size by profile | `full` 26.8k, `project` 22.3k, `lean` 5.2k tokens; fails above 25k for `project`, above 12k for `lean`, or when the order changes |
+| init message | `project` and `lean` list no MCP server and no skill, and `lean` lists only its six tools (the same check coda runs on every session) |
+| usage and rate limits | the usage event is read, and each `rate_limit_event` line becomes a `rate_limit` event |
+| `initialize` | answers `success`; the account block has `apiProvider`, `email`, `organization` and `subscriptionType`, and no `apiKeySource` or `tokenSource` |
+| `set_permission_mode`, `set_model` | both answer `success` with no turn running |
+| `interrupt` | answers `success`; the turn then ends with a `result` of subtype `error_during_execution` and `is_error` true |
+| a message sent mid-turn | in a turn that only streams text it queues: the first message gets its own `result` and the second gets another. The manual run under Steer, with a tool still running, gave one `result` for both, so the answer depends on the turn |
+| `--fork-session` | with `--resume <id>` it starts a new session id and the turn works |
+| resume at a message | `claude --help` lists no flag for it (`--resume-session-at`); the probe fails the day one appears |
+
 ## Recording again
 
 ```sh
