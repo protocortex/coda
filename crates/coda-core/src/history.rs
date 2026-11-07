@@ -9,8 +9,9 @@
 
 use coda_protocol::events::{
     APPROVALS_UNAVAILABLE_KIND, APPROVE_KIND, BACKEND_CRASHED_KIND, COMPACTION_KIND, DENY_KIND,
-    HISTORY_NOT_RESTORED_KIND, HOOK_BLOCKED_KIND, RATE_LIMIT_KIND, RESULT_KIND, STREAM_DELTA_KIND,
-    TIMEOUT_KIND, TURN_INTERRUPTED_KIND, USAGE_KIND, USAGE_LIMIT_KIND,
+    GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, HISTORY_NOT_RESTORED_KIND, HOOK_BLOCKED_KIND,
+    RATE_LIMIT_KIND, RESULT_KIND, STREAM_DELTA_KIND, TIMEOUT_KIND, TURN_INTERRUPTED_KIND,
+    USAGE_KIND, USAGE_LIMIT_KIND,
 };
 use coda_protocol::types::{OriginalId, SessionId};
 use coda_store::{Store, StoreError, StoredEvent};
@@ -64,6 +65,7 @@ const BOOKKEEPING_KINDS: &[&str] = &[
     CHILD_EVENT_KIND,
     CONTEXT_OVERFLOW_KIND,
     DENY_KIND,
+    GUARD_LIMIT_KIND,
     HISTORY_NOT_RESTORED_KIND,
     HOOK_BLOCKED_KIND,
     MODEL_SWITCHED_KIND,
@@ -233,7 +235,7 @@ impl Rebuild {
     /// Applies one event.
     pub fn apply(&mut self, event: &StoredEvent, lookup: ResultLookup<'_>) {
         match event.kind.as_str() {
-            USER_MESSAGE_KIND => {
+            USER_MESSAGE_KIND | GUARD_CONTINUE_KIND => {
                 if let Some(body) = parse::<UserBody>(event) {
                     self.settle();
                     self.conversation.push(Message::User(body.text));

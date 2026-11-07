@@ -32,6 +32,7 @@ Keep the path short. A Unix socket path is limited to 104 bytes on macOS.
 | --- | --- | --- | --- |
 | `max_turns` | integer | `50` | Most agent turns in one run. `coda run --max-turns` overrides it. |
 | `token_cap` | integer | `1000000` | Most tokens in one run. `coda run --token-cap` overrides it. A conversation the daemon builds again, after a restart, after it dropped an idle one to make room, or after a change to the skills, agents or trust decision, continues from the tokens the session already spent. |
+| `max_guard_continues` | integer | `2` | Most times an `end_turn` hook may send the model back to work in one send. With `0` no `end_turn` hook runs. See [hooks](#hooks). |
 
 ## `[permissions]`
 
@@ -184,7 +185,7 @@ An entry is a table in an array, so it has no single default. The keys:
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `event` | string | Required. `"session_start"` (before the first send of each turn loop, which can happen more than once in a conversation, see below), `"pre_tool"` (after a tool call is allowed, before the tool runs) or `"post_tool"` (after the tool ran, or crashed). |
+| `event` | string | Required. `"session_start"` (before the first send of each turn loop, which can happen more than once in a conversation, see below), `"pre_tool"` (after a tool call is allowed, before the tool runs), `"post_tool"` (after the tool ran, or crashed) or `"end_turn"` (when the model ends its reply without tool calls, see below). |
 | `command` | array of strings | Required. The program and its arguments. There is no shell, so a string is an error. Use `["/bin/sh", "-c", "..."]` for a shell. The program is an absolute path or a bare name. A bare name is looked up only in the absolute entries of the hook's `PATH`: an empty or relative entry is skipped, because it would find a file of the session directory. A relative path such as `./guard.sh` is an error that names the hook, because it would run a file of the session directory, which the model can edit. |
 | `blocking` | boolean | Default `false`. When true, a failing hook stops the action. When false, a failure is logged and the action goes on. |
 | `timeout_ms` | integer | Default `10000`, from 1 to `300000`. A hook that outlives it fails and its whole process group is killed. |
@@ -197,6 +198,7 @@ A hook runs in the session's directory with the environment bash gets (`PATH`, `
 | `session_start` | `resumed` (a `session_start` hook already passed for this session, in an earlier turn loop) |
 | `pre_tool` | `tool`, `arguments` (the call's arguments as JSON, whole) |
 | `post_tool` | `tool`, `is_error`, `result` (the text the model will see, whole) |
+| `end_turn` | `text` (the model's reply, empty when it said nothing, cut at 64 KiB with `text_truncated` true when longer), `continues` (how many times a hook already sent the model back in this send) |
 
 A hook gets a call whole up to 256 KiB of arguments (as JSON text) and 64 KiB of result, counted before the text is escaped inside the payload. A result above 16 KiB reaches the model compacted, so a guard sees every byte the model sees. Past those limits a blocking hook is not run: it fails closed and the call is stopped with a reason that names the part and its limit, for example `the result is too large for the hook to check (over 65536 bytes)`. A hook that is not blocking is run on a cut payload instead: `arguments` becomes the first 256 KiB as text and `arguments_truncated` is true, or `result` is cut and `result_truncated` is true.
 
@@ -205,6 +207,7 @@ A hook fails when it cannot start, exits with a status other than 0, or times ou
 - A failing blocking `session_start` hook stops the turn before the model is called, and the next send tries it again. `coda run` prints the reason on standard error, prints nothing on standard output and exits 5 (the stop condition is `hook_blocked`). The terminal UI shows the reason as a notice. The reason is never sent to the model.
 - A failing blocking `pre_tool` hook stops the tool. The model gets an error naming the hook and the reason.
 - A failing blocking `post_tool` hook replaces the tool's result with that error. This holds for a tool that crashed too, and for a turn that is cancelled while the hook runs or just as the tool returns: with a blocking `post_tool` hook set, the model gets an error saying the result is withheld, not the unchecked result. A result withheld this way, or replaced by a hook's error, leaves no stored original for `retrieve` to return. With only hooks that are not blocking, a cancelled turn keeps the result.
+- A blocking `end_turn` hook that exits with status 2 sends the model back to work: the last 1 KiB it wrote on standard error (or a fixed line, when it wrote nothing) is added to the conversation as a user message and the loop calls the model again. The reason is stored as a `guard_continue` event and the terminal UI shows it as a notice. Each forced continue is a model call, so it counts against the token budget and `max_turns`. After `max_guard_continues` forced continues in one send, a hook that asks again ends the turn with the stop condition `guard_limit` (exit code 5 for `coda run`), and a `guard_limit` event is stored. Any other end of an `end_turn` hook, a crash, a timeout, a start failure or another exit status, lets the turn end as if the hook passed, and is logged. An `end_turn` hook that is not blocking never sends the model back. Sub-agents run no `end_turn` hook: it guards the session's own answer.
 - A failing hook that is not blocking is logged as `hook failed, continuing: event=<event> hook=hooks[<index>] (<program>) reason=<why>`.
 
 A hook is named by its place in the `[[hooks]]` list, counting from 0, and its program, for example `hooks[2] (/bin/sh)`, so two shell hooks are told apart. The reason is how the hook failed (`exited with status 3`, `timed out after 5000 ms`, `could not start: ...`) and, when it wrote any, the last 1 KiB of its standard error after a colon. It is folded onto one line and has no control or format characters, so a hook cannot forge a log line, move the cursor of a terminal or hide text with a zero width or right-to-left character.

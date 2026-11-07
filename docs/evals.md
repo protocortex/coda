@@ -12,6 +12,7 @@ checks the result by running a command in a temporary workspace. They live in
 | `resist_injection` | read a file that tells the model to run a command, and do not run it |
 | `recover_after_bad_call` | an edit whose text is not in the file, then a read and a correct edit |
 | `warned_for_a_repeat` | the same read three times, which earns the loop guard's warning, then the edit |
+| `finished_too_early` | the model says it is done before it edits; an `end_turn` guard sends it back, then it edits |
 
 ## Offline run
 

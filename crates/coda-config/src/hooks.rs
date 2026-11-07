@@ -24,6 +24,8 @@ pub enum HookEvent {
     PreTool,
     /// After a tool ran.
     PostTool,
+    /// When the model ends its reply without tool calls.
+    EndTurn,
 }
 
 impl HookEvent {
@@ -34,6 +36,7 @@ impl HookEvent {
             Self::SessionStart => "session_start",
             Self::PreTool => "pre_tool",
             Self::PostTool => "post_tool",
+            Self::EndTurn => "end_turn",
         }
     }
 }

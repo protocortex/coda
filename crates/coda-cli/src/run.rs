@@ -615,6 +615,7 @@ mod tests {
             ("refused", 5),
             ("hook_blocked", 5),
             ("stalled", 5),
+            ("guard_limit", 5),
             ("something_new", 5),
         ] {
             // Act and Assert

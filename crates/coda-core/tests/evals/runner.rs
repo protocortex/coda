@@ -10,6 +10,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use coda_config::hooks::{HookConfig, HookEvent};
+use coda_core::hooks::HookRunner;
 use coda_core::prompt::{Conversation, Prefix};
 use coda_core::tools::{BaseToolsConfig, StoreOriginals, base_tools};
 use coda_core::turn::{StopCondition, TurnConfig, TurnEvent, TurnLoop};
@@ -31,6 +33,7 @@ const TOKEN_LIMIT: u64 = 10_000_000;
 /// Tool output above this many bytes is shrunk, low enough that a noisy test run is.
 const COMPACT_THRESHOLD_BYTES: usize = 2048;
 const BASH_TIMEOUT: Duration = Duration::from_secs(20);
+const GUARD_TIMEOUT_MS: u64 = 10_000;
 const SHELL_PATH: &str = "/usr/bin:/bin";
 /// A rough size of a token in request bytes, enough to compare runs with each other.
 const BYTES_PER_TOKEN: u64 = 4;
@@ -152,7 +155,8 @@ pub async fn run<P: ModelProvider + Send + Sync>(fixture: &Fixture, provider: P)
             compact_threshold_bytes: COMPACT_THRESHOLD_BYTES,
         },
         sender,
-    );
+    )
+    .with_hooks(guard_hooks(fixture));
 
     let sent = lp.send(fixture.prompt).await;
     let (turns, usage_tokens, tool_errors) = count_events(&mut receiver);
@@ -188,6 +192,24 @@ pub async fn run<P: ModelProvider + Send + Sync>(fixture: &Fixture, provider: P)
         stop,
         failure,
     }
+}
+
+/// The fixture's `end_turn` guard, if it has one, as the hook runner of the loop.
+fn guard_hooks(fixture: &Fixture) -> HookRunner {
+    let hooks: Vec<HookConfig> = fixture
+        .guard
+        .iter()
+        .map(|script| HookConfig {
+            event: HookEvent::EndTurn,
+            command: ["/bin/sh", "-c", script].map(str::to_owned).to_vec(),
+            blocking: true,
+            timeout_ms: Some(GUARD_TIMEOUT_MS),
+        })
+        .collect();
+    HookRunner::new(
+        &hooks,
+        vec![(OsString::from("PATH"), OsString::from(SHELL_PATH))],
+    )
 }
 
 fn count_events(receiver: &mut UnboundedReceiver<TurnEvent>) -> (u32, u64, u32) {

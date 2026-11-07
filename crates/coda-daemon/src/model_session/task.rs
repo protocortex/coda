@@ -227,7 +227,8 @@ impl LoopFactory {
         .with_context_window(parts.window)
         .with_hooks(self.hooks_for(depth))
         .with_checks(Checks::new(&self.env.config.checks, self.env.env.clone()))
-        .with_loop_guard(self.env.config.loop_guard);
+        .with_loop_guard(self.env.config.loop_guard)
+        .with_max_guard_continues(self.env.config.max_guard_continues);
         if let Some(runner) = below {
             turn_loop = turn_loop.with_tasks(runner);
         }
@@ -241,13 +242,16 @@ impl LoopFactory {
     /// environment bash gets and no API key. Every loop runs the tool hooks, so
     /// a sub-agent is no way around a blocking one. Only the session itself
     /// runs `session_start`, which marks the start of the session, not of a
-    /// sub-agent.
+    /// sub-agent. The same goes for `end_turn`: it guards the session's answer,
+    /// not a sub-agent's report back to it.
     fn hooks_for(&self, depth: u8) -> HookRunner {
         let runner = HookRunner::new(&self.env.config.hooks, self.env.env.clone());
         if depth == 0 {
             runner
         } else {
-            runner.without(HookEvent::SessionStart)
+            runner
+                .without(HookEvent::SessionStart)
+                .without(HookEvent::EndTurn)
         }
     }
 }

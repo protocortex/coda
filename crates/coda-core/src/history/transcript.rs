@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use coda_protocol::events::STREAM_DELTA_KIND;
+use coda_protocol::events::{GUARD_CONTINUE_KIND, STREAM_DELTA_KIND};
 use coda_protocol::types::{SessionId, TurnId};
 use coda_store::{Store, StoreError, StoredEvent};
 use serde::Deserialize;
@@ -111,7 +111,7 @@ impl Transcript {
             return;
         }
         let speaker = match event.kind.as_str() {
-            USER_MESSAGE_KIND => Speaker::User,
+            USER_MESSAGE_KIND | GUARD_CONTINUE_KIND => Speaker::User,
             STREAM_DELTA_KIND => Speaker::Assistant,
             _ => return,
         };
@@ -218,6 +218,27 @@ mod tests {
             transcript.render(),
             Some(r#"{"role":"user","text":"now"}"#.to_owned())
         );
+    }
+
+    #[test]
+    fn a_guard_continue_is_a_user_turn_of_the_transcript() {
+        // Arrange
+        let events = [
+            said(1, USER_MESSAGE_KIND, "hi"),
+            said(2, STREAM_DELTA_KIND, "done"),
+            said(3, GUARD_CONTINUE_KIND, "run the tests"),
+        ];
+
+        // Act
+        let text = render(100, &events);
+
+        // Assert
+        let expected = [
+            r#"{"role":"user","text":"hi"}"#,
+            r#"{"role":"assistant","text":"done"}"#,
+            r#"{"role":"user","text":"run the tests"}"#,
+        ];
+        assert_eq!(text, Some(expected.join("\n")));
     }
 
     #[test]
