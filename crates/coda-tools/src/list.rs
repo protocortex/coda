@@ -60,6 +60,10 @@ impl ListTool {
 }
 
 impl Tool for ListTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         NAME
     }

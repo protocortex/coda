@@ -76,6 +76,10 @@ impl GrepTool {
 }
 
 impl Tool for GrepTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         NAME
     }

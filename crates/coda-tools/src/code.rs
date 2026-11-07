@@ -207,6 +207,10 @@ index_tool!(
 );
 
 impl Tool for CodeSearchTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         SEARCH_NAME
     }
@@ -237,6 +241,10 @@ index_tool!(
 );
 
 impl Tool for CodeSymbolTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         SYMBOL_NAME
     }
@@ -267,6 +275,10 @@ index_tool!(
 );
 
 impl Tool for CodeOutlineTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         OUTLINE_NAME
     }
@@ -301,6 +313,10 @@ impl CodeReadRangeTool {
 }
 
 impl Tool for CodeReadRangeTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         READ_RANGE_NAME
     }

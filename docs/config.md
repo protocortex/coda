@@ -33,6 +33,11 @@ Keep the path short. A Unix socket path is limited to 104 bytes on macOS.
 | `max_turns` | integer | `50` | Most agent turns in one run. `coda run --max-turns` overrides it. |
 | `token_cap` | integer | `1000000` | Most tokens in one run. `coda run --token-cap` overrides it. A conversation the daemon builds again, after a restart, after it dropped an idle one to make room, or after a change to the skills, agents or trust decision, continues from the tokens the session already spent. |
 | `max_guard_continues` | integer | `2` | Most times an `end_turn` hook may send the model back to work in one send. With `0` no `end_turn` hook runs. See [hooks](#hooks). |
+| `max_parallel_tools` | integer | `4` | Most read-only tool calls from one model reply that run at the same time. Must be at least `1`; with `1` every call runs in turn. See [parallel tool calls](#parallel-tool-calls). |
+
+### Parallel tool calls
+
+When one model reply holds several calls to read-only tools (`read`, `grep`, `list` and the `code_*` tools), they run at the same time, up to `max_parallel_tools` at once. A call to any other tool, such as `edit`, `write` or `bash`, never overlaps another call: it waits for the read-only calls before it and runs alone. Permission prompts and `pre_tool` hooks still go one call at a time, in the order the model wrote them, but for a run of read-only calls all of them come before the first call starts, so a `pre_tool` hook of a later call does not see what the `post_tool` hook of an earlier call did. `post_tool` hooks run in call order as each call finishes. A cancel stops the prompts for the calls not yet asked. Results are stored in that same order, so a replayed session reads the same.
 
 ## `[permissions]`
 

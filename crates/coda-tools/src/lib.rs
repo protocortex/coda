@@ -187,6 +187,13 @@ pub trait Tool: Send + Sync {
         true
     }
 
+    /// Whether a call changes nothing outside the process, so the loop may run
+    /// it at the same time as other read-only calls from one reply. A tool that
+    /// writes files or runs commands keeps the default, `false`.
+    fn read_only(&self) -> bool {
+        false
+    }
+
     /// Like [`call`](Tool::call), but a long-running tool should stop soon
     /// after `cancel` becomes true. Tools that finish quickly keep this default.
     ///
