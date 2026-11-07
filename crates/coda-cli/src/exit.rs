@@ -30,3 +30,6 @@ pub const DOCTOR_FAILURES: u8 = 20;
 pub const DOCTOR_WARNINGS: u8 = 21;
 /// `coda agents lint` found at least one problem.
 pub const LINT_FAILURES: u8 = 22;
+/// `coda review --hook` found a finding of severity high or critical and the config says
+/// to block the push.
+pub const REVIEW_BLOCKED: u8 = 23;

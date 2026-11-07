@@ -47,6 +47,7 @@ use crate::cli::ReviewArgs;
 use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
 use crate::error::CliError;
+use crate::exit;
 use crate::review_issues::{Linked, gather as gather_issues};
 use crate::review_memory::{Memory, saw_everything};
 use crate::review_post::{Confirm, RealGh, head_of, post};
@@ -73,6 +74,8 @@ const NO_DEFAULT_BRANCH_NOTE: &str =
 const FORCED_NOTE: &str = "a skip rule matched, but --force asks for the review anyway";
 const GH: &str = "gh";
 const HEAD: &str = "HEAD";
+/// The branch a push goes to.
+const UPSTREAM: &str = "@{u}";
 const END_TURN: &str = StopCondition::EndTurn.as_str();
 
 /// Runs the review. `force` reviews a pull request that a skip rule would skip.
@@ -86,17 +89,95 @@ pub async fn run(
     force: bool,
     args: ReviewArgs,
 ) -> Result<ExitCode, CliError> {
+    if args.hook {
+        return run_hook(ctx, io, force, args).await;
+    }
+    run_review(ctx, io, force, args).await
+}
+
+/// What the pre-push hook runs. It reviews nothing unless the global config turns it on, and
+/// a branch with no upstream or a review that fails does not stop the push: only a finding
+/// of severity high or critical can, when the config says so.
+async fn run_hook(
+    ctx: &Context,
+    io: &mut Io<'_>,
+    force: bool,
+    args: ReviewArgs,
+) -> Result<ExitCode, CliError> {
+    match hook_review(ctx, io, force, args).await {
+        Err(error) => {
+            writeln!(
+                io.err,
+                "coda: the review before the push failed, so the push goes on: {error}"
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
+        done => done,
+    }
+}
+
+/// What is reviewed: nothing named for `--staged`, the commits about to be pushed for the
+/// hook, else what the user typed.
+fn review_target(args: &ReviewArgs) -> Option<Target> {
+    if args.staged {
+        return None;
+    }
+    if args.hook {
+        return Some(Target::Range {
+            base: UPSTREAM.to_owned(),
+            head: HEAD.to_owned(),
+        });
+    }
+    Some(Target::parse(args.target.as_deref()))
+}
+
+/// Whether the hook run stops the push: the config says so and a finding of severity high or
+/// critical remains.
+fn blocks_push(args: &ReviewArgs, config: &ReviewConfig, review: &Review) -> bool {
+    args.hook && config.hook.block_on_high && review.findings.iter().any(|f| f.severity.blocks())
+}
+
+async fn hook_review(
+    ctx: &Context,
+    io: &mut Io<'_>,
+    force: bool,
+    args: ReviewArgs,
+) -> Result<ExitCode, CliError> {
+    if !load_config(&ctx.dirs)?.review.hook.enabled {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let cwd = session_cwd(&ctx.cwd, args.cwd.clone())?;
+    if !has_upstream(Path::new(&cwd)) {
+        writeln!(
+            io.err,
+            "coda: the branch has no upstream, so there is nothing to review before the push"
+        )?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    run_review(ctx, io, force, args).await
+}
+
+fn has_upstream(repo: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", UPSTREAM])
+        .current_dir(repo)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+async fn run_review(
+    ctx: &Context,
+    io: &mut Io<'_>,
+    force: bool,
+    args: ReviewArgs,
+) -> Result<ExitCode, CliError> {
     let config = load_config(&ctx.dirs)?;
     let backend = review_backend(&config, args.backend.map(Into::into));
     let cwd = session_cwd(&ctx.cwd, args.cwd.clone())?;
     let repo = Path::new(&cwd);
     info!(step = "read_change", "reading the change");
     let rules = load_rules(&config.review, repo)?;
-    let target = if args.staged {
-        None
-    } else {
-        Some(Target::parse(args.target.as_deref()))
-    };
+    let target = review_target(&args);
     let post_to = post_request(ctx, repo, &args, target.as_ref())?;
     if !args.dismiss.is_empty() {
         return dismiss_only(ctx, io, repo, &args, target.as_ref());
@@ -184,6 +265,9 @@ pub async fn run(
     }
     if let Some(to) = post_to {
         post_review(io, repo, to, &parts, &review)?;
+    }
+    if blocks_push(&args, &config.review, &review) {
+        return Ok(ExitCode::from(exit::REVIEW_BLOCKED));
     }
     Ok(ExitCode::SUCCESS)
 }

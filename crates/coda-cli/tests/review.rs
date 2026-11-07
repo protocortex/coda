@@ -877,3 +877,115 @@ async fn a_verdict_with_no_linked_issue_behind_it_is_dropped_and_the_section_is_
         outcome.out
     );
 }
+
+const REVIEW_BLOCKED: u8 = 23;
+
+/// A [`rig`] whose branch has an upstream, so the commits not yet pushed are what `topic`
+/// adds to `main`, with `[review.hook]` set as given.
+fn hook_rig(script: &[Value], hook_config: &str, upstream: bool) -> FauxRig {
+    let rig = rig(script);
+    if upstream {
+        git(rig.work.path(), &["branch", "-q", "-u", "main"]);
+    }
+    let path = rig.home.path().join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(path, format!("{config}\n[review.hook]\n{hook_config}")).unwrap();
+    rig
+}
+
+#[tokio::test]
+async fn the_hook_does_nothing_unless_the_config_turns_it_on() {
+    // Arrange
+    let rig = hook_rig(&[], "block_on_high = true\n", true);
+
+    // Act
+    let outcome = review(&rig, &["--hook"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert_eq!(outcome.out, "");
+    assert_eq!(rig.requests().len(), 0);
+}
+
+#[tokio::test]
+async fn a_high_finding_blocks_the_push_when_the_config_says_so() {
+    // Arrange
+    let rig = hook_rig(
+        &answered(&review_json(4)),
+        "enabled = true\nblock_on_high = true\n",
+        true,
+    );
+
+    // Act
+    let outcome = review(&rig, &["--hook"]).await;
+
+    // Assert
+    assert_eq!(
+        outcome.code,
+        ExitCode::from(REVIEW_BLOCKED),
+        "{}",
+        outcome.err
+    );
+    assert!(outcome.out.contains("Wrong word"), "{}", outcome.out);
+}
+
+#[tokio::test]
+async fn a_high_finding_only_prints_when_the_config_does_not_block() {
+    // Arrange
+    let rig = hook_rig(&answered(&review_json(4)), "enabled = true\n", true);
+
+    // Act
+    let outcome = review(&rig, &["--hook"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert!(outcome.out.contains("Wrong word"), "{}", outcome.out);
+}
+
+#[tokio::test]
+async fn a_branch_with_no_upstream_or_a_failed_review_does_not_stop_the_push() {
+    // Arrange
+    let config = "enabled = true\nblock_on_high = true\n";
+    let no_upstream = hook_rig(&answered(&review_json(4)), config, false);
+    let failing = hook_rig(&[], config, true);
+
+    // Act
+    let first = review(&no_upstream, &["--hook"]).await;
+    let second = review(&failing, &["--hook"]).await;
+
+    // Assert
+    assert_eq!(first.code, ExitCode::SUCCESS, "{}", first.err);
+    assert!(first.err.contains("no upstream"), "{}", first.err);
+    assert_eq!(second.code, ExitCode::SUCCESS, "{}", second.err);
+    assert!(second.err.contains("the push goes on"), "{}", second.err);
+}
+
+#[tokio::test]
+async fn a_broken_config_does_not_stop_the_push() {
+    // Arrange
+    let rig = hook_rig(&[], "enabled = true\n", true);
+    std::fs::write(
+        rig.home.path().join("config.toml"),
+        "this is = not [valid\n",
+    )
+    .unwrap();
+
+    // Act
+    let outcome = review(&rig, &["--hook"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert!(outcome.err.contains("the push goes on"), "{}", outcome.err);
+}
+
+#[tokio::test]
+async fn the_hook_flag_cannot_be_combined_with_a_target() {
+    // Arrange
+    let rig = rig(&[]);
+
+    // Act
+    let outcome = review(&rig, &["--hook", "topic"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::from(USAGE), "{}", outcome.err);
+}

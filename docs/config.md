@@ -210,6 +210,17 @@ For a pull request target, `coda review` also reads the issues it links to. It l
 
 For a pull request target, `coda review` remembers each run in the database: the head commit it reviewed and each finding, by fingerprint (the file, the category and the headline, ignoring case and punctuation, so rewording the explanation keeps it), with the lines it pointed at and a hash of that code. The markdown shows each finding's fingerprint. The next run puts the open and the dismissed findings in the prompt, so the reviewer keeps their wording and does not repeat a dismissed one, and removes a dismissed finding from the result whatever words it used. A finding stays dismissed when it is reported again. A run of the whole change marks an open finding resolved when the reviewer no longer reports it and the code it pointed at changed in the diff; a finding about lines the diff does not show stays open. An incremental run or a run where a part failed never resolves anything, since it did not see everything. A branch, a range or `--staged` has no memory, and when the database cannot be opened the review goes on without it and says so. The dismissal is done with `--dismiss`; the terminal UI has no view of review findings yet.
 
+## `[review.hook]`
+
+`coda hooks install review` writes a pre-push hook (in the hooks directory git uses, so a `core.hooksPath` is honored) that runs `coda review --hook`, and `coda hooks remove review` deletes it. Coda refuses to overwrite or delete a pre-push hook it did not write. The hook script does nothing, and nothing is reviewed, until the global config sets `enabled`; the repository's `.coda/review.toml` cannot turn it on.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Whether `coda review --hook` reviews the commits about to be pushed (`@{u}..HEAD`) and prints the findings. Off, it exits 0 at once. |
+| `block_on_high` | boolean | `false` | Whether a finding of severity high or critical makes `coda review --hook` exit 23, which stops the push. Off, the findings are only printed. |
+
+The hook reviews the checked-out branch against its upstream (`@{u}..HEAD`), whatever ref the push names, so `git push origin other-branch` reviews the branch you are on. A branch with no upstream has nothing to review and does not stop the push. A review that fails (no backend, a bad answer, a broken config) says so on standard error and does not stop it either, and the script lets every outcome of coda through except exit 23; only a finding can stop a push. The script skips the review when `coda` is not on the `PATH`. The review uses the same settings as `coda review`, so a push waits for a model run, with no time limit of its own. A global `core.hooksPath` makes the hook global: one install covers every repository that uses it, and a remove takes it away from all of them. Starting a review from a pull request watch needs the watch itself (#166) and is tracked in #316.
+
 ## `[review.ignore]`
 
 Files a review leaves out.

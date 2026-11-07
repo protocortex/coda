@@ -41,6 +41,14 @@ impl Severity {
     }
 }
 
+impl Severity {
+    /// Whether a finding this serious is one that can stop a push: high or critical.
+    #[must_use]
+    pub const fn blocks(self) -> bool {
+        matches!(self, Self::Critical | Self::High)
+    }
+}
+
 /// What kind of problem a finding is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -379,6 +387,16 @@ mod tests {
 
     fn names(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn only_high_and_critical_findings_block() {
+        // Act and Assert
+        assert!(Severity::Critical.blocks());
+        assert!(Severity::High.blocks());
+        assert!(!Severity::Medium.blocks());
+        assert!(!Severity::Low.blocks());
+        assert!(!Severity::Info.blocks());
     }
 
     #[test]
