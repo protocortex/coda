@@ -398,10 +398,11 @@ fn rate_limit(info: &Value, unusable: &mut Vec<&'static str>) -> Option<RateLimi
 ///
 /// A whole-number float is accepted. A negative, fractional or too large value
 /// (milliseconds, for one) is not guessed at: it reads as absent and is noted in `unusable`.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::cast_precision_loss
+    clippy::cast_precision_loss,
+    reason = "the range check keeps the casts exact"
 )]
 fn epoch_seconds(value: &Value, unusable: &mut Vec<&'static str>) -> Option<u64> {
     if value.is_null() {
@@ -423,7 +424,11 @@ fn epoch_seconds(value: &Value, unusable: &mut Vec<&'static str>) -> Option<u64>
 }
 
 /// The clamp keeps the value inside `u32`, so the cast cannot truncate or change sign.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is rounded and clamped into range first"
+)]
 fn basis_points(fraction: f64) -> u32 {
     (fraction * BASIS_POINTS_PER_UNIT)
         .round()

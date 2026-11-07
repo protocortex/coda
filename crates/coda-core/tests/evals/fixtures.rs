@@ -14,7 +14,7 @@ const SCRIPTED_USAGE: Usage = Usage {
     output_tokens: 5,
 };
 
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "independent switches of one fixture's setup"
 )]

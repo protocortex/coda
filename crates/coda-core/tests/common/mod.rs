@@ -3,7 +3,11 @@
 //! Helpers for the hook tests: small scripts in a temporary directory, hook
 //! entries, log capture and bounded polling.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    clippy::allow_attributes,
+    reason = "each test binary uses a different part of this module"
+)]
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;

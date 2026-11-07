@@ -421,7 +421,7 @@ struct Chain<P> {
 }
 
 /// One session's loop state.
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "independent switches of one loop's state"
 )]

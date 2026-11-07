@@ -178,7 +178,7 @@ impl MaxTokensField {
 /// One `[providers.<backend>]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each flag is its own key in config.toml"
 )]
