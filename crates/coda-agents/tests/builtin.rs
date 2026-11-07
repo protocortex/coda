@@ -21,7 +21,14 @@ const READ_ONLY: [&str; 7] = [
     "read",
     "retrieve",
 ];
-const NAMES: [&str; 5] = ["explore", "implementer", "reviewer", "tester", "verifier"];
+const NAMES: [&str; 6] = [
+    "describer",
+    "explore",
+    "implementer",
+    "reviewer",
+    "tester",
+    "verifier",
+];
 
 fn agent(name: &str, tools: &str, body: &str) -> String {
     format!(
@@ -81,8 +88,10 @@ fn explore_reviewer_and_verifier_have_exactly_the_read_only_tools() {
 
     // Act
     let (explore, reviewer, verifier) = (sorted("explore"), sorted("reviewer"), sorted("verifier"));
+    let describer = sorted("describer");
 
     // Assert
+    assert_eq!(describer, READ_ONLY);
     assert_eq!(explore, READ_ONLY);
     assert_eq!(reviewer, READ_ONLY);
     assert_eq!(verifier, READ_ONLY);

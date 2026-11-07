@@ -98,7 +98,7 @@ impl Confirm {
             return Ok(());
         }
         Err(CliError::ReviewPost(
-            "standard input is not a terminal, so pass --yes to post without being asked"
+            "standard input is not a terminal, so pass --yes to go on without being asked"
                 .to_owned(),
         ))
     }
@@ -177,7 +177,7 @@ pub fn post(
         return Ok(());
     }
     write!(io.err, "{}", preview(&plan, summary_id.is_some()))?;
-    if !confirm.assume_yes && !asked_yes(io)? {
+    if !confirm.assume_yes && !asked_yes(io, "Post this to the pull request? [y/N] ")? {
         writeln!(io.err, "coda: nothing was posted")?;
         return Ok(());
     }
@@ -311,8 +311,9 @@ fn comment_json(c: &InlineComment) -> Value {
     out
 }
 
-fn asked_yes(io: &mut Io<'_>) -> Result<bool, CliError> {
-    write!(io.err, "Post this to the pull request? [y/N] ")?;
+/// Asks `question` on standard error and reads one line of the answer: `y` or `yes`.
+pub(crate) fn asked_yes(io: &mut Io<'_>, question: &str) -> Result<bool, CliError> {
+    write!(io.err, "{question}")?;
     io.err.flush()?;
     let mut answer = String::new();
     io.input.read_line(&mut answer)?;

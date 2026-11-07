@@ -11,6 +11,7 @@ use serde::Deserialize;
 use crate::chunk::Merged;
 use crate::pack::Packed;
 use crate::parse::answer_object;
+use crate::parse::last_object_with;
 use crate::schema::{
     Category, Confidence, MAX_EFFORT, MIN_EFFORT, Review, Risk, RunDetails, Severity,
 };
@@ -23,6 +24,8 @@ pub const REVIEWER_AGENT: &str = "reviewer";
 pub const VERIFIER_AGENT: &str = "verifier";
 /// The name of the built-in agent that runs the checks.
 pub const TESTER_AGENT: &str = "tester";
+/// The name of the built-in agent that drafts descriptions.
+pub const DESCRIBER_AGENT: &str = "describer";
 
 /// Which agent a run is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +36,8 @@ pub enum Role {
     Verifier,
     /// Runs the configured test and lint commands and reports what happened.
     Tester,
+    /// Drafts a description of the change.
+    Describer,
 }
 
 impl Role {
@@ -43,6 +48,7 @@ impl Role {
             Self::Reviewer => REVIEWER_AGENT,
             Self::Verifier => VERIFIER_AGENT,
             Self::Tester => TESTER_AGENT,
+            Self::Describer => DESCRIBER_AGENT,
         }
     }
 
@@ -53,6 +59,7 @@ impl Role {
             Self::Reviewer => answer_object(text),
             Self::Verifier => verdicts_object(text),
             Self::Tester => text.trim(),
+            Self::Describer => last_object_with(text, &["title", "summary"]),
         }
     }
 }
@@ -366,6 +373,11 @@ pub fn task_prompt(role: Role, input_path: &str, retry_hint: Option<&str>) -> St
             "Run the commands listed in the file {input_path}, once each and in order, from the \
              repository root. Read it first. Change no file."
         ),
+        Role::Describer => format!(
+            "Describe the change described in the file {input_path}. Read it all first, in as \
+             many `read` calls as it takes. It holds the reply format and the diff. You may read \
+             other files of the repository to see what the changed code is for."
+        ),
     };
     append_hint(&mut prompt, retry_hint);
     prompt
@@ -395,6 +407,7 @@ pub fn direct_prompt(role: Role, input: &str, retry_hint: Option<&str>) -> Strin
              around each."
         }
         Role::Tester => "Run the commands below, once each and in order.",
+        Role::Describer => "Describe the change below. It holds the reply format and the diff.",
     };
     let mut prompt = format!(
         "{what} You may read other files of the repository to check how the changed code is \

@@ -27,7 +27,8 @@ const ANGLE_BREAK: &str = "<\u{200b}";
 const MENTION_BREAK: &str = "@\u{200b}";
 
 /// Text for an inline code span: backticks and line breaks would end the span or the line.
-fn inline(text: &str) -> String {
+#[must_use]
+pub fn inline(text: &str) -> String {
     text.chars()
         .map(|c| {
             if c == FENCE_CHAR || c.is_control() {
@@ -40,7 +41,8 @@ fn inline(text: &str) -> String {
 }
 
 /// Model text that must stay on one line, such as a heading.
-fn one_line(text: &str) -> String {
+#[must_use]
+pub fn one_line(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
@@ -50,7 +52,8 @@ fn one_line(text: &str) -> String {
 /// heading, a rule or a code fence is escaped, also after list and quote markers, and `<` and
 /// `@` cannot start HTML or a mention. The breaks are invisible zero-width spaces, so code
 /// spans keep their look.
-fn prose(text: &str) -> String {
+#[must_use]
+pub fn prose(text: &str) -> String {
     let cleaned: String = text
         .chars()
         .map(|c| if c != '\n' && c.is_control() { ' ' } else { c })

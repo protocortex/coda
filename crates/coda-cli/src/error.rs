@@ -97,6 +97,8 @@ pub enum CliError {
     ReviewInput(String),
     #[error("the review failed: {0}")]
     ReviewFailed(String),
+    #[error("cannot describe the change: {0}")]
+    Describe(String),
     #[error("the backend cannot go on: it {0}")]
     BackendUnavailable(Unavailable),
     #[error("cannot post the review: {0}")]

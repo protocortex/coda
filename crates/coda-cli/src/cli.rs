@@ -45,6 +45,11 @@ pub enum Command {
     /// Exit codes: 0 reviewed or skipped by a rule, 64 bad usage, 70 the review
     /// failed.
     Review(ReviewArgs),
+    /// Draft a pull request title, summary and file notes; nothing is written unless you
+    /// pass `--apply`.
+    ///
+    /// Exit codes: 0 drafted or nothing to describe, 64 bad usage, 70 it failed.
+    Describe(DescribeArgs),
     /// Write or remove the git hooks that start a review.
     #[command(subcommand)]
     Hooks(HooksCommand),
@@ -340,6 +345,43 @@ pub struct ReviewArgs {
     /// reports to the prompt, as untrusted data. Needs a model-API backend.
     #[arg(long)]
     pub run_checks: bool,
+}
+
+#[derive(Debug, Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is its own option on the command line"
+)]
+pub struct DescribeArgs {
+    /// A pull request number or URL, a branch, or a range such as `main...topic`.
+    /// Without one, the current branch is described against the default branch.
+    pub target: Option<String>,
+    /// Describe the staged changes instead.
+    #[arg(long, conflicts_with = "target")]
+    pub staged: bool,
+    /// Extra instructions for the describer.
+    #[arg(long)]
+    pub instructions: Option<String>,
+    /// Print the draft as JSON instead of text.
+    #[arg(long)]
+    pub json: bool,
+    /// The backend that runs the describer. By default the one `coda run` uses.
+    #[arg(long, value_enum)]
+    pub backend: Option<BackendArg>,
+    /// Working directory.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// Also suggest labels, from the `[[describe.labels]]` list that the repository has.
+    #[arg(long)]
+    pub labels: bool,
+    /// Put the draft in the pull request's body, in a block under a marker comment, and add the
+    /// suggested labels, after a preview you confirm. It never removes a label and never
+    /// changes the title. Needs a pull request target.
+    #[arg(long, conflicts_with = "staged")]
+    pub apply: bool,
+    /// Apply without asking. Needed when standard input is not a terminal.
+    #[arg(long, requires = "apply")]
+    pub yes: bool,
 }
 
 /// The backends as typed on the command line.

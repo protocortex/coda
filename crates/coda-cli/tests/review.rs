@@ -521,6 +521,86 @@ async fn run_checks_that_give_no_report_leave_a_note_and_the_review_goes_on() {
     assert!(outcome.err.contains("Review run:"), "{}", outcome.err);
 }
 
+async fn describe(rig: &FauxRig, flags: &[&str]) -> Outcome {
+    let cwd = rig.work.path().display().to_string();
+    let mut args = vec!["coda", "describe", "--cwd", &cwd];
+    args.extend_from_slice(flags);
+    cli(&rig.ctx, &args, "").await
+}
+
+fn describer_turns(draft: &Value) -> Vec<Value> {
+    let hand_off = tool_turn(
+        "task",
+        &json!({"agent": "describer", "prompt": "Describe the file."}),
+    );
+    vec![hand_off, text_turn(&draft.to_string()), text_turn("done")]
+}
+
+#[tokio::test]
+async fn describe_prints_a_draft_and_writes_nothing() {
+    // Arrange
+    let draft = json!({
+        "title": "Add two lines to a.txt",
+        "summary": "The file grows by two lines.",
+        "files": [
+            {"file": "a.txt", "note": "adds four and five"},
+            {"file": "gone.txt", "note": "not in the change"}
+        ],
+        "labels": ["bug"]
+    });
+    let rig = rig(&describer_turns(&draft));
+
+    // Act
+    let outcome = describe(&rig, &[]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert!(
+        outcome.out.starts_with("Title: Add two lines to a.txt\n"),
+        "{}",
+        outcome.out
+    );
+    assert!(
+        outcome.out.contains("- a.txt: adds four and five"),
+        "{}",
+        outcome.out
+    );
+    assert!(!outcome.out.contains("gone.txt"), "{}", outcome.out);
+    assert!(!outcome.out.contains("Suggested labels"), "{}", outcome.out);
+    assert!(!outcome.err.contains("suggested label"), "{}", outcome.err);
+    assert!(!rig.work.path().join(".coda").exists());
+}
+
+#[tokio::test]
+async fn describe_json_is_the_checked_draft() {
+    // Arrange
+    let draft = json!({"title": "T", "summary": "S", "files": [], "labels": []});
+    let rig = rig(&describer_turns(&draft));
+
+    // Act
+    let outcome = describe(&rig, &["--json"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let parsed: Value = serde_json::from_str(&outcome.out).unwrap();
+    assert_eq!(parsed["title"], "T");
+    assert_eq!(parsed["summary"], "S");
+}
+
+#[tokio::test]
+async fn describe_apply_needs_a_pull_request_and_stops_before_any_model_call() {
+    // Arrange
+    let rig = rig(&[]);
+
+    // Act
+    let outcome = describe(&rig, &["--apply", "--yes"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::from(FAILURE), "{}", outcome.err);
+    assert!(outcome.err.contains("pull request"), "{}", outcome.err);
+    assert_eq!(rig.requests().len(), 0);
+}
+
 #[tokio::test]
 async fn staged_cannot_be_combined_with_a_target() {
     // Arrange

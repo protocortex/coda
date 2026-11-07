@@ -636,7 +636,7 @@ fn notice(io: &mut Io<'_>, json: bool, text: &str) -> Result<(), CliError> {
 }
 
 /// The backend that runs the review: the one asked for, else the one `coda run` would use.
-fn review_backend(config: &Config, asked: Option<BackendKind>) -> BackendKind {
+pub(crate) fn review_backend(config: &Config, asked: Option<BackendKind>) -> BackendKind {
     asked.unwrap_or_else(|| pick_backend(config))
 }
 
@@ -648,7 +648,7 @@ pub(crate) fn backend_name(backend: BackendKind) -> String {
         .unwrap_or_else(|| format!("{backend:?}"))
 }
 
-fn load_rules(config: &ReviewConfig, repo: &Path) -> Result<Rules, CliError> {
+pub(crate) fn load_rules(config: &ReviewConfig, repo: &Path) -> Result<Rules, CliError> {
     let rules = match default_branch_ref(repo) {
         Some(default_ref) => load(config, repo, &default_ref),
         None => Rules::compile(config),
@@ -700,7 +700,7 @@ fn gh_pr_decision(repo: &Path, pr: &str, rules: &Rules, force: bool) -> Result<D
 }
 
 /// The unified diff of the change. `None` is the staged changes.
-fn change_text(repo: &Path, target: Option<&Target>) -> Result<String, CliError> {
+pub(crate) fn change_text(repo: &Path, target: Option<&Target>) -> Result<String, CliError> {
     let read = |result: Result<String, coda_review::diff::GitError>| {
         result.map_err(|e| CliError::ReviewInput(e.to_string()))
     };
@@ -723,7 +723,7 @@ fn default_branch(repo: &Path) -> Result<String, CliError> {
     })
 }
 
-fn split_files(
+pub(crate) fn split_files(
     repo: &Path,
     files: &[FileDiff],
     config: &ReviewConfig,
@@ -1202,6 +1202,50 @@ fn reply_text(kind: &str, body: &Value, agent: &str) -> Option<String> {
         return None;
     }
     body["body"]["text"].as_str().map(str::to_owned)
+}
+
+/// One run of a built-in agent on one input, for the commands that draft text from a change.
+/// On a model-API backend the input goes through a file the agent reads, which is removed when
+/// the run ends; on Claude Code and Codex it is the prompt.
+pub(crate) struct Ask<'a> {
+    pub(crate) ctx: &'a Context,
+    pub(crate) cwd: &'a str,
+    pub(crate) role: Role,
+    /// The start of the name of the input file.
+    pub(crate) file_prefix: &'a str,
+    pub(crate) input: &'a str,
+}
+
+impl Attempt for Ask<'_> {
+    async fn attempt(
+        &mut self,
+        backend: BackendKind,
+        model: Option<&str>,
+        hint: Option<String>,
+    ) -> Result<Answer, CliError> {
+        let texts = [self.input.to_owned()];
+        let written = if backend.is_model_backend() {
+            Some(InputFiles::write(
+                Path::new(self.cwd),
+                self.file_prefix,
+                &texts,
+            )?)
+        } else {
+            None
+        };
+        let tally = TokenTally::default();
+        let mut live = Live {
+            ctx: self.ctx,
+            role: self.role,
+            cwd: self.cwd,
+            handoff: match &written {
+                Some(files) => Handoff::File(&files.relative[0]),
+                None => Handoff::Prompt(self.input),
+            },
+            tally: &tally,
+        };
+        live.attempt(backend, model, hint).await
+    }
 }
 
 /// The files the reviewer reads, one per part. They are removed when the review is over.
