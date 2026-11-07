@@ -88,6 +88,8 @@ jobs:
           persist-credentials: false
       - run: bash scripts/check-spdx.sh
       - run: bash scripts/tests/check-spdx.test.sh
+      - run: bash scripts/check-conflict-markers.sh
+      - run: bash scripts/tests/check-conflict-markers.test.sh
       - run: bash scripts/tests/check-leaked-daemons.test.sh
       - run: bash scripts/tests/ci-aggregate.test.sh
 
