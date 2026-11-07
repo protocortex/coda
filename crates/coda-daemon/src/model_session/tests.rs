@@ -458,6 +458,41 @@ async fn accept_edits_creates_a_file_and_lists_it_without_a_prompt() {
     assert!(listing.contains("made.txt"), "{listing}");
 }
 
+/// The names of the tools and the system prompt of the first request a one-reply session sends.
+async fn offered_by(tune: impl FnOnce(&mut Config)) -> (Vec<String>, String) {
+    let mut rig = Rig::custom(Mode::Default, &[text_turn("hi")], true, None, tune);
+    rig.send("hello").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+    let first = rig.request_lines().remove(0);
+    let tools = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool.as_str().unwrap().to_owned())
+        .collect();
+    (tools, first["system"].as_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn a_session_offers_fetch_and_the_untrusted_rule_only_when_a_host_is_listed() {
+    // Act
+    let (off_tools, off_system) = offered_by(|_| {}).await;
+    let (on_tools, on_system) = offered_by(|config| {
+        config.fetch.allow_hosts = vec!["docs.example".to_owned()];
+    })
+    .await;
+
+    // Assert
+    assert!(!off_tools.contains(&"fetch".to_owned()), "{off_tools:?}");
+    assert!(!off_system.contains("untrusted"), "{off_system}");
+    assert!(on_tools.contains(&"fetch".to_owned()), "{on_tools:?}");
+    assert!(
+        on_system.contains(coda_tools::fetch::UNTRUSTED_RULE),
+        "{on_system}"
+    );
+}
+
 #[tokio::test]
 async fn a_write_over_an_unread_file_or_outside_the_workspace_is_refused() {
     // Arrange

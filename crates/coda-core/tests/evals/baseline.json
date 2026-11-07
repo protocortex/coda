@@ -9,6 +9,10 @@
       "turns": 3,
       "tokens": 4664
     },
+    "cut_a_long_page": {
+      "turns": 3,
+      "tokens": 4935
+    },
     "fell_back_on_rate_limit": {
       "turns": 2,
       "tokens": 4202
@@ -29,6 +33,10 @@
       "turns": 2,
       "tokens": 2830
     },
+    "read_a_page": {
+      "turns": 3,
+      "tokens": 4844
+    },
     "read_files_in_parallel": {
       "turns": 3,
       "tokens": 4306
@@ -36,6 +44,14 @@
     "recover_after_bad_call": {
       "turns": 4,
       "tokens": 5701
+    },
+    "refused_a_private_host": {
+      "turns": 3,
+      "tokens": 4815
+    },
+    "refused_a_redirect": {
+      "turns": 3,
+      "tokens": 4798
     },
     "rename_symbol": {
       "turns": 4,

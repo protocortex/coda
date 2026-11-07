@@ -104,6 +104,33 @@ pub(super) fn text_of(result: &Value) -> &str {
 }
 
 #[tokio::test]
+async fn a_child_gets_no_fetch_tool_even_when_its_session_offers_it() {
+    // Arrange
+    let script = [
+        task_call("t1", "scout"),
+        text_turn("found"),
+        text_turn("done"),
+    ];
+    let mut rig = scout_rig(&script, "\"read\"", |config| {
+        config.fetch.allow_hosts = vec!["docs.example".to_owned()];
+    });
+
+    // Act
+    rig.send("please search").await;
+    finish(&rig, 1).await;
+
+    // Assert
+    let lines = rig.request_lines();
+    assert!(
+        lines[0]["tools"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("fetch"))
+    );
+    assert_eq!(lines[1]["tools"], json!(["read"]));
+}
+
+#[tokio::test]
 async fn a_child_runs_fresh_with_only_its_tools_and_cannot_call_task_or_others() {
     // Arrange
     let nested = json!({"agent": "scout", "prompt": "again"});

@@ -16,6 +16,10 @@ use crate::daemon::DaemonConfig;
 use crate::describe::{
     DESCRIBE_KEY, DescribeConfig, LABEL_NAME_KEY, LABEL_USE_WHEN_KEY, LABELS_KEY,
 };
+use crate::fetch::{
+    ALLOW_HOSTS_KEY, FETCH_KEY, FETCH_TIMEOUT_LIMIT_MS, FetchConfig, MAX_BYTES_KEY,
+    MAX_BYTES_LIMIT, TIMEOUT_MS_KEY, host_problem,
+};
 use crate::hooks::{HookConfig, MAX_TIMEOUT_MS};
 use crate::loop_guard::{
     LOOP_GUARD_KEY, LoopGuardConfig, MIN_WARN_AFTER, STOP_AFTER_KEY, WARN_AFTER_KEY,
@@ -348,6 +352,8 @@ pub struct Config {
     pub checkpoints: CheckpointsConfig,
     /// Labels `coda describe --labels` may suggest.
     pub describe: DescribeConfig,
+    /// The hosts the `fetch` tool may read; off while the list is empty.
+    pub fetch: FetchConfig,
 }
 
 impl Default for Config {
@@ -372,6 +378,7 @@ impl Default for Config {
             worktree: WorktreeConfig::default(),
             checkpoints: CheckpointsConfig::default(),
             describe: DescribeConfig::default(),
+            fetch: FetchConfig::default(),
         }
     }
 }
@@ -417,6 +424,7 @@ impl Config {
         config.check_parallel_tools()?;
         config.check_worktree()?;
         config.check_checkpoints()?;
+        config.check_fetch()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -722,6 +730,33 @@ impl Config {
             return Err(ConfigError::InvalidValue {
                 path: format!("{WORKTREE_KEY}.{CLEANUP_KEY}.{CLEAN_COMMAND_KEY}"),
                 allowed: "a program name first, then its arguments".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn check_fetch(&self) -> Result<(), ConfigError> {
+        let fetch = &self.fetch;
+        for entry in &fetch.allow_hosts {
+            if let Some(allowed) = host_problem(entry) {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{FETCH_KEY}.{ALLOW_HOSTS_KEY}"),
+                    allowed: format!("{allowed}, not `{entry}`"),
+                });
+            }
+        }
+        if fetch.max_bytes == 0 || fetch.max_bytes > MAX_BYTES_LIMIT {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{FETCH_KEY}.{MAX_BYTES_KEY}"),
+                allowed: format!("a whole number of bytes from 1 to {MAX_BYTES_LIMIT}"),
+            });
+        }
+        if fetch.timeout_ms == 0 || fetch.timeout_ms > FETCH_TIMEOUT_LIMIT_MS {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{FETCH_KEY}.{TIMEOUT_MS_KEY}"),
+                allowed: format!(
+                    "a whole number of milliseconds from 1 to {FETCH_TIMEOUT_LIMIT_MS}"
+                ),
             });
         }
         Ok(())
@@ -1594,6 +1629,58 @@ bots = true
         assert_eq!(default.cache_ttl_secs, DEFAULT_CACHE_TTL_SECS);
         assert_eq!(default.cache_hint_tokens, DEFAULT_CACHE_HINT_TOKENS);
         assert_eq!((read.cache_ttl_secs, read.cache_hint_tokens), (3600, 1000));
+    }
+
+    #[test]
+    fn the_fetch_tool_is_off_until_a_host_is_listed() {
+        // Act
+        let fetch = Config::from_toml_str("").unwrap().config.fetch;
+
+        // Assert
+        assert_eq!(fetch.allow_hosts, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_fetch_table_is_read_from_the_file() {
+        // Arrange
+        let text = "[fetch]\nallow_hosts = [\"docs.rs\", \"*.rust-lang.org\"]\nmax_bytes = 4096\ntimeout_ms = 2000\n";
+
+        // Act
+        let fetch = Config::from_toml_str(text).unwrap().config.fetch;
+
+        // Assert
+        assert_eq!(fetch.allow_hosts, ["docs.rs", "*.rust-lang.org"]);
+        assert_eq!((fetch.max_bytes, fetch.timeout_ms), (4096, 2000));
+    }
+
+    #[test]
+    fn a_misspelled_fetch_key_is_an_error_so_a_typo_cannot_widen_or_hide_the_list() {
+        // Act
+        let error = Config::from_toml_str("[fetch]\nallow_host = [\"docs.rs\"]\n").unwrap_err();
+
+        // Assert
+        assert!(error.to_string().contains("allow_host"), "{error}");
+    }
+
+    #[test]
+    fn a_fetch_table_with_a_bad_value_names_the_key() {
+        // Arrange
+        let cases = [
+            ("allow_hosts = [\"10.0.0.1\"]", "fetch.allow_hosts"),
+            ("allow_hosts = [\"https://docs.rs\"]", "fetch.allow_hosts"),
+            ("max_bytes = 0", "fetch.max_bytes"),
+            ("max_bytes = 99999999", "fetch.max_bytes"),
+            ("timeout_ms = 0", "fetch.timeout_ms"),
+            ("timeout_ms = 99999999", "fetch.timeout_ms"),
+        ];
+
+        for (line, key) in cases {
+            // Act
+            let error = Config::from_toml_str(&format!("[fetch]\n{line}\n")).unwrap_err();
+
+            // Assert
+            assert!(error.to_string().contains(key), "{line}: {error}");
+        }
     }
 
     #[test]

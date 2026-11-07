@@ -25,8 +25,8 @@ pub use coda_core::history::{CONTEXT_OVERFLOW_KIND, MODEL_SWITCHED_KIND, TURN_ST
 use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
 use coda_core::steer::SteerQueue;
 use coda_core::tools::{
-    BaseToolsConfig, StoreOriginals, ToolsError, ask_schema, base_tools, refresh_index,
-    task_schema, todo_schema,
+    BaseTools, BaseToolsConfig, StoreOriginals, ToolsError, ask_schema, base_tools, refresh_index,
+    task_schema, todo_schema, with_fetch,
 };
 use coda_core::turn::{CancelToken, Fallback, StopCondition, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{
@@ -46,7 +46,7 @@ use coda_providers::registry::{
 use coda_store::{EventRecord, NewQueued, SessionRecord, StoreError};
 use coda_tools::bash::NAME as SHELL_TOOL;
 use coda_tools::bash::{DEFAULT_ENV_ALLOWLIST, allowlisted_env};
-use coda_tools::{Tool, skill};
+use coda_tools::{Tool, fetch, skill};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -866,6 +866,30 @@ impl ModelSessions {
         }
     }
 
+    /// The base tools of a session, and `fetch` when the user listed a host.
+    fn session_tools(&self, record: &SessionRecord) -> Result<BaseTools, ToolsError> {
+        let tools = base_tools(
+            &BaseToolsConfig {
+                workdir: PathBuf::from(&record.cwd),
+                bash_timeout: self.config.timing.tool_execution,
+                env: self.env.clone(),
+            },
+            self.hub.store_handle(),
+            StoreOriginals::new(self.hub.store_handle(), record.id.clone()),
+        )?;
+        Ok(with_fetch(tools, &self.config.fetch))
+    }
+
+    /// The system prompt, with the rule about untrusted text added when the
+    /// session can fetch pages.
+    fn system_prompt(&self) -> String {
+        if self.config.fetch.allow_hosts.is_empty() {
+            SYSTEM_PROMPT.to_owned()
+        } else {
+            format!("{SYSTEM_PROMPT} {}", fetch::UNTRUSTED_RULE)
+        }
+    }
+
     async fn build(
         &self,
         record: &SessionRecord,
@@ -886,15 +910,7 @@ impl ModelSessions {
         {
             warn!(%error, "the code index refresh crashed");
         }
-        let mut tools = base_tools(
-            &BaseToolsConfig {
-                workdir: PathBuf::from(&record.cwd),
-                bash_timeout: self.config.timing.tool_execution,
-                env: self.env.clone(),
-            },
-            self.hub.store_handle(),
-            StoreOriginals::new(self.hub.store_handle(), record.id.clone()),
-        )?;
+        let mut tools = self.session_tools(record)?;
         if let Some(skills) = &offer.skills {
             tools.schemas.push(skill_schema(skills));
             tools.tools = tools.tools.with(Arc::clone(skills) as Arc<dyn Tool>);
@@ -912,7 +928,7 @@ impl ModelSessions {
         schemas.push(task_schema(&offer.agents));
         schemas.push(todo_schema());
         schemas.push(ask_schema());
-        let prefix = Prefix::new(SYSTEM_PROMPT, schemas, "")?;
+        let prefix = Prefix::new(&self.system_prompt(), schemas, "")?;
         let (conversation, session_started, todos) =
             self.stored_conversation(&record.id, prefix).await?;
         let turn = Arc::new(Mutex::new(TurnId::new(NO_TURN)));
