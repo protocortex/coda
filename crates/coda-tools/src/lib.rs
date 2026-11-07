@@ -11,6 +11,7 @@ pub mod ask;
 pub mod bash;
 pub mod code;
 pub mod edit;
+pub mod fetch;
 pub mod git;
 pub mod grep;
 pub mod list;
@@ -161,6 +162,14 @@ pub enum ToolError {
         start: u64,
         /// How many lines the file has.
         lines: u64,
+    },
+    /// A tool declined the call because of what it asked for, not because it was malformed.
+    #[error("{tool} refused: {reason}")]
+    Refused {
+        /// The tool that refused.
+        tool: &'static str,
+        /// Why.
+        reason: String,
     },
     /// The file is not valid UTF-8 text.
     #[error("{path} is not valid UTF-8 text")]

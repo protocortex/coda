@@ -24,7 +24,9 @@ use coda_store::Store;
 use coda_telemetry::attrs::{CODA_SESSION_ID, CODA_TOOL_NAME};
 use coda_tools::ask as ask_tool;
 use coda_tools::todo::{self as todo_tool, TodoList};
-use coda_tools::{Tool, git as git_tool, skill as skill_tool, task as task_tool};
+use coda_tools::{
+    Tool, fetch as fetch_tool, git as git_tool, skill as skill_tool, task as task_tool,
+};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Notify, Semaphore, oneshot};
@@ -1835,19 +1837,30 @@ fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
         skill_tool::NAME => RequestTool::Skill,
         git_tool::STATUS_NAME => RequestTool::GitStatus,
         git_tool::DIFF_NAME => RequestTool::GitDiff,
+        fetch_tool::NAME => RequestTool::Fetch,
         other => RequestTool::Unknown(other.to_owned()),
     };
     let target_paths = target_paths(&tool, input);
     ToolRequest {
         tool,
         target_paths,
-        command: input
-            .get("command")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        command: command_text(name, input),
         cwd: cwd.to_owned(),
         reason: None,
     }
+}
+
+/// The argument a permission grant is matched against: the address for `fetch`,
+/// as the tool will fetch it, and the command line for everything else.
+fn command_text(tool: &str, input: &Value) -> Option<String> {
+    if tool == fetch_tool::NAME {
+        let raw = input.get("url").and_then(Value::as_str)?;
+        return Some(fetch_tool::canonical_address(raw).unwrap_or_else(|| raw.to_owned()));
+    }
+    input
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn request_message(message: &Message) -> RequestMessage {
@@ -1880,6 +1893,35 @@ fn request_message(message: &Message) -> RequestMessage {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_fetch_request_carries_the_address_so_a_grant_covers_that_address_only() {
+        // Arrange
+        let input = serde_json::json!({"url": "https://docs.example/page"});
+
+        // Act
+        let request = super::tool_request("fetch", &input, Path::new("/ws"));
+
+        // Assert
+        assert_eq!(request.tool, RequestTool::Fetch);
+        assert_eq!(
+            request.command.as_deref(),
+            Some("https://docs.example/page")
+        );
+        assert_eq!(request.target_paths, Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_fetch_request_names_the_address_the_parser_will_fetch() {
+        // Arrange
+        let input = serde_json::json!({"url": " https://DOCS.example/a\tb\n"});
+
+        // Act
+        let request = super::tool_request("fetch", &input, Path::new("/ws"));
+
+        // Assert
+        assert_eq!(request.command.as_deref(), Some("https://docs.example/ab"));
+    }
+
+    #[test]
     fn code_tools_map_to_their_own_permission_tools() {
         // Arrange
         let names = [
@@ -1893,6 +1935,7 @@ mod tests {
             ("multi_edit", RequestTool::MultiEdit),
             ("git_status", RequestTool::GitStatus),
             ("git_diff", RequestTool::GitDiff),
+            ("fetch", RequestTool::Fetch),
         ];
 
         for (name, expected) in names {
