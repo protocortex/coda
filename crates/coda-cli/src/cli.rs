@@ -302,12 +302,23 @@ pub struct ReviewArgs {
     /// What the pre-push hook runs: review the commits not yet pushed (`@{u}..HEAD`), print
     /// the findings, and exit 23 when a finding of severity high or critical remains and
     /// `[review.hook] block_on_high` is set. Does nothing unless `[review.hook] enabled` is set.
-    #[arg(long, conflicts_with_all = ["target", "staged", "post", "incremental", "dismiss"])]
+    #[arg(long, conflicts_with_all = ["target", "staged", "post", "incremental", "dismiss", "context_file", "context_note", "run_checks"])]
     pub hook: bool,
     /// Dismiss the finding of this pull request that starts with this fingerprint, so later
     /// reviews leave it out, and stop. May be given more than once.
     #[arg(long, value_name = "FINGERPRINT", conflicts_with_all = ["staged", "post", "incremental"])]
     pub dismiss: Vec<String>,
+    /// Add a file of test, coverage or linter output to the prompt, as untrusted data. May
+    /// be given up to five times; each file is cut at 20000 characters.
+    #[arg(long, value_name = "PATH")]
+    pub context_file: Vec<PathBuf>,
+    /// One short line on how the reviewer should use the context files or the check output.
+    #[arg(long, value_name = "TEXT")]
+    pub context_note: Option<String>,
+    /// Run the `[review] check_commands` through the `tester` agent first and add what it
+    /// reports to the prompt, as untrusted data. Needs a model-API backend.
+    #[arg(long)]
+    pub run_checks: bool,
 }
 
 /// The backends as typed on the command line.

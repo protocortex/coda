@@ -16,15 +16,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, ExitCode};
+use std::sync::Mutex;
 use std::task::Poll;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use coda_config::config::Config;
 use coda_config::review::ReviewConfig;
 use coda_core::history::{ASSISTANT_MESSAGE_KIND, CHILD_EVENT_KIND};
 use coda_core::turn::StopCondition;
-use coda_protocol::events::USAGE_LIMIT_KIND;
+use coda_protocol::events::{USAGE_KIND, USAGE_LIMIT_KIND};
 use coda_protocol::types::{BackendKind, Mode};
 use coda_review::chunk::{Merged, Outcome, merge, plan};
+use coda_review::context::{ContextFile, prompt_section as context_section};
 use coda_review::diff::{FileDiff, git_diff, git_diff_staged, parse_diff, tracked_files};
 use coda_review::guidance;
 use coda_review::issues::{check_compliance, prompt_section};
@@ -32,9 +35,10 @@ use coda_review::memory::Scope;
 use coda_review::pack::{PackOptions, Packed, main_extension};
 use coda_review::parse::{BadShape, Parsed, parse_model_output};
 use coda_review::render::{to_json, to_markdown};
+use coda_review::report::{RunFacts, RunReport, Tokens, append};
 use coda_review::request::{
     Extras, GH_PR_FIELDS, Part, Role, Target, VerifierRun, assemble, direct_prompt, input_text,
-    pr_info_from_gh, session_prompt, task_prompt,
+    pr_info_from_gh, session_prompt, task_prompt, tester_task,
 };
 use coda_review::rules::{Rules, default_branch_ref, load};
 use coda_review::schema::{Coverage, DiffScope, Finding, MIN_EFFORT, Review, Risk, RunDetails};
@@ -49,6 +53,7 @@ use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
 use crate::error::{CliError, Unavailable};
 use crate::exit;
+use crate::review_context::{Asked, run_checks};
 use crate::review_issues::{Linked, gather as gather_issues};
 use crate::review_memory::{Memory, saw_everything};
 use crate::review_post::{Confirm, RealGh, head_of, post};
@@ -74,6 +79,8 @@ const NO_DEFAULT_BRANCH_NOTE: &str =
     "the repository has no default branch to read project rules from, so none are used";
 const FORCED_NOTE: &str = "a skip rule matched, but --force asks for the review anyway";
 const VERIFIER_LABEL: &str = "verifier";
+const CHECKS_NOT_RUN_NOTE: &str =
+    "the checks did not run, so the review has no check output; the reviewer is told so";
 const GH: &str = "gh";
 const HEAD: &str = "HEAD";
 /// The branch a push goes to.
@@ -173,12 +180,14 @@ async fn run_review(
     force: bool,
     args: ReviewArgs,
 ) -> Result<ExitCode, CliError> {
+    let started = Instant::now();
     let config = load_config(&ctx.dirs)?;
     let backend = review_backend(&config, args.backend.map(Into::into));
     let cwd = session_cwd(&ctx.cwd, args.cwd.clone())?;
     let repo = Path::new(&cwd);
     info!(step = "read_change", "reading the change");
     let rules = load_rules(&config.review, repo)?;
+    let asked = Asked::new(&args, &config.review, backend)?;
     let target = review_target(&args);
     let post_to = post_request(ctx, repo, &args, target.as_ref())?;
     if !args.dismiss.is_empty() {
@@ -210,6 +219,15 @@ async fn run_review(
         notice(io, args.json, NOTHING_LEFT)?;
         return Ok(ExitCode::SUCCESS);
     }
+    let tally = TokenTally::default();
+    let place = Placement {
+        ctx,
+        config: &config,
+        cwd: &cwd,
+        backend,
+        tally: &tally,
+    };
+    let gathered = gather_context(io, &place, &asked, args.context_note.as_deref()).await?;
     let sources = Sources {
         repo,
         config: &config,
@@ -217,6 +235,7 @@ async fn run_review(
         args: &args,
         target: target.as_ref(),
         memory: memory.as_ref(),
+        context: &gathered.section,
     };
     let (inputs, linked) = sources.inputs(io, &parts)?;
     // Kept until the review is over, which removes the files.
@@ -228,12 +247,6 @@ async fn run_review(
     // Every part runs on its own connection, so the daemon is started once, here, where
     // the user can be asked about a restart.
     drop(ensure_daemon(ctx, io, false).await?);
-    let place = Placement {
-        ctx,
-        config: &config,
-        cwd: &cwd,
-        backend,
-    };
     let mut reviewers = part_reviewers(&place, &parts, &inputs, written.as_ref());
     let results = review_parts(&parts, &mut reviewers, config.review.chunk_concurrency).await;
     let fallbacks: Vec<String> = reviewers
@@ -246,22 +259,12 @@ async fn run_review(
     if let Some(m) = &memory {
         m.drop_dismissed(&mut merged.parsed);
     }
-    let verified = if config.review.verify && !merged.parsed.findings.is_empty() {
-        let at = Checking {
-            ctx,
-            repo,
-            cwd: &cwd,
-            config: &config,
-            reviewed_on: backend,
-        };
-        Some(check_findings(&at, &parts, &mut merged).await?)
-    } else {
-        None
-    };
+    let verified = verify_if_asked(&place, repo, &parts, &mut merged).await?;
     let model = model.unwrap_or_else(|| backend_name(backend));
     let mut review = assemble_linked(merged, (&model, input_chars, verified), linked);
     review.run.fallbacks = fallbacks;
     print_review(io, args.json, &review)?;
+    report_run(io, &place, &review, (started, &gathered))?;
     if let Some(m) = memory.as_mut() {
         remember(io, m, &review, &files, saw_everything(&review, whole))?;
     }
@@ -280,6 +283,103 @@ struct Placement<'a> {
     config: &'a Config,
     cwd: &'a str,
     backend: BackendKind,
+    tally: &'a TokenTally,
+}
+
+/// What the person added to the prompt, ready to go in it.
+struct Gathered {
+    section: String,
+    files: usize,
+    checks_run: bool,
+}
+
+/// Makes the context section of the prompt from the context files and, when asked, from the
+/// output of the checks, which the `tester` agent runs here.
+async fn gather_context(
+    io: &mut Io<'_>,
+    place: &Placement<'_>,
+    asked: &Asked,
+    note: Option<&str>,
+) -> Result<Gathered, CliError> {
+    let mut files: Vec<ContextFile> = asked.files.clone();
+    let mut checks_run = false;
+    if let Some(commands) = &asked.commands {
+        drop(ensure_daemon(place.ctx, io, false).await?);
+        let task = tester_task(commands);
+        let mut tester = Live {
+            ctx: place.ctx,
+            role: Role::Tester,
+            cwd: place.cwd,
+            handoff: Handoff::Task(&task),
+            tally: place.tally,
+        };
+        let checks = run_checks(&mut tester, place.backend).await?;
+        if !checks.ran {
+            writeln!(io.err, "coda: {CHECKS_NOT_RUN_NOTE}")?;
+        }
+        checks_run = checks.ran;
+        files.push(checks.file);
+    }
+    Ok(Gathered {
+        section: context_section(&files, note),
+        files: files.len(),
+        checks_run,
+    })
+}
+
+/// Runs the verifier on the findings of `merged` when the config has it on and there are
+/// any.
+async fn verify_if_asked(
+    place: &Placement<'_>,
+    repo: &Path,
+    parts: &[Packed],
+    merged: &mut Merged,
+) -> Result<Option<VerifierRun>, CliError> {
+    if !place.config.review.verify || merged.parsed.findings.is_empty() {
+        return Ok(None);
+    }
+    let at = Checking {
+        ctx: place.ctx,
+        repo,
+        cwd: place.cwd,
+        config: place.config,
+        reviewed_on: place.backend,
+        tally: place.tally,
+    };
+    Ok(Some(check_findings(&at, parts, merged).await?))
+}
+
+/// Prints the report of the run on standard error and adds it to the report file in the data
+/// directory. A file that cannot be written is a note: the review is already out.
+fn report_run(
+    io: &mut Io<'_>,
+    place: &Placement<'_>,
+    review: &Review,
+    (started, gathered): (Instant, &Gathered),
+) -> Result<(), CliError> {
+    let facts = RunFacts {
+        at: now_secs(),
+        backend: backend_name(place.backend),
+        wall_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        context_files: gathered.files,
+        checks_run: gathered.checks_run,
+        tokens: place.tally.total(),
+    };
+    let report = RunReport::of(review, facts);
+    write!(io.err, "{}", report.text())?;
+    if let Err(error) = append(&place.ctx.dirs.data_dir(), &report) {
+        writeln!(
+            io.err,
+            "coda: could not add the run to the report file: {error}"
+        )?;
+    }
+    Ok(())
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// One reviewer for each part: on the backend asked for, set to the model the routing rules
@@ -307,6 +407,7 @@ fn part_reviewers<'a>(
                     Some(files) => Handoff::File(&files.relative[n]),
                     None => Handoff::Prompt(&inputs[n]),
                 },
+                tally: place.tally,
             };
             let model = routing.model_for(part.size()).map(str::to_owned);
             let label = format!("part {} of {}", n + 1, parts.len());
@@ -339,6 +440,7 @@ struct Sources<'a> {
     args: &'a ReviewArgs,
     target: Option<&'a Target>,
     memory: Option<&'a Memory>,
+    context: &'a str,
 }
 
 impl Sources<'_> {
@@ -356,6 +458,7 @@ impl Sources<'_> {
             run: self.args.instructions.as_deref(),
             issues: Some(&issues_text),
             earlier: Some(&earlier),
+            context: Some(self.context),
         };
         let inputs = parts
             .iter()
@@ -659,6 +762,9 @@ enum Handoff<'a> {
     File(&'a str),
     /// Claude Code and Codex: the daemon runs the reviewer on this input as the prompt.
     Prompt(&'a str),
+    /// A model API: a session hands this short text to the agent through the `task` tool,
+    /// with the session open to the user's standing grants.
+    Task(&'a str),
 }
 
 /// The reviewer run by the daemon.
@@ -667,6 +773,39 @@ struct Live<'a> {
     role: Role,
     cwd: &'a str,
     handoff: Handoff<'a>,
+    tally: &'a TokenTally,
+}
+
+/// The tokens the backends reported over a whole review, when any did.
+#[derive(Debug, Default)]
+struct TokenTally(Mutex<Option<Tokens>>);
+
+impl TokenTally {
+    fn add(&self, input: u64, output: u64) {
+        if let Ok(mut total) = self.0.lock() {
+            let sum = total.get_or_insert(Tokens {
+                input: 0,
+                output: 0,
+            });
+            sum.input = sum.input.saturating_add(input);
+            sum.output = sum.output.saturating_add(output);
+        }
+    }
+
+    fn total(&self) -> Option<Tokens> {
+        self.0.lock().ok().and_then(|total| *total)
+    }
+}
+
+/// The input and output tokens a `usage` event reports, when it reports any.
+fn usage_tokens(kind: &str, body: &Value) -> Option<(u64, u64)> {
+    if kind != USAGE_KIND {
+        return None;
+    }
+    let usage = &body["usage"];
+    let input = usage["input_tokens"].as_u64().unwrap_or(0);
+    let output = usage["output_tokens"].as_u64().unwrap_or(0);
+    (input.saturating_add(output) > 0).then_some((input, output))
 }
 
 impl Attempt for Live<'_> {
@@ -688,6 +827,11 @@ impl Attempt for Live<'_> {
                 role: self.role,
                 direct: true,
             },
+            Handoff::Task(text) => Request {
+                prompt: session_prompt(self.role, text),
+                role: self.role,
+                direct: false,
+            },
         };
         // Parts run side by side, so none of them writes to the terminal.
         let (mut out, mut err, mut input) = (io::sink(), io::sink(), io::empty());
@@ -700,7 +844,7 @@ impl Attempt for Live<'_> {
             kind: backend,
             model,
         };
-        run_reviewer(self.ctx, &mut quiet, on, self.cwd, request).await
+        run_reviewer(self.ctx, &mut quiet, on, self.cwd, request, self.tally).await
     }
 }
 
@@ -834,6 +978,7 @@ struct Checking<'a> {
     cwd: &'a str,
     config: &'a Config,
     reviewed_on: BackendKind,
+    tally: &'a TokenTally,
 }
 
 /// Has the verifier check the findings of `merged` against the diff of `parts`, and keeps
@@ -870,6 +1015,7 @@ async fn check_findings(
             Some(file) => Handoff::File(&file.relative[0]),
             None => Handoff::Prompt(&input),
         },
+        tally: at.tally,
     };
     let mut live = Failover::new(live, vec![backend], None, VERIFIER_LABEL.to_owned());
     let findings = std::mem::take(&mut merged.parsed.findings);
@@ -959,6 +1105,7 @@ async fn run_reviewer(
     on: Backend<'_>,
     cwd: &str,
     request: Request,
+    tally: &TokenTally,
 ) -> Result<Answer, CliError> {
     let Request {
         prompt,
@@ -985,6 +1132,9 @@ async fn run_reviewer(
     let mut limit_hit = false;
     let mut watch = |kind: &str, body: &Value| {
         limit_hit |= kind == USAGE_LIMIT_KIND;
+        if let Some((input, output)) = usage_tokens(kind, body) {
+            tally.add(input, output);
+        }
         if direct {
             if let Some(piece) = delta_text(kind, body) {
                 streamed.push_str(piece);
@@ -1138,6 +1288,37 @@ mod tests {
     }
 
     #[test]
+    fn tokens_come_from_usage_events_that_report_some_and_add_up_over_runs() {
+        // Arrange
+        let usage = |input: u64, output: u64| serde_json::json!({"usage": {"input_tokens": input, "output_tokens": output}});
+        let tally = TokenTally::default();
+
+        // Act
+        let none_yet = tally.total();
+        for (kind, body) in [
+            (USAGE_KIND, usage(100, 10)),
+            (USAGE_KIND, usage(0, 0)),
+            (STREAM_DELTA_KIND, usage(5, 5)),
+            (USAGE_KIND, usage(50, 5)),
+        ] {
+            if let Some((input, output)) = usage_tokens(kind, &body) {
+                tally.add(input, output);
+            }
+        }
+
+        // Assert
+        assert_eq!(none_yet, None);
+        assert_eq!(
+            tally.total(),
+            Some(Tokens {
+                input: 150,
+                output: 15
+            })
+        );
+        assert_eq!(usage_tokens(USAGE_KIND, &serde_json::json!({})), None);
+    }
+
+    #[test]
     fn only_the_stream_of_a_direct_run_is_its_answer() {
         // Arrange
         let delta = serde_json::json!({"text": "x"});
@@ -1163,6 +1344,22 @@ mod tests {
         assert!(was_cancelled(&finish(Some(CANCELLED))));
         assert!(!was_cancelled(&finish(Some("max_turns"))));
         assert!(!was_cancelled(&finish(None)));
+    }
+
+    #[test]
+    fn the_tester_is_known_by_its_agent_name_and_its_reply_is_taken_as_written() {
+        // Arrange
+        let reply = serde_json::json!({"agent": "tester", "kind": "assistant_message", "body": {"text": "3 passed"}});
+
+        // Act and Assert
+        assert_eq!(
+            reply_text(CHILD_EVENT_KIND, &reply, Role::Tester.agent()),
+            Some("3 passed".to_owned())
+        );
+        assert_eq!(
+            reply_text(CHILD_EVENT_KIND, &reply, Role::Reviewer.agent()),
+            None
+        );
     }
 
     #[test]

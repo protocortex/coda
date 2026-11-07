@@ -14,9 +14,9 @@ use crate::loop_guard::{
     LOOP_GUARD_KEY, LoopGuardConfig, MIN_WARN_AFTER, STOP_AFTER_KEY, WARN_AFTER_KEY,
 };
 use crate::review::{
-    CHUNK_CONCURRENCY_KEY, DIFF_BUDGET_CHARS_KEY, MAX_CHUNKS_KEY, MAX_FINDINGS_KEY, REVIEW_KEY,
-    ROUTING_MODEL_KEY, ROUTING_RULES_PATH, ReviewConfig, VERIFY_THRESHOLD_KEY,
-    VERIFY_THRESHOLD_MAX,
+    CHECK_COMMANDS_KEY, CHUNK_CONCURRENCY_KEY, DIFF_BUDGET_CHARS_KEY, MAX_CHUNKS_KEY,
+    MAX_FINDINGS_KEY, REVIEW_KEY, ROUTING_MODEL_KEY, ROUTING_RULES_PATH, ReviewConfig,
+    VERIFY_THRESHOLD_KEY, VERIFY_THRESHOLD_MAX,
 };
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
@@ -552,6 +552,14 @@ impl Config {
                 path: format!("{REVIEW_KEY}.{CHUNK_CONCURRENCY_KEY}"),
                 allowed: "a whole number of chunks above 0".to_owned(),
             });
+        }
+        for (index, command) in self.review.check_commands.iter().enumerate() {
+            if command.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{REVIEW_KEY}.{CHECK_COMMANDS_KEY}.{index}"),
+                    allowed: "a command line that is not empty".to_owned(),
+                });
+            }
         }
         for (index, rule) in self.review.routing.rules.iter().enumerate() {
             if rule.model.trim().is_empty() {
@@ -1236,6 +1244,26 @@ idle_timeout_ms = 1500
         assert_eq!(custom.review.routing.rules.len(), 2);
         assert_eq!(custom.review.routing.rules[0].max_hunks, Some(3));
         assert_eq!(custom.review.routing.rules[1].model, "strong");
+    }
+
+    #[test]
+    fn review_check_commands_are_read_and_a_blank_one_is_rejected() {
+        // Arrange
+        let set = "[review]\ncheck_commands = [\"cargo test\", \"cargo clippy\"]\n";
+        let blank = "[review]\ncheck_commands = [\"cargo test\", \"  \"]\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config;
+        let custom = Config::from_toml_str(set).unwrap().config;
+        let err = Config::from_toml_str(blank).unwrap_err();
+
+        // Assert
+        assert_eq!(default.review.check_commands, Vec::<String>::new());
+        assert_eq!(custom.review.check_commands, ["cargo test", "cargo clippy"]);
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { path, .. } if path == "review.check_commands.1"),
+            "{err}"
+        );
     }
 
     #[test]
