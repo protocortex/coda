@@ -3,10 +3,13 @@
 //! Terminal setup and a guard that restores it however the UI ends.
 
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -71,9 +74,9 @@ impl<M: TerminalMode> Drop for TerminalGuard<M> {
 }
 
 /// Restores the real terminal through stdout, for the panic hook.
-pub fn restore_stdout() {
+pub fn restore_stdout(key_flags: &Arc<AtomicBool>) {
     // A panic is already under way, so a failure here has nowhere to go.
-    let _ = AnsiMode::new(io::stdout(), SystemRawMode).leave();
+    let _ = AnsiMode::with_key_flags(io::stdout(), SystemRawMode, Arc::clone(key_flags)).leave();
 }
 
 /// Runs `restore` before the previously installed panic hook, so the panic
@@ -114,11 +117,29 @@ impl RawMode for SystemRawMode {
 pub struct AnsiMode<W: Write, R: RawMode> {
     out: W,
     raw: R,
+    /// Whether the key flags are pushed. A pop takes one entry off the terminal's
+    /// stack, so it goes out once per push, from whichever restore comes first.
+    key_flags: Arc<AtomicBool>,
 }
 
 impl<W: Write, R: RawMode> AnsiMode<W, R> {
     pub fn new(out: W, raw: R) -> Self {
-        Self { out, raw }
+        Self::with_key_flags(out, raw, Arc::default())
+    }
+
+    /// Shares the record of the key flag push with another mode, such as the
+    /// one a panic hook restores with.
+    pub fn with_key_flags(out: W, raw: R, key_flags: Arc<AtomicBool>) -> Self {
+        Self {
+            out,
+            raw,
+            key_flags,
+        }
+    }
+
+    #[must_use]
+    pub fn key_flags(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.key_flags)
     }
 }
 
@@ -131,11 +152,22 @@ impl<W: Write, R: RawMode> TerminalMode for AnsiMode<W, R> {
             EnableBracketedPaste,
             EnableFocusChange,
             Hide
-        )
+        )?;
+        execute!(
+            self.out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+        self.key_flags.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     fn leave(&mut self) -> io::Result<()> {
         // Always attempt both steps so one failure cannot leave the terminal raw.
+        let keys = if self.key_flags.swap(false, Ordering::SeqCst) {
+            execute!(self.out, PopKeyboardEnhancementFlags)
+        } else {
+            Ok(())
+        };
         let screen = execute!(
             self.out,
             Show,
@@ -144,13 +176,14 @@ impl<W: Write, R: RawMode> TerminalMode for AnsiMode<W, R> {
             LeaveAlternateScreen
         );
         let raw = self.raw.disable();
-        screen.and(raw)
+        keys.and(screen).and(raw)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -161,6 +194,8 @@ mod tests {
     const SHOW_CURSOR: &str = "\x1b[?25h";
     const ENABLE_PASTE: &str = "\x1b[?2004h";
     const DISABLE_PASTE: &str = "\x1b[?2004l";
+    const PUSH_KEY_FLAGS: &str = "\x1b[>1u";
+    const POP_KEY_FLAGS: &str = "\x1b[<1u";
     const ENABLE_FOCUS: &str = "\x1b[?1004h";
     const DISABLE_FOCUS: &str = "\x1b[?1004l";
 
@@ -246,6 +281,52 @@ mod tests {
         assert!(entered.contains(ENABLE_PASTE), "{entered:?}");
         assert!(!entered.contains(DISABLE_PASTE), "{entered:?}");
         assert_eq!(written.matches(DISABLE_PASTE).count(), 1, "{written:?}");
+    }
+
+    #[test]
+    fn the_guard_asks_for_disambiguated_keys_and_gives_them_back_on_exit() {
+        // Arrange
+        let log = Recording::default();
+        let guard = guard(&log);
+        let entered = joined(&log);
+
+        // Act
+        guard.restore().unwrap();
+
+        // Assert
+        let written = joined(&log);
+        assert!(entered.contains(PUSH_KEY_FLAGS), "{entered:?}");
+        assert!(!entered.contains(POP_KEY_FLAGS), "{entered:?}");
+        assert_eq!(written.matches(POP_KEY_FLAGS).count(), 1, "{written:?}");
+    }
+
+    #[test]
+    fn a_second_leave_does_not_pop_the_key_flags_again_and_a_leave_without_a_push_pops_none() {
+        // Arrange
+        let log = Recording::default();
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut mode = AnsiMode::with_key_flags(
+            RecordingWriter(log.clone()),
+            RecordingRaw(log.clone()),
+            Arc::clone(&flag),
+        );
+        mode.leave().unwrap();
+        let before_push = joined(&log);
+        mode.enter().unwrap();
+
+        // Act
+        mode.leave().unwrap();
+        let hook = AnsiMode::with_key_flags(
+            RecordingWriter(log.clone()),
+            RecordingRaw(log.clone()),
+            Arc::clone(&flag),
+        )
+        .leave();
+
+        // Assert
+        hook.unwrap();
+        assert!(!before_push.contains(POP_KEY_FLAGS), "{before_push:?}");
+        assert_eq!(joined(&log).matches(POP_KEY_FLAGS).count(), 1);
     }
 
     #[test]

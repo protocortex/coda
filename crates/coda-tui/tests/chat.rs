@@ -138,7 +138,7 @@ fn a_one_cell_screen_survives_a_busy_session() {
 }
 
 #[test]
-fn a_paste_with_newlines_fills_the_prompt_and_only_enter_submits_it() {
+fn a_paste_with_newlines_fills_the_prompt_on_several_rows_and_only_enter_submits_it() {
     // Arrange
     let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
     let (link, mut commands) = mpsc::unbounded_channel();
@@ -153,5 +153,6 @@ fn a_paste_with_newlines_fills_the_prompt_and_only_enter_submits_it() {
     // Assert
     assert!(commands.try_recv().is_err());
     let rows = rows(&terminal);
-    assert!(rows.iter().any(|row| row == "> first second"), "{rows:?}");
+    assert!(rows.iter().any(|row| row == "> first"), "{rows:?}");
+    assert!(rows.iter().any(|row| row == "  second"), "{rows:?}");
 }

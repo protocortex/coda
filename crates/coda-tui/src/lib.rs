@@ -10,6 +10,7 @@ pub mod errors;
 pub mod input;
 pub mod logs;
 pub mod notify;
+pub mod paste;
 pub mod permission;
 pub mod sessions;
 pub mod status;
@@ -285,8 +286,10 @@ pub async fn run(
 ) -> Result<(), TuiError> {
     let shutdown = termination()?;
     let logs = LogBuffer::default();
-    let guard = TerminalGuard::new(AnsiMode::new(io::stdout(), SystemRawMode))?;
-    install_panic_hook(restore_stdout);
+    let mode = AnsiMode::new(io::stdout(), SystemRawMode);
+    let key_flags = mode.key_flags();
+    let guard = TerminalGuard::new(mode)?;
+    install_panic_hook(move || restore_stdout(&key_flags));
     let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let session = run_session(
         terminal,
