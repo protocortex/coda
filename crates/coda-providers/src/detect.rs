@@ -96,6 +96,10 @@ fn is_executable_file(path: &Path) -> bool {
 /// Both streams are drained on their own threads so a chatty binary cannot
 /// stall on a full pipe. Some CLIs print the version on stderr, so it is the
 /// fallback when stdout holds no version.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "polls a real subprocess for the version probe"
+)]
 fn probe_version(path: &Path, timeout: Duration) -> Result<String, String> {
     let mut child = Command::new(path)
         .arg(VERSION_FLAG)

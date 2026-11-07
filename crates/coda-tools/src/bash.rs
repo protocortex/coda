@@ -216,6 +216,10 @@ impl RunningCommand {
     ///
     /// Either way the group is killed first, which also ends stragglers that
     /// would keep the output pipe open, and only then is the shell reaped.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the tool runs a real subprocess and waits for it in real time"
+    )]
     fn wait(&mut self, timeout: Duration, cancel: &AtomicBool) -> io::Result<Outcome> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -470,6 +474,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the tool runs a real subprocess and waits for it in real time"
+    )]
     fn endless_output_is_cut_at_the_cap() {
         // Arrange
         let (_dir, tool) = tool(BOUND, &[]);
@@ -538,6 +546,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the tool runs a real subprocess and waits for it in real time"
+    )]
     fn timeout_kills_the_whole_process_group() {
         // Arrange
         let (_dir, tool) = tool(SHORT, &[]);
@@ -582,6 +594,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the tool runs a real subprocess and waits for it in real time"
+    )]
     fn stragglers_are_killed_when_the_shell_exits_on_its_own() {
         // Arrange
         let (_dir, tool) = tool(BOUND, &[]);
@@ -616,6 +632,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the tool runs a real subprocess and waits for it in real time"
+    )]
     fn capture_failure_after_spawn_kills_and_reaps_the_shell() {
         // Arrange
         let (dir, tool) = tool(BOUND, &[]);
@@ -648,6 +668,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the tool runs a real subprocess and waits for it in real time"
+    )]
     fn concurrent_calls_never_wait_on_a_stray_pipe_end() {
         // Arrange
         let (_dir, tool) = tool(BOUND, &[]);

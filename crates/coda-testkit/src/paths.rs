@@ -6,13 +6,14 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::wait::output_within;
 
 /// Attempts at the post-build smoke run, see [`ensure_runnable`].
 const SMOKE_ATTEMPTS: u32 = 5;
 /// How long one smoke run may take before it is killed and retried.
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const CLAUDE_BIN: &str = "fake-claude";
 const CODEX_BIN: &str = "fake-codex";
 const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
@@ -152,26 +153,19 @@ fn ensure_runnable(bin_name: &str, path: &Path) -> Result<(), BuildError> {
 /// Runs `--version` with null stdio and kills the child once `timeout` passes,
 /// so a binary that hangs on exec cannot block the test process.
 fn smoke_attempt(path: &Path, timeout: Duration) -> Result<(), String> {
-    let mut child = Command::new(path)
+    let child = Command::new(path)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|source| source.to_string())?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => return Err(status.to_string()),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("timed out after {timeout:?}"));
-            }
-            Ok(None) => std::thread::sleep(POLL_INTERVAL),
-            Err(source) => return Err(source.to_string()),
-        }
+    let output =
+        output_within(child, timeout).ok_or_else(|| format!("timed out after {timeout:?}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(output.status.to_string())
     }
 }
 
@@ -179,6 +173,7 @@ fn smoke_attempt(path: &Path, timeout: Duration) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
 
     #[test]
     fn a_hanging_binary_is_killed_and_reported_as_a_failed_attempt() {

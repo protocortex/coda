@@ -1785,6 +1785,10 @@ async fn text_streamed_before_a_tool_call_is_stored_before_the_call() {
 const SLOW_STORE: Duration = Duration::from_millis(400);
 
 #[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test thread holds a lock for a real interval"
+)]
 async fn a_permission_request_is_stored_after_the_text_and_reply_before_it_with_a_slow_store() {
     // Arrange
     let mut asking = tool_turn(&[("c2", "bash", json!({"command": "true"}))]);

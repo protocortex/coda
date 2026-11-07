@@ -6,9 +6,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use coda_selfhost::task::{MAX_TURNS, TOKEN_CAP};
+use coda_testkit::wait::poll_until;
 
 const BIN: &str = env!("CARGO_BIN_EXE_coda-selfhost");
 
@@ -441,20 +442,16 @@ fn a_failure_to_run_prints_without_environment_values() {
 /// An upper bound, not a duration: copying the workspace and starting a
 /// process can stall for a long time on a loaded machine.
 const PROCESS_BOUND: Duration = Duration::from_secs(120);
+const FILE_POLL: Duration = Duration::from_millis(25);
 
 fn wait_for(path: &Path) -> String {
-    let deadline = Instant::now() + PROCESS_BOUND;
-    loop {
-        if let Ok(text) = fs::read_to_string(path) {
-            return text.trim().to_owned();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{} never appeared",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    let mut text = None;
+    let appeared = poll_until(PROCESS_BOUND, FILE_POLL, || {
+        text = fs::read_to_string(path).ok();
+        text.is_some()
+    });
+    assert!(appeared, "{} never appeared", path.display());
+    text.unwrap().trim().to_owned()
 }
 
 fn process_alive(pid: &str) -> bool {
@@ -503,18 +500,17 @@ fn an_interrupt_kills_the_running_coda_and_removes_the_temporary_root() {
             .arg(child.id().to_string())
             .status()
             .unwrap();
-        let deadline = Instant::now() + PROCESS_BOUND;
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                let _ = Command::new("kill").args(["-KILL", &sleeper]).status();
-                panic!("live did not exit after SIG{signal}");
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        };
+        let mut exited = None;
+        let finished = poll_until(PROCESS_BOUND, FILE_POLL, || {
+            exited = child.try_wait().unwrap();
+            exited.is_some()
+        });
+        if !finished {
+            child.kill().unwrap();
+            let _ = Command::new("kill").args(["-KILL", &sleeper]).status();
+            panic!("live did not exit after SIG{signal}");
+        }
+        let status = exited.unwrap();
 
         // Assert
         assert_eq!(status.code(), Some(130), "SIG{signal}");

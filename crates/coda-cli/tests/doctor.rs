@@ -12,13 +12,13 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
-use std::time::{Duration, Instant};
 
 use coda_config::config::Dirs;
 use coda_daemon::lock::InstanceLock;
 use coda_daemon::pidfile;
 use coda_daemon::server::{Server, ServerConfig};
 use coda_store::Store;
+use coda_testkit::wait::{output_within, poll_until};
 use common::{POLL, TestDaemon, WAIT, cli, context, short_dir};
 use serde_json::Value;
 
@@ -126,14 +126,10 @@ impl Sleeper {
     }
 
     fn wait_for_death(&mut self) {
-        let deadline = Instant::now() + WAIT;
-        while self.is_alive() {
-            assert!(
-                Instant::now() < deadline,
-                "the orphan was not killed in time"
-            );
-            std::thread::sleep(POLL);
-        }
+        assert!(
+            poll_until(WAIT, POLL, || !self.is_alive()),
+            "the orphan was not killed in time"
+        );
     }
 }
 
@@ -591,14 +587,6 @@ async fn a_plaintext_secret_in_the_config_is_reported_without_its_value() {
 }
 
 /// Waits for `child` to exit, killing it when it outlives [`WAIT`].
-fn wait_bounded(mut child: Child) -> std::process::Output {
-    let deadline = Instant::now() + WAIT;
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    child.wait_with_output().unwrap()
+fn wait_bounded(child: Child) -> std::process::Output {
+    output_within(child, WAIT).expect("the child outlived WAIT")
 }

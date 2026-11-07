@@ -47,6 +47,10 @@ struct Probe {
 }
 
 impl Probe {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the probe tool must really overlap on threads"
+    )]
     fn wait_for_peers(&self, meet: usize) -> Result<(), ToolError> {
         self.shared.arrived.fetch_add(1, Ordering::SeqCst);
         let start = Instant::now();
@@ -72,6 +76,10 @@ impl Tool for Probe {
         self.read_only
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the probe tool must really overlap on threads"
+    )]
     fn call(&self, input: &Value) -> Result<ToolOutput, ToolError> {
         let label = input["label"].as_str().unwrap_or_default().to_owned();
         let ms = input["ms"].as_u64().unwrap_or(WORK_MS);

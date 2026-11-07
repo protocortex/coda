@@ -60,6 +60,10 @@ impl InstanceLock {
 /// concurrent test inherits every open descriptor until it execs, so a released
 /// lock or closed listener can stay live for a few milliseconds.
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "retries while another thread releases a real descriptor"
+)]
 pub(crate) fn retry_while_held<T>(
     mut attempt: impl FnMut() -> Result<T, crate::server::ServerError>,
 ) -> Result<T, crate::server::ServerError> {

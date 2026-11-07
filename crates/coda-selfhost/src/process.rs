@@ -65,6 +65,10 @@ pub fn run_cleanup(command: &mut Command, limit: Duration) -> Result<Captured, P
     run(command, limit, false)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "supervises a real subprocess and checks for interrupts as it waits"
+)]
 fn run(
     command: &mut Command,
     limit: Duration,

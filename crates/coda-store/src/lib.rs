@@ -233,6 +233,10 @@ impl Store {
 /// SQLite can return BUSY for this pragma without consulting the busy handler
 /// when another connection is doing the same on a fresh file, so the busy
 /// timeout alone does not cover it. The switch is idempotent, so retry it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "backs off while another connection holds the database"
+)]
 fn switch_to_wal(conn: &Connection) -> Result<String, StoreError> {
     let mut attempt = 1;
     loop {

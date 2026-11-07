@@ -12,15 +12,15 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use coda_config::config::{Config, ProviderConfig};
+use coda_testkit::wait::output_within;
 use common::StopDaemon;
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_coda");
 const BLOCK_TIMEOUT: Duration = Duration::from_secs(60);
-const POLL: Duration = Duration::from_millis(20);
 const MIN_TEST_BLOCKS: usize = 3;
 const TEST_TAG: &str = "coda-test";
 const OUTPUT_TAG: &str = "coda-output";
@@ -137,24 +137,16 @@ fn run_block(script: &str, home: &Path, work: &Path, scratch: &Path) -> Ran {
     let mut command = Command::new("sh");
     command.arg("-ec").arg(script).current_dir(work);
     isolate(&mut command, home, scratch);
-    let mut child = command
+    let child = command
         .stdin(Stdio::null())
         .stdout(fs::File::create(&out_path).unwrap())
         .stderr(fs::File::create(&err_path).unwrap())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + BLOCK_TIMEOUT;
-    let code = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status.code();
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("a README block ran longer than {BLOCK_TIMEOUT:?}:\n{script}");
-        }
-        std::thread::sleep(POLL);
+    let Some(finished) = output_within(child, BLOCK_TIMEOUT) else {
+        panic!("a README block ran longer than {BLOCK_TIMEOUT:?}:\n{script}");
     };
+    let code = finished.status.code();
     Ran {
         code,
         out: fs::read_to_string(out_path).unwrap(),

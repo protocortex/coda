@@ -59,6 +59,10 @@ impl QuitAfter {
 }
 
 impl KeySource for QuitAfter {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a key source that feeds real terminal time"
+    )]
     fn next_input(&mut self) -> io::Result<Option<UserInput>> {
         std::thread::sleep(Duration::from_millis(10));
         Ok(

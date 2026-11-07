@@ -2,12 +2,12 @@
 
 #![allow(dead_code)]
 
-use std::io::{BufRead, Cursor, Read};
+use std::io::{BufRead, Cursor};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use coda_cli::{Context, Io, Wait, run};
 use coda_client::{Client, Subscription};
@@ -17,6 +17,7 @@ use coda_daemon::server::{Server, ServerConfig};
 use coda_daemon::state::DaemonState;
 use coda_daemon::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
 use coda_store::Store;
+use coda_testkit::wait::poll_until;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -208,37 +209,22 @@ impl Drop for StopDaemon {
             return;
         };
         signal("-TERM", pid);
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        while signal("-0", pid) {
-            if Instant::now() >= deadline {
-                signal("-KILL", pid);
-                return;
-            }
-            std::thread::sleep(POLL);
+        if !poll_until(STOP_TIMEOUT, POLL, || !signal("-0", pid)) {
+            signal("-KILL", pid);
         }
     }
 }
 
 /// Runs `command` and returns its standard output, or `None` if it outlasts `limit`.
 fn output_within(command: &mut Command, limit: Duration) -> Option<String> {
-    let mut child = command
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + limit;
-    while child.try_wait().ok()?.is_none() {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(POLL);
-    }
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    Some(out)
+    let output = coda_testkit::wait::output_within(child, limit)?;
+    String::from_utf8(output.stdout).ok()
 }
 
 fn signal(name: &str, pid: &str) -> bool {

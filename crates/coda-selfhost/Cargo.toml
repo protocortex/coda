@@ -22,5 +22,8 @@ signal-hook.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+coda-testkit = { path = "../coda-testkit" }
+
 [lints]
 workspace = true
