@@ -46,6 +46,7 @@ pub async fn open(ctx: &Context, io: &mut Io<'_>, force: bool) -> Result<(), Cli
     let startup = Startup {
         needs_setup: !config.providers.values().any(|p| p.enabled),
         hooks_configured: !config.hooks.is_empty(),
+        notify: config.tui.notify,
     };
     info!(?startup, "opening the terminal UI");
     let commands = file_commands(ctx);

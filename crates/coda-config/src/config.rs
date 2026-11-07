@@ -19,6 +19,7 @@ use crate::review::{
 };
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
+use crate::tui::TuiConfig;
 
 /// Output limit of a model request when `max_output_tokens` is unset.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
@@ -292,6 +293,8 @@ pub struct Config {
     pub review: ReviewConfig,
     /// Thresholds for the stall and loop detector.
     pub loop_guard: LoopGuardConfig,
+    /// Settings of the terminal UI.
+    pub tui: TuiConfig,
 }
 
 impl Default for Config {
@@ -311,6 +314,7 @@ impl Default for Config {
             checks: BTreeMap::new(),
             review: ReviewConfig::default(),
             loop_guard: LoopGuardConfig::default(),
+            tui: TuiConfig::default(),
         }
     }
 }
@@ -752,6 +756,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::tui::NotifyMode;
 
     fn parse(s: &str) -> Parsed {
         Config::from_toml_str(s).expect("valid config")
@@ -1245,6 +1250,46 @@ bots = true
         assert_eq!(review.skip.target_branch_regex, ["^release/"]);
         assert_eq!(review.skip.authors, ["alice"]);
         assert_eq!(parsed.unknown_keys.len(), 0);
+    }
+
+    #[test]
+    fn the_terminal_notification_defaults_to_the_bell_and_is_read_from_the_file() {
+        // Arrange
+        let named = |mode: &str| format!("[tui]\nnotify = \"{mode}\"\n");
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config.tui.notify;
+        let read: Vec<_> = ["off", "bell", "osc9", "osc777"]
+            .iter()
+            .map(|mode| {
+                Config::from_toml_str(&named(mode))
+                    .unwrap()
+                    .config
+                    .tui
+                    .notify
+            })
+            .collect();
+
+        // Assert
+        assert_eq!(default, NotifyMode::Bell);
+        assert_eq!(
+            read,
+            [
+                NotifyMode::Off,
+                NotifyMode::Bell,
+                NotifyMode::Osc9,
+                NotifyMode::Osc777
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_terminal_notification_is_rejected_naming_the_key() {
+        // Act
+        let err = Config::from_toml_str("[tui]\nnotify = \"flash\"\n").unwrap_err();
+
+        // Assert
+        assert!(err.to_string().contains("notify"), "{err}");
     }
 
     #[test]

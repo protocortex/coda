@@ -208,14 +208,16 @@ impl Overlay {
     }
 
     /// Queues a request; one already queued (a replay) is not added twice.
-    pub fn push(&mut self, prompt: PermissionPrompt, now: Instant) {
+    /// Returns whether it was added.
+    pub fn push(&mut self, prompt: PermissionPrompt, now: Instant) -> bool {
         if self.queue.iter().any(|p| p.request_id == prompt.request_id) {
-            return;
+            return false;
         }
         if self.queue.is_empty() {
             self.disarm(now);
         }
         self.queue.push_back(prompt);
+        true
     }
 
     /// Drops a request that was answered elsewhere or timed out.

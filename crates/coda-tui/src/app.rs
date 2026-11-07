@@ -4,6 +4,7 @@
 
 use std::time::{Duration, Instant};
 
+use coda_config::tui::NotifyMode;
 use coda_protocol::events::{Event, InterruptCause, TodoItem};
 use coda_protocol::methods::{Capabilities, SessionStatus, SessionSummary};
 use coda_protocol::types::{BackendKind, SessionInfo};
@@ -17,12 +18,23 @@ use crate::activity::{self, Stage};
 use crate::chat::Chat;
 use crate::commands::{self, Command, CommandError, Resolved, UserCommands};
 use crate::input::Input;
+use crate::notify;
 use crate::permission::{Overlay, PermissionPrompt};
 use crate::sessions::LinkCommand;
 use crate::status::Status;
 use crate::todos;
 use crate::work::WorkLog;
 
+const NOTIFY_TITLE: &str = "coda";
+const NOTIFY_APPROVAL: &str = "needs your approval";
+const NOTIFY_QUESTION: &str = "the model asks you a question";
+const NOTIFY_FAILED: &str = "turn failed";
+const NOTIFY_FINISHED: &str = "turn finished";
+const NOTIFY_STOPPED: &str = "turn stopped";
+const NOTIFY_CRASHED: &str = "backend crashed";
+const NOTIFY_LOST: &str = "connection lost";
+/// Longest tool name put in a notification, in characters.
+const NOTIFY_TOOL_CHARS: usize = 40;
 const TITLE: &str = " coda (/quit to exit) ";
 /// How long after an idle Ctrl+C a second one still quits.
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
@@ -78,6 +90,13 @@ pub enum LinkEvent {
     Quit,
 }
 
+/// Whether the terminal has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Gained,
+    Lost,
+}
+
 #[derive(Debug)]
 pub struct App {
     connection: ConnectionState,
@@ -94,6 +113,12 @@ pub struct App {
     stop: Option<(Instant, bool)>,
     /// What the daemon said it can do; unknown until the link reports it.
     capabilities: Option<Capabilities>,
+    /// Whether the terminal has focus. Assumed until the terminal says it lost it.
+    focus: Focus,
+    /// How to tell the user, while out of focus, that the UI needs them.
+    notify: NotifyMode,
+    /// A title and text waiting to be written to the terminal.
+    notification: Option<(String, String)>,
     setup_shown: bool,
     user_commands: UserCommands,
     quit: bool,
@@ -117,6 +142,9 @@ impl App {
             todos: Vec::new(),
             stop: None,
             capabilities: None,
+            focus: Focus::Gained,
+            notify: NotifyMode::Off,
+            notification: None,
             setup_shown: false,
             user_commands: UserCommands::default(),
             quit: false,
@@ -180,11 +208,24 @@ impl App {
             LinkEvent::Disconnected(reason) => {
                 self.connection = ConnectionState::Disconnected(reason);
                 self.overlay = Overlay::default();
+                if self.turn_running {
+                    self.notify_user(NOTIFY_TITLE, NOTIFY_LOST.to_owned());
+                }
                 self.turn_running = false;
                 self.work.reset();
             }
             LinkEvent::Session(event) => self.apply_session_event(&event, now),
-            LinkEvent::Permission(prompt) => self.overlay.push(prompt, Instant::now()),
+            LinkEvent::Permission(prompt) => {
+                let body = if prompt.options.is_empty() {
+                    let tool: String = prompt.tool.chars().take(NOTIFY_TOOL_CHARS).collect();
+                    format!("{tool} {NOTIFY_APPROVAL}")
+                } else {
+                    NOTIFY_QUESTION.to_owned()
+                };
+                if self.overlay.push(prompt, Instant::now()) {
+                    self.notify_user(NOTIFY_TITLE, body);
+                }
+            }
             LinkEvent::SessionStarted(info) => {
                 self.chat.clear();
                 self.todos.clear();
@@ -215,8 +256,21 @@ impl App {
             Event::Approve { request_id, .. }
             | Event::Deny { request_id, .. }
             | Event::Timeout { request_id, .. } => self.overlay.resolve(request_id),
-            Event::Result { .. } => self.turn_running = false,
+            Event::Result { is_error, .. } => {
+                if self.turn_running {
+                    let body = if *is_error {
+                        NOTIFY_FAILED
+                    } else {
+                        NOTIFY_FINISHED
+                    };
+                    self.notify_user(NOTIFY_TITLE, body.to_owned());
+                }
+                self.turn_running = false;
+            }
             Event::TurnInterrupted { cause, .. } => {
+                if self.turn_running {
+                    self.notify_user(NOTIFY_TITLE, NOTIFY_STOPPED.to_owned());
+                }
                 self.turn_running = false;
                 if *cause == Some(InterruptCause::BackendLost) {
                     self.overlay.backend_gone();
@@ -224,6 +278,9 @@ impl App {
             }
             // A restart keeps the same turn going, so only a final crash ends it.
             Event::BackendCrashed { will_restart, .. } => {
+                if self.turn_running && !*will_restart {
+                    self.notify_user(NOTIFY_TITLE, NOTIFY_CRASHED.to_owned());
+                }
                 self.turn_running &= *will_restart;
                 self.overlay.backend_gone();
             }
@@ -284,6 +341,8 @@ impl App {
             }
         } else if ctrl && key.code == KeyCode::Char('o') {
             self.chat.toggle_fold();
+        } else if ctrl && key.code == KeyCode::Char('e') {
+            self.chat.toggle_error();
         } else if key.code == KeyCode::Esc {
             self.input.clear();
         } else {
@@ -334,6 +393,33 @@ impl App {
         } else {
             self.stop.get_or_insert((now, false));
             self.send(LinkCommand::Cancel);
+        }
+    }
+
+    /// Sets how the user is told, while the terminal is out of focus, that a turn
+    /// ended or an approval waits.
+    pub fn set_notify(&mut self, mode: NotifyMode) {
+        self.notify = mode;
+    }
+
+    /// Records that the terminal gained or lost focus. Gaining it drops a
+    /// notification that was not written yet, since the user is looking.
+    pub fn set_focus(&mut self, gained: bool) {
+        self.focus = if gained { Focus::Gained } else { Focus::Lost };
+        if gained {
+            self.notification = None;
+        }
+    }
+
+    /// The terminal sequence for the notification waiting to be written, once.
+    pub fn take_notification(&mut self) -> Option<String> {
+        let (title, body) = self.notification.take()?;
+        notify::sequence(self.notify, &title, &body)
+    }
+
+    fn notify_user(&mut self, title: &str, body: String) {
+        if self.focus == Focus::Lost {
+            self.notification = Some((title.to_owned(), body));
         }
     }
 
@@ -1221,6 +1307,197 @@ mod tests {
 
         // Assert
         assert!(!shown.contains("backend process is gone"), "{shown}");
+    }
+
+    fn result_event(is_error: bool) -> LinkEvent {
+        LinkEvent::Session(Event::Result {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new("t-1"),
+            is_error,
+        })
+    }
+
+    /// A linked app that sends this notification mode, with a turn running.
+    fn notifying(mode: NotifyMode) -> App {
+        let (mut app, _commands) = armed();
+        app.set_notify(mode);
+        type_line(&mut app, "go");
+        app
+    }
+
+    #[test]
+    fn a_turn_that_ends_while_the_terminal_is_out_of_focus_rings_the_bell_once() {
+        // Arrange
+        let mut app = notifying(NotifyMode::Bell);
+        app.set_focus(false);
+
+        // Act
+        app.handle_event(result_event(false));
+        let first = app.take_notification();
+        let second = app.take_notification();
+
+        // Assert
+        assert_eq!(first.as_deref(), Some("\u{7}"));
+        assert_eq!(second, None);
+    }
+
+    #[test]
+    fn nothing_is_sent_while_the_terminal_has_focus_or_the_mode_is_off() {
+        // Arrange
+        let mut focused = notifying(NotifyMode::Bell);
+        let mut off = notifying(NotifyMode::Off);
+        off.set_focus(false);
+
+        // Act
+        focused.handle_event(result_event(false));
+        off.handle_event(result_event(false));
+
+        // Assert
+        assert_eq!(focused.take_notification(), None);
+        assert_eq!(off.take_notification(), None);
+    }
+
+    #[test]
+    fn a_new_approval_while_out_of_focus_names_the_tool_in_the_notification() {
+        // Arrange
+        let mut app = notifying(NotifyMode::Osc777);
+        app.set_focus(false);
+
+        // Act
+        app.handle_event(prompt("r-1"));
+
+        // Assert
+        let sent = app.take_notification().unwrap();
+        assert!(sent.starts_with("\u{1b}]777;notify;"), "{sent:?}");
+        assert!(
+            sent.contains("approval") && sent.contains("bash"),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_or_stopped_turn_says_so_and_a_replayed_end_says_nothing() {
+        // Arrange
+        let mut failed = notifying(NotifyMode::Osc9);
+        failed.set_focus(false);
+        let mut idle = App::new();
+        idle.set_notify(NotifyMode::Osc9);
+        idle.set_focus(false);
+
+        // Act
+        failed.handle_event(result_event(true));
+        idle.handle_event(result_event(false));
+
+        // Assert
+        assert!(failed.take_notification().unwrap().contains("failed"));
+        assert_eq!(idle.take_notification(), None);
+    }
+
+    #[test]
+    fn a_backend_that_dies_for_good_while_out_of_focus_is_a_notification_and_a_restart_is_not() {
+        // Arrange
+        let mut dead = notifying(NotifyMode::Osc9);
+        dead.set_focus(false);
+        let mut restarting = notifying(NotifyMode::Osc9);
+        restarting.set_focus(false);
+
+        // Act
+        dead.handle_event(crashed(false));
+        restarting.handle_event(crashed(true));
+
+        // Assert
+        assert!(
+            dead.take_notification()
+                .unwrap()
+                .contains("backend crashed")
+        );
+        assert_eq!(restarting.take_notification(), None);
+    }
+
+    #[test]
+    fn losing_the_link_during_a_turn_while_out_of_focus_is_a_notification() {
+        // Arrange
+        let mut app = notifying(NotifyMode::Osc9);
+        app.set_focus(false);
+
+        // Act
+        app.handle_event(LinkEvent::Disconnected("gone".to_owned()));
+
+        // Assert
+        assert!(app.take_notification().unwrap().contains("connection lost"));
+    }
+
+    #[test]
+    fn a_request_that_is_already_showing_does_not_ring_again() {
+        // Arrange
+        let mut app = notifying(NotifyMode::Bell);
+        app.set_focus(false);
+        app.handle_event(prompt("r-1"));
+        app.take_notification();
+
+        // Act
+        app.handle_event(prompt("r-1"));
+
+        // Assert
+        assert_eq!(app.take_notification(), None);
+    }
+
+    #[test]
+    fn a_long_tool_name_is_cut_and_the_reason_for_the_notification_is_kept() {
+        // Arrange
+        let mut app = notifying(NotifyMode::Osc9);
+        app.set_focus(false);
+        let long = LinkEvent::Permission(PermissionPrompt {
+            tool: "t".repeat(300),
+            ..match prompt("r-1") {
+                LinkEvent::Permission(prompt) => prompt,
+                _ => unreachable!(),
+            }
+        });
+
+        // Act
+        app.handle_event(long);
+
+        // Assert
+        let sent = app.take_notification().unwrap();
+        assert!(sent.contains("needs your approval"), "{sent:?}");
+    }
+
+    #[test]
+    fn regaining_focus_drops_a_notification_nobody_wrote_yet() {
+        // Arrange
+        let mut app = notifying(NotifyMode::Bell);
+        app.set_focus(false);
+        app.handle_event(result_event(false));
+
+        // Act
+        app.set_focus(true);
+
+        // Assert
+        assert_eq!(app.take_notification(), None);
+    }
+
+    #[test]
+    fn ctrl_e_expands_the_newest_error() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        app.handle_event(LinkEvent::Notice(
+            r#"cannot send: {"error":{"message":"overloaded"}}"#.to_owned(),
+        ));
+
+        // Act
+        app.handle_key(key(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        ));
+        let shown = wide_screen(&app);
+
+        // Assert
+        assert!(
+            shown.contains(r#"{"error":{"message":"overloaded"}}"#),
+            "{shown}"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use coda_protocol::events::Event;
 use coda_protocol::types::TurnId;
@@ -15,10 +16,12 @@ use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::errors::{ErrorText, provider_error, summarize, usage_limit_text};
 use crate::work::Fold;
 
 const USER_PREFIX: &str = "you: ";
 const NOTICE_PREFIX: &str = "! ";
+const WARNING_PREFIX: &str = "warning: ";
 const DROPPED_MARKER: &str = "[older messages dropped]";
 /// Entries kept; the oldest go first.
 const MAX_ENTRIES: usize = 1000;
@@ -26,6 +29,7 @@ const MAX_ENTRIES: usize = 1000;
 const MAX_BYTES: usize = 1024 * 1024;
 const TAB_WIDTH: usize = 4;
 const EXPAND_HINT: &str = "(ctrl+o to expand)";
+const EXPAND_ERROR_HINT: &str = "(ctrl+e to expand)";
 const DETAIL_INDENT: &str = "  ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +40,14 @@ enum Entry {
         text: String,
     },
     Notice(String),
+    /// Something the user should heed, such as a usage limit.
+    Warning(String),
+    /// An error as one line, with the whole text behind a key when there is more.
+    Error {
+        line: String,
+        full: Option<String>,
+        expanded: bool,
+    },
     /// A settled turn's work as one line, with a line per call behind it.
     Fold {
         line: String,
@@ -47,7 +59,11 @@ enum Entry {
 impl Entry {
     fn text_len(&self) -> usize {
         match self {
-            Self::User(text) | Self::Notice(text) | Self::Assistant { text, .. } => text.len(),
+            Self::User(text)
+            | Self::Notice(text)
+            | Self::Warning(text)
+            | Self::Assistant { text, .. } => text.len(),
+            Self::Error { line, full, .. } => line.len() + full.as_ref().map_or(0, String::len),
             Self::Fold { line, details, .. } => {
                 line.len() + details.iter().map(String::len).sum::<usize>()
             }
@@ -59,6 +75,22 @@ impl Entry {
             Self::User(text) => format!("{USER_PREFIX}{text}"),
             Self::Assistant { text, .. } => text.clone(),
             Self::Notice(text) => format!("{NOTICE_PREFIX}{text}"),
+            Self::Warning(text) => format!("{WARNING_PREFIX}{text}"),
+            Self::Error {
+                line,
+                full,
+                expanded,
+            } => match (full, *expanded) {
+                (None, _) => format!("{NOTICE_PREFIX}{line}"),
+                (Some(_), false) => format!("{NOTICE_PREFIX}{line} {EXPAND_ERROR_HINT}"),
+                (Some(full), true) => {
+                    let rows: Vec<_> = full
+                        .lines()
+                        .map(|row| format!("{DETAIL_INDENT}{row}"))
+                        .collect();
+                    format!("{NOTICE_PREFIX}{line}\n{}", rows.join("\n"))
+                }
+            },
             Self::Fold {
                 line,
                 details,
@@ -131,9 +163,41 @@ impl Chat {
         self.top.set(None);
     }
 
+    /// Adds a notice. Text that holds a provider's JSON error is shortened to
+    /// the provider's message, with the whole text behind Ctrl+E.
     pub fn push_notice(&mut self, text: impl Into<String>) {
-        self.push(Entry::Notice(text.into()));
+        let text = text.into();
+        match provider_error(&text) {
+            Some(error) => self.push_error(error.short.clone(), &error),
+            None => self.push(Entry::Notice(text)),
+        }
         self.top.set(None);
+    }
+
+    /// Adds an error as `line`, with all of `error` behind a key when it has more.
+    fn push_error(&mut self, line: String, error: &ErrorText) {
+        self.push(Entry::Error {
+            line,
+            full: error.expandable().then(|| error.full.clone()),
+            expanded: false,
+        });
+    }
+
+    /// Expands the newest error, or folds it again.
+    pub fn toggle_error(&mut self) {
+        let newest = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|slot| matches!(slot.entry, Entry::Error { full: Some(_), .. }));
+        if let Some(Slot {
+            entry: Entry::Error { expanded, .. },
+            wrapped,
+        }) = newest
+        {
+            *expanded = !*expanded;
+            *wrapped.get_mut() = None;
+        }
     }
 
     /// Adds a settled turn's work, folded into one line.
@@ -170,6 +234,14 @@ impl Chat {
     /// Streamed text extends the message of its turn; crashes and interruptions
     /// leave a notice; every other event has nothing to show.
     pub fn apply(&mut self, event: &Event) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        self.apply_at(event, now);
+    }
+
+    /// [`Self::apply`] with the time in seconds since the Unix epoch.
+    pub fn apply_at(&mut self, event: &Event, now: u64) {
         match event {
             Event::StreamDelta { turn_id, text, .. } => match self.entries.back_mut() {
                 Some(Slot {
@@ -192,19 +264,33 @@ impl Chat {
                 detail,
                 ..
             } => {
-                let mut notice = match exit_code {
+                let mut line = match exit_code {
                     Some(code) => format!("backend crashed (exit {code})"),
                     None => "backend crashed".to_owned(),
                 };
-                // The last line is the reason; earlier ones are usually a banner.
-                if let Some(reason) = detail.as_deref().and_then(|text| text.lines().last()) {
-                    notice.push_str(": ");
-                    notice.push_str(reason);
+                // The last line is the reason, or the provider's message in it;
+                // earlier lines are usually a banner, kept behind the key.
+                let error = detail
+                    .as_deref()
+                    .map(summarize)
+                    .filter(|error| !error.short.is_empty());
+                if let Some(error) = &error {
+                    line.push_str(": ");
+                    line.push_str(&error.short);
                 }
                 if *will_restart {
-                    notice.push_str(", restarting");
+                    line.push_str(", restarting");
                 }
-                self.push(Entry::Notice(notice));
+                match error {
+                    Some(error) => self.push_error(line, &error),
+                    None => self.push(Entry::Notice(line)),
+                }
+            }
+            Event::UsageLimit {
+                window, reset_at, ..
+            } => {
+                let remaining = reset_at.map(|at| Duration::from_secs(at.saturating_sub(now)));
+                self.push(Entry::Warning(usage_limit_text(*window, remaining)));
             }
             Event::TurnInterrupted { .. } => {
                 self.push(Entry::Notice("turn interrupted".to_owned()));
@@ -433,6 +519,137 @@ mod tests {
             let shown = draw(&chat, 40, HEIGHT);
             assert!(shown.contains(expected), "{shown}");
         }
+    }
+
+    const PROVIDER_ERROR: &str =
+        r#"API Error: 400 {"type":"error","error":{"message":"max_tokens is too large"}}"#;
+
+    fn crashed_with(detail: &str) -> Event {
+        Event::BackendCrashed {
+            session_id: SessionId::new("s-1"),
+            exit_code: Some(1),
+            will_restart: false,
+            detail: Some(detail.to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_crash_shows_the_providers_message_and_the_key_to_see_the_rest() {
+        // Arrange
+        let mut chat = Chat::new();
+
+        // Act
+        chat.apply(&crashed_with(&format!("banner\n{PROVIDER_ERROR}")));
+
+        // Assert
+        let shown = draw(&chat, 120, HEIGHT);
+        assert!(
+            shown.contains("backend crashed (exit 1): API Error: 400 max_tokens is too large"),
+            "{shown}"
+        );
+        assert!(shown.contains("(ctrl+e to expand)"), "{shown}");
+        assert!(!shown.contains("invalid_request"), "{shown}");
+        assert!(!shown.contains("banner"), "{shown}");
+    }
+
+    #[test]
+    fn expanding_an_error_shows_all_of_it_and_a_second_press_folds_it_again() {
+        // Arrange
+        let mut chat = Chat::new();
+        chat.apply(&crashed_with(&format!("banner\n{PROVIDER_ERROR}")));
+
+        // Act
+        chat.toggle_error();
+        let open = draw(&chat, 120, HEIGHT);
+        chat.toggle_error();
+        let closed = draw(&chat, 120, HEIGHT);
+
+        // Assert
+        assert!(open.contains("banner"), "{open}");
+        assert!(open.contains(r#""type":"error""#), "{open}");
+        assert!(!open.contains("(ctrl+e to expand)"), "{open}");
+        assert!(!closed.contains("banner"), "{closed}");
+    }
+
+    #[test]
+    fn a_crash_with_a_short_plain_reason_has_nothing_to_expand() {
+        // Arrange
+        let mut chat = Chat::new();
+
+        // Act
+        chat.apply(&crashed_with("no repo"));
+        chat.toggle_error();
+
+        // Assert
+        let shown = draw(&chat, 80, HEIGHT);
+        assert!(
+            shown.contains("backend crashed (exit 1): no repo"),
+            "{shown}"
+        );
+        assert!(!shown.contains("ctrl+e"), "{shown}");
+    }
+
+    #[test]
+    fn a_notice_that_holds_a_providers_error_is_shortened_and_other_notices_are_not() {
+        // Arrange
+        let mut chat = Chat::new();
+
+        // Act
+        chat.push_notice(format!("cannot send the message: {PROVIDER_ERROR}"));
+        chat.push_notice("line one\nline two");
+
+        // Assert
+        let shown = draw(&chat, 100, HEIGHT);
+        assert!(
+            shown.contains("cannot send the message: API Error: 400 max_tokens is too large"),
+            "{shown}"
+        );
+        assert!(shown.contains("line one"), "{shown}");
+        assert!(shown.contains("line two"), "{shown}");
+    }
+
+    fn usage_limit(reset_at: Option<u64>) -> Event {
+        Event::UsageLimit {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new("t-1"),
+            window: coda_protocol::events::UsageWindowKind::FiveHour,
+            reset_at,
+        }
+    }
+
+    #[test]
+    fn a_usage_limit_is_a_warning_that_says_when_the_window_resets() {
+        // Arrange
+        let mut chat = Chat::new();
+        let now = 1_000_000;
+
+        // Act
+        chat.apply_at(&usage_limit(Some(now + 2 * 3600 + 15 * 60)), now);
+        chat.apply_at(&usage_limit(None), now);
+
+        // Assert
+        let shown = draw(&chat, 100, HEIGHT);
+        assert!(
+            shown.contains("warning: usage limit reached: five-hour window, resets in 2h 15m"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("warning: usage limit reached: five-hour window, reset time unknown"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_reset_time_in_the_past_says_the_window_has_reset() {
+        // Arrange
+        let mut chat = Chat::new();
+
+        // Act
+        chat.apply_at(&usage_limit(Some(10)), 1_000);
+
+        // Assert
+        let shown = draw(&chat, 100, HEIGHT);
+        assert!(shown.contains("the window has reset"), "{shown}");
     }
 
     #[test]
