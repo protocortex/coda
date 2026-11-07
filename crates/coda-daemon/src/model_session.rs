@@ -732,6 +732,7 @@ impl ModelSessions {
             Arc::clone(&turn),
         ));
         let (sender, events) = unbounded_channel();
+        gate.fence().attach_model(sender.downgrade());
         let factory = task::LoopFactory::new(
             Arc::clone(&self.children),
             record.clone(),
@@ -984,6 +985,7 @@ async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Ro
         | TurnEvent::GuardContinued { .. }
         | TurnEvent::GuardStopped { .. }
         | TurnEvent::Compaction { .. }
+        | TurnEvent::Fence(_)
         | TurnEvent::Child { .. } => Row::NotStored,
     }
 }
@@ -1108,6 +1110,10 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
                 },
             };
             store_event(hub, session, turn, &usage).await
+        }
+        TurnEvent::Fence(reached) => {
+            reached.confirm();
+            return;
         }
         TurnEvent::Child { agent, event } => {
             task::publish_child_event(hub, session, turn, &agent, *event).await;

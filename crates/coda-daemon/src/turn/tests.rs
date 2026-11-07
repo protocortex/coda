@@ -18,8 +18,9 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 use super::{
-    BACKEND_UNSUPPORTED, CancelHandle, EVENT_QUEUE_BOUND, EventOutbox, Fence, Queued, Reservation,
-    SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig, TurnState, Turns, WIND_DOWN_TIMEOUT,
+    BACKEND_UNSUPPORTED, CancelHandle, EVENT_QUEUE_BOUND, EventOutbox, FENCE_TIMEOUT, Fence,
+    Queued, Reservation, SESSION_NOT_FOUND, TURN_RUNNING, TurnConfig, TurnState, Turns,
+    WIND_DOWN_TIMEOUT,
 };
 use crate::dispatch::Dispatcher;
 use crate::idle_pool::MAX_IDLE_SERVERS;
@@ -2381,4 +2382,18 @@ async fn text_streamed_before_a_permission_request_is_stored_before_its_announce
         position("stream_delta") < position("permission_request"),
         "{kinds:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_model_fence_nobody_reads_stops_waiting_after_its_limit() {
+    // Arrange
+    let (tx, _unread) = mpsc::unbounded_channel();
+    let fence = Fence::default();
+    fence.attach_model(tx.downgrade());
+
+    // Act
+    let finished = tokio::time::timeout(FENCE_TIMEOUT + WAIT_OVERSHOOT, fence.wait()).await;
+
+    // Assert
+    assert!(finished.is_ok());
 }

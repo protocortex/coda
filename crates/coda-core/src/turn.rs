@@ -24,8 +24,8 @@ use coda_store::Store;
 use coda_telemetry::attrs::{CODA_SESSION_ID, CODA_TOOL_NAME};
 use coda_tools::{Tool, skill as skill_tool, task as task_tool};
 use serde_json::Value;
-use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{Notify, oneshot};
 use tracing::{Instrument, info, info_span, warn};
 
 use crate::budget::TokenBudget;
@@ -198,6 +198,9 @@ pub enum TurnEvent {
         /// What was done.
         how: Recovery,
     },
+    /// A marker, not an event. Whoever reads the channel answers it once every
+    /// event sent before it is stored, so the sender can write after them.
+    Fence(FenceAck),
     /// An event of a sub-agent's run, passed up the session's own channel so it
     /// is stored in order with the session's events: after the call that started
     /// the sub-agent and before that call's result.
@@ -207,6 +210,36 @@ pub enum TurnEvent {
         /// What happened in its run.
         event: Box<TurnEvent>,
     },
+}
+
+/// Answers a [`TurnEvent::Fence`] once the events before it are stored.
+#[derive(Debug, Clone)]
+pub struct FenceAck(Arc<Mutex<Option<oneshot::Sender<()>>>>);
+
+impl PartialEq for FenceAck {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FenceAck {}
+
+impl FenceAck {
+    /// A fence and the receiver that resolves when it is answered.
+    #[must_use]
+    pub fn channel() -> (Self, oneshot::Receiver<()>) {
+        let (sender, receiver) = oneshot::channel();
+        (Self(Arc::new(Mutex::new(Some(sender)))), receiver)
+    }
+
+    /// Says the earlier events are stored. Only the first answer counts.
+    pub fn confirm(&self) {
+        let sender = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(sender) = sender {
+            // The asker may have stopped waiting.
+            let _ = sender.send(());
+        }
+    }
 }
 
 /// How a tool call that the model did not make cleanly was recovered.

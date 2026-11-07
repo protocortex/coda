@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use coda_config::config::{Config, PermissionMode};
 use coda_core::history::Transcript;
+use coda_core::turn::{FenceAck, TurnEvent};
 use coda_protocol::events::Event;
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, INVALID_PARAMS};
 use coda_protocol::methods::{
@@ -68,6 +69,11 @@ pub const TURN_RUNNING: i64 = coda_protocol::methods::TURN_RUNNING_CODE;
 pub const BACKEND_UNSUPPORTED: i64 = -32004;
 
 pub use coda_core::history::USER_MESSAGE_KIND;
+/// How long a model-API fence waits for its answer. The loop sits idle between
+/// turns with its channel open, so a fence that arrives after the last read
+/// would otherwise wait for the next turn.
+pub(crate) const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
 const AGENT_NEEDS_DELEGATED: &str = "agent.run needs a Claude Code or Codex session; a model API session runs agents through its task tool";
 const AGENT_NEEDS_PLAN_MODE: &str =
     "agent.run needs a session in plan mode, so the agent cannot change anything";
@@ -1029,24 +1035,50 @@ pub(crate) enum Queued {
 /// queued are stored, so what it writes next lands after them in the log.
 #[derive(Default)]
 pub(crate) struct Fence {
-    queue: OnceLock<mpsc::WeakSender<Queued>>,
+    queue: OnceLock<Attached>,
+}
+
+/// The channel a fence sends its marker through.
+enum Attached {
+    /// A Claude Code or Codex turn's queue.
+    Backend(mpsc::WeakSender<Queued>),
+    /// A model-API session's event channel.
+    Model(mpsc::WeakUnboundedSender<TurnEvent>),
 }
 
 impl Fence {
     pub(crate) fn attach(&self, queue: mpsc::WeakSender<Queued>) {
         // A turn's queue is attached once; a second attach has nothing to add.
-        let _ = self.queue.set(queue);
+        let _ = self.queue.set(Attached::Backend(queue));
+    }
+
+    pub(crate) fn attach_model(&self, events: mpsc::WeakUnboundedSender<TurnEvent>) {
+        let _ = self.queue.set(Attached::Model(events));
     }
 
     /// Returns when the queued events are stored, or at once when there is no
     /// queue or its publisher is gone.
     pub(crate) async fn wait(&self) {
-        let Some(queue) = self.queue.get().and_then(mpsc::WeakSender::upgrade) else {
-            return;
-        };
-        let (reached, stored) = oneshot::channel();
-        if queue.send(Queued::Fence(reached)).await.is_ok() {
-            let _ = stored.await;
+        match self.queue.get() {
+            Some(Attached::Backend(queue)) => {
+                let Some(queue) = queue.upgrade() else {
+                    return;
+                };
+                let (reached, stored) = oneshot::channel();
+                if queue.send(Queued::Fence(reached)).await.is_ok() {
+                    let _ = stored.await;
+                }
+            }
+            Some(Attached::Model(events)) => {
+                let Some(events) = events.upgrade() else {
+                    return;
+                };
+                let (reached, stored) = FenceAck::channel();
+                if events.send(TurnEvent::Fence(reached)).is_ok() {
+                    let _ = tokio::time::timeout(FENCE_TIMEOUT, stored).await;
+                }
+            }
+            None => {}
         }
     }
 }
