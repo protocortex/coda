@@ -22,10 +22,10 @@ use coda_core::turn::{FenceAck, TurnEvent};
 use coda_protocol::events::Event;
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, INVALID_PARAMS};
 use coda_protocol::methods::{
-    AgentRunParams, AgentRunResult, PermissionRespondParams, PermissionRespondResult,
-    REWIND_REFUSED_CODE, SessionCancelParams, SessionCancelResult, SessionCloseParams,
-    SessionCloseResult, SessionRewindParams, SessionSendParams, SessionSendResult,
-    SessionSetModeParams, SessionSetModeResult,
+    AgentRunParams, AgentRunResult, DIFF_REFUSED_CODE, PermissionRespondParams,
+    PermissionRespondResult, REWIND_REFUSED_CODE, SessionCancelParams, SessionCancelResult,
+    SessionCloseParams, SessionCloseResult, SessionDiffParams, SessionRewindParams,
+    SessionSendParams, SessionSendResult, SessionSetModeParams, SessionSetModeResult,
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::TurnOutcome;
@@ -49,6 +49,7 @@ use crate::backends::{
     AgentSession, CodexStart, SessionStart, StartError, pidfile_path, resolve_codex_off_worker,
     start_claude_session, start_codex_session,
 };
+mod diff;
 mod drive;
 mod mode;
 mod rewind;
@@ -132,6 +133,9 @@ pub enum TurnError {
     /// A `session.rewind` that cannot be done as asked. The text is for the caller.
     #[error("{0}")]
     Rewind(String),
+    /// A `session.diff` that cannot be answered. The text is for the caller.
+    #[error("{0}")]
+    Diff(String),
     /// An `agent.run` request that cannot be served as asked. The text is for the caller.
     #[error("{0}")]
     Agent(String),
@@ -149,6 +153,7 @@ impl TurnError {
             Self::SessionNotFound(_) => error(SESSION_NOT_FOUND, "Session not found"),
             Self::Agent(why) => error(INVALID_PARAMS, &why),
             Self::Rewind(why) => error(REWIND_REFUSED_CODE, &why),
+            Self::Diff(why) => error(DIFF_REFUSED_CODE, &why),
             Self::Busy(_) => error(TURN_RUNNING, "A turn is already running"),
             Self::Ending(_) => error(
                 TURN_RUNNING,
@@ -1453,6 +1458,14 @@ pub(crate) async fn rewind(turns: Option<&Arc<Turns>>, params: Option<Value>) ->
     let turns = turns.ok_or_else(unavailable)?;
     let params: SessionRewindParams = parse_params(params)?;
     let result = turns.rewind(params).await.map_err(TurnError::into_rpc)?;
+    to_value(&result)
+}
+
+/// Answers `session.diff`.
+pub(crate) async fn diff(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
+    let turns = turns.ok_or_else(unavailable)?;
+    let params: SessionDiffParams = parse_params(params)?;
+    let result = turns.diff(params).await.map_err(TurnError::into_rpc)?;
     to_value(&result)
 }
 

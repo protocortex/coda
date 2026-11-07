@@ -118,6 +118,11 @@ pub fn protocol_schema() -> Value {
         &mut methods,
         m::SESSION_REWIND,
     );
+    add_method::<m::SessionDiffParams, m::SessionDiffResult>(
+        &mut generator,
+        &mut methods,
+        m::SESSION_DIFF,
+    );
     add_method::<m::SessionWorktreeParams, m::SessionWorktreeResult>(
         &mut generator,
         &mut methods,

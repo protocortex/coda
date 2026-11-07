@@ -1,0 +1,1 @@
+{"turn_id":"3","files":[{"path":"a.txt","added":1,"deleted":1}],"patch":"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n","truncated":true}
