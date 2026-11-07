@@ -93,6 +93,7 @@ async fn kill_daemon_mid_turn(home: &Path, work: &Path) -> SessionId {
                 text: PERMISSION_PROMPT.to_owned(),
                 max_turns: None,
                 token_cap: None,
+                mode: coda_protocol::methods::SendMode::Start,
             },
         )
         .await
@@ -151,6 +152,7 @@ async fn a_restart_interrupts_the_turn_and_expires_its_prompt_and_the_session_re
                 text: PERMISSION_PROMPT.to_owned(),
                 max_turns: None,
                 token_cap: None,
+                mode: coda_protocol::methods::SendMode::Start,
             },
         )
         .await

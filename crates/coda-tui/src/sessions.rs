@@ -705,6 +705,7 @@ impl Link {
             text,
             max_turns: None,
             token_cap: None,
+            mode: coda_protocol::methods::SendMode::Start,
         };
         self.client
             .request::<_, SessionSendResult>(SESSION_SEND, &params)

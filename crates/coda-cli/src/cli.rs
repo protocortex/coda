@@ -198,6 +198,10 @@ pub struct SessionSendArgs {
     /// Wait for the turn to end and exit with the code `coda run` would.
     #[arg(long)]
     pub wait: bool,
+    /// When the session has a turn running, keep the message and start it when
+    /// that turn ends, instead of refusing.
+    #[arg(long, conflicts_with = "wait")]
+    pub queue: bool,
     /// Print a JSON object instead of text.
     #[arg(long)]
     pub json: bool,
@@ -518,6 +522,26 @@ mod tests {
         assert_eq!(run.cwd, Some(PathBuf::from("/x")));
         assert_eq!(run.mode, ModeArg::AcceptEdits);
         assert_eq!((run.max_turns, run.token_cap), (Some(3), Some(100)));
+    }
+
+    #[test]
+    fn a_session_send_may_queue_but_not_while_waiting() {
+        // Arrange
+        let queued = ["coda", "session", "send", "s1", "--prompt", "hi", "--queue"];
+        let both = [
+            "coda", "session", "send", "s1", "--prompt", "hi", "--queue", "--wait",
+        ];
+
+        // Act
+        let parsed = Cli::try_parse_from(queued);
+        let refused = Cli::try_parse_from(both);
+
+        // Assert
+        let Some(Command::Session(SessionCommand::Send(send))) = parsed.unwrap().command else {
+            panic!("expected the session send command");
+        };
+        assert!(send.queue);
+        assert!(refused.is_err());
     }
 
     #[test]

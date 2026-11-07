@@ -20,8 +20,8 @@ use coda_protocol::methods::{
     AGENT_RUN, CHECKPOINTS_PRUNE, Capabilities, DAEMON_BACKENDS, DAEMON_PING, DAEMON_SHUTDOWN,
     DAEMON_STATUS, DaemonShutdownResult, GRANT_ADD, INITIALIZE, InitializeParams, InitializeResult,
     PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult, SESSION_CANCEL, SESSION_CLOSE,
-    SESSION_CREATE, SESSION_DIFF, SESSION_LIST, SESSION_RESUME, SESSION_REWIND, SESSION_SEND,
-    SESSION_SET_MODE, SESSION_SET_MODEL, SESSION_SUBSCRIBE, SESSION_WORKTREE,
+    SESSION_CREATE, SESSION_DIFF, SESSION_LIST, SESSION_QUEUE, SESSION_RESUME, SESSION_REWIND,
+    SESSION_SEND, SESSION_SET_MODE, SESSION_SET_MODEL, SESSION_SUBSCRIBE, SESSION_WORKTREE,
     SessionSubscribeParams, SessionSubscribeResult, USAGE_SUMMARY, WORKTREE_CLEAN,
 };
 use coda_protocol::types::SessionId;
@@ -165,7 +165,10 @@ impl Dispatcher {
         let Request {
             id, method, params, ..
         } = request;
-        if matches!(method.as_str(), SESSION_RESUME | SESSION_SEND | AGENT_RUN) {
+        if matches!(
+            method.as_str(),
+            SESSION_RESUME | SESSION_SEND | SESSION_QUEUE | AGENT_RUN
+        ) {
             let ready = session_rpc::ensure_checkout(
                 self.hub.as_ref(),
                 self.worktrees.as_ref(),
@@ -214,6 +217,7 @@ impl Dispatcher {
                 session_rpc::list(self.hub.as_ref(), running, params).await
             }
             SESSION_SEND => turn::send(self.turns.as_ref(), params).await,
+            SESSION_QUEUE => turn::session_queue(self.turns.as_ref(), params).await,
             AGENT_RUN => turn::run_agent(self.turns.as_ref(), params).await,
             SESSION_CANCEL => turn::cancel(self.turns.as_ref(), params).await,
             SESSION_CLOSE => turn::close(self.turns.as_ref(), params).await,
@@ -342,6 +346,7 @@ fn initialize(params: Option<Value>) -> HandlerFuture {
                 rewind: true,
                 set_mode: true,
                 diff: true,
+                queued_sends: true,
             },
         })
     })
@@ -411,6 +416,7 @@ mod tests {
         assert_eq!(result["capabilities"]["rewind"], json!(true));
         assert_eq!(result["capabilities"]["set_mode"], json!(true));
         assert_eq!(result["capabilities"]["diff"], json!(true));
+        assert_eq!(result["capabilities"]["queued_sends"], json!(true));
     }
 
     #[tokio::test]

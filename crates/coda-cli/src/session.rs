@@ -12,7 +12,7 @@ use coda_core::history::{ASSISTANT_MESSAGE_KIND, USER_MESSAGE_KIND};
 use std::collections::HashSet;
 
 use coda_protocol::methods::{
-    SESSION_LIST, SESSION_REWIND, SESSION_SEND, SessionListParams, SessionListResult,
+    SESSION_LIST, SESSION_REWIND, SESSION_SEND, SendMode, SessionListParams, SessionListResult,
     SessionRewindParams, SessionRewindResult, SessionSendParams, SessionSendResult, SessionSummary,
 };
 use coda_protocol::types::{SessionId, TurnId};
@@ -147,13 +147,23 @@ async fn send(
             text: prompt,
             max_turns: args.max_turns,
             token_cap: args.token_cap,
+            mode: if args.queue {
+                SendMode::Queue
+            } else {
+                SendMode::Start
+            },
         };
         let sent: SessionSendResult = client.request(SESSION_SEND, &params).await?;
         if args.json {
-            let out = json!({"session_id": session, "turn_id": sent.turn_id});
+            let out = json!({
+                "session_id": session,
+                "turn_id": sent.turn_id,
+                "queued": sent.queued,
+            });
             writeln!(io.out, "{out}")?;
         } else {
-            writeln!(io.out, "{}", sent.turn_id)?;
+            let note = if sent.queued { " (queued)" } else { "" };
+            writeln!(io.out, "{}{note}", sent.turn_id)?;
         }
         return Ok(ExitCode::SUCCESS);
     }

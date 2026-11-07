@@ -53,6 +53,7 @@ async fn start_turn(daemon_home: &Path, work: &Path, prompt: &str) -> SessionId 
                 text: prompt.to_owned(),
                 max_turns: None,
                 token_cap: None,
+                mode: coda_protocol::methods::SendMode::Start,
             },
         )
         .await

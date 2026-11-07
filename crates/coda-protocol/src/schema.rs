@@ -87,6 +87,11 @@ pub fn protocol_schema() -> Value {
         &mut methods,
         m::SESSION_SEND,
     );
+    add_method::<m::SessionQueueParams, m::SessionQueueResult>(
+        &mut generator,
+        &mut methods,
+        m::SESSION_QUEUE,
+    );
     add_method::<m::AgentRunParams, m::AgentRunResult>(&mut generator, &mut methods, m::AGENT_RUN);
     add_method::<m::SessionCancelParams, m::SessionCancelResult>(
         &mut generator,

@@ -21,6 +21,8 @@ pub const INITIALIZE: &str = "initialize";
 pub const SESSION_CREATE: &str = "session.create";
 /// Sends a user message, starting a turn.
 pub const SESSION_SEND: &str = "session.send";
+/// Lists, resumes or edits the follow-up messages queued behind a running turn.
+pub const SESSION_QUEUE: &str = "session.queue";
 /// Run a named agent on a prompt in a session of a delegated backend.
 pub const AGENT_RUN: &str = "agent.run";
 /// Cancels the running turn.
@@ -67,6 +69,7 @@ pub const METHODS: &[&str] = &[
     INITIALIZE,
     SESSION_CREATE,
     SESSION_SEND,
+    SESSION_QUEUE,
     AGENT_RUN,
     SESSION_CANCEL,
     SESSION_SUBSCRIBE,
@@ -139,6 +142,9 @@ pub struct Capabilities {
     /// The daemon serves `session.diff`.
     #[serde(default)]
     pub diff: bool,
+    /// The daemon serves `mode: queue` on `session.send` and `session.queue`.
+    #[serde(default)]
+    pub queued_sends: bool,
 }
 
 /// Result of [`INITIALIZE`].
@@ -188,13 +194,88 @@ pub struct SessionSendParams {
     /// Most tokens the session's loop may spend, when it is built for this send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_cap: Option<u64>,
+    /// What to do when the session already has a turn running.
+    #[serde(default, skip_serializing_if = "SendMode::is_start")]
+    pub mode: SendMode,
+}
+
+/// What [`SESSION_SEND`] does with a message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SendMode {
+    /// Start a turn now. A session with a turn running refuses.
+    #[default]
+    Start,
+    /// Start a turn now when the session is free and nothing waits; otherwise keep
+    /// the message and start it when the running turn ends cleanly. A turn that
+    /// was stopped, failed or hit a limit leaves the queue waiting until the
+    /// client resumes it with [`SESSION_QUEUE`] or sends a new message that
+    /// ends cleanly. A message queued with limits keeps them.
+    Queue,
+}
+
+impl SendMode {
+    #[must_use]
+    pub fn is_start(&self) -> bool {
+        *self == Self::Start
+    }
 }
 
 /// Result of [`SESSION_SEND`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSendResult {
-    /// The turn the message started.
+    /// The turn the message started, or for a queued message the latest turn of
+    /// the session, which it waits behind.
     pub turn_id: TurnId,
+    /// The message was queued and has not started.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queued: bool,
+}
+
+/// Parameters of [`SESSION_QUEUE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionQueueParams {
+    /// Target session.
+    pub session_id: SessionId,
+    /// What to do with the queue.
+    #[serde(flatten)]
+    pub action: QueueAction,
+}
+
+/// What [`SESSION_QUEUE`] does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum QueueAction {
+    /// Report the waiting messages.
+    List,
+    /// Start the oldest waiting message when the session is free. Each clean
+    /// turn end then starts the next one.
+    Resume,
+    /// Remove one waiting message, for a client that edits or drops it.
+    Discard {
+        /// The message to remove.
+        queue_id: i64,
+    },
+}
+
+/// A message waiting for its turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct QueuedMessage {
+    /// Identifies the message to [`QueueAction::Discard`].
+    pub id: i64,
+    pub text: String,
+    /// When it was queued, in milliseconds since the Unix epoch.
+    pub at: i64,
+}
+
+/// Result of [`SESSION_QUEUE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionQueueResult {
+    /// The messages still waiting, oldest first.
+    pub messages: Vec<QueuedMessage>,
+    /// The turn a resume started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<TurnId>,
 }
 
 /// Parameters of [`AGENT_RUN`].

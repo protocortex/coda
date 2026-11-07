@@ -23,9 +23,10 @@ use coda_protocol::events::Event;
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, INVALID_PARAMS};
 use coda_protocol::methods::{
     AgentRunParams, AgentRunResult, DIFF_REFUSED_CODE, PermissionRespondParams,
-    PermissionRespondResult, REWIND_REFUSED_CODE, SessionCancelParams, SessionCancelResult,
-    SessionCloseParams, SessionCloseResult, SessionDiffParams, SessionRewindParams,
-    SessionSendParams, SessionSendResult, SessionSetModeParams, SessionSetModeResult,
+    PermissionRespondResult, REWIND_REFUSED_CODE, SendMode, SessionCancelParams,
+    SessionCancelResult, SessionCloseParams, SessionCloseResult, SessionDiffParams,
+    SessionRewindParams, SessionSendParams, SessionSendResult, SessionSetModeParams,
+    SessionSetModeResult,
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::TurnOutcome;
@@ -52,9 +53,12 @@ use crate::backends::{
 mod diff;
 mod drive;
 mod mode;
+mod queue;
 mod rewind;
 
 use self::drive::Drive;
+pub use self::queue::Sent;
+pub(crate) use self::queue::session_queue;
 use crate::checkpoint;
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
 use crate::gate::{BrokerGate, Brokers};
@@ -126,6 +130,8 @@ pub enum TurnError {
     SessionNotFound(SessionId),
     #[error("session {0} already has a turn running")]
     Busy(SessionId),
+    #[error("session {0} has too many queued messages")]
+    QueueFull(SessionId),
     #[error("session {0} is still ending a cancelled turn")]
     Ending(SessionId),
     #[error("session {0} does not use a backend this daemon can run")]
@@ -155,6 +161,7 @@ impl TurnError {
             Self::Rewind(why) => error(REWIND_REFUSED_CODE, &why),
             Self::Diff(why) => error(DIFF_REFUSED_CODE, &why),
             Self::Busy(_) => error(TURN_RUNNING, "A turn is already running"),
+            Self::QueueFull(_) => error(INVALID_PARAMS, "The queue is full"),
             Self::Ending(_) => error(
                 TURN_RUNNING,
                 "The cancelled turn is still ending. Try again.",
@@ -322,6 +329,8 @@ pub struct Turns {
     backend_ids: Mutex<HashMap<SessionId, String>>,
     /// The event queue of each running turn, to count what is waiting.
     queues: Mutex<HashMap<SessionId, mpsc::WeakSender<Queued>>>,
+    /// Held while a queued message is read, started and removed.
+    queue_gate: tokio::sync::Mutex<()>,
     /// Codex app-servers between turns, one per session. A turn takes its
     /// session's server out, so turns of one session never share it at once.
     idle: IdlePool<AgentSession>,
@@ -360,7 +369,7 @@ impl Turns {
             config.parent_env.clone(),
             Arc::new(|name| std::env::var(name).ok()),
         );
-        Arc::new(Self {
+        let turns = Arc::new(Self {
             hub,
             brokers,
             config,
@@ -368,10 +377,18 @@ impl Turns {
             running: Mutex::default(),
             backend_ids: Mutex::default(),
             queues: Mutex::default(),
+            queue_gate: tokio::sync::Mutex::new(()),
             idle: IdlePool::new(MAX_IDLE_SERVERS),
             supervisor,
             stopping: AtomicBool::new(false),
-        })
+        });
+        let weak = Arc::downgrade(&turns);
+        turns.models.set_on_clean_end(Arc::new(move |session| {
+            if let Some(turns) = weak.upgrade() {
+                turns.start_next_queued(session);
+            }
+        }));
+        turns
     }
 
     /// Starts a turn with `text` and returns without waiting for it to end.
@@ -381,12 +398,21 @@ impl Turns {
     /// [`TurnError::Busy`], [`TurnError::Ending`] when a cancelled turn does
     /// not end in time, [`TurnError::Start`] when the backend cannot start,
     /// and [`TurnError::Hub`] when the store refuses.
-    pub async fn send(self: &Arc<Self>, params: SessionSendParams) -> Result<TurnId, TurnError> {
+    pub async fn send(self: &Arc<Self>, params: SessionSendParams) -> Result<Sent, TurnError> {
+        match params.mode {
+            SendMode::Start => self.send_now(params).await.map(Sent::started),
+            SendMode::Queue => self.send_queued(params).await,
+        }
+    }
+
+    /// Starts a turn with the message of `params`, or refuses when one runs.
+    async fn send_now(self: &Arc<Self>, params: SessionSendParams) -> Result<TurnId, TurnError> {
         let SessionSendParams {
             session_id,
             text,
             max_turns,
             token_cap,
+            mode: _,
         } = params;
         let id = session_id.clone();
         let record = self
@@ -513,7 +539,13 @@ impl Turns {
         };
         let turns = Arc::clone(self);
         let span = backend_span(&job.session, &job.turn, backend_name);
-        spawn_guarded(slot, async move { turns.run(job).await }.instrument(span));
+        let after = Arc::clone(self);
+        let ended = job.session.clone();
+        spawn_guarded(
+            slot,
+            async move { turns.run(job).await }.instrument(span),
+            move || after.start_next_queued(ended),
+        );
         Ok(turn)
     }
 
@@ -855,7 +887,7 @@ impl Turns {
 
     /// The named steps of a running turn: drive the backend (restarting it
     /// when it crashes), drain its events, clean up, record the end.
-    async fn run(self: Arc<Self>, job: Job) {
+    async fn run(self: Arc<Self>, job: Job) -> bool {
         let Job {
             record,
             session,
@@ -952,6 +984,7 @@ impl Turns {
         } else {
             checkpoint::after_turn(&self.hub, &session, &turn).await;
         }
+        ended.is_some() && !failed && matches!(outcome, Some(Ok(TurnOutcome::Completed { .. })))
     }
 
     /// Denies the prompts the turn left open and records how it ended.
@@ -998,14 +1031,19 @@ fn turn_failed(hole_or_abort: bool, outcome: &drive::Outcome) -> bool {
         }
 }
 
-/// Runs `work` on its own task, holding `slot` until it ends or panics.
+/// Runs `work` on its own task, holding `slot` until it ends or panics. When
+/// `work` says its turn ended cleanly, `then` runs once the slot is free.
 fn spawn_guarded(
     slot: TurnSlot,
-    work: impl Future<Output = ()> + Send + 'static,
+    work: impl Future<Output = bool> + Send + 'static,
+    then: impl FnOnce() + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let _slot = slot;
-        work.await;
+        let clean = work.await;
+        drop(slot);
+        if clean {
+            then();
+        }
     })
 }
 
@@ -1400,11 +1438,14 @@ fn not_found_or(e: HubError, session: &SessionId) -> TurnError {
 /// Answers `session.send`.
 pub(crate) async fn send(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
     let turns = turns.ok_or_else(unavailable)?;
-    let turn_id = turns
+    let sent = turns
         .send(parse_params(params)?)
         .await
         .map_err(TurnError::into_rpc)?;
-    to_value(&SessionSendResult { turn_id })
+    to_value(&SessionSendResult {
+        turn_id: sent.turn,
+        queued: sent.queued,
+    })
 }
 
 /// Answers `agent.run`.
@@ -1414,7 +1455,10 @@ pub(crate) async fn run_agent(turns: Option<&Arc<Turns>>, params: Option<Value>)
         .run_agent(parse_params(params)?)
         .await
         .map_err(TurnError::into_rpc)?;
-    to_value(&AgentRunResult { turn_id })
+    to_value(&AgentRunResult {
+        turn_id,
+        queued: false,
+    })
 }
 
 /// Answers `session.cancel`.
