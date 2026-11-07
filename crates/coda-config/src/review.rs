@@ -35,6 +35,9 @@ pub const DEFAULT_VERIFY_THRESHOLD: u8 = 4;
 /// Highest score the verifier gives.
 pub const VERIFY_THRESHOLD_MAX: u8 = 10;
 
+/// Key of the check commands inside `[review]`.
+pub const CHECK_COMMANDS_KEY: &str = "check_commands";
+
 /// Path of the routing rules inside `[review]`, as `routing.rules`.
 pub const ROUTING_RULES_PATH: &str = "routing.rules";
 /// Key of the model inside a routing rule.
@@ -89,6 +92,9 @@ pub struct ReviewConfig {
     pub skip: ReviewSkip,
     /// Which model reviews a part, by its size, and what happens when a backend runs out.
     pub routing: ReviewRouting,
+    /// The test and lint commands `coda review --run-checks` has the `tester` agent run
+    /// first, each as one line of text. Only the global config sets them.
+    pub check_commands: Vec<String>,
 }
 
 impl Default for ReviewConfig {
@@ -109,6 +115,7 @@ impl Default for ReviewConfig {
             ignore: ReviewIgnore::default(),
             skip: ReviewSkip::default(),
             routing: ReviewRouting::default(),
+            check_commands: Vec::new(),
         }
     }
 }

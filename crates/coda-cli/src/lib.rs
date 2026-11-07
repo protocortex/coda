@@ -14,6 +14,7 @@ mod grant;
 mod hooks_cmd;
 mod init;
 mod review;
+mod review_context;
 mod review_issues;
 mod review_memory;
 mod review_post;

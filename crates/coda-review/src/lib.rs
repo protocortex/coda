@@ -5,6 +5,7 @@
 //! or a model.
 
 pub mod chunk;
+pub mod context;
 pub mod diff;
 pub mod guidance;
 pub mod ignore;
@@ -14,6 +15,7 @@ pub mod pack;
 pub mod parse;
 pub mod post;
 pub mod render;
+pub mod report;
 pub mod request;
 pub mod rules;
 pub mod schema;

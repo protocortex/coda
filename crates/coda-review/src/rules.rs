@@ -117,7 +117,7 @@ pub fn parse_repo_rules(text: &str) -> Result<ReviewConfig, RulesError> {
 
 /// Combines the global config with the repository rules. Lists add up, a switch that
 /// skips is on when either side turns it on, and the built-in ignore list stays on only
-/// when both sides keep it. The finding cap, the diff budget, the chunk limits, the verifier settings, the routing and the guidance cap come from the global config alone.
+/// when both sides keep it. The finding cap, the diff budget, the chunk limits, the verifier settings, the routing, the check commands and the guidance cap come from the global config alone.
 #[must_use]
 pub fn merge(global: &ReviewConfig, repo: Option<&ReviewConfig>) -> ReviewConfig {
     let Some(repo) = repo else {
@@ -135,6 +135,7 @@ pub fn merge(global: &ReviewConfig, repo: Option<&ReviewConfig>) -> ReviewConfig
         linked_repos: global.linked_repos.clone(),
         hook: global.hook.clone(),
         routing: global.routing.clone(),
+        check_commands: global.check_commands.clone(),
         incremental_min_commits: global.incremental_min_commits,
         incremental_min_minutes: global.incremental_min_minutes,
         extra_instructions: [
