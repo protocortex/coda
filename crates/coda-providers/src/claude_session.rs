@@ -36,7 +36,9 @@ use crate::steer::{self, SteerHandle, SteerInbox};
 use crate::tool_call::{CallInfo, ToolCalls};
 use crate::tool_request::{ToolRequest, reason_from};
 
-/// Only flags proven against a live binary; `--permission-mode` is left out on purpose.
+/// Only flags proven against a live binary. `--permission-mode` is left out on purpose:
+/// the `acceptEdits` of `claude` writes `Cargo.toml` without asking, which would drop the
+/// prompt coda's own accept-edits mode keeps for files that change what runs.
 const CLAUDE_FLAGS: &[&str] = &[
     "-p",
     "--input-format",

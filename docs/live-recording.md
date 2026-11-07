@@ -81,6 +81,7 @@ they found with claude 2.1.296 on 2026-11-08:
 | a message sent mid-turn | in a turn that only streams text it queues: the first message gets its own `result` and the second gets another. The manual run under Steer, with a tool still running, gave one `result` for both, so the answer depends on the turn |
 | helper call | `run_structured` returns JSON with a non-empty `title` that fits its schema |
 | login commands | `claude auth login --help` and `codex login --help` answer, and the `auth status` probe and the Codex account read both see the installed login (no quota, no token read) |
+| `--permission-mode acceptEdits` | writes `notes.txt` and `Cargo.toml` with no `can_use_tool` request, so coda does not pass it: coda's accept-edits mode still asks before a file that changes what runs. Only `Cargo.toml` was probed. The probe fails the day `claude` asks for it |
 | `--fork-session` | with `--resume <id>` it starts a new session id and the turn works |
 | resume at a message | `claude --help` lists no flag for it (`--resume-session-at`); the probe fails the day one appears |
 
