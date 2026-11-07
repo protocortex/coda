@@ -136,6 +136,13 @@ impl<'a, E: Emit> Drive<'a, E> {
         }
     }
 
+    /// Tells the backend the earlier conversation before the prompt, for a
+    /// conversation that starts new after a rewind.
+    pub fn with_seed(mut self, seed: Option<String>) -> Self {
+        self.seed = seed;
+        self
+    }
+
     /// Ends the turn as failed. The cause goes to the log: a result event carries none.
     async fn fail_turn(&mut self) {
         self.emit

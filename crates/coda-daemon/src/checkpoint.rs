@@ -24,9 +24,11 @@ use crate::subscribe::Hub;
 const BASELINE_LABEL: &str = "base";
 /// The whole snapshot, not one git step: a turn holds its slot while it runs.
 const SNAPSHOT_LIMIT: Duration = Duration::from_secs(30);
+const RESTORE_LIMIT: Duration = Duration::from_secs(60);
 const REF_PREFIX: &str = "refs/coda/checkpoints";
 const SCRATCH_INDEX_PREFIX: &str = "coda-checkpoint-index";
 const LOCK_SUFFIX: &str = ".lock";
+const INDEX_LOCK_FILE: &str = "index.lock";
 const COMMIT_MESSAGE: &str = "coda checkpoint";
 const IDENTITY_NAME: &str = "coda";
 const IDENTITY_EMAIL: &str = "coda@localhost";
@@ -47,6 +49,8 @@ static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) enum CheckpointError {
     #[error("not inside a git repository")]
     NotARepository,
+    #[error("another git process holds the index lock")]
+    IndexLocked,
     #[error("git {args} failed ({status}): {stderr}")]
     Git {
         args: String,
@@ -116,6 +120,66 @@ pub(crate) fn snapshot(cwd: &Path, reference: &str) -> Result<(), CheckpointErro
     let commit = run.git(index, &commit)?.trim().to_owned();
     run.git(None, &["update-ref", reference, &commit, MUST_NOT_EXIST])?;
     Ok(())
+}
+
+/// Puts the working tree of `cwd`'s folder back as `reference` holds it: files
+/// the snapshot has come back, files made since are removed, and what
+/// `.gitignore` excludes is left alone. The index ends up matching `HEAD`, as
+/// it does after a snapshot, and `HEAD` and the branches do not move. Only the
+/// folder `cwd` names is touched, not the rest of the repository.
+pub(crate) fn restore(cwd: &Path, reference: &str) -> Result<(), CheckpointError> {
+    let run = Git {
+        cwd,
+        deadline: Instant::now() + RESTORE_LIMIT,
+    };
+    let index = PathBuf::from(
+        run.git(
+            None,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )
+        .map_err(not_a_repository)?
+        .trim(),
+    );
+    let mut lock = index.into_os_string();
+    lock.push(LOCK_SUFFIX);
+    if Path::new(&lock).exists() {
+        return Err(CheckpointError::IndexLocked);
+    }
+    let commit = run
+        .git(
+            None,
+            &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+        )?
+        .trim()
+        .to_owned();
+    run.git(
+        None,
+        &[
+            "restore",
+            "--source",
+            &commit,
+            "--worktree",
+            "--staged",
+            "--",
+            ".",
+        ],
+    )
+    .map_err(lock_failure)?;
+    run.git(None, &["clean", "-fd", "--", "."])
+        .map_err(lock_failure)?;
+    run.git(None, &["reset", "-q", "--", "."])
+        .map_err(lock_failure)?;
+    Ok(())
+}
+
+/// A lock another git process took after the check at the start of a restore.
+fn lock_failure(error: CheckpointError) -> CheckpointError {
+    match error {
+        CheckpointError::Git { stderr, .. } if stderr.contains(INDEX_LOCK_FILE) => {
+            CheckpointError::IndexLocked
+        }
+        other => other,
+    }
 }
 
 fn not_a_repository(error: CheckpointError) -> CheckpointError {
@@ -641,6 +705,134 @@ mod tests {
         // Assert
         assert!(matches!(second, Err(CheckpointError::Git { .. })));
         assert_eq!(git(dir.path(), &["rev-parse", REF]), first);
+    }
+
+    fn read(dir: &Path, name: &str) -> Option<String> {
+        fs::read_to_string(dir.join(name)).ok()
+    }
+
+    #[test]
+    fn a_restore_brings_back_edits_deletions_and_untracked_files_and_drops_later_ones() {
+        // Arrange
+        let dir = repo();
+        fs::write(dir.path().join("kept.txt"), "kept\n").unwrap();
+        snapshot(dir.path(), REF).unwrap();
+        fs::write(dir.path().join("a.txt"), "edited\n").unwrap();
+        fs::remove_file(dir.path().join("kept.txt")).unwrap();
+        fs::write(dir.path().join("later.txt"), "later\n").unwrap();
+
+        // Act
+        restore(dir.path(), REF).unwrap();
+
+        // Assert
+        assert_eq!(read(dir.path(), "a.txt").as_deref(), Some("one\n"));
+        assert_eq!(read(dir.path(), "kept.txt").as_deref(), Some("kept\n"));
+        assert_eq!(read(dir.path(), "later.txt"), None);
+    }
+
+    #[test]
+    fn a_restore_leaves_head_the_index_and_ignored_files_alone() {
+        // Arrange
+        let dir = repo();
+        fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        git(dir.path(), &["add", ".gitignore"]);
+        git(dir.path(), &["commit", "-q", "-m", "ignore"]);
+        snapshot(dir.path(), REF).unwrap();
+        fs::create_dir(dir.path().join("target")).unwrap();
+        fs::write(dir.path().join("target/big.bin"), "x").unwrap();
+        fs::write(dir.path().join("a.txt"), "edited\n").unwrap();
+        let head = git(dir.path(), &["rev-parse", "HEAD"]);
+
+        // Act
+        restore(dir.path(), REF).unwrap();
+
+        // Assert
+        assert_eq!(read(dir.path(), "target/big.bin").as_deref(), Some("x"));
+        assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(dir.path(), &["diff", "--cached", "--name-only"]), "");
+        assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn a_restore_in_a_subfolder_leaves_the_rest_of_the_repository_alone() {
+        // Arrange
+        let dir = repo();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/s.txt"), "s\n").unwrap();
+        snapshot(&dir.path().join("sub"), REF).unwrap();
+        fs::write(dir.path().join("sub/s.txt"), "edited\n").unwrap();
+        fs::write(dir.path().join("a.txt"), "edited too\n").unwrap();
+
+        // Act
+        restore(&dir.path().join("sub"), REF).unwrap();
+
+        // Assert
+        assert_eq!(read(dir.path(), "sub/s.txt").as_deref(), Some("s\n"));
+        assert_eq!(read(dir.path(), "a.txt").as_deref(), Some("edited too\n"));
+    }
+
+    #[test]
+    fn a_held_index_lock_stops_a_restore_before_it_changes_anything() {
+        // Arrange
+        let dir = repo();
+        snapshot(dir.path(), REF).unwrap();
+        fs::write(dir.path().join("a.txt"), "edited\n").unwrap();
+        fs::write(dir.path().join(".git/index.lock"), "").unwrap();
+
+        // Act
+        let result = restore(dir.path(), REF);
+
+        // Assert
+        assert!(matches!(result, Err(CheckpointError::IndexLocked)));
+        assert_eq!(read(dir.path(), "a.txt").as_deref(), Some("edited\n"));
+    }
+
+    #[test]
+    fn a_restore_in_a_repository_with_no_commit_brings_back_the_snapshot() {
+        // Arrange
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        snapshot(dir.path(), REF).unwrap();
+        fs::write(dir.path().join("a.txt"), "edited\n").unwrap();
+        fs::write(dir.path().join("later.txt"), "later\n").unwrap();
+
+        // Act
+        restore(dir.path(), REF).unwrap();
+
+        // Assert
+        assert_eq!(read(dir.path(), "a.txt").as_deref(), Some("one\n"));
+        assert_eq!(read(dir.path(), "later.txt"), None);
+    }
+
+    #[test]
+    fn a_lock_failure_from_git_is_reported_as_a_held_index_lock() {
+        // Arrange
+        let failed = CheckpointError::Git {
+            args: "restore".to_owned(),
+            status: "exit status: 128".to_owned(),
+            stderr: "fatal: Unable to create '/r/.git/index.lock': File exists.".to_owned(),
+        };
+
+        // Act
+        let mapped = lock_failure(failed);
+
+        // Assert
+        assert!(matches!(mapped, CheckpointError::IndexLocked));
+    }
+
+    #[test]
+    fn a_restore_of_a_missing_ref_fails_and_changes_nothing() {
+        // Arrange
+        let dir = repo();
+        fs::write(dir.path().join("a.txt"), "edited\n").unwrap();
+
+        // Act
+        let result = restore(dir.path(), REF);
+
+        // Assert
+        assert!(matches!(result, Err(CheckpointError::Git { .. })));
+        assert_eq!(read(dir.path(), "a.txt").as_deref(), Some("edited\n"));
     }
 
     #[test]

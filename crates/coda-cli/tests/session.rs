@@ -199,3 +199,115 @@ async fn list_filters_by_a_directory_that_no_longer_exists() {
     assert_eq!(listed.code, ExitCode::SUCCESS, "{}", listed.err);
     assert!(listed.out.contains(&id), "{}", listed.out);
 }
+
+fn run_git(rig: &Rig, args: &[&str]) {
+    let done = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .current_dir(rig.work.path())
+        .output()
+        .unwrap();
+    assert!(done.status.success(), "git {args:?}");
+}
+
+/// The id of the first turn of `id`, read from the stored events.
+async fn first_turn(rig: &Rig, id: &str) -> String {
+    let shown = rig.coda(&["session", "show", id, "--json"]).await;
+    let shown: Value = serde_json::from_str(&shown.out).unwrap();
+    shown["events"][0]["turn"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn rewind_restores_the_files_marks_later_turns_and_show_says_so() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one"), text_turn("two")]);
+    std::fs::remove_dir(rig.work.path().join(".git")).unwrap();
+    run_git(&rig, &["init", "-q"]);
+    std::fs::write(rig.work.path().join("a.txt"), "a\n").unwrap();
+    run_git(&rig, &["add", "."]);
+    run_git(&rig, &["commit", "-q", "-m", "first"]);
+    let id = rig.start_session().await;
+    rig.coda(&["session", "send", &id, "--prompt", "first-q", "--wait"])
+        .await;
+    std::fs::write(rig.work.path().join("later.txt"), "later\n").unwrap();
+    rig.coda(&["session", "send", &id, "--prompt", "second-q", "--wait"])
+        .await;
+    let turn = first_turn(&rig, &id).await;
+
+    // Act
+    let rewound = rig
+        .coda(&["session", "rewind", &id, "--to", &turn, "--json"])
+        .await;
+    let shown = rig.coda(&["session", "show", &id]).await;
+    let shown_json = rig.coda(&["session", "show", &id, "--json"]).await;
+
+    // Assert
+    assert_eq!(rewound.code, ExitCode::SUCCESS, "{}", rewound.err);
+    let result: Value = serde_json::from_str(&rewound.out).unwrap();
+    assert_eq!(result["files_restored"], true);
+    assert_eq!(result["turns_rolled_back"], 1);
+    let saved = result["saved_as"].as_str().unwrap();
+    assert!(saved.starts_with("refs/coda/checkpoints/"), "{saved}");
+    assert!(!rig.work.path().join("later.txt").exists());
+    assert!(shown.out.contains("> first-q"), "{}", shown.out);
+    assert!(
+        shown.out.contains("> [rolled back] second-q"),
+        "{}",
+        shown.out
+    );
+    let shown: Value = serde_json::from_str(&shown_json.out).unwrap();
+    let flags: Vec<bool> = shown["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "user_message")
+        .map(|e| e["rolled_back"].as_bool().unwrap())
+        .collect();
+    assert_eq!(flags, [false, true]);
+}
+
+#[tokio::test]
+async fn rewind_to_base_rolls_back_every_turn_and_keep_files_leaves_the_tree() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one")]);
+    let id = rig.start_session().await;
+    rig.coda(&["session", "send", &id, "--prompt", "first-q", "--wait"])
+        .await;
+    std::fs::write(rig.work.path().join("mine.txt"), "mine\n").unwrap();
+
+    // Act
+    let rewound = rig
+        .coda(&["session", "rewind", &id, "--to", "base", "--keep-files"])
+        .await;
+
+    // Assert
+    assert_eq!(rewound.code, ExitCode::SUCCESS, "{}", rewound.err);
+    assert!(
+        rewound.out.contains("rolled back 1 turn"),
+        "{}",
+        rewound.out
+    );
+    assert!(rig.work.path().join("mine.txt").exists());
+}
+
+#[tokio::test]
+async fn a_refused_rewind_fails_the_command_with_the_reason() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one")]);
+    let id = rig.start_session().await;
+    rig.coda(&["session", "send", &id, "--prompt", "first-q", "--wait"])
+        .await;
+
+    // Act
+    let rewound = rig.coda(&["session", "rewind", &id, "--to", "base"]).await;
+
+    // Assert
+    assert_eq!(
+        rewound.code,
+        ExitCode::from(EXIT_FAILURE),
+        "{}",
+        rewound.out
+    );
+    assert!(rewound.err.contains("snapshot"), "{}", rewound.err);
+}

@@ -608,6 +608,19 @@ impl ModelSessions {
         self.running().len()
     }
 
+    /// Keeps a send from starting on `session` until the returned guard drops.
+    pub(crate) fn hold(
+        self: &Arc<Self>,
+        session: &SessionId,
+    ) -> Result<Box<dyn std::any::Any + Send>, TurnError> {
+        Ok(Box::new(self.reserve(session)?))
+    }
+
+    /// The sessions that have a send starting or running.
+    pub(crate) fn running_sessions(&self) -> Vec<SessionId> {
+        self.running().keys().cloned().collect()
+    }
+
     fn running(&self) -> MutexGuard<'_, HashMap<SessionId, Reservation<(CancelToken, TurnId)>>> {
         lock(&self.running)
     }

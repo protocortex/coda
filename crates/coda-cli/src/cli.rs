@@ -75,6 +75,26 @@ pub enum SessionCommand {
     Send(SessionSendArgs),
     /// Print a session's conversation.
     Show(SessionShowArgs),
+    /// Put the files back as an earlier turn left them and roll the later turns back.
+    Rewind(SessionRewindArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SessionRewindArgs {
+    /// The session to rewind.
+    pub session: String,
+    /// The turn to go back to, or `base` for before the first turn.
+    #[arg(long)]
+    pub to: String,
+    /// Leave the files as they are and roll back the conversation only.
+    #[arg(long, conflicts_with = "keep_conversation")]
+    pub keep_files: bool,
+    /// Restore the files only and keep every turn in the conversation.
+    #[arg(long)]
+    pub keep_conversation: bool,
+    /// Print the result as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
