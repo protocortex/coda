@@ -26,6 +26,7 @@ use coda_protocol::types::{BackendKind, Mode};
 use coda_review::chunk::{Merged, Outcome, merge, plan};
 use coda_review::diff::{FileDiff, git_diff, git_diff_staged, parse_diff, tracked_files};
 use coda_review::guidance;
+use coda_review::issues::{check_compliance, prompt_section};
 use coda_review::pack::{PackOptions, Packed, main_extension};
 use coda_review::parse::{BadShape, Parsed, parse_model_output};
 use coda_review::render::{to_json, to_markdown};
@@ -45,6 +46,7 @@ use crate::cli::ReviewArgs;
 use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
 use crate::error::CliError;
+use crate::review_issues::{Linked, gather as gather_issues};
 use crate::review_post::{Confirm, RealGh, head_of, post};
 use crate::run::{
     CANCELLED, CLAUDE_CODE_KEY, CODEX_KEY, Finish, Job, STREAM_DELTA_KIND, Tap, drive,
@@ -119,10 +121,13 @@ pub async fn run(
         writeln!(io.err, "coda: {NO_DEFAULT_BRANCH_NOTE}")?;
     }
     let rules_text = read_guidance(&config.review, repo)?;
+    let linked = linked_issues(repo, target.as_ref(), &config.review);
+    let issues_text = prompt_section(&linked.issues);
     let extras = Extras {
         guidance: Some(&rules_text),
         standing: Some(&rules.extra_instructions),
         run: args.instructions.as_deref(),
+        issues: Some(&issues_text),
     };
     let inputs: Vec<String> = parts
         .iter()
@@ -174,12 +179,43 @@ pub async fn run(
         None
     };
     let model = model.unwrap_or_else(|| backend_name(backend));
-    let review = assemble(merged, &model, input_chars, verified);
+    let review = assemble_linked(merged, (&model, input_chars, verified), linked);
     print_review(io, args.json, &review)?;
     if let Some(to) = post_to {
         post_review(io, repo, to, &parts, &review)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The issues a pull request links to. A branch, range or staged change has none.
+fn linked_issues(repo: &Path, target: Option<&Target>, config: &ReviewConfig) -> Linked {
+    match target {
+        Some(Target::PullRequest(pr)) => {
+            gather_issues(&mut RealGh { repo }, pr, &config.linked_repos)
+        }
+        _ => Linked::default(),
+    }
+}
+
+/// Builds the review. The compliance verdicts the issues do not back are dropped, so with no
+/// issue read there are none, and the notes of the skipped issues go in the run details.
+fn assemble_linked(
+    mut merged: Merged,
+    (model, input_chars, verified): (&str, usize, Option<VerifierRun>),
+    linked: Linked,
+) -> Review {
+    let given = std::mem::take(&mut merged.parsed.compliance);
+    let (kept, dropped) = check_compliance(given, &linked.issues);
+    if dropped > 0 {
+        info!(
+            step = "compliance",
+            dropped, "dropped verdicts the issues do not back"
+        );
+    }
+    merged.parsed.compliance = kept;
+    let mut review = assemble(merged, model, input_chars, verified);
+    review.run.skipped_issues = linked.notes;
+    review
 }
 
 fn print_review(io: &mut Io<'_>, json: bool, review: &Review) -> Result<(), CliError> {
@@ -255,6 +291,7 @@ fn notice(io: &mut Io<'_>, json: bool, text: &str) -> Result<(), CliError> {
             effort: MIN_EFFORT,
             risk: Risk::Low,
             findings: Vec::new(),
+            compliance: Vec::new(),
             coverage: Coverage::default(),
             run: RunDetails::default(),
         };

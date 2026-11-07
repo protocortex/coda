@@ -10,7 +10,7 @@
 use crate::diff::FileDiff;
 use crate::pack::{OmitReason, PackOptions, Packed, pack};
 use crate::parse::Parsed;
-use crate::schema::{Category, Coverage, Finding, MIN_EFFORT, Risk};
+use crate::schema::{Category, ComplianceItem, Coverage, Finding, MIN_EFFORT, Risk};
 
 /// Splits `files` into at most `max_chunks` packed parts, each within the budget.
 ///
@@ -116,6 +116,7 @@ pub fn merge(given: &[String], outcomes: Vec<Outcome<'_>>, max_findings: usize) 
     let mut found: Vec<Finding> = Vec::new();
     let mut rejected = Vec::new();
     let mut over_cap = 0;
+    let mut compliance: Vec<ComplianceItem> = Vec::new();
     for parsed in outcomes.into_iter().filter_map(|o| o.parsed) {
         if !parsed.summary.trim().is_empty() && !summaries.contains(&parsed.summary) {
             summaries.push(parsed.summary);
@@ -124,6 +125,15 @@ pub fn merge(given: &[String], outcomes: Vec<Outcome<'_>>, max_findings: usize) 
         risk = risk.max(parsed.risk);
         rejected.extend(parsed.rejected);
         over_cap += parsed.over_cap;
+        for item in parsed.compliance {
+            match compliance
+                .iter_mut()
+                .find(|kept| kept.issue == item.issue && kept.requirement == item.requirement)
+            {
+                Some(kept) => kept.verdict = kept.verdict.max(item.verdict),
+                None => compliance.push(item),
+            }
+        }
         for finding in parsed.findings {
             match found.iter_mut().find(|kept| same_finding(kept, &finding)) {
                 Some(kept) => absorb(kept, &finding),
@@ -158,6 +168,7 @@ pub fn merge(given: &[String], outcomes: Vec<Outcome<'_>>, max_findings: usize) 
             findings,
             rejected,
             over_cap,
+            compliance,
         },
         coverage,
         chunks,
@@ -171,7 +182,7 @@ mod tests {
     use crate::diff::parse_diff;
     use crate::ignore::IgnoreSet;
     use crate::parse::Rejection;
-    use crate::schema::{Confidence, Severity};
+    use crate::schema::{Confidence, Severity, Verdict};
 
     const BIG_BUDGET: usize = 100_000;
 
@@ -210,6 +221,39 @@ mod tests {
 
     fn names(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_requirement_keeps_the_best_verdict_any_part_gave_it() {
+        // Arrange
+        let item = |verdict| ComplianceItem {
+            issue: "#1".to_owned(),
+            requirement: "Retry three times".to_owned(),
+            verdict,
+        };
+        let a = packed(&["a.rs"]);
+        let b = packed(&["b.rs"]);
+        let mut first = parsed(Risk::Low, 1, vec![]);
+        first.compliance = vec![item(Verdict::Not)];
+        let mut second = parsed(Risk::Low, 1, vec![]);
+        second.compliance = vec![item(Verdict::Fully)];
+        let outcomes = vec![
+            Outcome {
+                packed: &a,
+                parsed: Some(first),
+            },
+            Outcome {
+                packed: &b,
+                parsed: Some(second),
+            },
+        ];
+
+        // Act
+        let merged = merge(&["a.rs".to_owned(), "b.rs".to_owned()], outcomes, 5);
+
+        // Assert
+        assert_eq!(merged.parsed.compliance.len(), 1);
+        assert_eq!(merged.parsed.compliance[0].verdict, Verdict::Fully);
     }
 
     #[test]
@@ -335,6 +379,7 @@ mod tests {
             findings,
             rejected: vec![],
             over_cap: 0,
+            compliance: vec![],
         }
     }
 

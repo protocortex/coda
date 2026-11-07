@@ -125,6 +125,52 @@ impl Risk {
     }
 }
 
+/// How well the change meets one requirement of a linked issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    /// The change does not meet it.
+    Not,
+    /// The change meets part of it.
+    Partially,
+    /// The change meets all of it.
+    Fully,
+}
+
+impl Verdict {
+    /// The name used in JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Not => "not",
+            Self::Partially => "partially",
+            Self::Fully => "fully",
+        }
+    }
+
+    /// The words the markdown uses.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::Not => "not compliant",
+            Self::Partially => "partially compliant",
+            Self::Fully => "fully compliant",
+        }
+    }
+}
+
+/// The verdict on one requirement of one linked issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComplianceItem {
+    /// The issue, as the prompt names it: `#12` or `org/repo#12`.
+    pub issue: String,
+    /// The requirement, quoted from the issue.
+    pub requirement: String,
+    /// How well the change meets it.
+    pub verdict: Verdict,
+}
+
 /// A finding as the model writes it. The id is added by coda, not the model.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -201,6 +247,10 @@ pub struct ModelOutput {
     pub risk: Risk,
     /// Findings, each checked on its own.
     pub findings: Vec<serde_json::Value>,
+    /// Verdicts on the requirements of the linked issues, when the prompt had any. Each is
+    /// checked on its own.
+    #[serde(default)]
+    pub compliance: Vec<serde_json::Value>,
 }
 
 /// Which files the review saw. Every file given to the packer is in exactly one list.
@@ -260,6 +310,9 @@ pub struct RunDetails {
     /// parts' findings are all that this review has.
     #[serde(default)]
     pub partial: bool,
+    /// Linked issues that were named but could not be used, each with the reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_issues: Vec<String>,
 }
 
 /// The finished review.
@@ -273,6 +326,10 @@ pub struct Review {
     pub risk: Risk,
     /// Kept findings, most serious first.
     pub findings: Vec<Finding>,
+    /// How the change meets the requirements of the linked issues. Empty when no issue was
+    /// linked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compliance: Vec<ComplianceItem>,
     /// Which files the review saw.
     pub coverage: Coverage,
     /// How the run went.

@@ -63,6 +63,9 @@ pub struct ReviewConfig {
     pub guidance_lines: usize,
     /// Instructions added to every review's prompt, after the project rules.
     pub extra_instructions: String,
+    /// Repositories (`org/repo`) whose issues a pull request may link to and have read
+    /// into the review. Issues of the pull request's own repository are always read.
+    pub linked_repos: Vec<String>,
     /// Files left out of a review.
     pub ignore: ReviewIgnore,
     /// Pull requests that are not reviewed.
@@ -80,6 +83,7 @@ impl Default for ReviewConfig {
             verify_threshold: DEFAULT_VERIFY_THRESHOLD,
             guidance_lines: DEFAULT_GUIDANCE_LINES,
             extra_instructions: String::new(),
+            linked_repos: Vec::new(),
             ignore: ReviewIgnore::default(),
             skip: ReviewSkip::default(),
         }
