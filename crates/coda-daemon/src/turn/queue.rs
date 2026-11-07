@@ -214,6 +214,9 @@ impl Turns {
                 None
             }
         };
+        if started.is_some() {
+            self.cancel_resume(&session_id);
+        }
         let messages = self.waiting(&session_id).await?;
         Ok(SessionQueueResult { messages, started })
     }

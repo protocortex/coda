@@ -19,12 +19,12 @@ use coda_protocol::methods::{
     DAEMON_BACKENDS, DAEMON_PING, DAEMON_STATUS, DaemonBackendsParams, DaemonBackendsResult,
     DaemonStatusParams, DaemonStatusResult, PERMISSION_RESPOND, PermissionRespondParams,
     PermissionRespondResult, PingParams, PingResult, SESSION_CANCEL, SESSION_CREATE, SESSION_DIFF,
-    SESSION_LIST, SESSION_RESUME, SESSION_SEND, SESSION_SET_MODE, SESSION_SET_MODEL,
-    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
-    SessionDiffParams, SessionDiffResult, SessionListParams, SessionListResult,
-    SessionResumeParams, SessionResumeResult, SessionSendParams, SessionSendResult,
-    SessionSetModeParams, SessionSetModeResult, SessionSetModelParams, SessionSetModelResult,
-    SessionSummary,
+    SESSION_LIST, SESSION_RESUME, SESSION_RESUME_AT_RESET, SESSION_SEND, SESSION_SET_MODE,
+    SESSION_SET_MODEL, SessionCancelParams, SessionCancelResult, SessionCreateParams,
+    SessionCreateResult, SessionDiffParams, SessionDiffResult, SessionListParams,
+    SessionListResult, SessionResumeAtResetParams, SessionResumeAtResetResult, SessionResumeParams,
+    SessionResumeResult, SessionSendParams, SessionSendResult, SessionSetModeParams,
+    SessionSetModeResult, SessionSetModelParams, SessionSetModelResult, SessionSummary,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId, SessionInfo};
 use serde_json::Value;
@@ -82,6 +82,8 @@ pub enum LinkCommand {
     SetModel(String),
     /// Change the mode of the current session, then send `then` when given.
     SetMode { mode: Mode, then: Option<String> },
+    /// Turn on or off continuing the current session when its plan window resets.
+    ResumeAtReset(bool),
     /// Read what the last turn changed and open it.
     Diff,
     /// Read how many files the last turn changed, for the line after the turn.
@@ -546,6 +548,7 @@ impl Link {
                 .map_err(|e| ("list the sessions", e)),
             LinkCommand::SetModel(alias) => self.set_model(alias).await,
             LinkCommand::SetMode { mode, then } => self.set_mode(mode, then).await,
+            LinkCommand::ResumeAtReset(enabled) => self.resume_at_reset(enabled).await,
             LinkCommand::Diff => self.diff().await,
             LinkCommand::TurnChanges => {
                 self.turn_changes().await;
@@ -621,6 +624,29 @@ impl Link {
             .await
             .map_err(|e| ("switch the model", e))?;
         self.tell(LinkEvent::ModelSwitched(switched.session));
+        Ok(())
+    }
+
+    async fn resume_at_reset(&self, enabled: bool) -> Result<(), (&'static str, ClientError)> {
+        let Some(session_id) = self.current() else {
+            self.notice("there is no session to change".to_owned());
+            return Ok(());
+        };
+        let params = SessionResumeAtResetParams {
+            session_id,
+            enabled,
+        };
+        let changed: SessionResumeAtResetResult = self
+            .client
+            .request(SESSION_RESUME_AT_RESET, &params)
+            .await
+            .map_err(|e| ("change resume at reset", e))?;
+        let text = if changed.enabled {
+            "resume at reset is on: after a plan limit stops a turn, the daemon continues the session when the window resets, unless you send a message or stop it first"
+        } else {
+            "resume at reset is off"
+        };
+        self.notice(text.to_owned());
         Ok(())
     }
 

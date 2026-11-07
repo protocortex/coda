@@ -36,7 +36,7 @@ fn add_pull_request_methods(generator: &mut SchemaGenerator, methods: &mut Map<S
     );
 }
 
-/// The methods about usage, the model, the mode and the daemon itself.
+/// The methods about usage, the model, the mode, resuming at a reset and the daemon itself.
 fn add_account_and_daemon_methods(
     generator: &mut SchemaGenerator,
     methods: &mut Map<String, Value>,
@@ -50,6 +50,11 @@ fn add_account_and_daemon_methods(
         generator,
         methods,
         m::SESSION_SET_MODE,
+    );
+    add_method::<m::SessionResumeAtResetParams, m::SessionResumeAtResetResult>(
+        generator,
+        methods,
+        m::SESSION_RESUME_AT_RESET,
     );
     add_method::<m::SessionSetModelParams, m::SessionSetModelResult>(
         generator,

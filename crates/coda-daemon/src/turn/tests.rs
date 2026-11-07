@@ -75,6 +75,7 @@ mod idempotent;
 mod interrupt;
 mod mode;
 mod queue;
+mod reset;
 mod restarts;
 mod resume;
 mod rewind;
