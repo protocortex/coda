@@ -67,13 +67,18 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            smoke: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+            smoke: true
           - target: aarch64-apple-darwin
             os: macos-latest
+            smoke: true
           # macos-13 is retired, so Intel macOS is cross-built from arm64.
+          # The runner cannot run it, so it is built and packaged but not smoked.
           - target: x86_64-apple-darwin
             os: macos-latest
+            smoke: false
     runs-on: ${{ matrix.os }}
     env:
       VERSION: ${{ needs.verify.outputs.version }}
@@ -91,6 +96,21 @@ jobs:
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/coda" LICENSE NOTICE README.md "dist/$name/"
           tar -czf "dist/$name.tar.gz" -C dist "$name"
+      - name: Smoke the packaged binary
+        if: ${{ matrix.smoke }}
+        timeout-minutes: 5
+        run: |
+          name="coda-$VERSION-$TARGET"
+          extract="$(mktemp -d)"
+          tar -xzf "dist/$name.tar.gz" -C "$extract"
+          bash scripts/smoke-binary.sh "$extract/$name/coda"
+      - name: Check the cross-built binary's architecture
+        if: ${{ !matrix.smoke }}
+        run: |
+          name="coda-$VERSION-$TARGET"
+          extract="$(mktemp -d)"
+          tar -xzf "dist/$name.tar.gz" -C "$extract"
+          [ "$(lipo -archs "$extract/$name/coda")" = x86_64 ]
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coda-${{ matrix.target }}
