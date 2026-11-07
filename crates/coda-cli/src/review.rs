@@ -27,6 +27,7 @@ use coda_review::chunk::{Merged, Outcome, merge, plan};
 use coda_review::diff::{FileDiff, git_diff, git_diff_staged, parse_diff, tracked_files};
 use coda_review::guidance;
 use coda_review::issues::{check_compliance, prompt_section};
+use coda_review::memory::Scope;
 use coda_review::pack::{PackOptions, Packed, main_extension};
 use coda_review::parse::{BadShape, Parsed, parse_model_output};
 use coda_review::render::{to_json, to_markdown};
@@ -47,6 +48,7 @@ use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
 use crate::error::CliError;
 use crate::review_issues::{Linked, gather as gather_issues};
+use crate::review_memory::{Memory, saw_everything};
 use crate::review_post::{Confirm, RealGh, head_of, post};
 use crate::run::{
     CANCELLED, CLAUDE_CODE_KEY, CODEX_KEY, Finish, Job, STREAM_DELTA_KIND, Tap, drive,
@@ -96,6 +98,9 @@ pub async fn run(
         Some(Target::parse(args.target.as_deref()))
     };
     let post_to = post_request(ctx, repo, &args, target.as_ref())?;
+    if !args.dismiss.is_empty() {
+        return dismiss_only(ctx, io, repo, &args, target.as_ref());
+    }
     if let Some(Target::PullRequest(pr)) = &target {
         match gh_pr_decision(repo, pr, &rules, force)? {
             Decision::Skip(reason) => {
@@ -106,7 +111,12 @@ pub async fn run(
             Decision::Review => {}
         }
     }
-    let diff = change_text(repo, target.as_ref())?;
+    let (mut memory, scope) = open_memory(ctx, io, repo, &args, target.as_ref(), &config.review)?;
+    if let Scope::Skip(why) = &scope {
+        notice(io, args.json, why)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let (diff, whole) = read_change(io, repo, target.as_ref(), memory.as_ref(), &scope)?;
     let files = parse_diff(&diff);
     if files.is_empty() {
         notice(io, args.json, NOTHING_TO_REVIEW)?;
@@ -117,29 +127,15 @@ pub async fn run(
         notice(io, args.json, NOTHING_LEFT)?;
         return Ok(ExitCode::SUCCESS);
     }
-    note_missing_default_branch(io, &config.review, repo)?;
-    let rules_text = read_guidance(&config.review, repo)?;
-    let linked = linked_issues(repo, target.as_ref(), &config.review);
-    let issues_text = prompt_section(&linked.issues);
-    let extras = Extras {
-        guidance: Some(&rules_text),
-        standing: Some(&rules.extra_instructions),
-        run: args.instructions.as_deref(),
-        issues: Some(&issues_text),
-        earlier: None,
+    let sources = Sources {
+        repo,
+        config: &config,
+        rules: &rules,
+        args: &args,
+        target: target.as_ref(),
+        memory: memory.as_ref(),
     };
-    let inputs: Vec<String> = parts
-        .iter()
-        .enumerate()
-        .map(|(n, part)| {
-            input_text(
-                part,
-                &extras,
-                config.review.max_findings,
-                Part::of(n + 1, parts.len()),
-            )
-        })
-        .collect();
+    let (inputs, linked) = sources.inputs(io, &parts)?;
     // Kept until the review is over, which removes the files.
     let written = if backend.is_model_backend() {
         Some(InputFiles::write(repo, INPUT_FILE_PREFIX, &inputs)?)
@@ -165,6 +161,9 @@ pub async fn run(
     let given: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
     let input_chars = inputs.iter().map(|i| i.chars().count()).sum();
     let (mut merged, model) = merged_review(&parts, results, &given, config.review.max_findings)?;
+    if let Some(m) = &memory {
+        m.drop_dismissed(&mut merged.parsed);
+    }
     let verified = if config.review.verify && !merged.parsed.findings.is_empty() {
         let at = Checking {
             ctx,
@@ -180,9 +179,114 @@ pub async fn run(
     let model = model.unwrap_or_else(|| backend_name(backend));
     let review = assemble_linked(merged, (&model, input_chars, verified), linked);
     print_review(io, args.json, &review)?;
+    if let Some(m) = memory.as_mut() {
+        remember(io, m, &review, &files, saw_everything(&review, whole))?;
+    }
     if let Some(to) = post_to {
         post_review(io, repo, to, &parts, &review)?;
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The review memory of the pull request, when there is one, and what this run reviews.
+fn open_memory(
+    ctx: &Context,
+    io: &mut Io<'_>,
+    repo: &Path,
+    args: &ReviewArgs,
+    target: Option<&Target>,
+    config: &ReviewConfig,
+) -> Result<(Option<Memory>, Scope), CliError> {
+    let memory = Memory::open(ctx, repo, target, io, args.incremental)?;
+    let scope = memory
+        .as_ref()
+        .map_or(Scope::Full, |m| m.scope(args.incremental, repo, config));
+    Ok((memory, scope))
+}
+
+/// Everything the prompts are built from.
+struct Sources<'a> {
+    repo: &'a Path,
+    config: &'a Config,
+    rules: &'a Rules,
+    args: &'a ReviewArgs,
+    target: Option<&'a Target>,
+    memory: Option<&'a Memory>,
+}
+
+impl Sources<'_> {
+    /// The reviewer's input for each part, and the issues the pull request links to.
+    fn inputs(&self, io: &mut Io<'_>, parts: &[Packed]) -> Result<(Vec<String>, Linked), CliError> {
+        let (repo, review) = (self.repo, &self.config.review);
+        note_missing_default_branch(io, review, repo)?;
+        let rules_text = read_guidance(review, repo)?;
+        let linked = linked_issues(repo, self.target, review);
+        let issues_text = prompt_section(&linked.issues);
+        let earlier = self.memory.map(Memory::prompt).unwrap_or_default();
+        let extras = Extras {
+            guidance: Some(&rules_text),
+            standing: Some(&self.rules.extra_instructions),
+            run: self.args.instructions.as_deref(),
+            issues: Some(&issues_text),
+            earlier: Some(&earlier),
+        };
+        let inputs = parts
+            .iter()
+            .enumerate()
+            .map(|(n, part)| {
+                let at = Part::of(n + 1, parts.len());
+                input_text(part, &extras, review.max_findings, at)
+            })
+            .collect();
+        Ok((inputs, linked))
+    }
+}
+
+/// The diff to review. With an incremental scope it is what came after the last run; if git
+/// cannot give that, such as after a force push, it is the whole change, said on standard
+/// error. The flag says whether the whole change was read.
+fn read_change(
+    io: &mut Io<'_>,
+    repo: &Path,
+    target: Option<&Target>,
+    memory: Option<&Memory>,
+    scope: &Scope,
+) -> Result<(String, bool), CliError> {
+    if let (Scope::Since(sha), Some(memory)) = (scope, memory) {
+        match memory.diff_since(repo, sha) {
+            Ok(diff) => return Ok((diff, false)),
+            Err(error) => writeln!(io.err, "coda: reviewing everything instead: {error}")?,
+        }
+    }
+    Ok((change_text(repo, target)?, true))
+}
+
+/// Records the run in the review memory. A failure is a note: the review is already out.
+fn remember(
+    io: &mut Io<'_>,
+    memory: &mut Memory,
+    review: &Review,
+    files: &[FileDiff],
+    sees_everything: bool,
+) -> Result<(), CliError> {
+    if let Err(error) = memory.record(&review.findings, files, sees_everything) {
+        writeln!(io.err, "coda: could not remember this review: {error}")?;
+    }
+    Ok(())
+}
+
+/// `--dismiss`: marks findings as dismissed in the memory of the pull request and stops.
+fn dismiss_only(
+    ctx: &Context,
+    io: &mut Io<'_>,
+    repo: &Path,
+    args: &ReviewArgs,
+    target: Option<&Target>,
+) -> Result<ExitCode, CliError> {
+    let Some(mut memory) = Memory::open(ctx, repo, target, io, true)? else {
+        return Err(CliError::ReviewMemory("no review memory".to_owned()));
+    };
+    memory.dismiss(&args.dismiss, io)?;
     Ok(ExitCode::SUCCESS)
 }
 

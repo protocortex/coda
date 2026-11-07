@@ -14,6 +14,7 @@ mod grant;
 mod init;
 mod review;
 mod review_issues;
+mod review_memory;
 mod review_post;
 mod run;
 mod session;
