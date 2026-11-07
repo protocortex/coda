@@ -6,6 +6,7 @@ pub mod account;
 pub mod anthropic;
 pub mod backend;
 pub mod claude_code;
+pub mod claude_compact;
 pub mod claude_helper;
 pub mod claude_session;
 pub mod codex;

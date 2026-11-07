@@ -931,7 +931,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::tui::NotifyMode;
+    use crate::tui::{DEFAULT_CACHE_HINT_TOKENS, DEFAULT_CACHE_TTL_SECS, NotifyMode};
 
     fn parse(s: &str) -> Parsed {
         Config::from_toml_str(s).expect("valid config")
@@ -1579,6 +1579,21 @@ bots = true
                 NotifyMode::Osc777
             ]
         );
+    }
+
+    #[test]
+    fn the_cache_hint_defaults_are_read_and_overridden_from_the_file() {
+        // Arrange
+        let text = "[tui]\ncache_ttl_secs = 3600\ncache_hint_tokens = 1000\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config.tui;
+        let read = Config::from_toml_str(text).unwrap().config.tui;
+
+        // Assert
+        assert_eq!(default.cache_ttl_secs, DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(default.cache_hint_tokens, DEFAULT_CACHE_HINT_TOKENS);
+        assert_eq!((read.cache_ttl_secs, read.cache_hint_tokens), (3600, 1000));
     }
 
     #[test]

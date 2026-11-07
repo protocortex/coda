@@ -144,16 +144,17 @@ pub(crate) async fn resume(hub: Option<&Arc<Hub>>, params: Option<Value>) -> Han
     let hub = hub.ok_or_else(unavailable)?;
     let params: SessionResumeParams = parse_params(params)?;
     let id = params.session_id;
-    let record = hub
+    let (record, updated_at) = hub
         .with_store({
             let id = id.clone();
-            move |store| store.load_session(&id)
+            move |store| Ok((store.load_session(&id)?, store.session_updated_at(&id)?))
         })
         .instrument(session_span(&id))
         .await
         .map_err(failed)?;
     to_value(&SessionResumeResult {
         session: info(record),
+        updated_at: Some(updated_at),
     })
 }
 

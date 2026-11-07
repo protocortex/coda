@@ -61,7 +61,7 @@ impl Turns {
 
     /// Stops the pooled backend server and drops the idle model loop, which keep
     /// the mode they were built with. A model loop hands its spent budget on.
-    async fn drop_idle(&self, session: &SessionId) {
+    pub(super) async fn drop_idle(&self, session: &SessionId) {
         if let Some(mut server) = self.idle.take(session) {
             let pid = server.pid();
             stop(&mut server, session).await;

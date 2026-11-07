@@ -51,6 +51,7 @@ use crate::backends::{
     codex_persists_threads, pidfile_path, resolve_codex_off_worker, start_claude_session,
     start_codex_session,
 };
+mod compact;
 mod diff;
 mod drive;
 mod fork;
@@ -60,6 +61,7 @@ mod reset;
 mod rewind;
 mod steer;
 
+pub(crate) use self::compact::session_compact;
 use self::drive::Drive;
 pub use self::queue::Sent;
 pub(crate) use self::queue::session_queue;

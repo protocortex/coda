@@ -61,7 +61,7 @@ CODA_LIVE_TESTS=1 cargo nextest run -p coda-providers --test live_probes \
 
 They use the login of whoever runs them, the unmodified binary, the same cleared
 environment a session gets, the `haiku` model and a turn limit, so the tests
-spend about nine short calls. They write no fixture, and they print no token and
+spend about twelve short calls. They write no fixture, and they print no token and
 no account value (only the names of the fields of the `initialize` account block).
 Run them one at a time, as above, so they do not hit the plan's rate limit together.
 Each call starts a real session, so `claude` keeps a transcript of it under
@@ -80,6 +80,7 @@ they found with claude 2.1.296 on 2026-11-08:
 | `interrupt` | answers `success`; the turn then ends with a `result` of subtype `error_during_execution` and `is_error` true, and the same process takes the next message (coda keeps it for the session's next turn) |
 | a message sent mid-turn | in a turn that only streams text it queues: the first message gets its own `result` and the second gets another. The manual run under Steer, with a tool still running, gave one `result` for both, so the answer depends on the turn |
 | helper call | `run_structured` returns JSON with a non-empty `title` that fits its schema |
+| `/compact` | under `--disable-slash-commands` it does nothing (no turn, no cost), and `claude_compact::compact`, which runs without that flag, compacts the same session |
 | login commands | `claude auth login --help` and `codex login --help` answer, and the `auth status` probe and the Codex account read both see the installed login (no quota, no token read) |
 | `--permission-mode acceptEdits` | writes `notes.txt` and `Cargo.toml` with no `can_use_tool` request, so coda does not pass it: coda's accept-edits mode still asks before a file that changes what runs. Only `Cargo.toml` was probed. The probe fails the day `claude` asks for it |
 | `--fork-session` | with `--resume <id>` it starts a new session id and the turn works |

@@ -5,8 +5,10 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::time::Duration;
 
 use coda_config::timing::Timing;
+use coda_tui::cache_hint::CacheHint;
 use coda_tui::commands::UserCommands;
 use coda_tui::{Startup, TuiError};
 use tracing::{info, warn};
@@ -49,6 +51,10 @@ pub async fn open(ctx: &Context, io: &mut Io<'_>, force: bool) -> Result<(), Cli
         needs_setup: !config.providers.values().any(|p| p.enabled),
         hooks_configured: !config.hooks.is_empty(),
         notify: config.tui.notify,
+        cache_hint: CacheHint {
+            ttl: Duration::from_secs(config.tui.cache_ttl_secs),
+            min_tokens: config.tui.cache_hint_tokens,
+        },
     };
     info!(?startup, "opening the terminal UI");
     let commands = file_commands(ctx);

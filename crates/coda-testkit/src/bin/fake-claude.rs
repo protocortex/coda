@@ -28,6 +28,10 @@
 //! `hit-limit` reports a rejected seven-day limit, then ends the turn with an error.
 //! `stream-long` streams `input_json_delta` and `thinking_delta` lines for longer than
 //! the idle limits the tests use, then finishes.
+//! A start with `/compact` as an argument is a compaction, not a session: it appends its
+//! arguments to the control file's `compact_log`, then answers one JSON result, an error
+//! with the control file's `compact_error` as its text when that is set. After logging it waits for
+//! the file named by `compact_gate` to exist, when that is set.
 //! `flaky` crashes like `crash` the first time and works afterwards, using
 //! the control file's `crash_marker` path to remember it already crashed.
 //!
@@ -58,6 +62,7 @@ const SESSION_ID: &str = "fake-session-1";
 const REQUEST_ID: &str = "req-1";
 const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 const CLAUDECODE_VAR: &str = "CLAUDECODE";
+const COMPACT_PROMPT: &str = "/compact";
 const CONTROL_FILE: &str = "fake-claude-control.json";
 const CREDENTIALS_PATH: &str = ".claude/.credentials.json";
 const GATE_POLL: Duration = Duration::from_millis(10);
@@ -484,6 +489,37 @@ fn run_unasked_tool(user_line: &str, out: &mut impl Write) -> io::Result<()> {
     emit(out, &serde_json::json!({"type":"result","is_error":false}))
 }
 
+/// Answers `claude -p /compact --resume <id> --output-format json`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the fake provider waits on a file in real time"
+)]
+fn compaction(control: &Control) -> io::Result<()> {
+    if let Some(path) = control.path("compact_log") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(
+            file,
+            "{}",
+            std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+        )?;
+    }
+    if let Some(gate) = control.path("compact_gate") {
+        let deadline = Instant::now() + GATE_LIMIT;
+        while !gate.exists() && Instant::now() < deadline {
+            std::thread::sleep(GATE_POLL);
+        }
+    }
+    let answer = match control.text("compact_error") {
+        Some(text) => serde_json::json!({"is_error": true, "result": text}),
+        None => serde_json::json!({"is_error": false, "result": ""}),
+    };
+    println!("{answer}");
+    Ok(())
+}
+
 fn write_report(path: PathBuf) -> io::Result<()> {
     let report = serde_json::json!({
         "args": std::env::args().skip(1).collect::<Vec<_>>(),
@@ -504,6 +540,9 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     let control = Control::load();
+    if std::env::args().any(|arg| arg == COMPACT_PROMPT) {
+        return compaction(&control);
+    }
     if let Some(path) = control.path("report_path") {
         write_report(path)?;
     }
