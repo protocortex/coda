@@ -167,6 +167,8 @@ golden_tests! {
     event_rate_limit_minimal: "event.rate_limit.minimal" => Event,
     event_usage_limit: "event.usage_limit" => Event,
     event_usage_limit_minimal: "event.usage_limit.minimal" => Event,
+    event_account: "event.account" => Event,
+    event_account_minimal: "event.account.minimal" => Event,
     event_tool_call: "event.tool_call" => Event,
     event_tool_call_minimal: "event.tool_call.minimal" => Event,
 }

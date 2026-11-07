@@ -341,6 +341,7 @@ fn initialize(params: Option<Value>) -> HandlerFuture {
                 usage_details: true,
                 rate_limit_events: true,
                 usage_limit_events: true,
+                account_events: true,
                 tool_call_events: true,
                 force_cancel: true,
                 rewind: true,
@@ -411,6 +412,7 @@ mod tests {
         assert_eq!(result["capabilities"]["usage_details"], json!(true));
         assert_eq!(result["capabilities"]["rate_limit_events"], json!(true));
         assert_eq!(result["capabilities"]["usage_limit_events"], json!(true));
+        assert_eq!(result["capabilities"]["account_events"], json!(true));
         assert_eq!(result["capabilities"]["tool_call_events"], json!(true));
         assert_eq!(result["capabilities"]["force_cancel"], json!(true));
         assert_eq!(result["capabilities"]["rewind"], json!(true));

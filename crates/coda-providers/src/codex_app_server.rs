@@ -42,6 +42,7 @@ use tokio::sync::watch;
 use tokio::time::{sleep, timeout, timeout_at};
 use tracing::{debug, warn};
 
+use crate::account::{AccountStatus, parse_codex_account};
 use crate::claude_session::{
     CancelHandle, EXIT_GRACE, READ_CHUNK_BYTES, REAP_TIMEOUT, TurnOutcome, allowlisted, cancelled,
     kill_group,
@@ -90,6 +91,7 @@ const CANCEL: &str = "cancel";
 const SERVER_DIED_DETAIL: &str =
     "the Codex app-server exited during the turn; the next turn starts a new server";
 const INTERRUPT_METHOD: &str = "turn/interrupt";
+const ACCOUNT_METHOD: &str = "account/read";
 /// How long a server gets to end an interrupted or cancelled turn before its group is killed.
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -279,6 +281,19 @@ fn reply_for(allowed: bool, params: &Value) -> Reply {
     }
 }
 
+/// What a started server hands to the session.
+struct Started {
+    stream: UnixStream,
+    reader: FrameReader,
+    version: String,
+    thread_id: String,
+    account: Option<AccountStatus>,
+}
+
+fn account_params() -> Value {
+    json!({"refreshToken": false})
+}
+
 /// What the session knows about the plan limits.
 #[derive(Debug, Default)]
 struct PlanLimits {
@@ -313,6 +328,8 @@ pub struct CodexAppServerSession {
     /// Whether the server accepted the last `turn/start`.
     turn_accepted: bool,
     plan: PlanLimits,
+    /// What `account/read` said at start, reported with the first turn.
+    account: Option<AccountStatus>,
     /// Messages that arrived while an approval was pending.
     queued: VecDeque<Message>,
     closed: bool,
@@ -332,11 +349,7 @@ impl CodexAppServerSession {
         spec: AppServerSpec,
         on_spawn: Option<SpawnHook>,
     ) -> Result<Self, AppServerError> {
-        let socket_dir = tempfile::Builder::new()
-            .prefix(SOCKET_DIR_PREFIX)
-            .permissions(std::fs::Permissions::from_mode(SOCKET_DIR_MODE))
-            .tempdir()
-            .map_err(AppServerError::SocketDir)?;
+        let socket_dir = private_socket_dir()?;
         let socket = socket_dir.path().join(SOCKET_FILE);
         if socket.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
             return Err(AppServerError::SocketPathTooLong);
@@ -347,7 +360,13 @@ impl CodexAppServerSession {
             hook(pid).await.map_err(AppServerError::SpawnHook)?;
         }
         let handshake = timeout(START_TIMEOUT, Self::handshake(&spec, &socket, &mut child)).await;
-        let (stream, reader, version, thread_id) = match handshake {
+        let Started {
+            stream,
+            reader,
+            version,
+            thread_id,
+            account,
+        } = match handshake {
             Ok(result) => result?,
             Err(_) => return Err(AppServerError::StartTimeout),
         };
@@ -375,6 +394,7 @@ impl CodexAppServerSession {
             context: None,
             turn_accepted: false,
             plan: PlanLimits::default(),
+            account,
             queued: VecDeque::new(),
             closed: false,
         })
@@ -384,16 +404,8 @@ impl CodexAppServerSession {
         spec: &AppServerSpec,
         socket: &Path,
         child: &mut Child,
-    ) -> Result<(UnixStream, FrameReader, String, String), AppServerError> {
-        let mut stream = connect(socket, child).await?;
-        let mut reader = FrameReader::default();
-        upgrade(&mut stream, &mut reader).await?;
-        let mut next_id = 0;
-        let init =
-            json!({"clientInfo": {"name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")}});
-        request(&mut stream, &mut reader, &mut next_id, "initialize", init).await?;
-        let initialized = json!({"method": "initialized"}).to_string();
-        stream.write_all(&text_frame(&initialized)).await?;
+    ) -> Result<Started, AppServerError> {
+        let (mut stream, mut reader, mut next_id) = open(socket, child).await?;
         let thread = json!({
             "cwd": spec.cwd,
             "sandbox": spec.sandbox.as_arg(),
@@ -415,7 +427,27 @@ impl CodexAppServerSession {
             })?
             .to_owned();
         let version = server_version(&result);
-        Ok((stream, reader, version, thread_id))
+        // A server that refuses the read still serves turns; only the billing report is lost.
+        let account = match request(
+            &mut stream,
+            &mut reader,
+            &mut next_id,
+            ACCOUNT_METHOD,
+            account_params(),
+        )
+        .await
+        {
+            Ok(result) => Some(parse_codex_account(&result)),
+            Err(AppServerError::Rejected { .. }) => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Started {
+            stream,
+            reader,
+            version,
+            thread_id,
+            account,
+        })
     }
 
     /// A handle that cancels this session from another task.
@@ -539,6 +571,14 @@ impl CodexAppServerSession {
             self.plan.asked = true;
             Some(self.send_request(READ_METHOD, Value::Null).await?)
         };
+        if let Some(AccountStatus::LoggedIn(account)) = self.account.take() {
+            emit.emit(Event::Account {
+                session_id: self.session_id.clone(),
+                billing: account.billing,
+                plan: account.plan,
+            })
+            .await;
+        }
         let params = json!({"threadId": self.thread_id, "input": [{"type": "text", "text": text}]});
         let turn_request = self.send_request("turn/start", params).await?;
         self.server_turn = None;
@@ -1058,6 +1098,66 @@ fn spawn_server(spec: &AppServerSpec, socket: &Path) -> Result<Child, AppServerE
         path: spec.binary.clone(),
         source,
     })
+}
+
+/// Connects, upgrades to WebSocket and initializes; the next request id is returned with the stream.
+async fn open(
+    socket: &Path,
+    child: &mut Child,
+) -> Result<(UnixStream, FrameReader, u64), AppServerError> {
+    let mut stream = connect(socket, child).await?;
+    let mut reader = FrameReader::default();
+    upgrade(&mut stream, &mut reader).await?;
+    let mut next_id = 0;
+    let init = json!({"clientInfo": {"name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")}});
+    request(&mut stream, &mut reader, &mut next_id, "initialize", init).await?;
+    let initialized = json!({"method": "initialized"}).to_string();
+    stream.write_all(&text_frame(&initialized)).await?;
+    Ok((stream, reader, next_id))
+}
+
+/// Starts a server just long enough to ask `account/read`, then stops it. No thread
+/// is made, so nothing is saved or run.
+///
+/// # Errors
+/// Fails when the server cannot start, is not ready in time, refuses the upgrade or
+/// the request, or breaks the protocol; the child is stopped in every case.
+pub async fn read_account(spec: &AppServerSpec) -> Result<AccountStatus, AppServerError> {
+    let socket_dir = private_socket_dir()?;
+    let socket = socket_dir.path().join(SOCKET_FILE);
+    if socket.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+        return Err(AppServerError::SocketPathTooLong);
+    }
+    let mut child = spawn_server(spec, &socket)?;
+    let guard = ChildGuard(child.id());
+    let asked = timeout(START_TIMEOUT, async {
+        let (mut stream, mut reader, mut next_id) = open(&socket, &mut child).await?;
+        let params = account_params();
+        request(
+            &mut stream,
+            &mut reader,
+            &mut next_id,
+            ACCOUNT_METHOD,
+            params,
+        )
+        .await
+    })
+    .await;
+    drop(guard);
+    let _ = child.start_kill();
+    let _ = timeout(REAP_TIMEOUT, child.wait()).await;
+    match asked {
+        Ok(result) => Ok(parse_codex_account(&result?)),
+        Err(_) => Err(AppServerError::StartTimeout),
+    }
+}
+
+fn private_socket_dir() -> Result<tempfile::TempDir, AppServerError> {
+    tempfile::Builder::new()
+        .prefix(SOCKET_DIR_PREFIX)
+        .permissions(std::fs::Permissions::from_mode(SOCKET_DIR_MODE))
+        .tempdir()
+        .map_err(AppServerError::SocketDir)
 }
 
 /// Connects once the server has created its socket, giving up as soon as the child

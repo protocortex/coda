@@ -12,10 +12,11 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use coda_protocol::events::{Event, ToolCallStatus};
+use coda_protocol::events::{AccountBilling, Event, ToolCallStatus};
 use coda_protocol::types::{
     ContextFill, PermissionDecision, RequestId, SessionId, TokenUsage, TurnId,
 };
+use coda_providers::account::{Account, AccountStatus};
 use coda_providers::claude_session::{CancelHandle, ENV_ALLOWLIST, TurnOutcome};
 use coda_providers::codex_app_server::{AppServerError, AppServerSpec, CodexAppServerSession};
 use coda_providers::codex_exec::SandboxMode;
@@ -1087,4 +1088,125 @@ async fn a_turn_that_fails_for_another_reason_reports_no_usage_limit() {
             .iter()
             .any(|e| matches!(e, Event::UsageLimit { .. }))
     );
+}
+
+fn chatgpt_account() -> Value {
+    json!({"account": {"type": "chatgpt", "email": "me@example.com", "planType": "pro"}, "requiresOpenaiAuth": true})
+}
+
+fn account_events(events: &[Event]) -> Vec<&Event> {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::Account { .. }))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_first_turn_reports_how_the_codex_login_is_billed() {
+    // Arrange
+    let fixture = Fixture::new(&json!({"account": chatgpt_account()}));
+    let mut session = fixture.session().await;
+
+    // Act
+    let (_, first) = turn(&mut session, "say hi").await;
+    let (_, second) = turn(&mut session, "say hi again").await;
+
+    // Assert
+    let expected = Event::Account {
+        session_id: SessionId::new("s-1"),
+        billing: AccountBilling::Subscription,
+        plan: Some("pro".to_owned()),
+    };
+    assert_eq!(account_events(&first), vec![&expected]);
+    assert_eq!(account_events(&second), Vec::<&Event>::new());
+    assert_eq!(fixture.report()["account_reads"], 1);
+    assert_eq!(
+        fixture.report()["account_read_params"]["refreshToken"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn a_codex_api_key_login_is_reported_as_api_billing() {
+    // Arrange
+    let fixture = Fixture::new(
+        &json!({"account": {"account": {"type": "apiKey"}, "requiresOpenaiAuth": true}}),
+    );
+    let mut session = fixture.session().await;
+
+    // Act
+    let (_, events) = turn(&mut session, "say hi").await;
+
+    // Assert
+    assert!(events.contains(&Event::Account {
+        session_id: SessionId::new("s-1"),
+        billing: AccountBilling::ApiKey,
+        plan: None,
+    }));
+}
+
+#[tokio::test]
+async fn a_refused_or_empty_account_read_reports_nothing_and_the_turn_runs() {
+    // Arrange
+    let refused = Fixture::new(&json!({}));
+    let empty = Fixture::new(&json!({"account": {"account": null, "requiresOpenaiAuth": true}}));
+    let mut first = refused.session().await;
+    let mut second = empty.session().await;
+
+    // Act
+    let (outcome, events) = turn(&mut first, "say hi").await;
+    let (_, none) = turn(&mut second, "say hi").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Completed { is_error: false });
+    assert_eq!(account_events(&events), Vec::<&Event>::new());
+    assert_eq!(account_events(&none), Vec::<&Event>::new());
+}
+
+#[tokio::test]
+async fn the_account_probe_reads_the_login_and_stops_the_server() {
+    // Arrange
+    let fixture = Fixture::new(&json!({"account": chatgpt_account()}));
+
+    // Act
+    let status = tokio::time::timeout(
+        TURN_TIMEOUT,
+        coda_providers::codex_app_server::read_account(&fixture.spec(&[], &[])),
+    )
+    .await
+    .expect("the probe did not finish in time")
+    .unwrap();
+
+    // Assert
+    assert!(matches!(
+        status,
+        AccountStatus::LoggedIn(Account {
+            billing: AccountBilling::Subscription,
+            ..
+        })
+    ));
+    assert_eq!(fixture.report()["thread_start"], Value::Null);
+    assert_gone_soon(fixture.pid(true)).await;
+}
+
+#[tokio::test]
+async fn the_account_probe_fails_when_the_server_refuses_the_read() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+
+    // Act
+    let result = tokio::time::timeout(
+        TURN_TIMEOUT,
+        coda_providers::codex_app_server::read_account(&fixture.spec(&[], &[])),
+    )
+    .await
+    .expect("the probe did not finish in time");
+
+    // Assert
+    assert!(matches!(
+        result,
+        Err(AppServerError::Rejected {
+            method: "account/read"
+        })
+    ));
 }

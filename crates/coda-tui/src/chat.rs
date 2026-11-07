@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{AccountBilling, Event};
 use coda_protocol::types::TurnId;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -22,6 +22,7 @@ use crate::work::Fold;
 const USER_PREFIX: &str = "you: ";
 const NOTICE_PREFIX: &str = "! ";
 const WARNING_PREFIX: &str = "warning: ";
+const API_BILLING_WARNING: &str = "this session bills API rates, not your subscription";
 const DROPPED_MARKER: &str = "[older messages dropped]";
 /// Entries kept; the oldest go first.
 const MAX_ENTRIES: usize = 1000;
@@ -292,6 +293,10 @@ impl Chat {
                 let remaining = reset_at.map(|at| Duration::from_secs(at.saturating_sub(now)));
                 self.push(Entry::Warning(usage_limit_text(*window, remaining)));
             }
+            Event::Account {
+                billing: AccountBilling::ApiKey,
+                ..
+            } => self.push(Entry::Warning(API_BILLING_WARNING.to_owned())),
             Event::TurnInterrupted { .. } => {
                 self.push(Entry::Notice("turn interrupted".to_owned()));
             }
@@ -635,6 +640,34 @@ mod tests {
         );
         assert!(
             shown.contains("warning: usage limit reached: five-hour window, reset time unknown"),
+            "{shown}"
+        );
+    }
+
+    fn account(billing: coda_protocol::events::AccountBilling) -> Event {
+        Event::Account {
+            session_id: SessionId::new("s-1"),
+            billing,
+            plan: None,
+        }
+    }
+
+    #[test]
+    fn an_api_key_login_is_a_warning_and_a_subscription_says_nothing() {
+        // Arrange
+        use coda_protocol::events::AccountBilling;
+        let mut chat = Chat::new();
+
+        // Act
+        chat.apply_at(&account(AccountBilling::Subscription), 0);
+        let quiet = draw(&chat, 100, HEIGHT);
+        chat.apply_at(&account(AccountBilling::ApiKey), 0);
+
+        // Assert
+        assert!(!quiet.contains("warning"), "{quiet}");
+        let shown = draw(&chat, 100, HEIGHT);
+        assert!(
+            shown.contains("warning: this session bills API rates, not your subscription"),
             "{shown}"
         );
     }

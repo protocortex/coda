@@ -496,10 +496,11 @@ fn main() -> io::Result<()> {
             "anthropic_api_key_present":std::env::var_os(API_KEY_VAR).is_some(),
             "claudecode_present":std::env::var_os(CLAUDECODE_VAR).is_some()}),
     )?;
-    emit(
-        &mut out,
-        &serde_json::json!({"type":"system","subtype":"init","session_id":SESSION_ID}),
-    )?;
+    let mut init = serde_json::json!({"type":"system","subtype":"init","session_id":SESSION_ID});
+    if let Some(source) = control.text("api_key_source") {
+        init["apiKeySource"] = serde_json::json!(source);
+    }
+    emit(&mut out, &init)?;
     let mut lines = io::stdin().lock().lines();
     while let Some(line) = lines.next().transpose()? {
         if !line.trim().is_empty() {

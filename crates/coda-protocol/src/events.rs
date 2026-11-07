@@ -40,6 +40,8 @@ pub const COMPACTION_KIND: &str = "compaction";
 pub const RATE_LIMIT_KIND: &str = "rate_limit";
 /// Stored event kind of a turn that ended because the plan limit was hit.
 pub const USAGE_LIMIT_KIND: &str = "usage_limit";
+/// Stored event kind of the report of how a session is billed.
+pub const ACCOUNT_KIND: &str = "account";
 /// Stored event kind of a tool call that started or finished.
 pub const TOOL_CALL_KIND: &str = "tool_call";
 /// Longest tool summary, in characters. A longer one is cut and ends in `...`.
@@ -301,6 +303,21 @@ impl UsageWindowKind {
     }
 }
 
+/// How the login a session runs on is billed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AccountBilling {
+    /// A subscription plan, which has usage limits and no per-token charge.
+    Subscription,
+    /// An API key, which is billed at API rates.
+    ApiKey,
+    /// A login this peer has no name for, such as a cloud account, or a kind a
+    /// newer peer sent.
+    #[serde(other)]
+    Other,
+}
+
 /// Where a tool call stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -483,6 +500,17 @@ pub enum Event {
         /// What the provider reported.
         limit: RateLimit,
     },
+    /// How the login behind the session is billed, told by the backend binary at the
+    /// start of the session. It carries no email or account id.
+    Account {
+        /// Affected session.
+        session_id: SessionId,
+        /// Whether the session spends a subscription or is billed at API rates.
+        billing: AccountBilling,
+        /// The subscription plan, as the backend names it, when it says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
+    },
     /// The turn ended in error because the provider's plan limit was hit.
     /// Sent just before that turn's `result`.
     UsageLimit {
@@ -557,6 +585,7 @@ mod tests {
             COMPACTION_KIND,
             RATE_LIMIT_KIND,
             USAGE_LIMIT_KIND,
+            ACCOUNT_KIND,
             TOOL_CALL_KIND,
         ];
 
@@ -568,7 +597,7 @@ mod tests {
                 "usage": {"input_tokens": 0, "output_tokens": 0},
                 "summary": "1", "replaced_messages": 0, "kept_messages": 0,
                 "limit": {"status": "allowed"}, "window": "five_hour",
-                "id": "c", "name": "Bash", "status": "started",
+                "id": "c", "name": "Bash", "status": "started", "billing": "api_key",
             });
             let event: Event = serde_json::from_value(fields).unwrap();
 

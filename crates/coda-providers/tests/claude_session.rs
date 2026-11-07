@@ -14,7 +14,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use coda_config::config::ClaudeProfile;
-use coda_protocol::events::{Event, InterruptCause, ToolCallStatus, UsageWindowKind};
+use coda_protocol::events::{
+    AccountBilling, Event, InterruptCause, ToolCallStatus, UsageWindowKind,
+};
 use coda_protocol::types::{
     ContextFill, PermissionDecision, RequestId, SessionId, TokenUsage, TurnId,
 };
@@ -92,6 +94,16 @@ impl Fixture {
             "report_path": self.cwd.path().join(REPORT_FILE),
             "pid_path": self.cwd.path().join(PID_FILE),
             "flood": flood,
+        });
+        fs::write(self.cwd.path().join(CONTROL_FILE), control.to_string()).unwrap();
+    }
+
+    /// Starts the fake with an `apiKeySource` in its init frame.
+    fn api_key_source(&self, source: &str) {
+        let control = serde_json::json!({
+            "report_path": self.cwd.path().join(REPORT_FILE),
+            "pid_path": self.cwd.path().join(PID_FILE),
+            "api_key_source": source,
         });
         fs::write(self.cwd.path().join(CONTROL_FILE), control.to_string()).unwrap();
     }
@@ -340,6 +352,60 @@ async fn a_rejected_rate_limit_ends_the_turn_with_a_usage_limit_event() {
         events[at + 1],
         Event::Result { is_error: true, .. }
     ));
+}
+
+fn account(billing: AccountBilling) -> Event {
+    Event::Account {
+        session_id: SessionId::new("s-1"),
+        billing,
+        plan: None,
+    }
+}
+
+#[tokio::test]
+async fn an_api_key_in_the_init_frame_is_reported_as_api_billing_once() {
+    // Arrange
+    let fixture = Fixture::new();
+    fixture.api_key_source("ANTHROPIC_API_KEY");
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    let (_, first) = turn(&mut session, &gate, "report-usage").await;
+    let (_, second) = turn(&mut session, &gate, "report-usage").await;
+
+    // Assert
+    assert!(first.contains(&account(AccountBilling::ApiKey)));
+    assert!(!second.iter().any(|e| matches!(e, Event::Account { .. })));
+}
+
+#[tokio::test]
+async fn no_api_key_source_is_reported_as_a_subscription() {
+    // Arrange
+    let fixture = Fixture::new();
+    fixture.api_key_source("none");
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    let (_, events) = turn(&mut session, &gate, "report-usage").await;
+
+    // Assert
+    assert!(events.contains(&account(AccountBilling::Subscription)));
+}
+
+#[tokio::test]
+async fn an_init_frame_without_an_api_key_source_reports_no_account() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    let (_, events) = turn(&mut session, &gate, "report-usage").await;
+
+    // Assert
+    assert!(!events.iter().any(|e| matches!(e, Event::Account { .. })));
 }
 
 #[tokio::test]

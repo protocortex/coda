@@ -154,7 +154,7 @@ kill "$(coda status | sed -n 's/^pid: //p')"
 | `coda hooks install review` | Write a git pre-push hook that runs `coda review --hook`. It reviews nothing until `[review.hook] enabled = true` is set in the config. `coda hooks remove review` deletes it, and only when coda wrote it. See [docs/config.md](docs/config.md#reviewhook). |
 | `coda grant add` | Allow one command in a repository permanently. Flags: `--repo`, `--cwd`, `--tool`. |
 | `coda usage` | Show token usage and savings. `--session` limits it to one session. It asks a running daemon, or reads the database when none runs. |
-| `coda doctor` | Check the socket, lock, orphaned backends, database, schema, database release, config and backends. `--repair` removes a stale socket and kills orphaned backends. `--json` prints JSON. |
+| `coda doctor` | Check the socket, lock, orphaned backends, database, schema, database release, config, backends and logins (it asks each enabled backend's own binary, and an API key that would bill API rates is a warning). `--repair` removes a stale socket and kills orphaned backends. `--json` prints JSON. |
 
 `coda run`, `coda session send`, `coda session rewind`, `coda grant add`, `coda tui` and bare `coda` start a daemon if none is running. `coda daemon restart` starts one too. `coda status`, `coda ping`, `coda usage`, `coda session list`, `coda session show` and `coda doctor` do not start one.
 

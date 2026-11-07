@@ -28,6 +28,8 @@ pub enum Message {
     Init {
         /// Claude Code's session id.
         session_id: String,
+        /// Where the API key came from, `none` when no key backs the session.
+        api_key_source: Option<String>,
     },
     /// A streamed fragment of model text.
     TextDelta(String),
@@ -198,6 +200,7 @@ impl StreamParser {
                 };
                 Some(Message::Init {
                     session_id: session_id.to_owned(),
+                    api_key_source: value["apiKeySource"].as_str().map(str::to_owned),
                 })
             }
             // Real streams also carry the model's own tool results.
@@ -761,7 +764,8 @@ mod tests {
             messages,
             vec![
                 Message::Init {
-                    session_id: "sess-1".to_owned()
+                    session_id: "sess-1".to_owned(),
+                    api_key_source: None,
                 },
                 Message::TextDelta("hi".to_owned()),
                 Message::PermissionRequest(PermissionAsk {
@@ -774,6 +778,36 @@ mod tests {
             ]
         );
         assert_eq!(parser.diagnostics(), []);
+    }
+
+    #[test]
+    fn the_init_frame_carries_where_the_api_key_came_from() {
+        // Arrange
+        let mut parser = StreamParser::new();
+        let with_key = r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":"ANTHROPIC_API_KEY"}"#;
+        let without =
+            r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":"none"}"#;
+        let odd = r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":7}"#;
+
+        // Act
+        let messages = feed_lines(&mut parser, &[with_key, without, odd]);
+
+        // Assert
+        let sources: Vec<Option<String>> = messages
+            .into_iter()
+            .map(|message| match message {
+                Message::Init { api_key_source, .. } => api_key_source,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                Some("ANTHROPIC_API_KEY".to_owned()),
+                Some("none".to_owned()),
+                None
+            ]
+        );
     }
 
     #[test]
@@ -807,7 +841,8 @@ mod tests {
         assert_eq!(
             second,
             vec![Message::Init {
-                session_id: "sess-1".to_owned()
+                session_id: "sess-1".to_owned(),
+                api_key_source: None,
             }]
         );
     }

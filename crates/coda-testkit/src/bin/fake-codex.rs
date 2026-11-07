@@ -423,6 +423,18 @@ mod app_server {
                         &json!({"id": id, "result": {"thread": thread}}),
                     )?;
                 }
+                "account/read" => {
+                    let reads = read_report("account_reads").as_u64().unwrap_or(0) + 1;
+                    update_report("account_reads", &json!(reads))?;
+                    update_report("account_read_params", params)?;
+                    let reply = match control_value("account") {
+                        Some(result) => json!({"id": id, "result": result}),
+                        None => {
+                            json!({"id": id, "error": {"code": -32000, "message": "no account"}})
+                        }
+                    };
+                    send(&mut stream, &reply)?;
+                }
                 "account/rateLimits/read" => {
                     let reads = read_report("rate_limit_reads").as_u64().unwrap_or(0) + 1;
                     update_report("rate_limit_reads", &json!(reads))?;
