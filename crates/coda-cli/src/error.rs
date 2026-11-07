@@ -12,6 +12,24 @@ use coda_store::StoreError;
 use coda_telemetry::init::TelemetryError;
 use coda_tui::TuiError;
 
+/// Why a backend cannot take a part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unavailable {
+    /// The plan's quota ran out, so another run on the same backend fails the same way.
+    UsageLimit,
+    /// The backend process went away, which may not happen again.
+    Lost,
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UsageLimit => "hit a usage limit",
+            Self::Lost => "was lost",
+        })
+    }
+}
+
 /// Why a `coda` command failed. The messages are shown to the user as they are.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
@@ -79,6 +97,8 @@ pub enum CliError {
     ReviewInput(String),
     #[error("the review failed: {0}")]
     ReviewFailed(String),
+    #[error("the backend cannot go on: it {0}")]
+    BackendUnavailable(Unavailable),
     #[error("cannot post the review: {0}")]
     ReviewPost(String),
     #[error("review memory: {0}")]

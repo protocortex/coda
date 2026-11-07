@@ -257,6 +257,9 @@ pub fn to_markdown(review: &Review) -> String {
         );
     }
     out.push('\n');
+    for note in &review.run.fallbacks {
+        let _ = writeln!(out, "\nFallback: {}", prose(note));
+    }
     out
 }
 
@@ -340,6 +343,7 @@ mod tests {
                 chunks: 1,
                 partial: false,
                 skipped_issues: vec![],
+                fallbacks: vec![],
             },
         }
     }
@@ -414,6 +418,24 @@ Model: m1. Input: 900 characters. Findings dropped: 1.
         assert!(text.contains("Chunks: 3."), "{text}");
         assert!(!to_markdown(&whole).contains("Partial review"));
         assert!(!to_markdown(&whole).contains("Chunks:"));
+    }
+
+    #[test]
+    fn a_part_that_moved_to_another_backend_is_named_in_the_run_section() {
+        // Arrange
+        let mut moved = review();
+        moved.run.fallbacks =
+            vec!["part 2 of 3: claude_code hit a usage limit, ran on codex".to_owned()];
+
+        // Act
+        let text = to_markdown(&moved);
+
+        // Assert
+        assert!(
+            text.contains("Fallback: part 2 of 3: claude_code hit a usage limit, ran on codex"),
+            "{text}"
+        );
+        assert!(!to_markdown(&review()).contains("Fallback"));
     }
 
     #[test]

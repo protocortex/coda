@@ -35,6 +35,11 @@ pub const DEFAULT_VERIFY_THRESHOLD: u8 = 4;
 /// Highest score the verifier gives.
 pub const VERIFY_THRESHOLD_MAX: u8 = 10;
 
+/// Path of the routing rules inside `[review]`, as `routing.rules`.
+pub const ROUTING_RULES_PATH: &str = "routing.rules";
+/// Key of the model inside a routing rule.
+pub const ROUTING_MODEL_KEY: &str = "model";
+
 /// Lines of the repository's guidance files that go in the reviewer's prompt when the file
 /// does not say.
 pub const DEFAULT_GUIDANCE_LINES: usize = 500;
@@ -82,6 +87,8 @@ pub struct ReviewConfig {
     pub ignore: ReviewIgnore,
     /// Pull requests that are not reviewed.
     pub skip: ReviewSkip,
+    /// Which model reviews a part, by its size, and what happens when a backend runs out.
+    pub routing: ReviewRouting,
 }
 
 impl Default for ReviewConfig {
@@ -101,6 +108,7 @@ impl Default for ReviewConfig {
             hook: ReviewHook::default(),
             ignore: ReviewIgnore::default(),
             skip: ReviewSkip::default(),
+            routing: ReviewRouting::default(),
         }
     }
 }
@@ -155,4 +163,165 @@ pub struct ReviewSkip {
     pub authors: Vec<String>,
     /// Skip when the author is a bot.
     pub bots: bool,
+}
+
+/// The `[review.routing]` section.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewRouting {
+    /// Rules tried in order for each part. The first one that fits sets the model. When none
+    /// fits, the backend runs on its own default model.
+    pub rules: Vec<RoutingRule>,
+    /// Whether a part that hits a usage limit, or loses its backend, is tried once on the
+    /// other backend that is enabled.
+    pub fallback: bool,
+}
+
+impl Default for ReviewRouting {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            fallback: true,
+        }
+    }
+}
+
+/// One rule of `[review.routing]`. A rule fits a part when every limit it sets holds; a rule
+/// with no limit fits every part.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingRule {
+    /// Most hunks the part may have.
+    #[serde(default)]
+    pub max_hunks: Option<usize>,
+    /// Most files the part may have.
+    #[serde(default)]
+    pub max_files: Option<usize>,
+    /// Most characters of packed diff the part may have.
+    #[serde(default)]
+    pub max_chars: Option<usize>,
+    /// The model the backend is set to. Must not be empty.
+    pub model: String,
+}
+
+/// How big one part of a review is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartSize {
+    /// Hunks in the part.
+    pub hunks: usize,
+    /// Files the part sends to the model, whole or clipped.
+    pub files: usize,
+    /// Characters of packed diff.
+    pub chars: usize,
+}
+
+impl RoutingRule {
+    fn fits(&self, size: PartSize) -> bool {
+        self.max_hunks.is_none_or(|max| size.hunks <= max)
+            && self.max_files.is_none_or(|max| size.files <= max)
+            && self.max_chars.is_none_or(|max| size.chars <= max)
+    }
+}
+
+impl ReviewRouting {
+    /// The model for a part of `size`: that of the first rule that fits, or `None`.
+    #[must_use]
+    pub fn model_for(&self, size: PartSize) -> Option<&str> {
+        self.rules
+            .iter()
+            .find(|rule| rule.fits(size))
+            .map(|rule| rule.model.trim())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SMALL: PartSize = PartSize {
+        hunks: 2,
+        files: 1,
+        chars: 500,
+    };
+    const BIG: PartSize = PartSize {
+        hunks: 40,
+        files: 12,
+        chars: 90_000,
+    };
+
+    fn rule(max_hunks: Option<usize>, model: &str) -> RoutingRule {
+        RoutingRule {
+            max_hunks,
+            max_files: None,
+            max_chars: None,
+            model: model.to_owned(),
+        }
+    }
+
+    fn routing(rules: Vec<RoutingRule>) -> ReviewRouting {
+        ReviewRouting {
+            rules,
+            fallback: true,
+        }
+    }
+
+    #[test]
+    fn the_first_rule_that_fits_wins() {
+        // Arrange
+        let routing = routing(vec![
+            rule(Some(5), "cheap"),
+            rule(Some(50), "middle"),
+            rule(None, "strong"),
+        ]);
+
+        // Act and Assert
+        assert_eq!(routing.model_for(SMALL), Some("cheap"));
+        assert_eq!(routing.model_for(BIG), Some("middle"));
+    }
+
+    #[test]
+    fn an_earlier_catch_all_hides_the_later_rules() {
+        // Arrange
+        let routing = routing(vec![rule(None, "first"), rule(Some(5), "second")]);
+
+        // Act and Assert
+        assert_eq!(routing.model_for(SMALL), Some("first"));
+    }
+
+    #[test]
+    fn no_rule_that_fits_leaves_the_backend_default() {
+        // Arrange
+        let routing = routing(vec![rule(Some(1), "cheap")]);
+
+        // Act and Assert
+        assert_eq!(routing.model_for(BIG), None);
+        assert_eq!(ReviewRouting::default().model_for(SMALL), None);
+    }
+
+    #[test]
+    fn a_rule_fits_only_when_every_limit_it_sets_holds() {
+        // Arrange
+        let both = RoutingRule {
+            max_hunks: Some(10),
+            max_files: Some(3),
+            max_chars: Some(1000),
+            model: "cheap".to_owned(),
+        };
+        let too_many_files = PartSize { files: 4, ..SMALL };
+        let too_long = PartSize {
+            chars: 1001,
+            ..SMALL
+        };
+        let at_the_edge = PartSize {
+            hunks: 10,
+            files: 3,
+            chars: 1000,
+        };
+
+        // Act and Assert
+        assert!(both.fits(SMALL));
+        assert!(!both.fits(too_many_files));
+        assert!(!both.fits(too_long));
+        assert!(both.fits(at_the_edge));
+    }
 }

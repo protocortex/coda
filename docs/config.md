@@ -234,6 +234,31 @@ For a pull request target, `coda review` remembers each run in the database: the
 
 The hook reviews the checked-out branch against its upstream (`@{u}..HEAD`), whatever ref the push names, so `git push origin other-branch` reviews the branch you are on. A branch with no upstream has nothing to review and does not stop the push. A review that fails (no backend, a bad answer, a broken config) says so on standard error and does not stop it either, and the script lets every outcome of coda through except exit 23; only a finding can stop a push. The script skips the review when `coda` is not on the `PATH`. The review uses the same settings as `coda review`, so a push waits for a model run, with no time limit of its own. A global `core.hooksPath` makes the hook global: one install covers every repository that uses it, and a remove takes it away from all of them. Starting a review from a pull request watch needs the watch itself (#166) and is tracked in #316.
 
+## `[review.routing]`
+
+Chooses the model that reviews each part of a change by its size, and says what happens when a backend runs out of quota. Quota is the cost here, so there is no price table. Only the global config sets it; `.coda/review.toml` cannot.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `fallback` | boolean | `true` | Whether a part that hits a usage limit, or whose backend process is lost, runs again on the other of Claude Code and Codex when that one is enabled. Off, or with one backend enabled, that part fails. Only Claude Code reports a usage limit today (#325); a lost backend moves a part from either. |
+| `rules` | array of tables | none | Rules tried in order for each part. The first one that fits sets the model. |
+
+Each `[[review.routing.rules]]` has `model` (a model name the backend accepts, not empty) and any of `max_hunks`, `max_files` and `max_chars`. A rule fits a part when every limit it sets holds, counted on the packed part: hunks, files sent to the model (whole or clipped) and characters of packed diff. A rule with no limit fits every part, so put it last. When no rule fits, the backend runs on its own default model.
+
+The model reaches the model-API backends (`anthropic`, `openai_compat`). Claude Code and Codex start on their own default model whatever a rule says, until their launch takes a model (#324); the review's `Model:` line then names what the backend reports, not the rule.
+
+```toml
+[[review.routing.rules]]
+max_hunks = 4
+max_chars = 6000
+model = "haiku"
+
+[[review.routing.rules]]
+model = "opus"
+```
+
+The model goes to the first backend only: a model name belongs to one backend, so a part that moves to the other backend runs on that backend's default. Only a usage limit or a lost backend moves a part, not a bad answer, and only that part moves; the others stay on their backend. A part moves to the other backend once, and the first one is not asked again for that part. A part that hits a usage limit with no other backend is not run again; one whose backend was lost is run once more, like any failed part. The verifier picks its backend from the one the review was asked to use, so after a part moves it can run on the same model that wrote the findings. The review lists each move under `Fallback` in the Run section and in `run.fallbacks` of the JSON. When no backend is left for a part, the part fails as described under `coda review`: the review is partial and the part's files are listed under Left out, or the review fails when every part failed. The verifier does not fall back.
+
 ## `[review.ignore]`
 
 Files a review leaves out.

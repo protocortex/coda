@@ -321,6 +321,10 @@ pub struct RunDetails {
     /// Linked issues that were named but could not be used, each with the reason.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped_issues: Vec<String>,
+    /// Parts that moved to another backend because the first hit a usage limit or was
+    /// lost, one line each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<String>,
 }
 
 /// The finished review.

@@ -117,7 +117,7 @@ pub fn parse_repo_rules(text: &str) -> Result<ReviewConfig, RulesError> {
 
 /// Combines the global config with the repository rules. Lists add up, a switch that
 /// skips is on when either side turns it on, and the built-in ignore list stays on only
-/// when both sides keep it. The finding cap, the diff budget, the chunk limits, the verifier settings and the guidance cap come from the global config alone.
+/// when both sides keep it. The finding cap, the diff budget, the chunk limits, the verifier settings, the routing and the guidance cap come from the global config alone.
 #[must_use]
 pub fn merge(global: &ReviewConfig, repo: Option<&ReviewConfig>) -> ReviewConfig {
     let Some(repo) = repo else {
@@ -134,6 +134,7 @@ pub fn merge(global: &ReviewConfig, repo: Option<&ReviewConfig>) -> ReviewConfig
         guidance_lines: global.guidance_lines,
         linked_repos: global.linked_repos.clone(),
         hook: global.hook.clone(),
+        routing: global.routing.clone(),
         incremental_min_commits: global.incremental_min_commits,
         incremental_min_minutes: global.incremental_min_minutes,
         extra_instructions: [
@@ -332,6 +333,23 @@ mod tests {
         // Assert
         assert_eq!(merged.linked_repos, ["acme/lib"]);
         assert_eq!(parsed.linked_repos.len(), 0);
+    }
+
+    #[test]
+    fn a_repository_rules_file_cannot_pick_the_model() {
+        // Arrange
+        let global = ReviewConfig::default();
+        let repo = parse_repo_rules(
+            "[review.routing]\nfallback = false\n[[review.routing.rules]]\nmodel = \"evil\"\n",
+        )
+        .unwrap();
+
+        // Act
+        let merged = merge(&global, Some(&repo));
+
+        // Assert
+        assert_eq!(merged.routing.rules, []);
+        assert!(merged.routing.fallback);
     }
 
     #[test]
