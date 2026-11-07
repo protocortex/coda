@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use coda_config::config::DEFAULT_MAX_GUARD_CONTINUES;
 use coda_config::hooks::HookEvent;
 use coda_config::loop_guard::LoopGuardConfig;
 use coda_protocol::types::{OriginalId, PermissionDecision, SessionId};
@@ -89,6 +90,9 @@ pub enum StopCondition {
     HookBlocked,
     /// The model kept repeating the same calls after being warned.
     Stalled,
+    /// An `end_turn` hook still asked for more work after the allowed number
+    /// of forced continues.
+    GuardLimit,
 }
 
 impl StopCondition {
@@ -107,6 +111,7 @@ impl StopCondition {
             Self::CompactionFailed => "compaction_failed",
             Self::HookBlocked => "hook_blocked",
             Self::Stalled => "stalled",
+            Self::GuardLimit => "guard_limit",
         }
     }
 }
@@ -158,6 +163,22 @@ pub enum TurnEvent {
         kept: usize,
         /// Answered once the event is stored.
         ack: CompactionAck,
+    },
+    /// An `end_turn` hook sent the model back to work: the instruction was
+    /// added to the conversation as a user message and the loop goes on.
+    GuardContinued {
+        /// What the hook said, and the model was told.
+        instruction: String,
+        /// Which forced continue this is in the send, from 1.
+        attempt: u32,
+    },
+    /// An `end_turn` hook still asked for more work after the allowed number of
+    /// forced continues, so the turn ended.
+    GuardStopped {
+        /// The last thing the hook said.
+        instruction: String,
+        /// How many continues were forced.
+        attempts: u32,
     },
     /// An event of a sub-agent's run, passed up the session's own channel so it
     /// is stored in order with the session's events: after the call that started
@@ -296,6 +317,8 @@ pub struct TurnLoop<P, G> {
     /// that a hook blocked leaves some, and the retry is still a first start.
     resumed: bool,
     guard: LoopGuard,
+    /// Most continues an `end_turn` hook may force in one send.
+    max_guard_continues: u32,
 }
 
 /// How a compaction attempt ended.
@@ -338,7 +361,16 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             session_started: false,
             resumed: false,
             guard: LoopGuard::new(LoopGuardConfig::default()),
+            max_guard_continues: DEFAULT_MAX_GUARD_CONTINUES,
         }
+    }
+
+    /// Sets how many times an `end_turn` hook may send the model back to work
+    /// in one send. With 0 the hooks are not run.
+    #[must_use]
+    pub fn with_max_guard_continues(mut self, max: u32) -> Self {
+        self.max_guard_continues = max;
+        self
     }
 
     /// Sets when a repeating model is warned and stopped.
@@ -489,7 +521,9 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     }
 
     async fn run(&mut self) -> Result<StopCondition, TurnError> {
-        for _ in 0..self.config.max_turns {
+        let mut continues = 0;
+        for turn in 0..self.config.max_turns {
+            let last_turn = turn + 1 == self.config.max_turns;
             if self.cancel.is_cancelled() {
                 return Ok(StopCondition::Cancelled);
             }
@@ -513,6 +547,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             } else {
                 Vec::new()
             };
+            let answer = reply.text.clone();
             let text = if reply.text.is_empty() && calls.is_empty() {
                 NO_REPLY.to_owned()
             } else {
@@ -527,19 +562,73 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                 tool_calls: calls.clone(),
             });
             match reply.stop {
-                StopReason::ToolUse if calls.is_empty() => return Ok(StopCondition::EndTurn),
+                StopReason::ToolUse if calls.is_empty() => {
+                    if let Some(stop) = self.guard_end(&answer, &mut continues, last_turn).await {
+                        return Ok(stop);
+                    }
+                }
                 StopReason::ToolUse => {
                     if let Some(stop) = self.run_tools(calls).await {
                         return Ok(stop);
                     }
                 }
-                StopReason::EndTurn => return Ok(StopCondition::EndTurn),
+                StopReason::EndTurn => {
+                    if let Some(stop) = self.guard_end(&answer, &mut continues, last_turn).await {
+                        return Ok(stop);
+                    }
+                }
                 StopReason::MaxTokens => return Ok(StopCondition::MaxTokens),
                 StopReason::Refusal => return Ok(StopCondition::Refused),
                 StopReason::Paused => return Ok(StopCondition::Paused),
             }
         }
         Ok(StopCondition::MaxTurns)
+    }
+
+    /// Asks the `end_turn` hooks whether the turn may end after a reply with
+    /// no tool calls. `None` means the model was sent back to work, so the
+    /// loop goes on; otherwise the turn stops with the returned condition.
+    async fn guard_end(
+        &mut self,
+        answer: &str,
+        continues: &mut u32,
+        last_turn: bool,
+    ) -> Option<StopCondition> {
+        if self.max_guard_continues == 0 || !self.hooks.has(HookEvent::EndTurn) {
+            return Some(StopCondition::EndTurn);
+        }
+        let asked = tokio::select! {
+            asked = self.hooks.end_turn(&self.config.session, &self.config.cwd, answer, *continues) => asked,
+            () = self.cancel.cancelled() => return Some(StopCondition::Cancelled),
+        };
+        let Some(instruction) = asked else {
+            return Some(StopCondition::EndTurn);
+        };
+        if *continues >= self.max_guard_continues {
+            warn!(
+                attempts = *continues,
+                "an end_turn hook still asked for more work"
+            );
+            self.emit(TurnEvent::GuardStopped {
+                instruction,
+                attempts: *continues,
+            });
+            return Some(StopCondition::GuardLimit);
+        }
+        if last_turn {
+            return Some(StopCondition::MaxTurns);
+        }
+        *continues += 1;
+        info!(
+            attempt = *continues,
+            "an end_turn hook sent the model back to work"
+        );
+        self.emit(TurnEvent::GuardContinued {
+            instruction: instruction.clone(),
+            attempt: *continues,
+        });
+        self.conversation.push(Message::User(instruction));
+        None
     }
 
     /// One model call. A request near the window is compacted first, and an

@@ -36,6 +36,12 @@ pub const MAX_ARGUMENTS_BYTES: usize = 256 * 1024;
 /// footer), so a guard sees all that reaches the model. Over it, as for
 /// [`MAX_ARGUMENTS_BYTES`]. The bytes are counted before JSON escaping.
 pub const MAX_RESULT_BYTES: usize = 64 * 1024;
+/// The exit status with which an `end_turn` hook asks for another try. Any other
+/// failure, a crash or a timeout included, lets the turn end.
+pub const GUARD_RETRY_EXIT_CODE: i32 = 2;
+/// Told to the model when an `end_turn` hook asks for another try and says nothing.
+pub const GUARD_DEFAULT_INSTRUCTION: &str =
+    "an end_turn hook asked you to keep working, and gave no reason";
 /// The most bytes of a hook's standard error kept as the reason it failed.
 pub const MAX_REASON_BYTES: usize = 1024;
 /// The reason a blocking hook stops a call it could not be given whole: `what`
@@ -286,6 +292,61 @@ impl HookRunner {
             too_large: cut.then(|| too_large("the result is", MAX_RESULT_BYTES)),
         };
         self.run(HookEvent::PostTool, cwd, &payload).await
+    }
+
+    /// Runs the `end_turn` hooks for a reply of `text` that came after
+    /// `continues` forced continues. Returns what to tell the model when a
+    /// blocking hook exits with [`GUARD_RETRY_EXIT_CODE`], from its standard
+    /// error. A hook that is not blocking, or that fails any other way, never
+    /// keeps the turn going: it is logged.
+    pub async fn end_turn(
+        &self,
+        session: &SessionId,
+        cwd: &Path,
+        text: &str,
+        continues: u32,
+    ) -> Option<String> {
+        if !self.has(HookEvent::EndTurn) {
+            return None;
+        }
+        let mut payload = json!({
+            "event": HookEvent::EndTurn.as_str(),
+            "session": session,
+            "cwd": cwd.to_string_lossy(),
+            "text": head(text, MAX_RESULT_BYTES),
+            "continues": continues,
+        });
+        if text.len() > MAX_RESULT_BYTES {
+            payload["text_truncated"] = json!(true);
+        }
+        let payload = payload.to_string();
+        for entry in self
+            .hooks
+            .iter()
+            .filter(|entry| entry.config.event == HookEvent::EndTurn)
+        {
+            let Err((failure, tail)) = self.execute(&entry.config, payload.as_bytes(), cwd).await
+            else {
+                continue;
+            };
+            let asked = matches!(&failure, Failure::Exited(status) if status.code() == Some(GUARD_RETRY_EXIT_CODE));
+            if asked && entry.config.blocking {
+                let said = plain_lines(&tail);
+                let said = said.trim();
+                return Some(if said.is_empty() {
+                    GUARD_DEFAULT_INSTRUCTION.to_owned()
+                } else {
+                    said.to_owned()
+                });
+            }
+            warn!(
+                "hook failed, continuing: event={} hook={} reason={}",
+                HookEvent::EndTurn,
+                entry.name(),
+                one_line(&failure.describe())
+            );
+        }
+        None
     }
 
     /// Runs the hooks of `event` in order. The first blocking hook that fails

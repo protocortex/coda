@@ -26,7 +26,7 @@ use coda_providers::tool_request::ToolRequest;
 use coda_store::{NewSession, Store};
 use coda_tools::retrieve::RetrieveTool;
 use coda_tools::{Tool, ToolError, ToolOutput};
-use common::{BOUND, Scratch, hook, pid_from, poll_until, process_alive, shell};
+use common::{BOUND, STARTED_MS, Scratch, hook, pid_from, poll_until, process_alive, shell, timed};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -750,4 +750,225 @@ async fn a_result_kept_after_a_cancel_keeps_its_original_to_retrieve() {
         "{results:?}"
     );
     assert_eq!(retrievable(&f), [1]);
+}
+
+/// A guard that fails with the exit code that asks for another try, until it has
+/// run `fail_times` times, and says `instruction` each time it fails.
+fn guard(f: &Fixture, fail_times: u32, instruction: &str) -> HookConfig {
+    let count = f.scratch.out("guard_count");
+    let script = format!(
+        "n=$(cat {count} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {count}; \
+         if [ $n -le {fail_times} ]; then echo '{instruction}' >&2; exit 2; fi",
+        count = count.display()
+    );
+    shell(HookEvent::EndTurn, &script, true)
+}
+
+fn guard_notes(events: &mut UnboundedReceiver<TurnEvent>) -> Vec<(String, u32)> {
+    let mut notes = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let TurnEvent::GuardContinued {
+            instruction,
+            attempt,
+        } = event
+        {
+            notes.push((instruction, attempt));
+        }
+    }
+    notes
+}
+
+fn user_messages(lp: &Loop) -> Vec<String> {
+    lp.conversation()
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn three_replies() -> Vec<Turn> {
+    vec![end_turn(), end_turn(), end_turn()]
+}
+
+#[tokio::test]
+async fn a_guard_that_fails_twice_and_then_passes_costs_two_extra_calls_and_ends_the_turn() {
+    // Arrange
+    let f = Fixture::new();
+    let hooks = [guard(&f, 2, "run the tests before you finish")];
+    let (mut lp, mut events) = f.turn_loop(three_replies(), &hooks, "ran");
+
+    // Act
+    let stop = send(&mut lp, "go").await;
+
+    // Assert
+    assert_eq!(stop, StopCondition::EndTurn);
+    let said = "run the tests before you finish";
+    assert_eq!(user_messages(&lp), ["go", said, said]);
+    assert_eq!(
+        guard_notes(&mut events),
+        [(said.to_owned(), 1), (said.to_owned(), 2)]
+    );
+}
+
+#[tokio::test]
+async fn a_guard_that_always_fails_ends_the_turn_with_its_own_stop_after_the_cap() {
+    // Arrange
+    let f = Fixture::new();
+    let hooks = [guard(&f, 99, "not done")];
+    // Three scripted replies: a fourth model call would fail the send.
+    let (mut lp, mut events) = f.turn_loop(three_replies(), &hooks, "ran");
+
+    // Act
+    let stop = send(&mut lp, "go").await;
+
+    // Assert
+    assert_eq!(stop, StopCondition::GuardLimit);
+    assert_eq!(stop.as_str(), "guard_limit");
+    assert_eq!(guard_notes(&mut events).len(), 2);
+}
+
+#[tokio::test]
+async fn forced_continues_use_the_token_budget_and_stop_when_it_is_spent() {
+    // Arrange
+    let f = Fixture::new();
+    let hooks = [guard(&f, 99, "not done")];
+    let costly = || {
+        let mut turn = end_turn();
+        turn.events.insert(
+            1,
+            ModelEvent::Usage(coda_providers::model::Usage {
+                input_tokens: 500,
+                output_tokens: 100,
+            }),
+        );
+        turn
+    };
+    let (lp, _events) = f.turn_loop(vec![costly(), costly(), costly()], &hooks, "ran");
+    // 999_000 used of 1_000_000: two calls fit, the third is refused.
+    let mut lp = lp.with_max_guard_continues(5).with_used_tokens(999_000);
+
+    // Act
+    let stop = send(&mut lp, "go").await;
+
+    // Assert
+    assert_eq!(stop, StopCondition::BudgetExhausted);
+}
+
+#[tokio::test]
+async fn forced_continues_use_max_turns() {
+    // Arrange
+    let f = Fixture::new();
+    let hooks = [guard(&f, 99, "not done")];
+    let turns = (0..9).map(|_| end_turn()).collect();
+    let (lp, _events) = f.turn_loop(turns, &hooks, "ran");
+    // The fixture allows 8 model calls.
+    let mut lp = lp.with_max_guard_continues(20);
+
+    // Act
+    let stop = send(&mut lp, "go").await;
+
+    // Assert
+    assert_eq!(stop, StopCondition::MaxTurns);
+    // The last call's ask is not added: nothing could answer it.
+    assert_eq!(user_messages(&lp).len(), 8);
+}
+
+#[tokio::test]
+async fn a_cap_of_zero_never_forces_a_continue() {
+    // Arrange
+    let f = Fixture::new();
+    let hooks = [guard(&f, 99, "not done")];
+    let (lp, _events) = f.turn_loop(vec![end_turn()], &hooks, "ran");
+    let mut lp = lp.with_max_guard_continues(0);
+
+    // Act
+    let stop = send(&mut lp, "go").await;
+
+    // Assert
+    assert_eq!(stop, StopCondition::EndTurn);
+}
+
+#[tokio::test]
+async fn a_guard_that_crashes_times_out_or_cannot_start_lets_the_turn_end() {
+    // Arrange
+    let f = Fixture::new();
+    let slow = timed(shell(HookEvent::EndTurn, "sleep 30", true), STARTED_MS);
+    for failing in [
+        shell(HookEvent::EndTurn, "exit 1", true),
+        shell(HookEvent::EndTurn, "kill -9 $$", true),
+        hook(HookEvent::EndTurn, &["/nonexistent/guard"], true),
+        slow,
+    ] {
+        let (mut lp, mut events) = f.turn_loop(vec![end_turn()], &[failing], "ran");
+
+        // Act
+        let stop = send(&mut lp, "go").await;
+
+        // Assert
+        assert_eq!(stop, StopCondition::EndTurn);
+        assert_eq!(guard_notes(&mut events).len(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_guard_that_is_not_blocking_cannot_force_a_continue() {
+    // Arrange
+    let f = Fixture::new();
+    let hooks = [shell(HookEvent::EndTurn, "echo again >&2; exit 2", false)];
+    let (mut lp, _events) = f.turn_loop(vec![end_turn()], &hooks, "ran");
+
+    // Act
+    let stop = send(&mut lp, "go").await;
+
+    // Assert
+    assert_eq!(stop, StopCondition::EndTurn);
+}
+
+#[tokio::test]
+async fn the_guard_is_given_the_reply_and_how_many_continues_came_before() {
+    // Arrange
+    let f = Fixture::new();
+    let seen = f.scratch.out("seen.jsonl");
+    let script = format!(
+        "cat >> {seen}; echo >> {seen}; exit 2",
+        seen = seen.display()
+    );
+    let hooks = [shell(HookEvent::EndTurn, &script, true)];
+    let (mut lp, _events) = f.turn_loop(three_replies(), &hooks, "ran");
+
+    // Act
+    send(&mut lp, "go").await;
+
+    // Assert
+    let payloads: Vec<Value> = std::fs::read_to_string(&seen)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(payloads.len(), 3, "{payloads:?}");
+    assert_eq!(payloads[0]["event"], "end_turn");
+    assert_eq!(payloads[0]["text"], "done");
+    assert_eq!(payloads[0]["continues"], 0);
+    assert_eq!(payloads[2]["continues"], 2);
+}
+
+#[tokio::test]
+async fn a_guard_that_fails_with_no_words_still_gives_the_model_a_reason() {
+    // Arrange
+    let f = Fixture::new();
+    let hooks = [shell(HookEvent::EndTurn, "exit 2", true)];
+    let (lp, _events) = f.turn_loop(vec![end_turn(), end_turn()], &hooks, "ran");
+    let mut lp = lp.with_max_guard_continues(1);
+
+    // Act
+    send(&mut lp, "go").await;
+
+    // Assert
+    let users = user_messages(&lp);
+    assert_eq!(users.len(), 2);
+    assert!(users[1].contains("end_turn"), "{users:?}");
 }

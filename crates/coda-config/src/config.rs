@@ -19,6 +19,8 @@ use crate::timing::Timing;
 
 const DEFAULT_MAX_TURNS: u32 = 50;
 const DEFAULT_TOKEN_CAP: u64 = 1_000_000;
+/// Times an `end_turn` hook may send the model back to work in one send.
+pub const DEFAULT_MAX_GUARD_CONTINUES: u32 = 2;
 
 /// Environment variable that moves the config and data root.
 pub const CODA_HOME_VAR: &str = "CODA_HOME";
@@ -236,6 +238,8 @@ pub struct Config {
     pub max_turns: u32,
     /// Maximum tokens per run.
     pub token_cap: u64,
+    /// Most times an `end_turn` hook may send the model back to work in one send.
+    pub max_guard_continues: u32,
     /// Backends by name.
     pub providers: BTreeMap<String, ProviderConfig>,
     /// Model aliases by name.
@@ -262,6 +266,7 @@ impl Default for Config {
             permissions: Permissions::default(),
             max_turns: DEFAULT_MAX_TURNS,
             token_cap: DEFAULT_TOKEN_CAP,
+            max_guard_continues: DEFAULT_MAX_GUARD_CONTINUES,
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
             telemetry: TelemetryConfig::default(),
@@ -628,6 +633,28 @@ mod tests {
 
     fn parse(s: &str) -> Parsed {
         Config::from_toml_str(s).expect("valid config")
+    }
+
+    #[test]
+    fn an_end_turn_hook_and_its_continue_cap_are_read_and_default_to_two() {
+        // Arrange
+        let input = r#"
+max_guard_continues = 5
+
+[[hooks]]
+event = "end_turn"
+command = ["/bin/true"]
+blocking = true
+"#;
+
+        // Act
+        let set = parse(input).config;
+        let unset = parse("").config;
+
+        // Assert
+        assert_eq!(set.max_guard_continues, 5);
+        assert_eq!(set.hooks[0].event, crate::hooks::HookEvent::EndTurn);
+        assert_eq!(unset.max_guard_continues, 2);
     }
 
     #[test]

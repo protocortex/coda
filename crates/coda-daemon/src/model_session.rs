@@ -26,7 +26,10 @@ use coda_core::tools::{
     BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index, task_schema,
 };
 use coda_core::turn::{CancelToken, TurnConfig, TurnEvent, TurnLoop};
-use coda_protocol::events::{Event, HOOK_BLOCKED_KIND, HookBlockedBody, TIMEOUT_KIND};
+use coda_protocol::events::{
+    Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, GuardContinueBody, GuardLimitBody,
+    HOOK_BLOCKED_KIND, HookBlockedBody, TIMEOUT_KIND,
+};
 use coda_protocol::types::{
     BackendKind, OriginalId, PermissionDecision, SessionId, TokenUsage, TurnId,
 };
@@ -948,6 +951,8 @@ async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Ro
         | TurnEvent::Usage(_)
         | TurnEvent::SessionStarted
         | TurnEvent::HookBlocked { .. }
+        | TurnEvent::GuardContinued { .. }
+        | TurnEvent::GuardStopped { .. }
         | TurnEvent::Compaction { .. }
         | TurnEvent::Child { .. } => Row::NotStored,
     }
@@ -1038,6 +1043,26 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
         TurnEvent::HookBlocked { reason } => {
             let body = json!(HookBlockedBody { reason });
             publish_kind(hub, session, turn, HOOK_BLOCKED_KIND, &body).await
+        }
+        TurnEvent::GuardContinued {
+            instruction,
+            attempt,
+        } => {
+            let body = json!(GuardContinueBody {
+                text: instruction,
+                attempt
+            });
+            publish_kind(hub, session, turn, GUARD_CONTINUE_KIND, &body).await
+        }
+        TurnEvent::GuardStopped {
+            instruction,
+            attempts,
+        } => {
+            let body = json!(GuardLimitBody {
+                text: instruction,
+                attempts
+            });
+            publish_kind(hub, session, turn, GUARD_LIMIT_KIND, &body).await
         }
         TurnEvent::Compaction {
             summary,

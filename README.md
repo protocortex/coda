@@ -164,7 +164,7 @@ Every command accepts `--force`, but it only matters in three cases. `coda revie
 | 2 | The token budget was used up. |
 | 3 | The context window is full. |
 | 4 | The run was cancelled. |
-| 5 | Any other stop, or a failed turn. This includes a conversation that could not be compacted (`compaction_failed`) and a blocking `session_start` hook that failed (`hook_blocked`), whose reason goes to standard error, and a model that kept repeating the same tool calls after a warning (`stalled`; see `[loop_guard]` in [docs/config.md](docs/config.md#loop_guard)). |
+| 5 | Any other stop, or a failed turn. This includes a conversation that could not be compacted (`compaction_failed`) and a blocking `session_start` hook that failed (`hook_blocked`), whose reason goes to standard error, and a model that kept repeating the same tool calls after a warning (`stalled`; see `[loop_guard]` in [docs/config.md](docs/config.md#loop_guard)), or a blocking `end_turn` hook that still asked for more work after the allowed continues (`guard_limit`). |
 | 64 | Bad usage. |
 | 70 | The run itself failed. |
 

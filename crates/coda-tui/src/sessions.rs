@@ -8,7 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use coda_client::{Client, ClientError, Subscription};
 use coda_config::timing::Timing;
-use coda_protocol::events::{EVENT_NOTIFICATION, Event, HOOK_BLOCKED_KIND, HookBlockedBody};
+use coda_protocol::events::{
+    EVENT_NOTIFICATION, Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, GuardContinueBody,
+    GuardLimitBody, HOOK_BLOCKED_KIND, HookBlockedBody,
+};
 use coda_protocol::jsonrpc::Notification;
 use coda_protocol::methods::{
     DAEMON_BACKENDS, DAEMON_PING, DAEMON_STATUS, DaemonBackendsParams, DaemonBackendsResult,
@@ -106,6 +109,32 @@ pub fn hook_blocked_from_params(params: &Value) -> Option<String> {
     let blocked: HookBlockedBody = serde_json::from_str(params.get("body")?.as_str()?).ok()?;
     let reason = sanitize_line(&blocked.reason);
     Some(format!("The turn did not start. {reason}"))
+}
+
+/// Reads a stored `guard_continue` or `guard_limit` notification as a notice
+/// that says why the turn went on or stopped; other kinds give `None`.
+#[must_use]
+pub fn guard_notice_from_params(params: &Value) -> Option<String> {
+    let body = params.get("body")?.as_str()?;
+    match params.get("kind")?.as_str()? {
+        GUARD_CONTINUE_KIND => {
+            let guard: GuardContinueBody = serde_json::from_str(body).ok()?;
+            let said = sanitize_line(&guard.text);
+            Some(format!(
+                "An end_turn hook sent the model back to work ({}): {said}",
+                guard.attempt
+            ))
+        }
+        GUARD_LIMIT_KIND => {
+            let guard: GuardLimitBody = serde_json::from_str(body).ok()?;
+            let said = sanitize_line(&guard.text);
+            Some(format!(
+                "The turn ended: an end_turn hook still asked for more work after {} tries. {said}",
+                guard.attempts
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn backend_names(backends: &[BackendKind]) -> String {
@@ -598,7 +627,9 @@ impl Link {
             EVENT_NOTIFICATION => {
                 if let Some(text) = user_message_from_params(params) {
                     self.tell(LinkEvent::UserMessage(text));
-                } else if let Some(notice) = hook_blocked_from_params(params) {
+                } else if let Some(notice) =
+                    hook_blocked_from_params(params).or_else(|| guard_notice_from_params(params))
+                {
                     self.tell(LinkEvent::Notice(notice));
                 } else if let Some(event) = event_from_params(params) {
                     self.tell(LinkEvent::Session(event));
@@ -803,6 +834,39 @@ mod tests {
         assert!(!notice.chars().any(char::is_control), "{notice:?}");
         assert_eq!(hook_blocked_from_params(&other), None);
         assert_eq!(hook_blocked_from_params(&no_reason), None);
+    }
+
+    #[test]
+    fn a_guard_continue_and_a_guard_limit_become_one_line_notices() {
+        // Arrange
+        let continued = json!({
+            "kind": GUARD_CONTINUE_KIND,
+            "body": json!(GuardContinueBody {
+                text: "run the\ntests\u{1b}[31m".to_owned(),
+                attempt: 1
+            })
+            .to_string()
+        });
+        let limit = json!({
+            "kind": GUARD_LIMIT_KIND,
+            "body": json!(GuardLimitBody {
+                text: "still failing".to_owned(),
+                attempts: 2
+            })
+            .to_string()
+        });
+        let other = json!({"kind": "result", "body": "{}"});
+
+        // Act
+        let first = guard_notice_from_params(&continued).unwrap();
+        let second = guard_notice_from_params(&limit).unwrap();
+
+        // Assert
+        assert!(first.contains("back to work (1): run the tests"), "{first}");
+        assert!(!first.chars().any(char::is_control), "{first:?}");
+        assert!(second.contains("after 2 tries"), "{second}");
+        assert!(second.contains("still failing"), "{second}");
+        assert_eq!(guard_notice_from_params(&other), None);
     }
 
     #[test]

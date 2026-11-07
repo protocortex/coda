@@ -533,3 +533,36 @@ fn a_compaction_that_replaces_more_than_exists_is_skipped_with_a_warning() {
     );
     assert!(logs.contains("skipped a compaction"), "{logs}");
 }
+
+#[test]
+fn a_guard_continue_replays_as_the_user_message_it_was_and_a_guard_limit_is_skipped() {
+    // Arrange
+    let events = [
+        user("go"),
+        assistant("done", &[]),
+        (
+            GUARD_CONTINUE_KIND,
+            json!({"text": "run the tests", "attempt": 1}),
+        ),
+        assistant("done again", &[]),
+        (
+            GUARD_LIMIT_KIND,
+            json!({"text": "run the tests", "attempts": 1}),
+        ),
+    ];
+
+    // Act
+    let (messages, logs) = replay_logged(&events);
+
+    // Assert
+    assert_eq!(
+        messages,
+        replay(&[
+            user("go"),
+            assistant("done", &[]),
+            user("run the tests"),
+            assistant("done again", &[]),
+        ])
+    );
+    assert_eq!(logs, "");
+}

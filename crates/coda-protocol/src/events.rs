@@ -49,6 +49,33 @@ pub struct HookBlockedBody {
     pub reason: String,
 }
 
+/// Stored event kind of an `end_turn` hook sending the model back to work. The
+/// body is a [`GuardContinueBody`]. The text is also a user message in the
+/// model's history; clients show it as the reason the turn went on.
+pub const GUARD_CONTINUE_KIND: &str = "guard_continue";
+/// Stored event kind of a turn that ended because an `end_turn` hook still asked
+/// for more work after the allowed number of continues. The body is a
+/// [`GuardLimitBody`].
+pub const GUARD_LIMIT_KIND: &str = "guard_limit";
+
+/// The body of a stored `guard_continue` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardContinueBody {
+    /// What the hook said, which the model was told.
+    pub text: String,
+    /// Which forced continue this is in the send, from 1.
+    pub attempt: u32,
+}
+
+/// The body of a stored `guard_limit` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardLimitBody {
+    /// The last thing the hook said.
+    pub text: String,
+    /// How many continues were forced.
+    pub attempts: u32,
+}
+
 /// One rate-limit window of a provider plan, such as `five_hour` or `seven_day`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RateLimitWindow {

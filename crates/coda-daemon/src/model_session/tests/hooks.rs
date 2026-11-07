@@ -6,7 +6,10 @@
 use std::path::Path;
 
 use coda_config::hooks::{HookConfig, HookEvent};
-use coda_protocol::events::{HOOK_BLOCKED_KIND, HookBlockedBody};
+use coda_protocol::events::{
+    GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, GuardContinueBody, GuardLimitBody, HOOK_BLOCKED_KIND,
+    HookBlockedBody,
+};
 use coda_protocol::types::Mode;
 use serde_json::{Value, json};
 
@@ -479,4 +482,36 @@ async fn cancelling_a_sub_agents_post_tool_hook_withholds_the_childs_result() {
         2,
         "no model call after the cancel"
     );
+}
+
+#[tokio::test]
+async fn an_end_turn_guard_stores_why_the_turn_went_on_and_why_it_stopped() {
+    // Arrange
+    let out = tempfile::tempdir().unwrap();
+    let hook = shell_hook(
+        HookEvent::EndTurn,
+        r#"echo "run the tests" >&2; exit 2"#,
+        out.path(),
+        true,
+    );
+    let turns = [text_turn("one"), text_turn("two"), text_turn("three")];
+    let mut rig = Rig::custom(Mode::Default, &turns, true, None, |config| {
+        config.hooks.push(hook);
+    });
+
+    // Act
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let continued = rig.bodies(GUARD_CONTINUE_KIND).await;
+    assert_eq!(continued.len(), 2);
+    let first: GuardContinueBody = serde_json::from_value(continued[0].clone()).unwrap();
+    assert_eq!((first.text.as_str(), first.attempt), ("run the tests", 1));
+    let limit = rig.bodies(GUARD_LIMIT_KIND).await;
+    let limit: GuardLimitBody = serde_json::from_value(limit[0].clone()).unwrap();
+    assert_eq!(limit.attempts, 2);
+    let stopped = rig.bodies("turn_stopped").await;
+    assert_eq!(stopped[0]["condition"], "guard_limit");
 }
