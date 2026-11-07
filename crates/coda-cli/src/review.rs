@@ -22,6 +22,7 @@ use coda_config::config::Config;
 use coda_config::review::ReviewConfig;
 use coda_core::history::{ASSISTANT_MESSAGE_KIND, CHILD_EVENT_KIND};
 use coda_core::turn::StopCondition;
+use coda_protocol::events::USAGE_LIMIT_KIND;
 use coda_protocol::types::{BackendKind, Mode};
 use coda_review::chunk::{Merged, Outcome, merge, plan};
 use coda_review::diff::{FileDiff, git_diff, git_diff_staged, parse_diff, tracked_files};
@@ -46,14 +47,14 @@ use crate::autostart::ensure_daemon;
 use crate::cli::ReviewArgs;
 use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
-use crate::error::CliError;
+use crate::error::{CliError, Unavailable};
 use crate::exit;
 use crate::review_issues::{Linked, gather as gather_issues};
 use crate::review_memory::{Memory, saw_everything};
 use crate::review_post::{Confirm, RealGh, head_of, post};
+use crate::review_route::{Attempt, Failover, other_backend, unavailable_reason};
 use crate::run::{
-    CANCELLED, CLAUDE_CODE_KEY, CODEX_KEY, Finish, Job, STREAM_DELTA_KIND, Tap, drive,
-    pick_backend, session_cwd, stop_reason,
+    CANCELLED, Finish, Job, STREAM_DELTA_KIND, Tap, drive, pick_backend, session_cwd, stop_reason,
 };
 
 /// Where the packed input is written, relative to the working directory.
@@ -72,6 +73,7 @@ const NOTHING_LEFT: &str = "nothing to review: every changed file was left out b
 const NO_DEFAULT_BRANCH_NOTE: &str =
     "the repository has no default branch to read project rules from, so none are used";
 const FORCED_NOTE: &str = "a skip rule matched, but --force asks for the review anyway";
+const VERIFIER_LABEL: &str = "verifier";
 const GH: &str = "gh";
 const HEAD: &str = "HEAD";
 /// The branch a push goes to.
@@ -226,19 +228,18 @@ async fn run_review(
     // Every part runs on its own connection, so the daemon is started once, here, where
     // the user can be asked about a restart.
     drop(ensure_daemon(ctx, io, false).await?);
-    let reviewers: Vec<Live<'_>> = (0..parts.len())
-        .map(|n| Live {
-            ctx,
-            role: Role::Reviewer,
-            backend,
-            cwd: &cwd,
-            handoff: match &written {
-                Some(files) => Handoff::File(&files.relative[n]),
-                None => Handoff::Prompt(&inputs[n]),
-            },
-        })
+    let place = Placement {
+        ctx,
+        config: &config,
+        cwd: &cwd,
+        backend,
+    };
+    let mut reviewers = part_reviewers(&place, &parts, &inputs, written.as_ref());
+    let results = review_parts(&parts, &mut reviewers, config.review.chunk_concurrency).await;
+    let fallbacks: Vec<String> = reviewers
+        .iter()
+        .flat_map(|reviewer| reviewer.notes().to_vec())
         .collect();
-    let results = review_parts(&parts, reviewers, config.review.chunk_concurrency).await;
     let given: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
     let input_chars = inputs.iter().map(|i| i.chars().count()).sum();
     let (mut merged, model) = merged_review(&parts, results, &given, config.review.max_findings)?;
@@ -258,7 +259,8 @@ async fn run_review(
         None
     };
     let model = model.unwrap_or_else(|| backend_name(backend));
-    let review = assemble_linked(merged, (&model, input_chars, verified), linked);
+    let mut review = assemble_linked(merged, (&model, input_chars, verified), linked);
+    review.run.fallbacks = fallbacks;
     print_review(io, args.json, &review)?;
     if let Some(m) = memory.as_mut() {
         remember(io, m, &review, &files, saw_everything(&review, whole))?;
@@ -270,6 +272,47 @@ async fn run_review(
         return Ok(ExitCode::from(exit::REVIEW_BLOCKED));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Where the parts of a review run.
+struct Placement<'a> {
+    ctx: &'a Context,
+    config: &'a Config,
+    cwd: &'a str,
+    backend: BackendKind,
+}
+
+/// One reviewer for each part: on the backend asked for, set to the model the routing rules
+/// pick for the part's size, and with the other backend behind it when fallback is on.
+fn part_reviewers<'a>(
+    place: &Placement<'a>,
+    parts: &[Packed],
+    inputs: &'a [String],
+    written: Option<&'a InputFiles>,
+) -> Vec<Failover<Live<'a>>> {
+    let routing = &place.config.review.routing;
+    let mut order = vec![place.backend];
+    if routing.fallback {
+        order.extend(other_backend(place.config, place.backend));
+    }
+    parts
+        .iter()
+        .enumerate()
+        .map(|(n, part)| {
+            let live = Live {
+                ctx: place.ctx,
+                role: Role::Reviewer,
+                cwd: place.cwd,
+                handoff: match written {
+                    Some(files) => Handoff::File(&files.relative[n]),
+                    None => Handoff::Prompt(&inputs[n]),
+                },
+            };
+            let model = routing.model_for(part.size()).map(str::to_owned);
+            let label = format!("part {} of {}", n + 1, parts.len());
+            Failover::new(live, order.clone(), model, label)
+        })
+        .collect()
 }
 
 /// The review memory of the pull request, when there is one, and what this run reviews.
@@ -495,7 +538,7 @@ fn review_backend(config: &Config, asked: Option<BackendKind>) -> BackendKind {
 }
 
 /// The name of `backend` as the config and the protocol write it.
-fn backend_name(backend: BackendKind) -> String {
+pub(crate) fn backend_name(backend: BackendKind) -> String {
     serde_json::to_value(backend)
         .ok()
         .and_then(|name| name.as_str().map(str::to_owned))
@@ -597,13 +640,14 @@ fn split_files(
 }
 
 /// What the reviewer said in one run.
-struct Answer {
-    text: String,
-    model: Option<String>,
+#[derive(Debug)]
+pub(crate) struct Answer {
+    pub(crate) text: String,
+    pub(crate) model: Option<String>,
 }
 
 /// Something that can run the reviewer once.
-trait Reviewer {
+pub(crate) trait Reviewer {
     /// Runs the reviewer. `hint` says what was wrong with the last answer, when there was one.
     async fn run(&mut self, hint: Option<String>) -> Result<Answer, CliError>;
 }
@@ -621,13 +665,17 @@ enum Handoff<'a> {
 struct Live<'a> {
     ctx: &'a Context,
     role: Role,
-    backend: BackendKind,
     cwd: &'a str,
     handoff: Handoff<'a>,
 }
 
-impl Reviewer for Live<'_> {
-    async fn run(&mut self, hint: Option<String>) -> Result<Answer, CliError> {
+impl Attempt for Live<'_> {
+    async fn attempt(
+        &mut self,
+        backend: BackendKind,
+        model: Option<&str>,
+        hint: Option<String>,
+    ) -> Result<Answer, CliError> {
         let hint = hint.as_deref();
         let request = match self.handoff {
             Handoff::File(path) => Request {
@@ -648,8 +696,19 @@ impl Reviewer for Live<'_> {
             err: &mut err,
             input: &mut input,
         };
-        run_reviewer(self.ctx, &mut quiet, self.backend, self.cwd, request).await
+        let on = Backend {
+            kind: backend,
+            model,
+        };
+        run_reviewer(self.ctx, &mut quiet, on, self.cwd, request).await
     }
+}
+
+/// The backend an agent runs on, and the model it is set to when there is one. Claude Code
+/// and Codex start on their own default model whatever is set here.
+struct Backend<'a> {
+    kind: BackendKind,
+    model: Option<&'a str>,
 }
 
 /// One run of an agent.
@@ -685,12 +744,16 @@ async fn until_usable(
 
 type PartResult = Result<(Parsed, Option<String>), CliError>;
 
-/// Reviews one part. A run that fails for any reason but a bad answer or an interrupt is
-/// tried once more, since a model or a connection can fail for a moment; an answer in the
-/// wrong shape has already had its retry.
+/// Reviews one part. A run that fails for any reason but a bad answer, an interrupt or a
+/// usage limit is tried once more, since a model or a connection can fail for a moment; an
+/// answer in the wrong shape has already had its retry, and a usage limit does not pass.
 async fn review_part(scope: &DiffScope, reviewer: &mut impl Reviewer) -> PartResult {
     match until_usable(scope, reviewer).await {
-        Err(error @ (CliError::ReviewOutput(_) | CliError::RunInterrupted)) => Err(error),
+        Err(
+            error @ (CliError::ReviewOutput(_)
+            | CliError::RunInterrupted
+            | CliError::BackendUnavailable(Unavailable::UsageLimit)),
+        ) => Err(error),
         Err(error) => {
             info!(step = "review", %error, "the run failed, trying the part once more");
             until_usable(scope, reviewer).await
@@ -703,7 +766,7 @@ async fn review_part(scope: &DiffScope, reviewer: &mut impl Reviewer) -> PartRes
 /// the parts.
 async fn review_parts<R: Reviewer>(
     parts: &[Packed],
-    mut reviewers: Vec<R>,
+    reviewers: &mut [R],
     concurrency: usize,
 ) -> Vec<PartResult> {
     let runs = parts
@@ -799,16 +862,16 @@ async fn check_findings(
     } else {
         None
     };
-    let mut live = Live {
+    let live = Live {
         ctx: at.ctx,
         role: Role::Verifier,
-        backend,
         cwd: at.cwd,
         handoff: match &file {
             Some(file) => Handoff::File(&file.relative[0]),
             None => Handoff::Prompt(&input),
         },
     };
+    let mut live = Failover::new(live, vec![backend], None, VERIFIER_LABEL.to_owned());
     let findings = std::mem::take(&mut merged.parsed.findings);
     let Applied { findings, dropped } =
         verify_findings(findings, at.config.review.verify_threshold, &mut live).await?;
@@ -823,14 +886,7 @@ async fn check_findings(
 /// enabled, so the second look does not come from the model that wrote the first. Otherwise
 /// the backend of the review.
 fn verifier_backend(config: &Config, reviewer: BackendKind) -> BackendKind {
-    let enabled = |key: &str| config.providers.get(key).is_some_and(|p| p.enabled);
-    match reviewer {
-        BackendKind::ClaudeCode if enabled(CODEX_KEY) => BackendKind::CodexAppServer,
-        BackendKind::CodexAppServer | BackendKind::CodexExec if enabled(CLAUDE_CODE_KEY) => {
-            BackendKind::ClaudeCode
-        }
-        _ => reviewer,
-    }
+    other_backend(config, reviewer).unwrap_or(reviewer)
 }
 
 /// Asks the verifier about `findings` once. A verifier that fails or answers in the wrong
@@ -900,7 +956,7 @@ fn collect(
 async fn run_reviewer(
     ctx: &Context,
     io: &mut Io<'_>,
-    backend: BackendKind,
+    on: Backend<'_>,
     cwd: &str,
     request: Request,
 ) -> Result<Answer, CliError> {
@@ -914,7 +970,11 @@ async fn run_reviewer(
         prompt,
         cwd: cwd.to_owned(),
         worktree: false,
-        backend: Some(backend),
+        backend: Some(on.kind),
+        model: on
+            .model
+            .filter(|_| on.kind.is_model_backend())
+            .map(str::to_owned),
         agent: direct.then(|| agent.to_owned()),
         mode: if direct { Mode::Plan } else { Mode::Default },
         max_turns: None,
@@ -922,7 +982,9 @@ async fn run_reviewer(
     };
     let mut reply: Option<String> = None;
     let mut streamed = String::new();
+    let mut limit_hit = false;
     let mut watch = |kind: &str, body: &Value| {
+        limit_hit |= kind == USAGE_LIMIT_KIND;
         if direct {
             if let Some(piece) = delta_text(kind, body) {
                 streamed.push_str(piece);
@@ -938,6 +1000,9 @@ async fn run_reviewer(
     let done = drive(ctx, io, false, job, &mut tap).await?;
     if was_cancelled(&done.finish) {
         return Err(CliError::RunInterrupted);
+    }
+    if let Some(reason) = unavailable_reason(limit_hit, &done.finish) {
+        return Err(CliError::BackendUnavailable(reason));
     }
     let ended_well = !done.finish.failed
         && done
@@ -1291,6 +1356,86 @@ mod tests {
         vec![part("a.txt"), part("b.txt")]
     }
 
+    /// A backend that fails with `error`, or answers when it has none, counting its asks.
+    struct Flaky {
+        error: Option<Unavailable>,
+        asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Attempt for Flaky {
+        fn attempt(
+            &mut self,
+            _: BackendKind,
+            _: Option<&str>,
+            _: Option<String>,
+        ) -> impl Future<Output = Result<Answer, CliError>> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(match self.error {
+                Some(why) => Err(CliError::BackendUnavailable(why)),
+                None => Ok(Answer {
+                    text: GOOD.to_owned(),
+                    model: None,
+                }),
+            })
+        }
+    }
+
+    fn only_claude(
+        error: Option<Unavailable>,
+    ) -> (
+        Failover<Flaky>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = Flaky {
+            error,
+            asked: std::sync::Arc::clone(&asked),
+        };
+        let part = Failover::new(backend, vec![BackendKind::ClaudeCode], None, String::new());
+        (part, asked)
+    }
+
+    #[tokio::test]
+    async fn a_part_with_no_backend_left_is_reported_failed_and_its_files_are_left_out() {
+        // Arrange
+        let parts = two_parts();
+        let (limited, _) = only_claude(Some(Unavailable::UsageLimit));
+        let (fine, _) = only_claude(None);
+        let mut reviewers = vec![limited, fine];
+        let results = review_parts(&parts, &mut reviewers, 2).await;
+        let given = vec!["a.txt".to_owned(), "b.txt".to_owned()];
+
+        // Act
+        let (merged, _) = merged_review(&parts, results, &given, 5).unwrap();
+
+        // Assert
+        assert!(merged.partial);
+        assert_eq!(merged.coverage.left_out, ["a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn a_usage_limit_is_not_retried_on_the_same_backend_but_a_lost_backend_is() {
+        // Arrange
+        let (mut limited, limited_asked) = only_claude(Some(Unavailable::UsageLimit));
+        let (mut lost, lost_asked) = only_claude(Some(Unavailable::Lost));
+
+        // Act
+        let limit_result = review_part(&packed().scope, &mut limited).await;
+        let lost_result = review_part(&packed().scope, &mut lost).await;
+
+        // Assert
+        assert!(matches!(
+            limit_result,
+            Err(CliError::BackendUnavailable(Unavailable::UsageLimit))
+        ));
+        assert!(matches!(
+            lost_result,
+            Err(CliError::BackendUnavailable(Unavailable::Lost))
+        ));
+        assert_eq!(limited_asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(lost_asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn a_run_that_fails_is_tried_once_more_and_only_once() {
         // Arrange
@@ -1407,7 +1552,7 @@ mod tests {
             let running = Arc::new(AtomicUsize::new(0));
             let most = Arc::new(AtomicUsize::new(0));
             let parts: Vec<Packed> = (0..5).map(|_| packed()).collect();
-            let reviewers = (0..5)
+            let mut reviewers: Vec<Counting> = (0..5)
                 .map(|_| Counting {
                     running: Arc::clone(&running),
                     most: Arc::clone(&most),
@@ -1415,7 +1560,7 @@ mod tests {
                 .collect();
 
             // Act
-            let results = review_parts(&parts, reviewers, limit).await;
+            let results = review_parts(&parts, &mut reviewers, limit).await;
 
             // Assert
             assert_eq!(results.len(), 5);
@@ -1428,13 +1573,13 @@ mod tests {
     async fn results_are_in_the_order_of_the_parts_whatever_finishes_first() {
         // Arrange
         let parts = two_parts();
-        let reviewers = vec![
+        let mut reviewers = vec![
             scripted(&[Err("first"), Err("first")]),
             scripted(&[Ok(GOOD)]),
         ];
 
         // Act
-        let results = review_parts(&parts, reviewers, 2).await;
+        let results = review_parts(&parts, &mut reviewers, 2).await;
 
         // Assert
         assert!(matches!(&results[0], Err(CliError::ReviewFailed(why)) if why == "first"));

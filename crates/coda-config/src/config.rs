@@ -15,7 +15,8 @@ use crate::loop_guard::{
 };
 use crate::review::{
     CHUNK_CONCURRENCY_KEY, DIFF_BUDGET_CHARS_KEY, MAX_CHUNKS_KEY, MAX_FINDINGS_KEY, REVIEW_KEY,
-    ReviewConfig, VERIFY_THRESHOLD_KEY, VERIFY_THRESHOLD_MAX,
+    ROUTING_MODEL_KEY, ROUTING_RULES_PATH, ReviewConfig, VERIFY_THRESHOLD_KEY,
+    VERIFY_THRESHOLD_MAX,
 };
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
@@ -549,6 +550,14 @@ impl Config {
                 path: format!("{REVIEW_KEY}.{CHUNK_CONCURRENCY_KEY}"),
                 allowed: "a whole number of chunks above 0".to_owned(),
             });
+        }
+        for (index, rule) in self.review.routing.rules.iter().enumerate() {
+            if rule.model.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{REVIEW_KEY}.{ROUTING_RULES_PATH}.{index}.{ROUTING_MODEL_KEY}"),
+                    allowed: "a model name that is not empty".to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -1191,6 +1200,41 @@ idle_timeout_ms = 1500
         assert!(
             matches!(&workers_err, ConfigError::InvalidValue { path, .. } if path == "review.chunk_concurrency"),
             "{workers_err}"
+        );
+    }
+
+    #[test]
+    fn review_routing_rules_are_read_in_order_and_fallback_is_on_by_default() {
+        // Arrange
+        let set = "[review.routing]\nfallback = false\n\
+            [[review.routing.rules]]\nmax_hunks = 3\nmodel = \"cheap\"\n\
+            [[review.routing.rules]]\nmodel = \"strong\"\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config;
+        let custom = Config::from_toml_str(set).unwrap().config;
+
+        // Assert
+        assert_eq!(default.review.routing.rules, []);
+        assert!(default.review.routing.fallback);
+        assert!(!custom.review.routing.fallback);
+        assert_eq!(custom.review.routing.rules.len(), 2);
+        assert_eq!(custom.review.routing.rules[0].max_hunks, Some(3));
+        assert_eq!(custom.review.routing.rules[1].model, "strong");
+    }
+
+    #[test]
+    fn a_review_routing_rule_with_an_empty_model_is_rejected() {
+        // Arrange
+        let text = "[[review.routing.rules]]\nmax_hunks = 3\nmodel = \"  \"\n";
+
+        // Act
+        let err = Config::from_toml_str(text).unwrap_err();
+
+        // Assert
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { path, .. } if path == "review.routing.rules.0.model"),
+            "{err}"
         );
     }
 

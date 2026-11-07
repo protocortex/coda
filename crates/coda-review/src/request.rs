@@ -424,6 +424,7 @@ pub fn assemble(
             chunks,
             partial,
             skipped_issues: Vec::new(),
+            fallbacks: Vec::new(),
         },
     }
 }

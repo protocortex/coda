@@ -17,6 +17,7 @@ mod review;
 mod review_issues;
 mod review_memory;
 mod review_post;
+mod review_route;
 mod run;
 mod session;
 mod status;

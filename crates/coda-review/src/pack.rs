@@ -11,9 +11,15 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use coda_config::review::PartSize;
+
 use crate::diff::{FileDiff, Hunk, LineKind, Status};
 use crate::ignore::IgnoreSet;
 use crate::schema::{Coverage, DiffScope};
+
+/// How the header of a hunk starts in the packed text. Every other line starts with a line
+/// number or a marker.
+const HUNK_HEADER_START: &str = "@@ ";
 
 /// Directory names whose contents are third-party code.
 pub const VENDORED_DIRS: [&str; 4] = ["vendor", "node_modules", "third_party", "Pods"];
@@ -76,6 +82,22 @@ pub struct Packed {
     pub coverage: Coverage,
     /// Every file left out, with the reason.
     pub omitted: Vec<Omitted>,
+}
+
+impl Packed {
+    /// How big this part is, for choosing the model that reviews it.
+    #[must_use]
+    pub fn size(&self) -> PartSize {
+        PartSize {
+            hunks: self
+                .text
+                .lines()
+                .filter(|line| line.starts_with(HUNK_HEADER_START))
+                .count(),
+            files: self.coverage.reviewed.len() + self.coverage.clipped.len(),
+            chars: self.text.chars().count(),
+        }
+    }
 }
 
 /// The extension that most of `paths` have, ties going to the first in alphabetical order.
@@ -1120,5 +1142,40 @@ diff --git a/f.txt b/f.txt
         );
         assert!(packed.scope.contains("f.txt", 8, 14));
         assert!(!packed.scope.contains("f.txt", 15, 15));
+    }
+
+    #[test]
+    fn the_size_of_a_part_counts_hunks_files_and_characters() {
+        // Arrange
+        let text = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,3 @@
+ l1
++new
+ l2
+@@ -20,2 +21,3 @@
+ l20
++more
+ l21
+diff --git a/b.txt b/b.txt
+--- a/b.txt
++++ b/b.txt
+@@ -1,1 +1,2 @@
+ x
++y
+";
+        let files = parse_diff(text);
+        let ignore = no_ignore();
+
+        // Act
+        let packed = pack(&files, opts(&ignore, 10_000, None));
+        let size = packed.size();
+
+        // Assert
+        assert_eq!(size.hunks, 3);
+        assert_eq!(size.files, 2);
+        assert_eq!(size.chars, packed.text.chars().count());
     }
 }

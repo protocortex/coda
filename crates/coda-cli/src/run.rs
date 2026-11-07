@@ -122,6 +122,7 @@ pub async fn run(
         cwd,
         worktree: args.worktree,
         backend: None,
+        model: None,
         agent: None,
         mode: args.mode.into(),
         max_turns: args.max_turns,
@@ -143,6 +144,8 @@ pub(crate) struct Job {
     pub(crate) worktree: bool,
     /// The backend to use; the config picks one when absent.
     pub(crate) backend: Option<BackendKind>,
+    /// The model the session starts on; the backend's own default when absent.
+    pub(crate) model: Option<String>,
     /// A named agent to run the prompt, which the daemon allows on delegated
     /// backends in plan mode; the session's own agent runs it when absent.
     pub(crate) agent: Option<String>,
@@ -179,6 +182,7 @@ pub(crate) async fn drive(
         cwd,
         worktree,
         backend: chosen,
+        model: chosen_model,
         agent,
         mode,
         max_turns,
@@ -197,7 +201,7 @@ pub(crate) async fn drive(
             &SessionCreateParams {
                 backend,
                 cwd,
-                model: None,
+                model: chosen_model,
                 mode,
             },
         )
