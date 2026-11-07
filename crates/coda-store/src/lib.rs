@@ -14,6 +14,7 @@ pub mod migrate;
 mod originals;
 mod pending;
 mod readers;
+mod review_memory;
 mod rollback;
 mod savings;
 mod sessions;
@@ -29,6 +30,7 @@ pub use index::{IndexStatus, IndexedFileState, Symbol};
 pub use originals::{MAX_ORIGINAL_BYTES, MAX_SESSION_ORIGINAL_BYTES};
 pub use pending::{NewPending, PendingPermission};
 pub use readers::{RepoIndex, SessionOriginals};
+pub use review_memory::{FindingStatus, MemoryFinding, ReviewRunRecord, StoredFinding};
 pub use savings::SavingRecord;
 pub use sessions::{NewSession, SessionFilter, SessionRecord, SessionSummary};
 pub use usage::{UsageRecord, UsageSummary};
@@ -46,7 +48,7 @@ use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Release of this binary, recorded in the database each time it opens it.
 pub const BINARY_RELEASE: &str = env!("CARGO_PKG_VERSION");

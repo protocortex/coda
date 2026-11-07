@@ -133,6 +133,8 @@ pub fn merge(global: &ReviewConfig, repo: Option<&ReviewConfig>) -> ReviewConfig
         verify_threshold: global.verify_threshold,
         guidance_lines: global.guidance_lines,
         linked_repos: global.linked_repos.clone(),
+        incremental_min_commits: global.incremental_min_commits,
+        incremental_min_minutes: global.incremental_min_minutes,
         extra_instructions: [
             global.extra_instructions.trim(),
             repo.extra_instructions.trim(),

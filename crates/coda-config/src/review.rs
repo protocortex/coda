@@ -39,6 +39,11 @@ pub const VERIFY_THRESHOLD_MAX: u8 = 10;
 /// does not say.
 pub const DEFAULT_GUIDANCE_LINES: usize = 500;
 
+/// Commits an incremental review needs when the file does not say.
+pub const DEFAULT_INCREMENTAL_MIN_COMMITS: usize = 1;
+/// Minutes an incremental review waits after the last run when the file does not say.
+pub const DEFAULT_INCREMENTAL_MIN_MINUTES: u64 = 0;
+
 /// The `[review]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -61,6 +66,11 @@ pub struct ReviewConfig {
     /// the default branch, that go in the reviewer's prompt as project rules. Zero leaves
     /// them out.
     pub guidance_lines: usize,
+    /// An incremental run (`coda review --incremental`) does nothing unless at least this
+    /// many commits came after the last reviewed one.
+    pub incremental_min_commits: usize,
+    /// An incremental run does nothing until this many minutes passed since the last run.
+    pub incremental_min_minutes: u64,
     /// Instructions added to every review's prompt, after the project rules.
     pub extra_instructions: String,
     /// Repositories (`org/repo`) whose issues a pull request may link to and have read
@@ -82,6 +92,8 @@ impl Default for ReviewConfig {
             verify: true,
             verify_threshold: DEFAULT_VERIFY_THRESHOLD,
             guidance_lines: DEFAULT_GUIDANCE_LINES,
+            incremental_min_commits: DEFAULT_INCREMENTAL_MIN_COMMITS,
+            incremental_min_minutes: DEFAULT_INCREMENTAL_MIN_MINUTES,
             extra_instructions: String::new(),
             linked_repos: Vec::new(),
             ignore: ReviewIgnore::default(),

@@ -117,9 +117,7 @@ pub async fn run(
         notice(io, args.json, NOTHING_LEFT)?;
         return Ok(ExitCode::SUCCESS);
     }
-    if config.review.guidance_lines > 0 && default_branch_ref(repo).is_none() {
-        writeln!(io.err, "coda: {NO_DEFAULT_BRANCH_NOTE}")?;
-    }
+    note_missing_default_branch(io, &config.review, repo)?;
     let rules_text = read_guidance(&config.review, repo)?;
     let linked = linked_issues(repo, target.as_ref(), &config.review);
     let issues_text = prompt_section(&linked.issues);
@@ -128,6 +126,7 @@ pub async fn run(
         standing: Some(&rules.extra_instructions),
         run: args.instructions.as_deref(),
         issues: Some(&issues_text),
+        earlier: None,
     };
     let inputs: Vec<String> = parts
         .iter()
@@ -321,6 +320,18 @@ fn load_rules(config: &ReviewConfig, repo: &Path) -> Result<Rules, CliError> {
         None => Rules::compile(config),
     };
     rules.map_err(|e| CliError::ReviewInput(e.to_string()))
+}
+
+/// Says on standard error that no project rules can be read, when they are wanted.
+fn note_missing_default_branch(
+    io: &mut Io<'_>,
+    config: &ReviewConfig,
+    repo: &Path,
+) -> Result<(), CliError> {
+    if config.guidance_lines > 0 && default_branch_ref(repo).is_none() {
+        writeln!(io.err, "coda: {NO_DEFAULT_BRANCH_NOTE}")?;
+    }
+    Ok(())
 }
 
 /// The project rules of the repository, read from its default branch only. Empty when the

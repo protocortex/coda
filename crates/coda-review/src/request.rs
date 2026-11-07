@@ -257,6 +257,9 @@ pub struct Extras<'a> {
     /// The linked issues, as [`crate::issues::prompt_section`] wrote them. Their text is
     /// data written by other people.
     pub issues: Option<&'a str>,
+    /// What earlier runs on this pull request found, as [`crate::memory::prompt_section`]
+    /// wrote it.
+    pub earlier: Option<&'a str>,
 }
 
 fn present(text: Option<&str>) -> Option<&str> {
@@ -298,6 +301,10 @@ pub fn input_text(
         out.push_str("\n\n");
     }
     if let Some(text) = present(extras.issues) {
+        out.push_str(text);
+        out.push('\n');
+    }
+    if let Some(text) = present(extras.earlier) {
         out.push_str(text);
         out.push('\n');
     }
@@ -561,6 +568,7 @@ mod tests {
                 standing: Some(" "),
                 run: Some("  \n"),
                 issues: Some(" "),
+                earlier: Some(" "),
             },
             5,
             None,
@@ -580,6 +588,7 @@ mod tests {
             standing: Some("always check locks"),
             run: Some("look at the parser"),
             issues: None,
+            earlier: None,
         };
 
         // Act
