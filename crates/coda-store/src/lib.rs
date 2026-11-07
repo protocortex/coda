@@ -32,7 +32,9 @@ pub use pending::{NewPending, PendingPermission};
 pub use readers::{RepoIndex, SessionOriginals};
 pub use review_memory::{FindingStatus, MemoryFinding, ReviewRunRecord, StoredFinding};
 pub use savings::SavingRecord;
-pub use sessions::{NewSession, SessionFilter, SessionRecord, SessionSummary, SessionWorktree};
+pub use sessions::{
+    NewSession, SessionFilter, SessionRecord, SessionSummary, SessionWorktree, WorktreeSession,
+};
 pub use usage::{UsageRecord, UsageSummary};
 
 use std::fs::{self, DirBuilder, OpenOptions};

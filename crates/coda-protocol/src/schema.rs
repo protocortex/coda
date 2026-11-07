@@ -68,6 +68,7 @@ fn add_account_and_daemon_methods(
 /// `methods` map keyed by method name with its params and result, and the
 /// `event` schema.
 #[must_use]
+#[allow(clippy::too_many_lines, reason = "one registration per method")]
 pub fn protocol_schema() -> Value {
     let mut generator = SchemaGenerator::new(SchemaSettings::draft2020_12());
     let mut methods = Map::new();
@@ -121,6 +122,11 @@ pub fn protocol_schema() -> Value {
         &mut generator,
         &mut methods,
         m::SESSION_WORKTREE,
+    );
+    add_method::<m::WorktreeCleanParams, m::WorktreeCleanResult>(
+        &mut generator,
+        &mut methods,
+        m::WORKTREE_CLEAN,
     );
     add_method::<m::PermissionRespondParams, m::PermissionRespondResult>(
         &mut generator,

@@ -56,6 +56,16 @@ pub struct SessionWorktree {
     pub repo: String,
 }
 
+/// A session's worktree and when the session was last active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSession {
+    pub session: SessionId,
+    pub worktree: SessionWorktree,
+    /// Time of the last event, or the creation time when there is none, in
+    /// milliseconds since the Unix epoch.
+    pub updated_at: i64,
+}
+
 const SESSION_COLUMNS: &str = "id, backend, model, cwd, mode, created_at";
 
 /// Session ids are the decimal form of the row id.
@@ -262,17 +272,27 @@ impl Store {
             .optional()?)
     }
 
-    /// Every worktree coda made, with its session, oldest session first.
+    /// Every worktree coda made, with its session and the time of its last
+    /// activity, oldest session first.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Sqlite`] when the query fails.
-    pub fn session_worktrees(&self) -> Result<Vec<(SessionId, SessionWorktree)>, StoreError> {
+    pub fn worktree_sessions(&self) -> Result<Vec<WorktreeSession>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT worktree_path, branch, worktree_repo, id FROM sessions \
-             WHERE worktree_path IS NOT NULL ORDER BY id",
+            "SELECT s.worktree_path, s.branch, s.worktree_repo, s.id, \
+                    COALESCE((SELECT MAX(e.at) FROM events e \
+                              JOIN turns t ON t.id = e.turn_id \
+                              WHERE t.session_id = s.id), s.created_at) \
+             FROM sessions s WHERE s.worktree_path IS NOT NULL ORDER BY s.id",
         )?;
-        let rows = stmt.query_map([], |row| Ok((session_id(row.get(3)?), read_worktree(row)?)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(WorktreeSession {
+                worktree: read_worktree(row)?,
+                session: session_id(row.get(3)?),
+                updated_at: row.get(4)?,
+            })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 

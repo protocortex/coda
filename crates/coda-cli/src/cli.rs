@@ -54,6 +54,9 @@ pub enum Command {
     /// 0, 64 for bad usage, or 70 when they fail.
     #[command(subcommand)]
     Session(SessionCommand),
+    /// Report and clean up the worktrees coda made for sessions.
+    #[command(subcommand)]
+    Worktree(WorktreeCommand),
     /// Manage standing permission grants.
     #[command(subcommand)]
     Grant(GrantCommand),
@@ -102,6 +105,24 @@ pub enum SessionCommand {
     Show(SessionShowArgs),
     /// Put the files back as an earlier turn left them and roll the later turns back.
     Rewind(SessionRewindArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorktreeCommand {
+    /// List the worktrees coda made and what cleanup would do with each; with
+    /// --apply, remove the ones that are no longer needed.
+    Clean(WorktreeCleanArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WorktreeCleanArgs {
+    /// Remove what the report marks for removal. Needs `[worktree.cleanup]
+    /// enabled = true`. Without it nothing changes.
+    #[arg(long)]
+    pub apply: bool,
+    /// Print the report as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

@@ -35,6 +35,8 @@ pub const SESSION_CLOSE: &str = "session.close";
 pub const SESSION_REWIND: &str = "session.rewind";
 /// Moves a session that has not started into a git worktree made for it.
 pub const SESSION_WORKTREE: &str = "session.worktree";
+/// Reports, and with `apply` removes, the git worktrees coda made that are no longer needed.
+pub const WORKTREE_CLEAN: &str = "worktree.clean";
 /// Lists stored sessions, without their content.
 pub const SESSION_LIST: &str = "session.list";
 /// Answers a pending permission request.
@@ -69,6 +71,7 @@ pub const METHODS: &[&str] = &[
     SESSION_CLOSE,
     SESSION_REWIND,
     SESSION_WORKTREE,
+    WORKTREE_CLEAN,
     PERMISSION_RESPOND,
     GRANT_ADD,
     USAGE_SUMMARY,
@@ -298,6 +301,70 @@ pub struct SessionWorktreeResult {
     pub session: SessionInfo,
     /// The branch coda made for the worktree.
     pub branch: String,
+}
+
+/// Parameters of [`WORKTREE_CLEAN`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorktreeCleanParams {
+    /// Remove what the report lists for removal. Without it nothing changes and
+    /// the result only says what would go. The daemon refuses it while
+    /// `[worktree.cleanup] enabled` is off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub apply: bool,
+}
+
+/// What cleanup decided about one worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanVerdict {
+    /// The worktree can be removed.
+    Remove,
+    /// The worktree stays; the reason says why.
+    Keep,
+    /// The folder is already gone; nothing to do.
+    Gone,
+}
+
+/// One worktree coda made, as cleanup saw it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CleanWorktree {
+    /// The session the worktree belongs to.
+    pub session_id: SessionId,
+    /// The worktree folder.
+    pub path: String,
+    /// The branch coda made for it.
+    pub branch: String,
+    /// Bytes the folder holds, counting what `.gitignore` excludes.
+    pub bytes: u64,
+    /// What cleanup decided.
+    pub verdict: CleanVerdict,
+    /// Why, in words.
+    pub reason: String,
+    /// Whether this call removed it.
+    pub removed: bool,
+    /// Why a removal that was tried did not happen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A folder in the managed folder that no session owns. It is never removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UnknownFolder {
+    /// The folder.
+    pub path: String,
+    /// Bytes it holds.
+    pub bytes: u64,
+}
+
+/// Result of [`WORKTREE_CLEAN`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorktreeCleanResult {
+    /// Whether removals were allowed and tried in this call.
+    pub applied: bool,
+    /// Every worktree coda made.
+    pub worktrees: Vec<CleanWorktree>,
+    /// Folders in the managed folder that coda did not make.
+    pub unknown: Vec<UnknownFolder>,
 }
 
 /// Parameters of [`SESSION_SUBSCRIBE`].
@@ -602,6 +669,7 @@ mod tests {
             (SESSION_CLOSE, "session.close"),
             (SESSION_REWIND, "session.rewind"),
             (SESSION_WORKTREE, "session.worktree"),
+            (WORKTREE_CLEAN, "worktree.clean"),
             (PERMISSION_RESPOND, "permission.respond"),
             (GRANT_ADD, "grant.add"),
             (USAGE_SUMMARY, "usage.summary"),

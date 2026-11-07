@@ -340,6 +340,18 @@ A key the schema does not know in a hook entry is an error, so a misspelled `blo
 
 If a worktree folder is removed and the session is resumed or sent to again, the daemon puts the folder back from the session's branch, or from `HEAD` when the branch is gone, and runs `setup` again. It only does this at the path it computes from the session id under the managed folder, so a recorded path elsewhere is refused. It also refuses when the branch is checked out in another folder, so it never takes over a branch someone else is using. When `setup` fails on a put-back, the folder is removed again (the branch and its commits stay) so the next request tries again.
 
+## `[worktree.cleanup]`
+
+`coda worktree clean` lists every worktree coda made, with its size and what cleanup would do with it, and changes nothing. `coda worktree clean --apply` removes the ones marked for removal, and it only works while `enabled` is `true`. Cleanup is off by default, and nothing runs on its own: you run the command. Keys come from this file only.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Whether `coda worktree clean --apply` may remove anything. The report is always available. |
+| `idle_days` | integer | `14` | A worktree whose session has been idle this many days can be removed. Must not be zero. |
+| `clean_command` | array of strings | `[]` | A program and its arguments, run in a worktree just before it is removed, for example `["cargo", "clean"]`. No shell. It is killed after 10 minutes. When it fails, the worktree stays. |
+
+A worktree can be removed when a pull request is merged that ended at the commit the branch is at now (found with `gh pr list`; without `gh` or a login this never applies, and new commits after the merge keep the worktree), when its branch has no commits past the default branch, or when its session has been idle for `idle_days`. Coda keeps a worktree that has uncommitted changes (untracked files count), one whose session has a running turn or was active in the last hour, and one that git does not list as a worktree of the recorded repository at the folder coda made for that session. Files that `.gitignore` excludes are in no commit, so after `clean_command` runs, a worktree that still holds any (an `.env` file, a build folder the command did not clear) is kept and the report names some of them. Removal uses `git worktree remove` without `--force`, and coda checks again, holding the worktree lock, that no turn started. Coda deletes the branch only when the pull request is merged or the branch adds nothing, so an idle worktree's commits stay on their branch and the session can bring the folder back. A user's own worktrees and branches are never removed, even inside the managed folder. Folders in the managed folder that no session owns are listed as unknown, with their sizes, and are never touched. The default branch is `origin/HEAD`, else `main`, else `master`.
+
 ## `[checks.<extension>]`
 
 A check is a command coda runs after the model changes a file, so the model sees what it broke in the same tool result and can fix it at once. It runs in model-API sessions (`anthropic`, `openai_compat`, `faux`) after a successful `edit`, `write` or `multi_edit`, for files with the extension named in the table, for example `[checks.rs]`. The extension has no dot and is matched without regard to case. Nothing runs for an extension with no table, and there are no checks unless you add them. Checks come from this file only. A project file or a definition file cannot add one.
@@ -375,6 +387,11 @@ notify = "osc777"
 [worktree]
 dir = "/home/me/coda-worktrees"
 setup = ["npm", "install"]
+
+[worktree.cleanup]
+enabled = true
+idle_days = 7
+clean_command = ["cargo", "clean"]
 
 [permissions]
 mode = "accept-edits"

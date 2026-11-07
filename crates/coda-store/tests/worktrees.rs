@@ -101,8 +101,14 @@ fn every_worktree_is_listed_with_its_session() {
     store.set_session_worktree(&session, &worktree()).unwrap();
 
     // Act
-    let all = store.session_worktrees().unwrap();
+    let all = store.worktree_sessions().unwrap();
 
     // Assert
-    assert_eq!(all, vec![(session, worktree())]);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].session, session);
+    assert_eq!(all[0].worktree, worktree());
+    assert_eq!(
+        all[0].updated_at,
+        store.load_session(&session).unwrap().created_at
+    );
 }

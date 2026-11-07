@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::{fs, io};
 
+use coda_config::worktree::CleanupConfig;
 use coda_protocol::types::SessionId;
 use coda_selfhost::process::{ProcessError, run_bounded};
 use coda_store::SessionWorktree;
@@ -69,6 +70,7 @@ pub enum WorktreeError {
 pub struct Worktrees {
     root: PathBuf,
     setup: Vec<String>,
+    cleanup: CleanupConfig,
     /// One git change at a time, so two requests cannot race on one path.
     busy: Mutex<()>,
 }
@@ -81,8 +83,29 @@ impl Worktrees {
         Self {
             root,
             setup,
+            cleanup: CleanupConfig::default(),
             busy: Mutex::new(()),
         }
+    }
+
+    /// Sets when `coda worktree clean` may remove worktrees.
+    #[must_use]
+    pub fn with_cleanup(mut self, cleanup: CleanupConfig) -> Self {
+        self.cleanup = cleanup;
+        self
+    }
+
+    /// When worktrees may be removed again.
+    #[must_use]
+    pub fn cleanup(&self) -> &CleanupConfig {
+        &self.cleanup
+    }
+
+    /// Holds off every other worktree change until the guard is dropped.
+    pub(crate) fn exclusive(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The folder every worktree lives in.
@@ -289,7 +312,7 @@ fn checked_out_elsewhere(
 
 /// Whether two paths name one folder, even when it no longer exists, by
 /// resolving the parents, which do.
-fn same_folder(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_folder(a: &Path, b: &Path) -> bool {
     let resolve = |path: &Path| {
         let parent = path.parent().and_then(|dir| fs::canonicalize(dir).ok())?;
         Some(parent.join(path.file_name()?))
@@ -333,7 +356,7 @@ fn set_owner_only(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(OWNER_ONLY_MODE))
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
     let mut command = Command::new("git");
     command.args(args).current_dir(cwd);
     for name in INHERITED_GIT_VARIABLES {
