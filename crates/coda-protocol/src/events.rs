@@ -122,6 +122,27 @@ pub struct GuardLimitBody {
     pub attempts: u32,
 }
 
+/// Stored event kind of a tool call that was repaired or read from reply text.
+/// The body is a [`CallRecoveredBody`]; clients show it to the user.
+pub const CALL_RECOVERED_KIND: &str = "call_recovered";
+
+/// The `how` of a `call_recovered` event whose arguments were repaired.
+pub const CALL_REPAIRED: &str = "repaired";
+/// The `how` of a `call_recovered` event whose call was read from reply text.
+pub const CALL_FROM_TEXT: &str = "from_text";
+
+/// The body of a stored `call_recovered` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRecoveredBody {
+    /// The call, by its id in the conversation.
+    pub call_id: String,
+    /// The tool the call is for.
+    pub tool: String,
+    /// What was done: `repaired` (its arguments were fixed) or `from_text` (it
+    /// was read from the text of a reply).
+    pub how: String,
+}
+
 /// One rate-limit window of a provider plan, such as `five_hour` or `seven_day`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RateLimitWindow {

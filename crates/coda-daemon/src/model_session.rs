@@ -27,8 +27,9 @@ use coda_core::tools::{
 };
 use coda_core::turn::{CancelToken, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{
-    Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, GuardContinueBody, GuardLimitBody,
-    HOOK_BLOCKED_KIND, HookBlockedBody, TIMEOUT_KIND, ToolCallStatus, tool_summary,
+    CALL_RECOVERED_KIND, CallRecoveredBody, Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND,
+    GuardContinueBody, GuardLimitBody, HOOK_BLOCKED_KIND, HookBlockedBody, TIMEOUT_KIND,
+    ToolCallStatus, tool_summary,
 };
 use coda_protocol::types::{
     BackendKind, OriginalId, PermissionDecision, SessionId, TokenUsage, TurnId,
@@ -36,7 +37,7 @@ use coda_protocol::types::{
 use coda_providers::faux::{FauxError, FauxProvider};
 use coda_providers::model::{ModelProvider, ModelRequest, ModelStream, ProviderError};
 use coda_providers::registry::{
-    ANTHROPIC_KEY, ModelClient, ModelRegistry, OPENAI_COMPAT_KEY, RegistryError,
+    ANTHROPIC_KEY, ModelClient, ModelRegistry, OPENAI_COMPAT_KEY, RegistryError, provider_key,
 };
 use coda_store::{EventRecord, SessionRecord, StoreError};
 use coda_tools::bash::{DEFAULT_ENV_ALLOWLIST, allowlisted_env};
@@ -759,7 +760,8 @@ impl ModelSessions {
                 },
             )
             .with_used_tokens(used)
-            .with_resumed(session_started);
+            .with_resumed(session_started)
+            .with_text_tool_calls(self.text_tool_calls(record));
         Ok(ModelLoop {
             turn_loop,
             events,
@@ -768,6 +770,14 @@ impl ModelSessions {
             offer,
             problems,
         })
+    }
+
+    /// Whether the provider that serves `record` is set to read a call from a
+    /// reply's text.
+    fn text_tool_calls(&self, record: &SessionRecord) -> bool {
+        provider_key(record.backend)
+            .and_then(|key| self.config.providers.get(key))
+            .is_some_and(|section| section.text_tool_calls)
     }
 
     /// The named steps of a running send: drive the loop while storing its
@@ -946,6 +956,14 @@ async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Ro
         TurnEvent::ContextOverflow => Row::Stored {
             kind: CONTEXT_OVERFLOW_KIND,
             body: json!({}),
+        },
+        TurnEvent::CallRecovered { call_id, tool, how } => Row::Stored {
+            kind: CALL_RECOVERED_KIND,
+            body: json!(CallRecoveredBody {
+                call_id: call_id.clone(),
+                tool: tool.clone(),
+                how: how.as_str().to_owned()
+            }),
         },
         TurnEvent::Text(_)
         | TurnEvent::Usage(_)
@@ -1134,7 +1152,8 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
         // Stored above, as plain rows.
         TurnEvent::Assistant { .. }
         | TurnEvent::ToolFinished { .. }
-        | TurnEvent::ContextOverflow => return,
+        | TurnEvent::ContextOverflow
+        | TurnEvent::CallRecovered { .. } => return,
     };
     log_failure(stored);
 }

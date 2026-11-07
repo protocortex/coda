@@ -9,8 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use coda_client::{Client, ClientError, Subscription};
 use coda_config::timing::Timing;
 use coda_protocol::events::{
-    EVENT_NOTIFICATION, Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, GuardContinueBody,
-    GuardLimitBody, HOOK_BLOCKED_KIND, HookBlockedBody,
+    CALL_FROM_TEXT, CALL_RECOVERED_KIND, CALL_REPAIRED, CallRecoveredBody, EVENT_NOTIFICATION,
+    Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, GuardContinueBody, GuardLimitBody,
+    HOOK_BLOCKED_KIND, HookBlockedBody,
 };
 use coda_protocol::jsonrpc::Notification;
 use coda_protocol::methods::{
@@ -111,10 +112,10 @@ pub fn hook_blocked_from_params(params: &Value) -> Option<String> {
     Some(format!("The turn did not start. {reason}"))
 }
 
-/// Reads a stored `guard_continue` or `guard_limit` notification as a notice
-/// that says why the turn went on or stopped; other kinds give `None`.
+/// Reads a stored `guard_continue`, `guard_limit` or `call_recovered` notification as a notice
+/// that says why the turn went on or stopped, or what was recovered; other kinds give `None`.
 #[must_use]
-pub fn guard_notice_from_params(params: &Value) -> Option<String> {
+pub fn turn_notice_from_params(params: &Value) -> Option<String> {
     let body = params.get("body")?.as_str()?;
     match params.get("kind")?.as_str()? {
         GUARD_CONTINUE_KIND => {
@@ -132,6 +133,17 @@ pub fn guard_notice_from_params(params: &Value) -> Option<String> {
                 "The turn ended: an end_turn hook still asked for more work after {} tries. {said}",
                 guard.attempts
             ))
+        }
+        CALL_RECOVERED_KIND => {
+            let call: CallRecoveredBody = serde_json::from_str(body).ok()?;
+            let tool = sanitize_line(&call.tool);
+            match call.how.as_str() {
+                CALL_FROM_TEXT => Some(format!(
+                    "Read a call to {tool} from the model's reply text."
+                )),
+                CALL_REPAIRED => Some(format!("Repaired the arguments of a call to {tool}.")),
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -628,7 +640,7 @@ impl Link {
                 if let Some(text) = user_message_from_params(params) {
                     self.tell(LinkEvent::UserMessage(text));
                 } else if let Some(notice) =
-                    hook_blocked_from_params(params).or_else(|| guard_notice_from_params(params))
+                    hook_blocked_from_params(params).or_else(|| turn_notice_from_params(params))
                 {
                     self.tell(LinkEvent::Notice(notice));
                 } else if let Some(event) = event_from_params(params) {
@@ -858,15 +870,39 @@ mod tests {
         let other = json!({"kind": "result", "body": "{}"});
 
         // Act
-        let first = guard_notice_from_params(&continued).unwrap();
-        let second = guard_notice_from_params(&limit).unwrap();
+        let first = turn_notice_from_params(&continued).unwrap();
+        let second = turn_notice_from_params(&limit).unwrap();
 
         // Assert
         assert!(first.contains("back to work (1): run the tests"), "{first}");
         assert!(!first.chars().any(char::is_control), "{first:?}");
         assert!(second.contains("after 2 tries"), "{second}");
         assert!(second.contains("still failing"), "{second}");
-        assert_eq!(guard_notice_from_params(&other), None);
+        assert_eq!(turn_notice_from_params(&other), None);
+    }
+
+    #[test]
+    fn a_recovered_call_becomes_a_notice_for_each_way_it_was_recovered() {
+        // Arrange
+        let notification = |how: &str| {
+            json!({
+                "kind": CALL_RECOVERED_KIND,
+                "body": json!(CallRecoveredBody {
+                    call_id: "c1".to_owned(),
+                    tool: "read".to_owned(),
+                    how: how.to_owned()
+                })
+                .to_string()
+            })
+        };
+
+        // Act
+        let repaired = turn_notice_from_params(&notification("repaired")).unwrap();
+        let text = turn_notice_from_params(&notification("from_text")).unwrap();
+
+        // Assert
+        assert_eq!(repaired, "Repaired the arguments of a call to read.");
+        assert_eq!(text, "Read a call to read from the model's reply text.");
     }
 
     #[test]

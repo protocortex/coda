@@ -7,8 +7,8 @@ use std::path::Path;
 
 use coda_config::hooks::{HookConfig, HookEvent};
 use coda_protocol::events::{
-    GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, GuardContinueBody, GuardLimitBody, HOOK_BLOCKED_KIND,
-    HookBlockedBody,
+    CALL_RECOVERED_KIND, CallRecoveredBody, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND,
+    GuardContinueBody, GuardLimitBody, HOOK_BLOCKED_KIND, HookBlockedBody,
 };
 use coda_protocol::types::Mode;
 use serde_json::{Value, json};
@@ -514,4 +514,33 @@ async fn an_end_turn_guard_stores_why_the_turn_went_on_and_why_it_stopped() {
     assert_eq!(limit.attempts, 2);
     let stopped = rig.bodies("turn_stopped").await;
     assert_eq!(stopped[0]["condition"], "guard_limit");
+}
+
+#[tokio::test]
+async fn a_call_read_from_reply_text_runs_only_where_the_provider_allows_it_and_is_stored() {
+    // Arrange
+    let text_call = r#"{"name": "read", "arguments": {"path": "a.txt"}}"#;
+    let script = [text_turn(text_call), text_turn("done")];
+    let mut allowed = Rig::custom(Mode::Default, &script, true, None, |config| {
+        config.providers.get_mut("faux").unwrap().text_tool_calls = true;
+    });
+    let mut refused = Rig::custom(Mode::Default, &script, true, None, |_| {});
+
+    // Act
+    for rig in [&mut allowed, &mut refused] {
+        rig.send("go").await;
+        rig.wait_for("result").await;
+        rig.wait_until_idle().await;
+    }
+
+    // Assert
+    let recovered = allowed.bodies(CALL_RECOVERED_KIND).await;
+    let body: CallRecoveredBody = serde_json::from_value(recovered[0].clone()).unwrap();
+    assert_eq!(
+        (body.tool.as_str(), body.how.as_str()),
+        ("read", "from_text")
+    );
+    assert_eq!(allowed.bodies("tool_finished").await.len(), 1);
+    assert_eq!(refused.bodies(CALL_RECOVERED_KIND).await.len(), 0);
+    assert_eq!(refused.bodies("tool_finished").await.len(), 0);
 }

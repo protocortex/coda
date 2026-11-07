@@ -156,7 +156,8 @@ pub async fn run<P: ModelProvider + Send + Sync>(fixture: &Fixture, provider: P)
         },
         sender,
     )
-    .with_hooks(guard_hooks(fixture));
+    .with_hooks(guard_hooks(fixture))
+    .with_text_tool_calls(fixture.text_calls);
 
     let sent = lp.send(fixture.prompt).await;
     let (turns, usage_tokens, tool_errors) = count_events(&mut receiver);
