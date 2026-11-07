@@ -7,6 +7,7 @@
 //! inside `spawn_blocking`. Every path a tool touches goes through
 //! [`sandbox::Sandbox`].
 
+pub mod ask;
 pub mod bash;
 pub mod code;
 pub mod edit;

@@ -550,6 +550,9 @@ async fn deny(client: &Client, params: Value) -> Result<(), CliError> {
         session_id: request.session_id,
         request_id: request.request_id,
         decision: PermissionDecision::Deny,
+        choice: None,
+        // Nobody can answer here, and a question is told so.
+        no_terminal: true,
     };
     let _: PermissionRespondResult = client.request(PERMISSION_RESPOND, &answer).await?;
     Ok(())

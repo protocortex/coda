@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use coda_protocol::codec::{CodecError, encode_message};
 use coda_protocol::events::EVENT_NOTIFICATION;
+use coda_protocol::events::{ASK_TOOL, AskPrompt};
 use coda_protocol::jsonrpc::{Message, Notification, Version};
 use coda_protocol::methods::PermissionRequestParams;
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
@@ -106,14 +107,38 @@ fn event_frame(session: &SessionId, seq: u64, record: &EventRecord) -> Result<Ve
 }
 
 fn pending_frame(pending: &PendingPermission) -> Result<Vec<u8>, HubError> {
-    permission_frame(&PermissionRequestParams {
+    permission_frame(&request_params(
+        &pending.id,
+        &NewPending {
+            session: pending.session.clone(),
+            tool: pending.tool.clone(),
+            repo_path: pending.repo_path.clone(),
+            command: pending.command.clone(),
+            agent: pending.agent.clone(),
+        },
+    ))
+}
+
+/// The request a client is shown for `pending`. A question the model asked is
+/// kept as one text in `command`; the client gets it split into the question
+/// and its options.
+fn request_params(request: &RequestId, pending: &NewPending) -> PermissionRequestParams {
+    let asked = (pending.tool == ASK_TOOL)
+        .then(|| AskPrompt::decode(&pending.command))
+        .flatten();
+    let (command, options) = match asked {
+        Some(prompt) => (prompt.question, prompt.options),
+        None => (pending.command.clone(), Vec::new()),
+    };
+    PermissionRequestParams {
         session_id: pending.session.clone(),
-        request_id: pending.id.clone(),
+        request_id: request.clone(),
         tool: pending.tool.clone(),
         repo_path: pending.repo_path.clone(),
-        command: pending.command.clone(),
+        command,
         agent: pending.agent.clone(),
-    })
+        options,
+    }
 }
 
 fn permission_frame(params: &PermissionRequestParams) -> Result<Vec<u8>, HubError> {
@@ -232,15 +257,7 @@ impl Hub {
                 kind: PERMISSION_REQUEST_KIND.to_owned(),
                 body: serde_json::json!({ "request_id": request }).to_string(),
             };
-            let announcement = permission_frame(&PermissionRequestParams {
-                session_id: pending.session.clone(),
-                request_id: request.clone(),
-                tool: pending.tool.clone(),
-                repo_path: pending.repo_path.clone(),
-                command: pending.command.clone(),
-                agent: pending.agent.clone(),
-            })
-            .inspect_err(
+            let announcement = permission_frame(&request_params(&request, &pending)).inspect_err(
                 |e| warn!(request = %request, error = %e, "request stored but not announced"),
             )
             .ok();

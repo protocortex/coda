@@ -221,6 +221,7 @@ async fn resuming_an_unknown_session_and_stale_answers_show_notices() {
             session_id: SessionId::new("1"),
             request_id: RequestId::new("none"),
             decision: PermissionDecision::Deny,
+            choice: None,
         }))
         .unwrap();
     let stale = link.notice().await;

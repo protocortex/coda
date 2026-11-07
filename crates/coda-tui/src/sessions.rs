@@ -645,6 +645,8 @@ impl Link {
             session_id: answer.session_id,
             request_id: answer.request_id,
             decision: answer.decision,
+            choice: answer.choice,
+            no_terminal: false,
         };
         let result: PermissionRespondResult = self
             .client

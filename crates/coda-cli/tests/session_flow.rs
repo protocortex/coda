@@ -73,6 +73,8 @@ async fn a_session_runs_a_turn_with_a_permission_prompt_through_the_real_daemon(
                 session_id: session.clone(),
                 request_id,
                 decision: PermissionDecision::AllowOnce,
+                choice: None,
+                no_terminal: false,
             },
         )
         .await

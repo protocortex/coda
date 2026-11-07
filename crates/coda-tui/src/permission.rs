@@ -29,6 +29,10 @@ const CONFIRM_ALWAYS_RUN: [&str; 2] = [
     "Any other key cancels",
 ];
 const AGENT_LABEL: &str = "sub-agent: ";
+const ASK_LABEL: &str = "The model asks:";
+const HELP_DECLINE: &str = "[n] decline to answer";
+const WARNING_QUESTION: &str =
+    "WARNING: the question is not fully shown, so it can only be declined";
 const WARNING: &str = "WARNING: the command is not fully shown, so it can only be denied";
 /// Characters of model supplied text kept; a longer text is cut and can only be denied.
 const MAX_SHOWN_CHARS: usize = 4000;
@@ -87,6 +91,9 @@ pub struct PermissionPrompt {
     pub command: String,
     /// The sub-agent that asks, or `None` for the session's own call.
     pub agent: Option<String>,
+    /// For a question, the options to pick from, in the order a choice counts
+    /// them from 0; empty for a tool call.
+    pub options: Vec<String>,
     /// Some text was cut, so the user cannot see everything they would allow.
     pub truncated: bool,
 }
@@ -103,6 +110,22 @@ impl PermissionPrompt {
             let (shown, cut) = sanitize(name);
             (Some(shown), cut)
         });
+        let mut options_cut = false;
+        let options = params
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|listed| {
+                listed
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|option| {
+                        let (shown, cut) = sanitize(option);
+                        options_cut |= cut;
+                        shown
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(Self {
             session_id: SessionId::new(text("session_id")?),
             request_id: RequestId::new(text("request_id")?),
@@ -110,7 +133,8 @@ impl PermissionPrompt {
             repo_path,
             command,
             agent,
-            truncated: tool_cut || repo_cut || command_cut || agent_cut,
+            options,
+            truncated: tool_cut || repo_cut || command_cut || agent_cut || options_cut,
         })
     }
 }
@@ -121,6 +145,8 @@ pub struct PermissionAnswer {
     pub session_id: SessionId,
     pub request_id: RequestId,
     pub decision: PermissionDecision,
+    /// For a question, the option picked, counted from 0.
+    pub choice: Option<u32>,
 }
 
 /// Requests waiting for an answer, asked one at a time in arrival order.
@@ -182,6 +208,7 @@ impl Overlay {
                 session_id: p.session_id,
                 request_id: p.request_id,
                 decision: PermissionDecision::Deny,
+                choice: None,
             })
             .collect()
     }
@@ -206,8 +233,20 @@ impl Overlay {
         }
         let confirming = std::mem::take(&mut self.confirming_always);
         let can_allow = self.complete.get();
+        let options = self.queue.front().map_or(0, |p| p.options.len());
+        let mut choice = None;
         let decision = match key.code {
             KeyCode::Char('n') | KeyCode::Esc => PermissionDecision::Deny,
+            // A question is answered by number, and only once it is all shown.
+            KeyCode::Char(digit) if options > 0 && can_allow => {
+                let picked = digit
+                    .to_digit(10)
+                    .and_then(|number| number.checked_sub(1))
+                    .filter(|picked| usize::try_from(*picked).is_ok_and(|p| p < options));
+                choice = Some(picked?);
+                PermissionDecision::AllowOnce
+            }
+            _ if options > 0 => return None,
             KeyCode::Char('y') if can_allow => PermissionDecision::AllowOnce,
             KeyCode::Char('a') if can_allow => {
                 self.confirming_always = true;
@@ -222,12 +261,27 @@ impl Overlay {
             session_id: prompt.session_id,
             request_id: prompt.request_id,
             decision,
+            choice,
         })
     }
 
     fn footer(&self, complete: bool, width: usize) -> Vec<String> {
         let run_only = self.queue.front().is_some_and(|p| p.agent.is_some());
-        let mut lines = if complete {
+        let question = self.queue.front().filter(|p| !p.options.is_empty());
+        let mut lines = if let Some(prompt) = question {
+            let mut lines: Vec<String> = if complete {
+                let numbered = prompt
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(at, option)| format!("[{}] {option}", at + 1));
+                numbered.flat_map(|line| wrap(&line, width)).collect()
+            } else {
+                wrap(WARNING_QUESTION, width)
+            };
+            lines.push(HELP_DECLINE.to_owned());
+            lines
+        } else if complete {
             let choices: &[&str] = match (self.confirming_always, run_only) {
                 (true, true) => &CONFIRM_ALWAYS_RUN,
                 (true, false) => &CONFIRM_ALWAYS,
@@ -259,9 +313,13 @@ impl Overlay {
         if let Some(agent) = &prompt.agent {
             body.extend(wrap(&format!("{AGENT_LABEL}{agent}"), inner));
         }
-        body.push(format!("{} wants to run in", prompt.tool));
-        body.extend(wrap(&prompt.repo_path, inner));
-        body.push(String::new());
+        if prompt.options.is_empty() {
+            body.push(format!("{} wants to run in", prompt.tool));
+            body.extend(wrap(&prompt.repo_path, inner));
+            body.push(String::new());
+        } else {
+            body.push(ASK_LABEL.to_owned());
+        }
         body.extend(wrap(&prompt.command, inner));
 
         // The help and pending count keep their rows; the body gets the rest.
@@ -328,6 +386,7 @@ mod tests {
             repo_path: "/work/repo".to_owned(),
             command: command.to_owned(),
             agent: None,
+            options: Vec::new(),
             truncated: false,
         }
     }
@@ -385,6 +444,7 @@ mod tests {
                     session_id: SessionId::new("s-1"),
                     request_id: RequestId::new("r-1"),
                     decision,
+                    choice: None,
                 }],
                 "{keys:?}"
             );
@@ -673,5 +733,90 @@ mod tests {
             .filter(|c| c.is_alphanumeric() || *c == '-')
             .collect();
         assert!(letters.contains("forthissub-agentrunonly"), "{drawn}");
+    }
+
+    fn question(options: &[&str]) -> PermissionPrompt {
+        PermissionPrompt {
+            tool: "ask".to_owned(),
+            command: "Which file?".to_owned(),
+            options: options.iter().map(|o| (*o).to_owned()).collect(),
+            ..prompt("q-1", "")
+        }
+    }
+
+    #[test]
+    fn a_question_is_drawn_with_numbered_options_and_no_allow_keys() {
+        let mut overlay = Overlay::default();
+        overlay.push(question(&["a.rs", "b.rs"]), Instant::now());
+
+        let drawn = draw(&overlay, 80, 24);
+
+        assert!(drawn.contains("The model asks:"), "{drawn}");
+        assert!(drawn.contains("Which file?"), "{drawn}");
+        assert!(drawn.contains("[1] a.rs"), "{drawn}");
+        assert!(drawn.contains("[2] b.rs"), "{drawn}");
+        assert!(drawn.contains("[n] decline to answer"), "{drawn}");
+        assert!(!drawn.contains("allow"), "{drawn}");
+    }
+
+    #[test]
+    fn a_number_picks_that_option_and_other_keys_do_nothing() {
+        let (mut overlay, ready) = armed(&[question(&["a.rs", "b.rs"])]);
+
+        let ignored = press_all(
+            &mut overlay,
+            &[
+                KeyCode::Char('y'),
+                KeyCode::Char('a'),
+                KeyCode::Char('3'),
+                KeyCode::Char('0'),
+            ],
+            ready,
+        );
+        let picked = press_all(&mut overlay, &[KeyCode::Char('2')], ready);
+
+        assert_eq!(ignored, Vec::new());
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].decision, PermissionDecision::AllowOnce);
+        assert_eq!(picked[0].choice, Some(1));
+        assert!(!overlay.is_active());
+    }
+
+    #[test]
+    fn n_or_escape_declines_a_question_without_a_choice() {
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
+            let (mut overlay, ready) = armed(&[question(&["a.rs", "b.rs"])]);
+
+            let answers = press_all(&mut overlay, &[key], ready);
+
+            assert_eq!(answers[0].decision, PermissionDecision::Deny);
+            assert_eq!(answers[0].choice, None);
+        }
+    }
+
+    #[test]
+    fn a_number_pressed_in_the_grace_window_is_type_ahead_and_picks_nothing() {
+        let start = Instant::now();
+        let mut overlay = Overlay::default();
+        overlay.push(question(&["a.rs", "b.rs"]), start);
+        draw(&overlay, 80, 24);
+
+        let answers = press_all(&mut overlay, &[KeyCode::Char('1')], start);
+
+        assert_eq!(answers, Vec::new());
+        assert!(overlay.is_active());
+    }
+
+    #[test]
+    fn the_options_of_a_request_are_read_and_sanitized() {
+        let params = json!({
+            "session_id": "s", "request_id": "r", "tool": "ask", "repo_path": "/r",
+            "command": "Which?", "options": ["a\u{1b}[31m", "b"],
+        });
+
+        let prompt = PermissionPrompt::from_params(&params).unwrap();
+
+        assert_eq!(prompt.options.len(), 2);
+        assert!(!prompt.options[0].contains('\u{1b}'));
     }
 }

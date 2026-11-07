@@ -28,7 +28,7 @@ use coda_tools::read_log::ReadLog;
 use coda_tools::retrieve::RetrieveTool;
 use coda_tools::sandbox::{Sandbox, SandboxError};
 use coda_tools::write::WriteTool;
-use coda_tools::{DEFAULT_MAX_OUTPUT_BYTES, Tool, ToolError, ToolOutput, task, todo};
+use coda_tools::{DEFAULT_MAX_OUTPUT_BYTES, Tool, ToolError, ToolOutput, ask, task, todo};
 use serde_json::Value;
 use serde_json::json;
 
@@ -87,6 +87,26 @@ pub fn task_schema(agents: &[(String, String)]) -> ToolSchema {
             "prompt": {"type": "string", "description": "What the agent should do, with all it needs to know."},
         }),
         &["agent", "prompt"],
+    )
+}
+
+/// The schema of the `ask` tool.
+#[must_use]
+pub fn ask_schema() -> ToolSchema {
+    schema(
+        ask::NAME,
+        ask::DESCRIPTION,
+        &json!({
+            "question": {"type": "string", "description": "The question for the user."},
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": ask::MIN_OPTIONS,
+                "maxItems": ask::MAX_OPTIONS,
+                "description": "What the user may pick.",
+            },
+        }),
+        &["question", "options"],
     )
 }
 

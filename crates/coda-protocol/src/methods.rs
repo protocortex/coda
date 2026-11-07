@@ -318,6 +318,11 @@ pub struct PermissionRequestParams {
     /// asks. A client shows it apart from `command`, which is the model's text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// For a question the model asks the user (`tool` is `ask`): the choices,
+    /// in the order the answer's `choice` counts them from 0. `command` is then
+    /// the question. Empty for a tool call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
 }
 
 /// Parameters of [`PERMISSION_RESPOND`].
@@ -329,6 +334,14 @@ pub struct PermissionRespondParams {
     pub request_id: RequestId,
     /// The decision.
     pub decision: PermissionDecision,
+    /// For a question the model asked: the option picked, counted from 0. Absent
+    /// when the user declined to pick one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<u32>,
+    /// True when the client has no user to ask, as `coda run` has none. The
+    /// model is told so, instead of being told the user declined.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_terminal: bool,
 }
 
 /// Result of [`PERMISSION_RESPOND`].
@@ -453,6 +466,25 @@ pub struct PingResult {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_without_options_and_an_answer_without_a_choice_keep_their_old_wire_form() {
+        let request = serde_json::json!({
+            "session_id": "s", "request_id": "r", "tool": "bash",
+            "repo_path": "/r", "command": "ls",
+        });
+        let answer = serde_json::json!({
+            "session_id": "s", "request_id": "r", "decision": "deny",
+        });
+
+        let asked: PermissionRequestParams = serde_json::from_value(request.clone()).unwrap();
+        let answered: PermissionRespondParams = serde_json::from_value(answer.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(&asked).unwrap(), request);
+        assert_eq!(serde_json::to_value(&answered).unwrap(), answer);
+        assert_eq!(answered.choice, None);
+        assert!(!answered.no_terminal);
+    }
 
     #[test]
     fn wire_constants_match_the_contract() {

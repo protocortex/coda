@@ -349,6 +349,33 @@ async fn a_headless_run_denies_a_permission_prompt_and_carries_on() {
     assert!(!decisions[0].allowed);
 }
 
+#[tokio::test]
+async fn a_headless_run_answers_a_question_to_the_user_with_an_error_and_carries_on() {
+    // Arrange
+    let question = tool_turn(
+        "ask",
+        &json!({"question": "Which file?", "options": ["a.rs", "b.rs"]}),
+    );
+    let rig = rig(&[question, text_turn("no answer")], "");
+
+    // Act
+    let outcome = run(&rig, &[]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert_eq!(outcome.out, "no answer\n");
+    let session = only_session(&rig).await;
+    let store = Store::open(&Dirs::from_base(rig.home.path()).data_dir()).unwrap();
+    let events = store.load_events(&session.id, 0, 100).unwrap();
+    let finished: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "tool_finished")
+        .map(|event| serde_json::from_str::<Value>(&event.body).unwrap())
+        .collect();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["is_error"], true);
+}
+
 async fn only_session(rig: &Rig) -> SessionSummary {
     let socket = Dirs::from_base(rig.home.path()).socket_path();
     let client = Client::connect(&socket, timing()).await.unwrap();

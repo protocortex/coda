@@ -145,3 +145,16 @@ An agent's last message is its report. Plain text is the summary. So is JSON of 
 ## The `todo` tool
 
 A model-API session also offers a `todo` tool, a short ordered list the model keeps for itself. `action` is `add` (with `text`, 1 to 200 characters), `set` (with `id` and `status`: `pending`, `in_progress` or `done`) or `clear`. The list holds at most 20 items, each is numbered in the order it was added, and every call answers with the whole list. Each change is stored as a `todo_updated` event that holds the list after it, so the last one is the current list: it survives a daemon restart, because a rebuilt conversation reads it back, and the terminal UI draws it above the prompt. A compaction adds the list to the summary message, so the model still has it after the calls that built it are summarized away. The tool asks no permission. A sub-agent has no list and gets an error that says so, and `todo` is not a tool an agent file can name.
+
+## The `ask` tool
+
+A model-API session also offers an `ask` tool, which puts one short question to the user. The arguments are `question` (1 to 300 characters) and `options` (2 to 4 options of 1 to 80 characters each). The call waits for the user and then tells the model one of these:
+
+| Answer | What the model reads | Error |
+| --- | --- | --- |
+| The user picked an option | `The user chose option 2: <option>` | no |
+| The user declined | `The user did not choose an option.` | no |
+| No answer in time | `The user did not answer in time.` | no |
+| No one to ask, as in `coda run`, or a bad call | `ask is not available here: no one is at a terminal to answer`, or what is wrong with the arguments | yes |
+
+The question travels the path a permission prompt takes. It is a `permission.request` notification whose `tool` is `ask`, whose `command` is the question and whose `options` lists the choices, and the client answers with `permission.respond` and a `choice` that counts the options from 0. A client that has no user to ask sets `no_terminal`, which is what `coda run` does. The terminal UI draws the question with numbered options, and a number picks one, `n` or Esc declines. A question waits as long as a permission prompt does, and it is never decided by the permission mode or a stored grant. A sub-agent has no `ask` tool, and `ask` is not a tool an agent file can name. The tool asks no other permission.

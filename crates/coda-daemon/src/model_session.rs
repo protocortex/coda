@@ -24,8 +24,8 @@ use coda_core::history::{
 pub use coda_core::history::{CONTEXT_OVERFLOW_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND};
 use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
 use coda_core::tools::{
-    BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index, task_schema,
-    todo_schema,
+    BaseToolsConfig, StoreOriginals, ToolsError, ask_schema, base_tools, refresh_index,
+    task_schema, todo_schema,
 };
 use coda_core::turn::{CancelToken, Fallback, StopCondition, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{
@@ -830,6 +830,7 @@ impl ModelSessions {
         let mut schemas = tools.schemas;
         schemas.push(task_schema(&offer.agents));
         schemas.push(todo_schema());
+        schemas.push(ask_schema());
         let prefix = Prefix::new(SYSTEM_PROMPT, schemas, "")?;
         let (conversation, session_started, todos) =
             self.stored_conversation(&record.id, prefix).await?;
@@ -876,7 +877,8 @@ impl ModelSessions {
             .with_used_tokens(used)
             .with_resumed(session_started)
             .with_text_tool_calls(self.text_tool_calls(record))
-            .with_todos(todos);
+            .with_todos(todos)
+            .with_ask();
         if let Some((alias, chain)) = self.fallbacks(record, shared_script.as_ref()) {
             turn_loop = turn_loop.with_fallbacks(alias, chain);
         }

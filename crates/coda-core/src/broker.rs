@@ -9,11 +9,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use coda_config::config::PermissionMode;
+use coda_protocol::events::{ASK_TOOL, AskPrompt};
 use coda_protocol::paths::{classify_target, repo_identity};
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId};
-use coda_providers::gate::PermissionGate;
+use coda_providers::gate::{AskAnswer, PermissionGate};
 use coda_providers::policy::{ClassifiedTarget, PolicyInput, Verdict, decide, grant_pattern};
-use coda_providers::tool_request::ToolRequest;
+use coda_providers::tool_request::{Tool, ToolRequest};
 use coda_store::{GrantKey, NewDecision, NewPending, Store, StoreError};
 use coda_telemetry::attrs::{CODA_PERMISSION_DECISION, CODA_SESSION_ID, CODA_TOOL_NAME};
 use tokio::sync::{broadcast, oneshot};
@@ -89,6 +90,23 @@ pub fn resolve_repo(cwd: &Path) -> PathBuf {
 
 type Waiting = tokio::sync::Mutex<HashMap<RequestId, oneshot::Sender<PermissionDecision>>>;
 
+type Questions = Mutex<HashMap<RequestId, (Option<u32>, bool)>>;
+
+/// Forgets an open question when its asker is done or dropped.
+struct OpenQuestion {
+    questions: Arc<Questions>,
+    id: RequestId,
+}
+
+impl Drop for OpenQuestion {
+    fn drop(&mut self) {
+        self.questions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
 /// Denies a queued request whose prompt is dropped before it is answered.
 struct PendingGuard {
     store: Arc<Mutex<Store>>,
@@ -128,6 +146,9 @@ pub struct Broker {
     waiting: Arc<Waiting>,
     notices: broadcast::Sender<PendingNotice>,
     expired: broadcast::Sender<PendingNotice>,
+    /// The questions waiting for an answer, each with the answer once it comes:
+    /// the option picked and whether the client had no user to ask.
+    questions: Arc<Questions>,
 }
 
 impl Broker {
@@ -149,6 +170,7 @@ impl Broker {
             waiting: Arc::default(),
             notices: broadcast::channel(NOTICE_CAPACITY).0,
             expired: broadcast::channel(NOTICE_CAPACITY).0,
+            questions: Arc::default(),
         };
         let (repo, cwd) = (broker.repo(), lossy(&canonical(&broker.config.cwd)));
         broker
@@ -231,10 +253,35 @@ impl Broker {
         request: &RequestId,
         decision: PermissionDecision,
     ) -> Result<(), BrokerError> {
+        self.answer_question(request, decision, None, false).await
+    }
+
+    /// Like [`Broker::answer`], for a question the model asked: `choice` is the
+    /// option picked, counted from 0, and `no_terminal` says the client has no
+    /// user to ask.
+    ///
+    /// # Errors
+    /// Returns [`BrokerError::Store`] for an unknown or already answered request.
+    pub async fn answer_question(
+        &self,
+        request: &RequestId,
+        decision: PermissionDecision,
+        choice: Option<u32>,
+        no_terminal: bool,
+    ) -> Result<(), BrokerError> {
         let id = request.clone();
         self.with_store(move |store| store.resolve_pending(&id, decision))
             .await?;
         let waiter = self.waiting.lock().await.remove(request);
+        // Only a question that is open keeps what the answer carries.
+        if let Some(slot) = self
+            .questions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(request)
+        {
+            *slot = (choice, no_terminal);
+        }
         if let Some(tx) = waiter {
             // The prompt may have timed out and gone away; the stored answer stands.
             let _ = tx.send(decision);
@@ -365,6 +412,65 @@ impl Broker {
             .await
     }
 
+    /// Puts a question with `options` to the user and waits for the answer or
+    /// the prompt timeout. A question is never decided by the mode or by a
+    /// grant: someone has to answer it.
+    pub async fn ask_user(&self, question: &str, options: &[String]) -> AskAnswer {
+        let command = AskPrompt {
+            question: question.to_owned(),
+            options: options.to_vec(),
+        }
+        .encode();
+        let request = ToolRequest {
+            tool: Tool::Unknown(ASK_TOOL.to_owned()),
+            target_paths: Vec::new(),
+            command: Some(command),
+            cwd: self.config.cwd.clone(),
+        };
+        let ask = Ask {
+            request: &request,
+            agent: None,
+        };
+        let (id, mut rx) = match self.queue(ask).await {
+            Ok(queued) => queued,
+            Err(error) => {
+                tracing::error!(session = %self.config.session, %error, "the question could not be queued");
+                return AskAnswer::Unavailable;
+            }
+        };
+        let _open = OpenQuestion {
+            questions: Arc::clone(&self.questions),
+            id: id.clone(),
+        };
+        let mut guard = PendingGuard {
+            store: Arc::clone(&self.store),
+            waiting: Arc::clone(&self.waiting),
+            id: id.clone(),
+            armed: true,
+        };
+        let (decision, timed_out) = match timeout(self.config.prompt_timeout, &mut rx).await {
+            Ok(answer) => (answer.unwrap_or(PermissionDecision::Deny), false),
+            Err(_) => (self.deny_unanswered(ask, &id, &mut rx).await, true),
+        };
+        guard.disarm();
+        self.waiting.lock().await.remove(&id);
+        let (choice, no_terminal) = self
+            .questions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id)
+            .unwrap_or_default();
+        match (decision, choice) {
+            _ if no_terminal => AskAnswer::NoTerminal,
+            (PermissionDecision::Deny, None) if timed_out => AskAnswer::TimedOut,
+            (PermissionDecision::Deny, _) | (_, None) => AskAnswer::Declined,
+            (_, Some(picked)) => usize::try_from(picked)
+                .ok()
+                .filter(|picked| *picked < options.len())
+                .map_or(AskAnswer::Declined, AskAnswer::Chose),
+        }
+    }
+
     /// Queues the request, then waits for a client or the timeout; the timeout denies.
     /// An "always allow" is stored as a grant for the session's own calls, and
     /// kept for the run only for a sub-agent's.
@@ -426,6 +532,12 @@ impl Broker {
             .await?;
         let (tx, rx) = oneshot::channel();
         waiting.insert(id.clone(), tx);
+        if notice_tool == ASK_TOOL {
+            self.questions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id.clone(), (None, false));
+        }
         drop(waiting);
         // No subscriber is fine: the request stays listed for one that resumes.
         let _ = self.notices.send(PendingNotice {
@@ -662,6 +774,10 @@ impl PermissionGate for Broker {
     async fn request(&self, request: &ToolRequest) -> PermissionDecision {
         self.decide(request, None).await
     }
+
+    async fn ask(&self, question: &str, options: &[String]) -> AskAnswer {
+        self.ask_user(question, options).await
+    }
 }
 
 #[cfg(test)]
@@ -673,9 +789,10 @@ mod tests {
     use std::time::Duration;
 
     use coda_config::config::PermissionMode;
+    use coda_protocol::events::{ASK_TOOL, AskPrompt};
     use coda_protocol::paths::Target;
     use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId};
-    use coda_providers::gate::PermissionGate;
+    use coda_providers::gate::{AskAnswer, PermissionGate};
     use coda_providers::policy::{TableRow, Verdict, decision_table};
     use coda_providers::tool_request::{Tool, ToolRequest};
     use coda_store::{GrantKey, NewPending, NewSession, Store};
@@ -1169,6 +1286,135 @@ mod tests {
         assert_eq!(own_notice.agent, None);
         assert_eq!(child.command, "edit src/a.rs");
         assert_eq!(child.agent.as_deref(), Some("explore"));
+    }
+
+    /// Asks a question on `broker` and has `reply` answer its prompt.
+    async fn ask_question(
+        broker: &Arc<Broker>,
+        options: &[&str],
+        reply: Option<(PermissionDecision, Option<u32>, bool)>,
+    ) -> (AskAnswer, Option<PendingNotice>) {
+        let options: Vec<String> = options.iter().map(|o| (*o).to_owned()).collect();
+        let mut notices = broker.subscribe();
+        let asking = {
+            let broker = Arc::clone(broker);
+            tokio::spawn(async move { broker.ask_user("Which?", &options).await })
+        };
+        let notice = tokio::time::timeout(ANSWER_WAIT, notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some((decision, choice, no_terminal)) = reply {
+            broker
+                .answer_question(&notice.id, decision, choice, no_terminal)
+                .await
+                .unwrap();
+        }
+        let answer = tokio::time::timeout(ANSWER_WAIT, asking)
+            .await
+            .unwrap()
+            .unwrap();
+        (answer, Some(notice))
+    }
+
+    #[tokio::test]
+    async fn a_question_is_announced_with_its_options_and_returns_the_option_picked() {
+        let fixture = Fixture::new();
+        let mut config = fixture.config("/ws", PermissionMode::DenyAll);
+        config.prompt_timeout = PERMISSION_TIMEOUT;
+        let broker = Arc::new(fixture.broker(config).await);
+
+        let (answer, notice) = ask_question(
+            &broker,
+            &["red", "green"],
+            Some((PermissionDecision::AllowOnce, Some(1), false)),
+        )
+        .await;
+
+        assert_eq!(answer, AskAnswer::Chose(1));
+        let notice = notice.unwrap();
+        assert_eq!(notice.tool, ASK_TOOL);
+        let prompt = AskPrompt::decode(&notice.command).unwrap();
+        assert_eq!(prompt.question, "Which?");
+        assert_eq!(prompt.options, ["red", "green"]);
+    }
+
+    #[tokio::test]
+    async fn a_declined_question_a_bad_choice_and_a_missing_terminal_are_told_apart() {
+        let fixture = Fixture::new();
+        let mut config = fixture.config("/ws", PermissionMode::Prompt);
+        config.prompt_timeout = PERMISSION_TIMEOUT;
+        let broker = Arc::new(fixture.broker(config).await);
+        let options = ["a", "b"];
+
+        let declined = ask_question(
+            &broker,
+            &options,
+            Some((PermissionDecision::Deny, None, false)),
+        )
+        .await
+        .0;
+        let out_of_range = ask_question(
+            &broker,
+            &options,
+            Some((PermissionDecision::AllowOnce, Some(2), false)),
+        )
+        .await
+        .0;
+        let headless = ask_question(
+            &broker,
+            &options,
+            Some((PermissionDecision::Deny, None, true)),
+        )
+        .await
+        .0;
+
+        assert_eq!(declined, AskAnswer::Declined);
+        assert_eq!(out_of_range, AskAnswer::Declined);
+        assert_eq!(headless, AskAnswer::NoTerminal);
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_a_tool_prompt_keeps_nothing_of_a_choice() {
+        let fixture = Fixture::new();
+        let mut config = fixture.config("/ws", PermissionMode::Prompt);
+        config.prompt_timeout = PERMISSION_TIMEOUT;
+        let broker = Arc::new(fixture.broker(config).await);
+        let mut notices = broker.subscribe();
+        let asking = {
+            let broker = Arc::clone(&broker);
+            let request = fixture.bash("cargo test");
+            tokio::spawn(async move { broker.request(&request).await })
+        };
+        let notice = tokio::time::timeout(ANSWER_WAIT, notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        broker
+            .answer_question(&notice.id, PermissionDecision::Deny, Some(1), true)
+            .await
+            .unwrap();
+        let decision = asking.await.unwrap();
+
+        assert_eq!(decision, PermissionDecision::Deny);
+        assert_eq!(broker.questions.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_question_times_out_and_leaves_nothing_waiting() {
+        let fixture = Fixture::new();
+        let broker = Arc::new(
+            fixture
+                .broker(fixture.config("/ws", PermissionMode::Prompt))
+                .await,
+        );
+
+        let (answer, _) = ask_question(&broker, &["a", "b"], None).await;
+        let waiting = broker.pending().await.unwrap();
+
+        assert_eq!(answer, AskAnswer::TimedOut);
+        assert_eq!(waiting, Vec::new());
     }
 
     #[tokio::test]

@@ -13,11 +13,11 @@ use std::time::Duration;
 use coda_config::hooks::{HookConfig, HookEvent};
 use coda_core::hooks::HookRunner;
 use coda_core::prompt::{Conversation, Prefix};
-use coda_core::tools::{BaseToolsConfig, StoreOriginals, base_tools, todo_schema};
+use coda_core::tools::{BaseToolsConfig, StoreOriginals, ask_schema, base_tools, todo_schema};
 use coda_core::turn::{Fallback, StopCondition, TurnConfig, TurnError, TurnEvent, TurnLoop};
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision};
 use coda_providers::faux::FauxProvider;
-use coda_providers::gate::PermissionGate;
+use coda_providers::gate::{AskAnswer, PermissionGate};
 use coda_providers::model::{
     ModelProvider, ModelRequest, ModelStream, ProviderError, RequestMessage,
 };
@@ -62,6 +62,10 @@ struct AllowAll;
 impl PermissionGate for AllowAll {
     fn request(&self, _request: &ToolRequest) -> impl Future<Output = PermissionDecision> + Send {
         std::future::ready(PermissionDecision::AllowOnce)
+    }
+
+    fn ask(&self, _question: &str, _options: &[String]) -> impl Future<Output = AskAnswer> + Send {
+        std::future::ready(AskAnswer::Chose(0))
     }
 }
 
@@ -169,6 +173,9 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
     if fixture.todo {
         schemas.push(todo_schema());
     }
+    if fixture.ask {
+        schemas.push(ask_schema());
+    }
     let prefix = Prefix::new(SYSTEM_PROMPT, schemas, "").unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -206,6 +213,9 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
     .with_fallbacks(PRIMARY_ALIAS, chain);
     if fixture.todo {
         lp = lp.with_todos(Vec::new());
+    }
+    if fixture.ask {
+        lp = lp.with_ask();
     }
 
     let sent = lp.send(fixture.prompt).await;

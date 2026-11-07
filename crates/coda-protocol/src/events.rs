@@ -178,6 +178,33 @@ pub struct TodoUpdatedBody {
     pub items: Vec<TodoItem>,
 }
 
+/// The tool name of a question the model asks the user, in a permission request.
+pub const ASK_TOOL: &str = "ask";
+
+/// A question and its choices, as the daemon keeps them in the `command` text
+/// of the pending request a question makes, so no table needs another column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskPrompt {
+    /// What the user is asked.
+    pub question: String,
+    /// What the user may pick, in order.
+    pub options: Vec<String>,
+}
+
+impl AskPrompt {
+    /// The text kept in a pending request's `command`.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| self.question.clone())
+    }
+
+    /// Reads text made by [`AskPrompt::encode`]; `None` for any other text.
+    #[must_use]
+    pub fn decode(command: &str) -> Option<Self> {
+        serde_json::from_str(command).ok()
+    }
+}
+
 /// Stored event kind of a send that moved from one model alias to the next in
 /// its fallback chain after the first failed. The body is a [`ModelFallbackBody`];
 /// clients show it to the user.
@@ -493,6 +520,20 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ask_prompt_survives_the_command_text_and_other_text_is_not_one() {
+        let prompt = AskPrompt {
+            question: "Which?".to_owned(),
+            options: vec!["a".to_owned(), "b".to_owned()],
+        };
+
+        let decoded = AskPrompt::decode(&prompt.encode());
+
+        assert_eq!(decoded, Some(prompt));
+        assert_eq!(AskPrompt::decode("ls -la"), None);
+    }
+
     use crate::types::{RequestId, SessionId, TurnId};
     use serde_json::json;
 
