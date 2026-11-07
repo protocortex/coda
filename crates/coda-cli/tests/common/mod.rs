@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    clippy::allow_attributes,
+    reason = "each test binary uses a different part of this module"
+)]
 
 use std::io::{BufRead, Cursor};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};

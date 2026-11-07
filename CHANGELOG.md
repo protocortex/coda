@@ -85,6 +85,7 @@ All notable changes to Coda are recorded here. The format follows
 
 - Coda is now licensed under Apache-2.0. It was AGPL-3.0-only. Every source header, the workspace license field, `NOTICE`, `deny.toml` and the SPDX check use the new identifier.
 - `clippy.toml` now disallows `std::thread::sleep`, so a blocking wait in tests or code must wait on an event, use a `Sleeper` seam, or carry `#[expect(clippy::disallowed_methods, reason = "...")]`. Async `tokio::time::sleep` is not covered. Integration tests that polled a child process in a sleep loop now block on it through `coda_testkit::wait::output_within`, which kills the child at the limit. Waits with nothing to block on (a file appearing, a process that is not our child exiting) go through `coda_testkit::wait::poll_until`. `Instant::now` and `SystemTime::now` are not banned yet (#340).
+- `[workspace.lints.clippy]` now sets `allow_attributes = "warn"` and `allow_attributes_without_reason = "deny"`, so a lint suppression must be an `#[expect(..., reason = "...")]` that says why. An unneeded one warns, which fails CI. The shared `tests/common` modules keep `allow(dead_code)` with a reason, because each test binary uses a different part. One `too_many_lines` suppression in the protocol schema was not needed and is gone.
 
 ### Fixed
 

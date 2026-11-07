@@ -6,7 +6,7 @@ const KIB: u64 = 1024;
 const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
 
 /// `bytes` in the largest unit that keeps the number at 1 or more, such as `1.5 KiB`.
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     reason = "a size shown to one decimal place"
 )]

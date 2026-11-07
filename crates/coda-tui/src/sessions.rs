@@ -864,7 +864,7 @@ mod tests {
         calls: Vec<&'static str>,
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl, reason = "the fake never awaits")]
     impl Opener for FakeOpener {
         async fn resume(&mut self, _id: &SessionId) -> Result<(), ClientError> {
             self.calls.push("resume");
@@ -912,7 +912,7 @@ mod tests {
 
     struct FailingSubscribe;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl, reason = "the fake never awaits")]
     impl Subscribe for FailingSubscribe {
         async fn subscribe(
             &self,

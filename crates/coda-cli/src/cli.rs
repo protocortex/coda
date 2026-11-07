@@ -300,7 +300,7 @@ pub struct RunArgs {
 }
 
 #[derive(Debug, Args)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each flag is its own option on the command line"
 )]
@@ -358,7 +358,7 @@ pub struct ReviewArgs {
 }
 
 #[derive(Debug, Args)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each flag is its own option on the command line"
 )]
@@ -393,7 +393,7 @@ pub struct ChangelogArgs {
 }
 
 #[derive(Debug, Args)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each flag is its own option on the command line"
 )]

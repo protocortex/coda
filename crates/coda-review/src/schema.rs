@@ -238,7 +238,10 @@ pub struct Finding {
     pub unverified: bool,
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
 fn is_false(value: &bool) -> bool {
     !*value
 }

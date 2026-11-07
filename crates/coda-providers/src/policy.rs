@@ -384,7 +384,10 @@ impl Rows {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per column of the policy table"
+    )]
     fn push(
         &mut self,
         name: &'static str,
