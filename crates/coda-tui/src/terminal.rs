@@ -5,7 +5,9 @@
 use std::io::{self, Write};
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -123,12 +125,24 @@ impl<W: Write, R: RawMode> AnsiMode<W, R> {
 impl<W: Write, R: RawMode> TerminalMode for AnsiMode<W, R> {
     fn enter(&mut self) -> io::Result<()> {
         self.raw.enable()?;
-        execute!(self.out, EnterAlternateScreen, EnableBracketedPaste, Hide)
+        execute!(
+            self.out,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableFocusChange,
+            Hide
+        )
     }
 
     fn leave(&mut self) -> io::Result<()> {
         // Always attempt both steps so one failure cannot leave the terminal raw.
-        let screen = execute!(self.out, Show, DisableBracketedPaste, LeaveAlternateScreen);
+        let screen = execute!(
+            self.out,
+            Show,
+            DisableFocusChange,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let raw = self.raw.disable();
         screen.and(raw)
     }
@@ -147,6 +161,8 @@ mod tests {
     const SHOW_CURSOR: &str = "\x1b[?25h";
     const ENABLE_PASTE: &str = "\x1b[?2004h";
     const DISABLE_PASTE: &str = "\x1b[?2004l";
+    const ENABLE_FOCUS: &str = "\x1b[?1004h";
+    const DISABLE_FOCUS: &str = "\x1b[?1004l";
 
     #[derive(Clone, Default)]
     struct Recording(Arc<Mutex<Vec<String>>>);
@@ -230,6 +246,23 @@ mod tests {
         assert!(entered.contains(ENABLE_PASTE), "{entered:?}");
         assert!(!entered.contains(DISABLE_PASTE), "{entered:?}");
         assert_eq!(written.matches(DISABLE_PASTE).count(), 1, "{written:?}");
+    }
+
+    #[test]
+    fn the_guard_asks_for_focus_reports_and_stops_asking_on_exit() {
+        // Arrange
+        let log = Recording::default();
+        let guard = guard(&log);
+        let entered = joined(&log);
+
+        // Act
+        guard.restore().unwrap();
+
+        // Assert
+        let written = joined(&log);
+        assert!(entered.contains(ENABLE_FOCUS), "{entered:?}");
+        assert!(!entered.contains(DISABLE_FOCUS), "{entered:?}");
+        assert_eq!(written.matches(DISABLE_FOCUS).count(), 1, "{written:?}");
     }
 
     #[test]

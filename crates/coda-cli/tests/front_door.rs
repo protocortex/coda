@@ -45,8 +45,8 @@ fn record_launch(
         fs::write(
             run_dir.join(LAUNCH_MARKER),
             format!(
-                "needs_setup={} hooks_configured={}",
-                startup.needs_setup, startup.hooks_configured
+                "needs_setup={} hooks_configured={} notify={:?}",
+                startup.needs_setup, startup.hooks_configured, startup.notify
             ),
         )
         .unwrap();
@@ -75,7 +75,7 @@ async fn bare_coda_on_a_terminal_starts_the_daemon_and_runs_the_tui() {
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
     assert_eq!(
         launch_note(dir.path()).as_deref(),
-        Some("needs_setup=true hooks_configured=false"),
+        Some("needs_setup=true hooks_configured=false notify=Bell"),
         "no provider is enabled in a fresh home"
     );
 }
@@ -147,7 +147,7 @@ async fn an_enabled_provider_means_the_tui_needs_no_setup() {
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
     assert_eq!(
         launch_note(dir.path()).as_deref(),
-        Some("needs_setup=false hooks_configured=false")
+        Some("needs_setup=false hooks_configured=false notify=Bell")
     );
 }
 
@@ -173,7 +173,32 @@ async fn a_config_with_hooks_tells_the_tui_so() {
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
     assert_eq!(
         launch_note(dir.path()).as_deref(),
-        Some("needs_setup=false hooks_configured=true")
+        Some("needs_setup=false hooks_configured=true notify=Bell")
+    );
+}
+
+#[tokio::test]
+async fn the_tui_is_started_with_the_notification_mode_of_the_config() {
+    // Arrange
+    let dir = short_dir();
+    let _stop = StopDaemon::new(dir.path());
+    fs::write(
+        Dirs::from_base(dir.path()).config_file(),
+        format!("[tui]\nnotify = \"osc9\"\n{FAUX_ENABLED}"),
+    )
+    .unwrap();
+    let mut ctx = context(dir.path());
+    ctx.is_tty = true;
+    ctx.launch_tui = record_launch;
+
+    // Act
+    let outcome = cli(&ctx, &["coda", "tui"], "").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert_eq!(
+        launch_note(dir.path()).as_deref(),
+        Some("needs_setup=false hooks_configured=false notify=Osc9")
     );
 }
 

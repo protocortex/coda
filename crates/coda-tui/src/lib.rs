@@ -6,8 +6,10 @@ pub mod activity;
 pub mod app;
 pub mod chat;
 pub mod commands;
+pub mod errors;
 pub mod input;
 pub mod logs;
+pub mod notify;
 pub mod permission;
 pub mod sessions;
 pub mod status;
@@ -23,6 +25,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use coda_config::timing::Timing;
+use coda_config::tui::NotifyMode;
 use crossterm::event::{self, Event, KeyEvent};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -60,6 +63,8 @@ pub enum UserInput {
     Key(KeyEvent),
     /// Text pasted in one piece, as the terminal delivers it in bracketed paste mode.
     Paste(String),
+    /// The terminal gained (`true`) or lost (`false`) focus.
+    Focus(bool),
 }
 
 /// A source of user input that gives up after a short wait so the UI can redraw.
@@ -82,6 +87,8 @@ impl KeySource for TerminalKeys {
         match event::read()? {
             Event::Key(key) => Ok(Some(UserInput::Key(key))),
             Event::Paste(text) => Ok(Some(UserInput::Paste(text))),
+            Event::FocusGained => Ok(Some(UserInput::Focus(true))),
+            Event::FocusLost => Ok(Some(UserInput::Focus(false))),
             _ => Ok(None),
         }
     }
@@ -101,16 +108,45 @@ pub fn drive<B: Backend>(
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    drive_with(terminal, app, keys, events, &mut io::sink())
+}
+
+/// [`drive`], writing the notifications the app asks for to `out`.
+///
+/// # Errors
+/// Returns [`TuiError::Draw`] if drawing fails or [`TuiError::Terminal`] if reading keys or
+/// writing a notification does.
+pub fn drive_with<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    keys: &mut impl KeySource,
+    events: &mut mpsc::UnboundedReceiver<LinkEvent>,
+    out: &mut impl Write,
+) -> Result<(), TuiError>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     while !app.should_quit() {
         while let Ok(event) = events.try_recv() {
             app.handle_event(event);
         }
+        notify(app, out)?;
         draw(terminal, app)?;
         match keys.next_input()? {
             Some(UserInput::Key(key)) => app.handle_key(key),
             Some(UserInput::Paste(text)) => app.handle_paste(&text),
+            Some(UserInput::Focus(gained)) => app.set_focus(gained),
             None => {}
         }
+    }
+    Ok(())
+}
+
+/// Writes the notification the app is waiting to send, if any.
+fn notify(app: &mut App, out: &mut impl Write) -> Result<(), TuiError> {
+    if let Some(sequence) = app.take_notification() {
+        out.write_all(sequence.as_bytes())?;
+        out.flush()?;
     }
     Ok(())
 }
@@ -132,6 +168,9 @@ pub struct Startup {
     pub needs_setup: bool,
     /// The config has hooks, so a session on a backend that runs none gets a notice.
     pub hooks_configured: bool,
+    /// How to tell the user, while the terminal is out of focus, that a turn
+    /// ended or an approval waits.
+    pub notify: NotifyMode,
 }
 
 /// Shows the connection state and runs until the user quits or `shutdown`
@@ -159,6 +198,7 @@ where
     let (commands, command_rx) = mpsc::unbounded_channel();
     let mut app = App::with_link(commands.clone());
     app.set_user_commands(user_commands);
+    app.set_notify(startup.notify);
     if startup.needs_setup {
         app.show_setup_guidance();
     }
@@ -183,7 +223,14 @@ where
         let _ = sender.send(LinkEvent::Quit);
     });
     let driven = tokio::task::spawn_blocking(move || {
-        drive(&mut terminal, &mut app, &mut keys, &mut events).map(|()| app)
+        drive_with(
+            &mut terminal,
+            &mut app,
+            &mut keys,
+            &mut events,
+            &mut io::stdout(),
+        )
+        .map(|()| app)
     })
     .await;
     // The link closes the session it created before it ends; a daemon that does

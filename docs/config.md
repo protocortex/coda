@@ -161,6 +161,12 @@ Each value is an integer number of milliseconds. A key left out keeps its defaul
 
 A different argument or a changed result starts the count again, so a poll whose output changes never trips the guard. The count also starts again with each new message you send. Identical calls in one reply count one by one. The same thresholds apply to sub-agents.
 
+## `[tui]`
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `notify` | string | `"bell"` | What the terminal UI writes to the terminal when a turn ends or a new approval or question waits while the terminal does not have focus. `"off"` writes nothing, `"bell"` rings the bell, `"osc9"` sends an OSC 9 desktop notification (iTerm2 and others) and `"osc777"` an OSC 777 one (VTE terminals and others). A terminal that does not report focus changes never gets one, and the UI counts the terminal as focused until it hears otherwise. It also rings when the backend crashes for good or the link to the daemon drops during a turn. Under tmux, focus reports and OSC 9 or 777 need `set -g focus-events on` and `set -g allow-passthrough on`. |
+
 ## `[review]`
 
 | Key | Type | Default | Notes |
@@ -296,6 +302,9 @@ token_cap = 500000
 [loop_guard]
 warn_after = 3
 stop_after = 5
+
+[tui]
+notify = "osc777"
 
 [permissions]
 mode = "accept-edits"
