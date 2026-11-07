@@ -25,6 +25,7 @@ mod baseline_tests {
             usage_tokens: 0,
             shrunk_bytes: 0,
             tool_errors: 0,
+            fallbacks: 0,
             stop: "end_turn".to_owned(),
             failure: None,
         }
@@ -145,6 +146,28 @@ mod offline {
         let outcome = find(&outcomes, "recover_after_bad_call");
         assert!(outcome.tool_errors >= 1, "{outcome:?}");
         assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_primary_is_answered_by_the_fallback_and_the_task_passes() {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "fell_back_on_rate_limit");
+        assert_eq!(outcome.fallbacks, 1, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_with_no_fallback_fails_the_fixture() {
+        let mut fixture = fixtures::all()
+            .into_iter()
+            .find(|f| f.name == "fell_back_on_rate_limit")
+            .unwrap();
+        fixture.fallback = false;
+
+        let outcome = runner::run_offline(&fixture).await;
+
+        assert!(!outcome.passed, "{outcome:?}");
     }
 
     #[tokio::test]

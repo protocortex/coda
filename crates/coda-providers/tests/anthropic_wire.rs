@@ -407,6 +407,22 @@ fn statuses_are_classified_by_retryability() {
 }
 
 #[test]
+fn a_404_is_an_unknown_model() {
+    // Arrange
+    let body = r#"{"type":"error","error":{"type":"not_found_error","message":"model: nope"}}"#;
+
+    // Act
+    let error = classify_status(404, body);
+
+    // Assert
+    assert!(
+        matches!(error, ProviderError::UnknownModel { .. }),
+        "{error}"
+    );
+    assert!(error.can_fall_back());
+}
+
+#[test]
 fn a_400_that_reports_context_overflow_is_typed() {
     // Arrange
     let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;

@@ -766,6 +766,33 @@ fn overflow_is_read_from_markers_and_from_a_top_level_message() {
     }
 }
 
+#[test]
+fn a_missing_model_is_an_unknown_model_by_status_or_code() {
+    let by_status = classify_status(
+        404,
+        &json!({"error": {"message": "The model `nope` does not exist"}}).to_string(),
+    );
+    let by_code = classify_status(
+        400,
+        &json!({"error": {"code": "model_not_found", "message": "no such model"}}).to_string(),
+    );
+
+    for error in [by_status, by_code] {
+        assert!(
+            matches!(error, ProviderError::UnknownModel { .. }),
+            "{error}"
+        );
+        assert!(error.can_fall_back());
+    }
+}
+
+#[test]
+fn a_404_that_does_not_name_a_model_is_fatal() {
+    let error = classify_status(404, "");
+
+    assert!(matches!(error, ProviderError::Fatal { .. }), "{error}");
+}
+
 fn scenario_mock(scenario: Scenario) -> Mock {
     let overflow = json!({"error": {"code": "context_length_exceeded",
         "message": "maximum context length exceeded"}})

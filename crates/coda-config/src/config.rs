@@ -37,6 +37,10 @@ const SOCKET_FILE_NAME: &str = "coda.sock";
 const PROVIDERS_KEY: &str = "providers";
 const MODELS_KEY: &str = "models";
 const ROUTING_KEY: &str = "routing";
+const FALLBACK_KEY: &str = "fallback";
+/// The provider sections that call a model API themselves. The others hand the
+/// whole turn to another program, so there is no model call to fall back from.
+const INDEPENDENT_PROVIDERS: [&str; 3] = ["anthropic", "openai_compat", "faux"];
 const HOOKS_KEY: &str = "hooks";
 const CHECKS_KEY: &str = "checks";
 const SECRET_KEY_SUFFIXES: [&str; 7] = [
@@ -227,6 +231,11 @@ pub struct ModelAlias {
     /// value for it or is wrong.
     #[serde(default)]
     pub context_window: Option<u32>,
+    /// Aliases to try, in order, when this model fails with a rate limit that
+    /// outlasts the retries, an overload or an unknown-model error. Every alias
+    /// in the chain must be on a model-API provider.
+    #[serde(default)]
+    pub fallback: Vec<String>,
 }
 
 /// The `[telemetry]` section.
@@ -322,6 +331,7 @@ impl Config {
         config.check_context_windows()?;
         config.check_timing()?;
         config.check_routing()?;
+        config.check_fallbacks()?;
         config.check_hooks()?;
         config.check_checks()?;
         config.check_review()?;
@@ -346,6 +356,47 @@ impl Config {
                     path: format!("{ROUTING_KEY}.{tier}"),
                     allowed: format!("the name of a [{MODELS_KEY}] alias, not `{alias}`"),
                 });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_fallbacks(&self) -> Result<(), ConfigError> {
+        for (name, alias) in &self.models {
+            if alias.fallback.is_empty() {
+                continue;
+            }
+            let path = format!("{MODELS_KEY}.{name}.{FALLBACK_KEY}");
+            let invalid = |allowed: String| ConfigError::InvalidValue {
+                path: path.clone(),
+                allowed,
+            };
+            if !INDEPENDENT_PROVIDERS.contains(&alias.provider.as_str()) {
+                return Err(invalid(format!(
+                    "a list only on a model-API provider ({}), not `{}`",
+                    INDEPENDENT_PROVIDERS.join(", "),
+                    alias.provider
+                )));
+            }
+            let mut seen = std::collections::BTreeSet::from([name.as_str()]);
+            for target in &alias.fallback {
+                let Some(next) = self.models.get(target) else {
+                    return Err(invalid(format!(
+                        "the names of [{MODELS_KEY}] aliases, not `{target}`"
+                    )));
+                };
+                if !INDEPENDENT_PROVIDERS.contains(&next.provider.as_str()) {
+                    return Err(invalid(format!(
+                        "aliases on a model-API provider ({}), but `{target}` uses `{}`",
+                        INDEPENDENT_PROVIDERS.join(", "),
+                        next.provider
+                    )));
+                }
+                if !seen.insert(target.as_str()) {
+                    return Err(invalid(format!(
+                        "each alias once and never `{name}` itself, but `{target}` repeats"
+                    )));
+                }
             }
         }
         Ok(())
@@ -913,6 +964,53 @@ idle_timeout_ms = 1500
         assert_eq!(parsed.config.models["big"].context_window, Some(1_000_000));
         assert_eq!(parsed.config.models["plain"].context_window, None);
         assert_eq!(parsed.unknown_keys, Vec::<String>::new());
+    }
+
+    fn fallback_config(primary: &str, fallback: &str, other: &str) -> String {
+        format!(
+            "[models.main]\nprovider = \"{primary}\"\nmodel = \"m\"\nfallback = {fallback}\n\
+             [models.other]\nprovider = \"{other}\"\nmodel = \"n\"\n"
+        )
+    }
+
+    #[test]
+    fn a_model_alias_may_list_fallbacks_on_model_api_providers() {
+        let input = fallback_config("anthropic", "[\"other\"]", "openai_compat");
+
+        let parsed = parse(&input);
+
+        assert_eq!(parsed.config.models["main"].fallback, vec!["other"]);
+        assert_eq!(parsed.config.models["other"].fallback.len(), 0);
+        assert_eq!(parsed.unknown_keys, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_fallback_chain_with_a_delegated_backend_is_rejected_naming_the_key() {
+        for input in [
+            fallback_config("anthropic", "[\"other\"]", "claude"),
+            fallback_config("codex", "[\"other\"]", "anthropic"),
+        ] {
+            let err = Config::from_toml_str(&input).unwrap_err();
+
+            assert!(
+                matches!(&err, ConfigError::InvalidValue { path, .. } if path == "models.main.fallback"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fallback_that_is_unknown_repeated_or_the_alias_itself_is_rejected() {
+        for list in ["[\"nope\"]", "[\"other\", \"other\"]", "[\"main\"]"] {
+            let input = fallback_config("anthropic", list, "anthropic");
+
+            let err = Config::from_toml_str(&input).unwrap_err();
+
+            assert!(
+                matches!(&err, ConfigError::InvalidValue { path, .. } if path == "models.main.fallback"),
+                "{list}: {err}"
+            );
+        }
     }
 
     #[test]

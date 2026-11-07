@@ -138,6 +138,7 @@ fn config(script: std::path::PathBuf) -> Config {
             provider: "faux".to_owned(),
             model: "script-1".to_owned(),
             context_window: None,
+            fallback: Vec::new(),
         },
     );
     config

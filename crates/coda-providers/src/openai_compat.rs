@@ -20,6 +20,8 @@ const OVERFLOW_MARKERS: [&str; 4] = [
     "maximum context",
 ];
 const OVERFLOW_CODE: &str = "context_length_exceeded";
+const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
+const HTTP_NOT_FOUND: u16 = 404;
 
 /// Classifies a non-success HTTP status and its body.
 #[must_use]
@@ -39,7 +41,15 @@ pub fn classify_status(status: u16, body: &str) -> ProviderError {
         ),
         None => format!("the server returned HTTP {status}"),
     };
-    if is_retryable_status(status) {
+    // A 404 that does not speak of a model is a wrong base URL or path.
+    let says_model = detail.is_some_and(|detail| detail.to_lowercase().contains("model"));
+    let missing_model = (status == HTTP_NOT_FOUND && says_model)
+        || error
+            .as_ref()
+            .is_some_and(|error| error["code"].as_str() == Some(MODEL_NOT_FOUND_CODE));
+    if missing_model {
+        ProviderError::UnknownModel { message }
+    } else if is_retryable_status(status) {
         ProviderError::Retryable { message }
     } else {
         ProviderError::Fatal { message }

@@ -1335,6 +1335,7 @@ async fn a_store_user_is_not_blocked_while_the_index_walk_runs() {
 }
 
 mod catalog;
+mod fallback;
 mod hooks;
 mod reasoning;
 mod skills;
@@ -1407,6 +1408,7 @@ async fn a_configured_window_compacts_the_conversation_before_the_request_is_sen
                 provider: "faux".to_owned(),
                 model: "script-1".to_owned(),
                 context_window: Some(SMALL_WINDOW),
+                fallback: Vec::new(),
             },
         );
     });
