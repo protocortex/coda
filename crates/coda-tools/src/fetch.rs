@@ -23,7 +23,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use reqwest::Url;
+pub use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 

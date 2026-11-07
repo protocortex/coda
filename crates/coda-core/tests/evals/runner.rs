@@ -5,6 +5,7 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::future::Future;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -12,9 +13,14 @@ use std::time::Duration;
 
 use coda_config::hooks::{HookConfig, HookEvent};
 use coda_core::hooks::HookRunner;
+use coda_core::prompt::ToolSchema;
 use coda_core::prompt::{Conversation, Prefix};
-use coda_core::tools::{BaseToolsConfig, StoreOriginals, ask_schema, base_tools, todo_schema};
-use coda_core::turn::{Fallback, StopCondition, TurnConfig, TurnError, TurnEvent, TurnLoop};
+use coda_core::tools::{
+    BaseTools, BaseToolsConfig, StoreOriginals, ask_schema, base_tools, fetch_schema, todo_schema,
+};
+use coda_core::turn::{
+    Fallback, StopCondition, ToolSet, TurnConfig, TurnError, TurnEvent, TurnLoop,
+};
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision};
 use coda_providers::faux::FauxProvider;
 use coda_providers::gate::{AskAnswer, PermissionGate};
@@ -23,15 +29,21 @@ use coda_providers::model::{
 };
 use coda_providers::tool_request::ToolRequest;
 use coda_store::{NewSession, Store};
+use coda_tools::fetch::{
+    FetchPolicy, FetchTool, Reply, Request, Resolver, Transport, UNTRUSTED_RULE,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::fixtures::Fixture;
+use crate::fixtures::{Fixture, Site};
 
 const SYSTEM_PROMPT: &str = "You are Coda, a coding agent. Use the tools to finish the task, then reply with a short summary.";
 const MAX_TURNS: u32 = 12;
 const TOKEN_LIMIT: u64 = 10_000_000;
 /// Tool output above this many bytes is shrunk, low enough that a noisy test run is.
 const COMPACT_THRESHOLD_BYTES: usize = 2048;
+/// Bytes of a page the fake web lets the tool read, small enough that a short page is cut.
+const FETCH_MAX_BYTES: usize = 256;
+const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const BASH_TIMEOUT: Duration = Duration::from_secs(20);
 const GUARD_TIMEOUT_MS: u64 = 10_000;
 const SHELL_PATH: &str = "/usr/bin:/bin";
@@ -165,14 +177,8 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
         StoreOriginals::new(Arc::clone(&store), session.clone()),
     )
     .unwrap();
-    let mut schemas = tools.schemas;
-    if fixture.todo {
-        schemas.push(todo_schema());
-    }
-    if fixture.ask {
-        schemas.push(ask_schema());
-    }
-    let prefix = Prefix::new(SYSTEM_PROMPT, schemas, "").unwrap();
+    let (tool_set, schemas, system) = offered(fixture, tools);
+    let prefix = Prefix::new(&system, schemas, "").unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let chain = fallback
@@ -192,7 +198,7 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
             requests: Arc::clone(&requests),
         },
         AllowAll,
-        tools.tools,
+        tool_set,
         Arc::clone(&store),
         Conversation::new(prefix),
         TurnConfig {
@@ -239,6 +245,74 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
         stop,
         failure,
     }
+}
+
+/// The tools, schemas and system prompt a fixture's model is offered.
+fn offered(fixture: &Fixture, tools: BaseTools) -> (ToolSet, Vec<ToolSchema>, String) {
+    let mut schemas = tools.schemas;
+    let mut tool_set = tools.tools;
+    let mut system = SYSTEM_PROMPT.to_owned();
+    if !fixture.web.is_empty() {
+        tool_set = tool_set.with(Arc::new(fake_fetch(fixture.web)));
+        schemas.push(fetch_schema());
+        system = format!("{system} {UNTRUSTED_RULE}");
+    }
+    if fixture.todo {
+        schemas.push(todo_schema());
+    }
+    if fixture.ask {
+        schemas.push(ask_schema());
+    }
+    (tool_set, schemas, system)
+}
+
+/// The names and pages of a fixture's fake web.
+struct FakeWeb(&'static [Site]);
+
+impl FakeWeb {
+    fn site(&self, host: &str) -> Option<&'static Site> {
+        self.0.iter().find(|site| site.host == host)
+    }
+}
+
+impl Resolver for FakeWeb {
+    fn resolve(&self, host: &str, _timeout: Duration) -> std::io::Result<Vec<IpAddr>> {
+        let site = self
+            .site(host)
+            .ok_or_else(|| std::io::Error::other("no such name"))?;
+        Ok(site
+            .addrs
+            .iter()
+            .map(|addr| addr.parse().unwrap())
+            .collect())
+    }
+}
+
+impl Transport for FakeWeb {
+    fn get(&self, request: &Request<'_>) -> Result<Reply, String> {
+        let site = self.site(request.host).ok_or("no such site")?;
+        Ok(Reply {
+            status: site.status,
+            location: site.location.map(str::to_owned),
+            content_type: Some(site.content_type.to_owned()),
+            body: site
+                .body
+                .as_bytes()
+                .iter()
+                .take(request.max_bytes + 1)
+                .copied()
+                .collect(),
+        })
+    }
+}
+
+fn fake_fetch(web: &'static [Site]) -> FetchTool<FakeWeb, FakeWeb> {
+    let policy = FetchPolicy {
+        allow_hosts: web.iter().map(|site| site.host.to_owned()).collect(),
+        max_bytes: FETCH_MAX_BYTES,
+        timeout: FETCH_TIMEOUT,
+    };
+    FetchTool::with_parts(policy, FakeWeb(web), FakeWeb(web))
 }
 
 /// The workspace folder of `fixture` under `root`, with its files written.
@@ -353,6 +427,16 @@ fn judge(
         });
         if !seen {
             return Some(format!("no tool result held {text:?}"));
+        }
+    }
+    if let Some(text) = fixture.unseen {
+        let leaked = requests.iter().any(|request| {
+            request.messages.iter().any(
+                |message| matches!(message, RequestMessage::ToolResult { text: result, .. } if result.contains(text)),
+            )
+        });
+        if leaked {
+            return Some(format!("a tool result held {text:?}"));
         }
     }
     let status = Command::new("/bin/sh")

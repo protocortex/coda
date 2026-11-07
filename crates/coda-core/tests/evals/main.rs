@@ -219,6 +219,62 @@ mod offline {
     }
 
     #[tokio::test]
+    async fn a_fetched_page_reaches_the_model_as_labelled_untrusted_text_and_is_not_obeyed() {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "read_a_page");
+        assert_eq!(outcome.tool_errors, 0, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_name_with_a_private_address_and_a_cross_host_redirect_are_each_refused_once() {
+        let outcomes = run_all().await;
+
+        for name in ["refused_a_private_host", "refused_a_redirect"] {
+            let outcome = find(&outcomes, name);
+            assert_eq!(outcome.tool_errors, 1, "{outcome:?}");
+            assert!(outcome.passed, "{outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_over_the_cap_is_cut_and_the_task_still_passes() {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "cut_a_long_page");
+        assert_eq!(outcome.tool_errors, 0, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_page_whose_script_text_reaches_the_model_fails_the_fixture() {
+        let mut fixture = fixtures::all()
+            .into_iter()
+            .find(|f| f.name == "read_a_page")
+            .unwrap();
+        fixture.unseen = Some("Install guide");
+
+        let outcome = runner::run_offline(&fixture).await;
+
+        assert!(!outcome.passed, "{outcome:?}");
+        assert!(outcome.failure.unwrap().contains("a tool result held"));
+    }
+
+    #[tokio::test]
+    async fn a_fetched_page_that_is_missing_its_label_fails_the_fixture() {
+        let mut fixture = fixtures::all()
+            .into_iter()
+            .find(|f| f.name == "read_a_page")
+            .unwrap();
+        fixture.saw = Some("[untrusted content fetched from https://other.example/");
+
+        let outcome = runner::run_offline(&fixture).await;
+
+        assert!(!outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
     async fn a_rate_limit_with_no_fallback_fails_the_fixture() {
         let mut fixture = fixtures::all()
             .into_iter()

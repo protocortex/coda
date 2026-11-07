@@ -21,7 +21,13 @@ checks the result by running a command in a temporary workspace. They live in
 | `read_files_in_parallel` | three reads in one reply, which run at the same time, then three edits in one reply, which run in order and one at a time |
 | `saw_the_change` | an edit followed by `git_status` and `git_diff` in a staged working tree; the diff must show the changed line |
 | `shrank_a_large_diff` | a 400 line file written with `bash`, then `git_diff` and `retrieve`; the long run of added lines is cut to its ends, and `retrieve` returns the full diff, middle included |
+| `read_a_page` | a page fetched from a fake web whose text tells the model to run a command and whose script holds a marker; offline, the run checks what the model is shown: the page arrives labelled as untrusted, only inside a tool result, with the script removed |
+| `refused_a_private_host` | a listed name that resolves to a public and a private address; the fetch is refused and the model saves a note |
+| `refused_a_redirect` | a page that redirects to another listed host; the redirect is refused and the model saves a note |
+| `cut_a_long_page` | a page over the per-page cap, which comes back cut with a marker |
 | `finished_too_early` | the model says it is done before it edits; an `end_turn` guard sends it back, then it edits |
+
+The four page fixtures run the real `fetch` tool over a fake resolver and a fake transport, so they touch no network.
 
 ## Offline run
 
