@@ -101,8 +101,8 @@ impl Confidence {
     }
 }
 
-/// Overall risk of merging the change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Overall risk of merging the change, lowest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Risk {
     /// Safe to merge.
@@ -232,6 +232,13 @@ pub struct RunDetails {
     pub input_chars: usize,
     /// Findings the model returned that were not kept: over the cap or failed a check.
     pub dropped_findings: usize,
+    /// Parts the change was split into, each reviewed by its own run.
+    #[serde(default)]
+    pub chunks: usize,
+    /// True when a part could not be reviewed: its files are in `left_out`, and the other
+    /// parts' findings are all that this review has.
+    #[serde(default)]
+    pub partial: bool,
 }
 
 /// The finished review.

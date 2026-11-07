@@ -16,6 +16,16 @@ pub const DIFF_BUDGET_CHARS_KEY: &str = "diff_budget_chars";
 /// Characters of diff text sent to the model when the file does not say.
 pub const DEFAULT_DIFF_BUDGET_CHARS: usize = 120_000;
 
+/// Key of the chunk cap inside `[review]`.
+pub const MAX_CHUNKS_KEY: &str = "max_chunks";
+/// Most chunks one review is split into when the file does not say.
+pub const DEFAULT_MAX_CHUNKS: usize = 4;
+
+/// Key of the chunk parallelism inside `[review]`.
+pub const CHUNK_CONCURRENCY_KEY: &str = "chunk_concurrency";
+/// Chunks reviewed at the same time when the file does not say.
+pub const DEFAULT_CHUNK_CONCURRENCY: usize = 3;
+
 /// The `[review]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -24,6 +34,11 @@ pub struct ReviewConfig {
     pub max_findings: usize,
     /// Most characters of diff text one review sends to the model. Must not be zero.
     pub diff_budget_chars: usize,
+    /// Most parts one review splits a change into when it does not fit one run. Files past
+    /// the last part are left out. Must not be zero.
+    pub max_chunks: usize,
+    /// Most parts reviewed at the same time. Must not be zero.
+    pub chunk_concurrency: usize,
     /// Files left out of a review.
     pub ignore: ReviewIgnore,
     /// Pull requests that are not reviewed.
@@ -35,6 +50,8 @@ impl Default for ReviewConfig {
         Self {
             max_findings: DEFAULT_MAX_FINDINGS,
             diff_budget_chars: DEFAULT_DIFF_BUDGET_CHARS,
+            max_chunks: DEFAULT_MAX_CHUNKS,
+            chunk_concurrency: DEFAULT_CHUNK_CONCURRENCY,
             ignore: ReviewIgnore::default(),
             skip: ReviewSkip::default(),
         }

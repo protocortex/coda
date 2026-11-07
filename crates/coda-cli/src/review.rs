@@ -10,28 +10,34 @@
 //! working directory, and the reviewer is told to read it.
 
 use std::fs;
+use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, ExitCode};
+use std::task::Poll;
 
 use coda_config::config::Config;
 use coda_config::review::ReviewConfig;
 use coda_core::history::{ASSISTANT_MESSAGE_KIND, CHILD_EVENT_KIND};
 use coda_core::turn::StopCondition;
 use coda_protocol::types::{BackendKind, Mode};
+use coda_review::chunk::{Outcome, merge, plan};
 use coda_review::diff::{FileDiff, git_diff, git_diff_staged, parse_diff, tracked_files};
-use coda_review::pack::{PackOptions, Packed, main_extension, pack};
+use coda_review::pack::{PackOptions, Packed, main_extension};
 use coda_review::parse::{BadShape, Parsed, answer_object, parse_model_output};
 use coda_review::render::{to_json, to_markdown};
 use coda_review::request::{
-    GH_PR_FIELDS, REVIEWER_AGENT, Target, assemble, direct_prompt, input_text, pr_info_from_gh,
-    session_prompt, task_prompt,
+    GH_PR_FIELDS, Part, REVIEWER_AGENT, Target, assemble, direct_prompt, input_text,
+    pr_info_from_gh, session_prompt, task_prompt,
 };
 use coda_review::rules::{Rules, default_branch_ref, load};
-use coda_review::schema::{Coverage, MIN_EFFORT, Review, Risk, RunDetails};
+use coda_review::schema::{Coverage, DiffScope, MIN_EFFORT, Review, Risk, RunDetails};
 use coda_review::skip::Decision;
 use serde_json::Value;
 use tracing::info;
 
+use crate::autostart::ensure_daemon;
 use crate::cli::ReviewArgs;
 use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
@@ -43,6 +49,9 @@ const INPUT_DIR: &str = ".coda/review";
 const INPUT_PARENT_DIR: &str = ".coda";
 /// A review asks the reviewer again once when its answer has the wrong shape.
 const MAX_ATTEMPTS: usize = 2;
+/// A part's findings are not cut where they are read: the merge applies the cap, and it
+/// must see every finding about security.
+const NO_CAP: usize = usize::MAX;
 const NOTHING_TO_REVIEW: &str = "nothing to review: the change has no lines to look at";
 const NOTHING_LEFT: &str = "nothing to review: every changed file was left out by the review rules";
 const FORCED_NOTE: &str = "a skip rule matched, but --force asks for the review anyway";
@@ -88,35 +97,53 @@ pub async fn run(
         notice(io, args.json, NOTHING_TO_REVIEW)?;
         return Ok(ExitCode::SUCCESS);
     }
-    let packed = pack_files(repo, &files, &config.review, &rules)?;
-    if packed.coverage.reviewed.is_empty() && packed.coverage.clipped.is_empty() {
+    let parts = split_files(repo, &files, &config.review, &rules)?;
+    if parts[0].coverage.reviewed.is_empty() && parts[0].coverage.clipped.is_empty() {
         notice(io, args.json, NOTHING_LEFT)?;
         return Ok(ExitCode::SUCCESS);
     }
-    let input = input_text(
-        &packed,
-        args.instructions.as_deref(),
-        config.review.max_findings,
-    );
-    // Kept until the review is over, which removes the file.
-    let file = if backend.is_model_backend() {
-        Some(InputFile::write(repo, &input)?)
+    let inputs: Vec<String> = parts
+        .iter()
+        .enumerate()
+        .map(|(n, part)| {
+            input_text(
+                part,
+                args.instructions.as_deref(),
+                config.review.max_findings,
+                Part::of(n + 1, parts.len()),
+            )
+        })
+        .collect();
+    // Kept until the review is over, which removes the files.
+    let written = if backend.is_model_backend() {
+        Some(InputFiles::write(repo, &inputs)?)
     } else {
         None
     };
-    let mut reviewer = Live {
-        ctx,
-        io,
-        backend,
-        cwd: &cwd,
-        handoff: match &file {
-            Some(file) => Handoff::File(&file.relative),
-            None => Handoff::Prompt(&input),
-        },
-    };
-    let (parsed, model) = until_usable(&packed, config.review.max_findings, &mut reviewer).await?;
-    let model = model.unwrap_or_else(|| backend_name(backend));
-    let review = assemble(parsed, &packed, &model, input.chars().count());
+    // Every part runs on its own connection, so the daemon is started once, here, where
+    // the user can be asked about a restart.
+    drop(ensure_daemon(ctx, io, false).await?);
+    let reviewers: Vec<Live<'_>> = (0..parts.len())
+        .map(|n| Live {
+            ctx,
+            backend,
+            cwd: &cwd,
+            handoff: match &written {
+                Some(files) => Handoff::File(&files.relative[n]),
+                None => Handoff::Prompt(&inputs[n]),
+            },
+        })
+        .collect();
+    let results = review_parts(&parts, reviewers, config.review.chunk_concurrency).await;
+    let given: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    let input_chars = inputs.iter().map(|i| i.chars().count()).sum();
+    let review = finish(
+        &parts,
+        results,
+        &given,
+        config.review.max_findings,
+        (&backend_name(backend), input_chars),
+    )?;
     if args.json {
         write!(io.out, "{}", to_json(&review)?)?;
     } else {
@@ -209,21 +236,22 @@ fn default_branch(repo: &Path) -> Result<String, CliError> {
     })
 }
 
-fn pack_files(
+fn split_files(
     repo: &Path,
     files: &[FileDiff],
     config: &ReviewConfig,
     rules: &Rules,
-) -> Result<Packed, CliError> {
+) -> Result<Vec<Packed>, CliError> {
     let tracked = tracked_files(repo).map_err(|e| CliError::ReviewInput(e.to_string()))?;
     let extension = main_extension(tracked.iter().map(String::as_str));
-    Ok(pack(
+    Ok(plan(
         files,
         PackOptions {
             budget: config.diff_budget_chars,
             ignore: &rules.ignore,
             main_extension: extension.as_deref(),
         },
+        config.max_chunks,
     ))
 }
 
@@ -249,15 +277,14 @@ enum Handoff<'a> {
 }
 
 /// The reviewer run by the daemon.
-struct Live<'a, 'b> {
+struct Live<'a> {
     ctx: &'a Context,
-    io: &'a mut Io<'b>,
     backend: BackendKind,
     cwd: &'a str,
     handoff: Handoff<'a>,
 }
 
-impl Reviewer for Live<'_, '_> {
+impl Reviewer for Live<'_> {
     async fn run(&mut self, hint: Option<String>) -> Result<Answer, CliError> {
         let hint = hint.as_deref();
         let request = match self.handoff {
@@ -270,7 +297,14 @@ impl Reviewer for Live<'_, '_> {
                 direct: true,
             },
         };
-        run_reviewer(self.ctx, self.io, self.backend, self.cwd, request).await
+        // Parts run side by side, so none of them writes to the terminal.
+        let (mut out, mut err, mut input) = (io::sink(), io::sink(), io::empty());
+        let mut quiet = Io {
+            out: &mut out,
+            err: &mut err,
+            input: &mut input,
+        };
+        run_reviewer(self.ctx, &mut quiet, self.backend, self.cwd, request).await
     }
 }
 
@@ -285,8 +319,7 @@ struct Request {
 /// Runs `reviewer` until its answer parses, at most [`MAX_ATTEMPTS`] times. Every run
 /// after the first is given the hint that says what was wrong with the last answer.
 async fn until_usable(
-    packed: &Packed,
-    max_findings: usize,
+    scope: &DiffScope,
     reviewer: &mut impl Reviewer,
 ) -> Result<(Parsed, Option<String>), CliError> {
     let mut hint: Option<String> = None;
@@ -294,7 +327,7 @@ async fn until_usable(
     for attempt in 1..=MAX_ATTEMPTS {
         info!(step = "review", attempt, "asking the reviewer");
         let answer = reviewer.run(hint.take()).await?;
-        match parse_model_output(&answer.text, &packed.scope, max_findings) {
+        match parse_model_output(&answer.text, scope, NO_CAP) {
             Ok(parsed) => return Ok((parsed, answer.model)),
             Err(bad) => {
                 hint = Some(bad.retry_hint());
@@ -303,6 +336,124 @@ async fn until_usable(
         }
     }
     Err(CliError::ReviewOutput(last))
+}
+
+type PartResult = Result<(Parsed, Option<String>), CliError>;
+
+/// Reviews one part. A run that fails for any reason but a bad answer is tried once more,
+/// since a model or a connection can fail for a moment; an answer in the wrong shape has
+/// already had its retry.
+async fn review_part(scope: &DiffScope, reviewer: &mut impl Reviewer) -> PartResult {
+    match until_usable(scope, reviewer).await {
+        Err(CliError::ReviewOutput(bad)) => Err(CliError::ReviewOutput(bad)),
+        Err(error) => {
+            info!(step = "review", %error, "the run failed, trying the part once more");
+            until_usable(scope, reviewer).await
+        }
+        done => done,
+    }
+}
+
+/// Reviews every part, at most `concurrency` at a time. The results are in the order of
+/// the parts.
+async fn review_parts<R: Reviewer>(
+    parts: &[Packed],
+    mut reviewers: Vec<R>,
+    concurrency: usize,
+) -> Vec<PartResult> {
+    let runs = parts
+        .iter()
+        .zip(reviewers.iter_mut())
+        .map(|(part, reviewer)| review_part(&part.scope, reviewer))
+        .collect();
+    run_limited(runs, concurrency).await
+}
+
+/// Polls `futures` together, at most `limit` at a time: the next starts as soon as one
+/// ends. Returns their outputs in the order of the futures.
+async fn run_limited<F: Future>(futures: Vec<F>, limit: usize) -> Vec<F::Output> {
+    let mut waiting = futures.into_iter().map(Box::pin).enumerate();
+    let mut active: Vec<(usize, Pin<Box<F>>)> = Vec::new();
+    let mut done: Vec<(usize, F::Output)> = Vec::new();
+    std::future::poll_fn(|cx| {
+        loop {
+            while active.len() < limit.max(1) {
+                match waiting.next() {
+                    Some(next) => active.push(next),
+                    None => break,
+                }
+            }
+            if active.is_empty() {
+                return Poll::Ready(());
+            }
+            let mut progressed = false;
+            let mut still = Vec::with_capacity(active.len());
+            for (index, mut future) in active.drain(..) {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(output) => {
+                        done.push((index, output));
+                        progressed = true;
+                    }
+                    Poll::Pending => still.push((index, future)),
+                }
+            }
+            active = still;
+            if !progressed {
+                return Poll::Pending;
+            }
+        }
+    })
+    .await;
+    done.sort_by_key(|(index, _)| *index);
+    done.into_iter().map(|(_, output)| output).collect()
+}
+
+/// Builds the review from the results of the parts. `run` is the model name to give when no
+/// part reported one, and the characters sent.
+fn finish(
+    parts: &[Packed],
+    results: Vec<PartResult>,
+    given: &[String],
+    max_findings: usize,
+    run: (&str, usize),
+) -> Result<Review, CliError> {
+    let (outcomes, model) = collect(parts, results)?;
+    let merged = merge(given, outcomes, max_findings);
+    Ok(assemble(merged, model.as_deref().unwrap_or(run.0), run.1))
+}
+
+/// Pairs each part with its result. The review fails only when every part did; otherwise a
+/// failed part is an outcome with no answer, which makes the review partial.
+fn collect(
+    parts: &[Packed],
+    results: Vec<PartResult>,
+) -> Result<(Vec<Outcome<'_>>, Option<String>), CliError> {
+    let mut outcomes = Vec::with_capacity(parts.len());
+    let mut model = None;
+    let mut last_error = None;
+    for (part, result) in parts.iter().zip(results) {
+        match result {
+            Ok((parsed, used)) => {
+                model = model.or(used);
+                outcomes.push(Outcome {
+                    packed: part,
+                    parsed: Some(parsed),
+                });
+            }
+            Err(error) => {
+                info!(step = "review", %error, "a part could not be reviewed");
+                last_error = Some(error);
+                outcomes.push(Outcome {
+                    packed: part,
+                    parsed: None,
+                });
+            }
+        }
+    }
+    match last_error {
+        Some(error) if outcomes.iter().all(|o| o.parsed.is_none()) => Err(error),
+        _ => Ok((outcomes, model)),
+    }
 }
 
 /// Runs the reviewer in a new session and returns what it said. A direct run is the
@@ -386,42 +537,55 @@ fn reviewer_text(kind: &str, body: &Value) -> Option<String> {
     body["body"]["text"].as_str().map(str::to_owned)
 }
 
-/// The file the reviewer reads. It is removed when the review is over.
-struct InputFile {
+/// The files the reviewer reads, one per part. They are removed when the review is over.
+struct InputFiles {
     dir: PathBuf,
-    path: PathBuf,
-    relative: String,
+    paths: Vec<PathBuf>,
+    relative: Vec<String>,
     created_parent: bool,
 }
 
-impl InputFile {
-    fn write(cwd: &Path, text: &str) -> Result<Self, CliError> {
-        let name = format!("input-{}.txt", std::process::id());
+impl InputFiles {
+    fn write(cwd: &Path, texts: &[String]) -> Result<Self, CliError> {
         let dir = cwd.join(INPUT_DIR);
         let created_parent = !cwd.join(INPUT_PARENT_DIR).exists();
+        let mut files = Self {
+            dir: dir.clone(),
+            paths: Vec::new(),
+            relative: Vec::new(),
+            created_parent,
+        };
         fs::create_dir_all(&dir).map_err(|source| CliError::Path {
             path: dir.clone(),
             source,
         })?;
-        let path = dir.join(&name);
-        let file = Self {
-            relative: format!("{INPUT_DIR}/{name}"),
-            dir,
-            path,
-            created_parent,
-        };
-        fs::write(&file.path, text).map_err(|source| CliError::Path {
-            path: file.path.clone(),
-            source,
-        })?;
-        Ok(file)
+        for (n, text) in texts.iter().enumerate() {
+            let name = input_name(n);
+            let path = dir.join(&name);
+            files.relative.push(format!("{INPUT_DIR}/{name}"));
+            files.paths.push(path.clone());
+            fs::write(&path, text).map_err(|source| CliError::Path { path, source })?;
+        }
+        Ok(files)
     }
 }
 
-impl Drop for InputFile {
+/// The file of the part at `index`, from 0. The first keeps the name it always had.
+fn input_name(index: usize) -> String {
+    let pid = std::process::id();
+    if index == 0 {
+        format!("input-{pid}.txt")
+    } else {
+        format!("input-{pid}-{}.txt", index + 1)
+    }
+}
+
+impl Drop for InputFiles {
     fn drop(&mut self) {
-        // Nothing to report to: the file is a leftover at worst.
-        let _ = fs::remove_file(&self.path);
+        // Nothing to report to: the files are a leftover at worst.
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
         let _ = fs::remove_dir(&self.dir);
         if self.created_parent
             && let Some(parent) = self.dir.parent()
@@ -492,18 +656,31 @@ mod tests {
     }
 
     #[test]
-    fn the_input_file_is_removed_with_the_directories_it_made() {
+    fn the_input_files_are_removed_with_the_directories_they_made() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
+        let texts = ["one".to_owned(), "two".to_owned()];
 
         // Act
-        let file = InputFile::write(dir.path(), "text").unwrap();
-        let kept = fs::read_to_string(dir.path().join(&file.relative)).unwrap();
-        drop(file);
+        let files = InputFiles::write(dir.path(), &texts).unwrap();
+        let kept: Vec<String> = files
+            .relative
+            .iter()
+            .map(|path| fs::read_to_string(dir.path().join(path)).unwrap())
+            .collect();
+        drop(files);
 
         // Assert
-        assert_eq!(kept, "text");
+        assert_eq!(kept, ["one", "two"]);
         assert!(!dir.path().join(INPUT_PARENT_DIR).exists());
+    }
+
+    #[test]
+    fn the_first_input_file_keeps_its_name_and_the_others_are_numbered() {
+        // Act and Assert
+        let pid = std::process::id();
+        assert_eq!(input_name(0), format!("input-{pid}.txt"));
+        assert_eq!(input_name(1), format!("input-{pid}-2.txt"));
     }
 
     #[test]
@@ -513,7 +690,7 @@ mod tests {
         fs::create_dir(dir.path().join(INPUT_PARENT_DIR)).unwrap();
 
         // Act
-        drop(InputFile::write(dir.path(), "text").unwrap());
+        drop(InputFiles::write(dir.path(), &["text".to_owned()]).unwrap());
 
         // Assert
         assert!(dir.path().join(INPUT_PARENT_DIR).exists());
@@ -565,7 +742,7 @@ mod tests {
         let mut reviewer = scripted(&[Ok("prose"), Ok(GOOD)]);
 
         // Act
-        let (parsed, model) = until_usable(&packed(), 5, &mut reviewer).await.unwrap();
+        let (parsed, model) = until_usable(&packed().scope, &mut reviewer).await.unwrap();
 
         // Assert
         assert_eq!(parsed.summary, "s");
@@ -586,7 +763,7 @@ mod tests {
         let mut reviewer = scripted(&[Ok("prose"), Ok("more prose"), Ok(GOOD)]);
 
         // Act
-        let result = until_usable(&packed(), 5, &mut reviewer).await;
+        let result = until_usable(&packed().scope, &mut reviewer).await;
 
         // Assert
         assert!(matches!(result, Err(CliError::ReviewOutput(_))));
@@ -599,10 +776,174 @@ mod tests {
         let mut reviewer = scripted(&[Err("down"), Ok(GOOD)]);
 
         // Act
-        let result = until_usable(&packed(), 5, &mut reviewer).await;
+        let result = until_usable(&packed().scope, &mut reviewer).await;
 
         // Assert
         assert!(matches!(result, Err(CliError::ReviewFailed(_))));
         assert_eq!(reviewer.hints.len(), 1);
+    }
+
+    fn two_parts() -> Vec<Packed> {
+        let part = |file: &str| {
+            let mut part = packed();
+            part.coverage.reviewed = vec![file.to_owned()];
+            part
+        };
+        vec![part("a.txt"), part("b.txt")]
+    }
+
+    #[tokio::test]
+    async fn a_run_that_fails_is_tried_once_more_and_only_once() {
+        // Arrange
+        let mut again = scripted(&[Err("down"), Ok(GOOD)]);
+        let mut twice = scripted(&[Err("down"), Err("down"), Ok(GOOD)]);
+
+        // Act
+        let recovered = review_part(&packed().scope, &mut again).await;
+        let failed = review_part(&packed().scope, &mut twice).await;
+
+        // Assert
+        assert!(recovered.is_ok());
+        assert!(matches!(failed, Err(CliError::ReviewFailed(_))));
+        assert_eq!(twice.hints.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_answer_of_the_wrong_shape_twice_is_not_tried_a_third_time() {
+        // Arrange
+        let mut reviewer = scripted(&[Ok("prose"), Ok("more"), Ok(GOOD)]);
+
+        // Act
+        let result = review_part(&packed().scope, &mut reviewer).await;
+
+        // Assert
+        assert!(matches!(result, Err(CliError::ReviewOutput(_))));
+        assert_eq!(reviewer.hints.len(), MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn a_failed_part_is_an_outcome_without_an_answer_and_all_failing_is_an_error() {
+        // Arrange
+        let parts = two_parts();
+        let some = vec![
+            Ok((parsed_of(GOOD), Some("m".to_owned()))),
+            Err(CliError::ReviewFailed("down".to_owned())),
+        ];
+        let none = vec![
+            Err(CliError::ReviewFailed("first".to_owned())),
+            Err(CliError::ReviewFailed("second".to_owned())),
+        ];
+
+        // Act
+        let (outcomes, model) = collect(&parts, some).unwrap();
+        let error = collect(&parts, none).err().unwrap();
+
+        // Assert
+        assert!(outcomes[0].parsed.is_some());
+        assert!(outcomes[1].parsed.is_none());
+        assert_eq!(model.as_deref(), Some("m"));
+        assert!(matches!(error, CliError::ReviewFailed(why) if why == "second"));
+    }
+
+    fn parsed_of(text: &str) -> Parsed {
+        parse_model_output(text, &packed().scope, NO_CAP).unwrap()
+    }
+
+    /// A reviewer that records how many runs are in flight and waits a few turns of the
+    /// executor, so runs that are polled together overlap.
+    struct Counting {
+        running: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        most: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Reviewer for Counting {
+        async fn run(&mut self, _hint: Option<String>) -> Result<Answer, CliError> {
+            use std::sync::atomic::Ordering;
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            Ok(Answer {
+                text: GOOD.to_owned(),
+                model: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn parts_run_together_up_to_the_limit_and_the_results_keep_their_order() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (limit, expected_most) in [(1, 1), (2, 2), (9, 5)] {
+            // Arrange
+            let running = Arc::new(AtomicUsize::new(0));
+            let most = Arc::new(AtomicUsize::new(0));
+            let parts: Vec<Packed> = (0..5).map(|_| packed()).collect();
+            let reviewers = (0..5)
+                .map(|_| Counting {
+                    running: Arc::clone(&running),
+                    most: Arc::clone(&most),
+                })
+                .collect();
+
+            // Act
+            let results = review_parts(&parts, reviewers, limit).await;
+
+            // Assert
+            assert_eq!(results.len(), 5);
+            assert!(results.iter().all(Result::is_ok));
+            assert_eq!(most.load(Ordering::SeqCst), expected_most, "limit {limit}");
+        }
+    }
+
+    #[tokio::test]
+    async fn results_are_in_the_order_of_the_parts_whatever_finishes_first() {
+        // Arrange
+        let parts = two_parts();
+        let reviewers = vec![
+            scripted(&[Err("first"), Err("first")]),
+            scripted(&[Ok(GOOD)]),
+        ];
+
+        // Act
+        let results = review_parts(&parts, reviewers, 2).await;
+
+        // Assert
+        assert!(matches!(&results[0], Err(CliError::ReviewFailed(why)) if why == "first"));
+        assert!(results[1].is_ok());
+    }
+
+    #[test]
+    fn a_review_with_one_failed_part_is_partial_keeps_the_other_findings_and_shows_the_banner() {
+        // Arrange
+        let parts = two_parts();
+        let finding = r#"{"file": "a.txt", "start_line": 3, "end_line": 3, "severity": "high",
+            "category": "bug", "title": "T", "explanation": "E", "confidence": "high"}"#;
+        let answer = format!(
+            r#"{{"summary": "s", "effort": 2, "risk": "medium", "findings": [{finding}]}}"#
+        );
+        let results = vec![
+            Ok((parsed_of(&answer), None)),
+            Err(CliError::ReviewFailed("down".to_owned())),
+        ];
+        let given = vec!["a.txt".to_owned(), "b.txt".to_owned()];
+
+        // Act
+        let review = finish(&parts, results, &given, 5, ("claude_code", 10)).unwrap();
+        let text = to_markdown(&review);
+
+        // Assert
+        assert!(review.run.partial);
+        assert_eq!(review.run.chunks, 2);
+        assert_eq!(review.run.model, "claude_code");
+        assert_eq!(review.findings.len(), 1);
+        assert_eq!(review.coverage.reviewed, ["a.txt"]);
+        assert_eq!(review.coverage.left_out, ["b.txt"]);
+        assert!(
+            text.starts_with("# Review\n\n**Partial review:**"),
+            "{text}"
+        );
     }
 }
