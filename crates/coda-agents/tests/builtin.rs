@@ -21,11 +21,12 @@ const READ_ONLY: [&str; 7] = [
     "read",
     "retrieve",
 ];
-const NAMES: [&str; 6] = [
+const NAMES: [&str; 7] = [
     "describer",
     "explore",
     "implementer",
     "reviewer",
+    "scribe",
     "tester",
     "verifier",
 ];
@@ -89,9 +90,11 @@ fn explore_reviewer_and_verifier_have_exactly_the_read_only_tools() {
     // Act
     let (explore, reviewer, verifier) = (sorted("explore"), sorted("reviewer"), sorted("verifier"));
     let describer = sorted("describer");
+    let scribe = sorted("scribe");
 
     // Assert
     assert_eq!(describer, READ_ONLY);
+    assert_eq!(scribe, READ_ONLY);
     assert_eq!(explore, READ_ONLY);
     assert_eq!(reviewer, READ_ONLY);
     assert_eq!(verifier, READ_ONLY);

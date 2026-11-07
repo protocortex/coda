@@ -713,7 +713,7 @@ pub(crate) fn change_text(repo: &Path, target: Option<&Target>) -> Result<String
     }
 }
 
-fn default_branch(repo: &Path) -> Result<String, CliError> {
+pub(crate) fn default_branch(repo: &Path) -> Result<String, CliError> {
     default_branch_ref(repo).ok_or_else(|| {
         CliError::ReviewInput(
             "the repository has no default branch (origin/HEAD, main or master) to compare with; \

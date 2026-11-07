@@ -4,6 +4,7 @@
 
 mod agents;
 pub mod autostart;
+mod changelog;
 mod checkpoints_cmd;
 pub mod cli;
 mod context;
@@ -83,6 +84,7 @@ async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<ExitCode, C
         Some(Command::Checkpoints(command)) => return checkpoints_cmd::run(ctx, io, command).await,
         Some(Command::Worktree(command)) => return worktree_cmd::run(ctx, io, command).await,
         Some(Command::Describe(args)) => return describe::run(ctx, io, args).await,
+        Some(Command::Changelog(args)) => return changelog::run(ctx, io, args).await,
         Some(Command::Hooks(command)) => return hooks_cmd::run(ctx, io, &command),
         Some(Command::Session(command)) => return session::run(ctx, io, force, command).await,
         None if ctx.is_tty => tui_cmd::open(ctx, io, force).await,
