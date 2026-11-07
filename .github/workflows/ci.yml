@@ -93,6 +93,7 @@ jobs:
       - run: bash scripts/tests/check-leaked-daemons.test.sh
       - run: bash scripts/tests/ci-aggregate.test.sh
       - run: bash scripts/tests/smoke-binary.test.sh
+      - run: bash scripts/tests/agents-md.test.sh
 
   zizmor:
     runs-on: ubuntu-latest

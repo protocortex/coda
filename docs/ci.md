@@ -13,3 +13,5 @@ The `spdx` job also runs the repository's own script checks. You can run each on
 | `scripts/ci-aggregate.sh` | Turns the results of all jobs into the single `check` status. |
 
 Each script has a test under `scripts/tests/` that the `spdx` job runs as well.
+
+The rules a change must follow, including the ones these checks enforce, are in [AGENTS.md](../AGENTS.md). `scripts/tests/agents-md.test.sh` keeps that file pointing at scripts and docs that exist.
