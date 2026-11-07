@@ -2,6 +2,7 @@
 
 //! Model-API sessions end to end through the dispatcher, against the faux provider.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,16 +16,18 @@ use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::{EnvReader, ForceGate, MAX_IDLE_LOOPS, ModelSessions, TURN_STOPPED_KIND, lock};
+use super::{
+    EnvReader, ForceGate, MAX_IDLE_LOOPS, ModelSessions, StreamedText, TURN_STOPPED_KIND, lock,
+};
 use crate::dispatch::Dispatcher;
 use crate::gate::Brokers;
 use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
 use crate::trace::capture::{Spans, install};
-use crate::turn::{BACKEND_UNSUPPORTED, TurnConfig, TurnState, Turns};
+use crate::turn::{BACKEND_UNSUPPORTED, Fence, TurnConfig, TurnState, Turns};
 use crate::watchdog::Timing;
 use coda_core::history::{CONVERSATION_RESET_KIND, PERMISSION_REQUEST_KIND};
-use coda_core::turn::{CancelToken, PROVIDER_CALL_SPAN, TOOL_CALL_SPAN};
+use coda_core::turn::{CancelToken, PROVIDER_CALL_SPAN, TOOL_CALL_SPAN, TurnEvent};
 
 const WAIT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(20);
@@ -1783,15 +1786,63 @@ async fn text_streamed_before_a_tool_call_is_stored_before_the_call() {
     assert_eq!(rig.bodies("stream_delta").await[0]["text"], "looking");
 }
 
-/// How long the store stays busy while the loop streams text and asks.
-const SLOW_STORE: Duration = Duration::from_millis(400);
+/// The text of an event sent just before a fence.
+const BEFORE_THE_FENCE: &str = "streamed before the fence";
 
 #[tokio::test]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a test thread holds a lock for a real interval"
-)]
-async fn a_permission_request_is_stored_after_the_text_and_reply_before_it_with_a_slow_store() {
+async fn a_fence_comes_back_only_after_the_events_sent_before_it_are_stored() {
+    // Arrange
+    let mut rig = Rig::new(Mode::Default, &[text_turn("hi")]);
+    rig.send("go").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+    let session = rig.session.clone();
+    let turns = rig
+        .hub
+        .with_store(move |store| store.turn_checkpoints(&session))
+        .await
+        .unwrap();
+    let (hub, session, turn) = (
+        Arc::clone(&rig.hub),
+        rig.session.clone(),
+        turns[0].turn.clone(),
+    );
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let fence = Fence::default();
+    fence.attach_model(sender.downgrade());
+    sender
+        .send(TurnEvent::Text(BEFORE_THE_FENCE.to_owned()))
+        .unwrap();
+    // The publisher is the loop's own, so the text waits there for the event
+    // that follows it. It cannot run before the test awaits.
+    tokio::spawn(async move {
+        let mut streamed = StreamedText::default();
+        while let Some(event) = events.recv().await {
+            streamed.publish(&hub, &session, &turn, event).await;
+        }
+    });
+
+    // Act
+    let mut waiting = std::pin::pin!(fence.wait());
+    let early = waiting
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+    assert!(
+        early.is_pending(),
+        "the fence came back with nothing stored"
+    );
+    waiting.await;
+
+    // Assert
+    let streamed = rig.bodies("stream_delta").await;
+    assert!(
+        streamed.iter().any(|body| body["text"] == BEFORE_THE_FENCE),
+        "{streamed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_permission_request_is_stored_after_the_text_and_reply_before_it() {
     // Arrange
     let mut asking = tool_turn(&[("c2", "bash", json!({"command": "true"}))]);
     asking["events"]
@@ -1799,23 +1850,10 @@ async fn a_permission_request_is_stored_after_the_text_and_reply_before_it_with_
         .unwrap()
         .insert(0, json!({"type": "text_delta", "text": "about to run"}));
     let mut rig = Rig::new(Mode::Default, &[read_turn(), asking, text_turn("done")]);
-    let log = rig.data.path().join(REQUEST_LOG);
-    let store = rig.hub.store_handle();
-    // The store goes busy as the second model call starts, so the text, the
-    // reply and the request all queue up behind it.
-    let busy = std::thread::spawn(move || {
-        let started = std::time::Instant::now();
-        while std::fs::read_to_string(&log).map_or(0, |lines| lines.lines().count()) < 2 {
-            assert!(started.elapsed() < WAIT, "the second model call never came");
-        }
-        let _held = store.lock().unwrap();
-        std::thread::sleep(SLOW_STORE);
-    });
 
     // Act
     rig.send("go").await;
     let request = rig.wait_for_pending().await;
-    busy.join().unwrap();
     rig.respond(&request, "allow_once").await;
     rig.wait_for("result").await;
     rig.wait_until_idle().await;
