@@ -140,6 +140,7 @@ impl Turns {
             max_turns: next.max_turns,
             token_cap: next.token_cap,
             mode: SendMode::Start,
+            client_request_id: None,
         };
         match self.send_now(params).await {
             Ok(turn) => {

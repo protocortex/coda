@@ -83,6 +83,7 @@ impl Rig {
             max_turns: None,
             token_cap: None,
             mode: coda_protocol::methods::SendMode::Start,
+            client_request_id: None,
         };
         turns.send(params).await.unwrap();
     }

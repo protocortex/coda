@@ -436,6 +436,7 @@ async fn cancel(client: &Client, session_id: SessionId) -> SessionCancelResult {
             &SessionCancelParams {
                 session_id,
                 force: false,
+                client_request_id: None,
             },
         )
         .await

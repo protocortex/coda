@@ -40,6 +40,7 @@ async fn start_turn(daemon_home: &Path, work: &Path, prompt: &str) -> SessionId 
                 cwd: work.display().to_string(),
                 model: None,
                 mode: Mode::Default,
+                client_request_id: None,
             },
         )
         .await
@@ -54,6 +55,7 @@ async fn start_turn(daemon_home: &Path, work: &Path, prompt: &str) -> SessionId 
                 max_turns: None,
                 token_cap: None,
                 mode: coda_protocol::methods::SendMode::Start,
+                client_request_id: None,
             },
         )
         .await

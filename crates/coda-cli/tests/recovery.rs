@@ -79,6 +79,7 @@ async fn kill_daemon_mid_turn(home: &Path, work: &Path) -> SessionId {
                 cwd: work.display().to_string(),
                 model: None,
                 mode: Mode::Default,
+                client_request_id: None,
             },
         )
         .await
@@ -94,6 +95,7 @@ async fn kill_daemon_mid_turn(home: &Path, work: &Path) -> SessionId {
                 max_turns: None,
                 token_cap: None,
                 mode: coda_protocol::methods::SendMode::Start,
+                client_request_id: None,
             },
         )
         .await
@@ -153,6 +155,7 @@ async fn a_restart_interrupts_the_turn_and_expires_its_prompt_and_the_session_re
                 max_turns: None,
                 token_cap: None,
                 mode: coda_protocol::methods::SendMode::Start,
+                client_request_id: None,
             },
         )
         .await

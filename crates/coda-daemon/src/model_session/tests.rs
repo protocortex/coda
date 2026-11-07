@@ -794,7 +794,9 @@ async fn a_cancel_while_the_send_is_starting_cancels_the_loop_once_it_is_armed()
 async fn stuck_turn(rig: &Rig) -> TurnId {
     let models = &rig.turns.models;
     let slot = models.reserve(&rig.session).unwrap();
-    let turn = Turns::begin(&rig.hub, &rig.session, "go").await.unwrap();
+    let turn = Turns::begin_for(&rig.hub, &rig.session, "go", None)
+        .await
+        .unwrap();
     slot.arm((CancelToken::default(), turn.clone()));
     models.drive(
         slot,

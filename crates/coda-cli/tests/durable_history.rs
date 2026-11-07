@@ -67,6 +67,7 @@ async fn send(client: &Client, session: &SessionId, text: &str) {
         max_turns: None,
         token_cap: None,
         mode: coda_protocol::methods::SendMode::Start,
+        client_request_id: None,
     };
     let _: Value = client.request(SESSION_SEND, &params).await.unwrap();
 }
@@ -141,6 +142,7 @@ async fn restart_between_sends(script: Vec<Value>, first_requests: usize) -> Res
                 cwd: work.path().display().to_string(),
                 model: None,
                 mode: Mode::Default,
+                client_request_id: None,
             },
         )
         .await

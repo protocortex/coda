@@ -15,6 +15,7 @@ pub mod lock;
 pub mod model_session;
 pub mod pidfile;
 pub mod reaper;
+mod receipts;
 pub mod recover;
 pub mod registry;
 pub mod repair;

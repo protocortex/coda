@@ -203,6 +203,7 @@ pub(crate) async fn drive(
                 cwd,
                 model: chosen_model,
                 mode,
+                client_request_id: None,
             },
         )
         .await?;
@@ -277,6 +278,7 @@ pub(crate) async fn send_and_follow(
                 max_turns,
                 token_cap,
                 mode: SendMode::Start,
+                client_request_id: None,
             };
             client
                 .request::<_, SessionSendResult>(SESSION_SEND, &params)
@@ -538,6 +540,7 @@ async fn cancel_turn(client: &Client, session: &SessionId) -> bool {
     let params = SessionCancelParams {
         session_id: session.clone(),
         force: false,
+        client_request_id: None,
     };
     let cancelled: Result<SessionCancelResult, _> = client.request(SESSION_CANCEL, &params).await;
     match cancelled {
@@ -849,6 +852,7 @@ mod tests {
             max_turns: None,
             token_cap: None,
             mode: SendMode::Start,
+            client_request_id: None,
         }
     }
 

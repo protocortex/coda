@@ -152,6 +152,7 @@ async fn send(
                 (_, true) => SendMode::Steer,
                 _ => SendMode::Start,
             },
+            client_request_id: None,
         };
         let sent: SessionSendResult = client.request(SESSION_SEND, &params).await?;
         if args.json {
