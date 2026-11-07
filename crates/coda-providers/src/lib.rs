@@ -16,6 +16,7 @@ pub mod emit;
 pub mod faux;
 pub mod gate;
 mod http;
+pub mod init_check;
 mod jsonl;
 pub mod model;
 pub mod models;

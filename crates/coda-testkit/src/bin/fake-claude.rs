@@ -42,7 +42,8 @@
 //! appends every user line it reads to that file, and `replies` is a list of
 //! `{"when": <text>, "text": <reply>}` entries: a user line that contains `when` is answered
 //! with the `text` of the first such entry as a text delta, so two agents in one run can give
-//! different answers.
+//! different answers. `init` is an object whose fields are added to the `init` message,
+//! such as `mcp_servers` or `skills`.
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -499,6 +500,9 @@ fn main() -> io::Result<()> {
     let mut init = serde_json::json!({"type":"system","subtype":"init","session_id":SESSION_ID});
     if let Some(source) = control.text("api_key_source") {
         init["apiKeySource"] = serde_json::json!(source);
+    }
+    if let (Some(fields), Some(extra)) = (init.as_object_mut(), control.0["init"].as_object()) {
+        fields.extend(extra.clone());
     }
     emit(&mut out, &init)?;
     let mut lines = io::stdin().lock().lines();
