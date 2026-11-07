@@ -32,6 +32,7 @@ use coda_config::config::ClaudeProfile;
 use coda_protocol::events::{AccountBilling, Event};
 use coda_protocol::types::{PermissionDecision, SessionId, TurnId};
 use coda_providers::account::billing_of_api_key_source;
+use coda_providers::claude_helper::{DEFAULT_TIMEOUT, HelperRequest, run_structured};
 use coda_providers::claude_session::{ClaudeSession, ENV_ALLOWLIST, SessionSpec, TurnOutcome};
 use coda_providers::gate::PermissionGate;
 use coda_providers::init_check::InitReport;
@@ -57,6 +58,8 @@ const LEAN_PROMPT_CEILING: u64 = 12_000;
 const TEXT_PROMPT: &str = "Reply with the single word: ok";
 const LONG_PROMPT: &str = "Write the numbers 1 to 150, one per line, and nothing else.";
 const SECOND_PROMPT: &str = "Now reply with only the word steered.";
+const HELPER_PROMPT: &str =
+    "Make a title of at most six words for a session about adding a retry to an http client.";
 const RESUME_AT_FLAG: &str = "--resume-session-at";
 const FORK_FLAG: &str = "--fork-session";
 const CONTROL_SUCCESS: &str = "success";
@@ -524,4 +527,35 @@ fn the_cli_has_no_flag_to_resume_at_a_message_but_has_fork_session() {
         !text.contains(RESUME_AT_FLAG),
         "{RESUME_AT_FLAG} exists now: coda's rewind can use it"
     );
+}
+
+#[ignore = "spends Claude subscription quota; needs CODA_LIVE_TESTS=1"]
+#[tokio::test]
+async fn the_helper_call_returns_json_that_fits_its_schema() {
+    if !live() {
+        return;
+    }
+    let schema = json!({
+        "type": "object",
+        "properties": {"title": {"type": "string"}},
+        "required": ["title"],
+    });
+    let env = session_env();
+    let binary = find_claude();
+
+    let answer = run_structured(&HelperRequest {
+        binary: &binary,
+        parent_env: &env,
+        env_passthrough: &[],
+        prompt: HELPER_PROMPT,
+        schema: &schema,
+        model: Some(CHEAP_MODEL),
+        timeout: DEFAULT_TIMEOUT,
+    })
+    .await
+    .expect("the helper call failed");
+
+    let title = answer["title"].as_str().expect("no title");
+    assert_ne!(title.trim(), "");
+    eprintln!("helper title length: {} characters", title.len());
 }
