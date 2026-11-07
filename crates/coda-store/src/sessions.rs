@@ -2,6 +2,7 @@
 
 //! Session rows: creation, lookup, listing and model changes.
 
+use coda_protocol::events::ASK_TOOL;
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use rusqlite::{OptionalExtension, Row, params};
 
@@ -35,7 +36,19 @@ pub struct SessionSummary {
     /// Time of the last event, or the creation time when there is none, in
     /// milliseconds since the Unix epoch.
     pub updated_at: i64,
+    /// The first [`MAX_TITLE_CHARS`] characters of the first message the user
+    /// sent; `None` when there is no message or it carries no text.
+    pub title: Option<String>,
+    /// Tool calls waiting for permission.
+    pub pending_approvals: u32,
+    /// Questions from the model waiting for an answer.
+    pub pending_questions: u32,
 }
+
+/// How many characters of a session's first message make its title.
+pub const MAX_TITLE_CHARS: usize = 80;
+/// The stored kind of the message the user sent.
+const USER_MESSAGE_KIND: &str = "user_message";
 
 /// Narrows [`Store::list_sessions`]; the default matches every session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,6 +132,13 @@ fn read_session(row: &Row<'_>) -> Result<Result<SessionRecord, StoreError>, rusq
     }))
 }
 
+/// The title a stored first message gives: lossy where the bytes are not
+/// text, and none when only white space is left.
+fn clean_title(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    (!text.trim().is_empty()).then(|| text.into_owned())
+}
+
 impl Store {
     /// Creates a session and returns its id.
     ///
@@ -189,14 +209,34 @@ impl Store {
             "SELECT s.id, s.backend, s.model, s.cwd, s.mode, s.created_at, \
                     COALESCE((SELECT MAX(e.at) FROM events e \
                               JOIN turns t ON t.id = e.turn_id \
-                              WHERE t.session_id = s.id), s.created_at) \
+                              WHERE t.session_id = s.id), s.created_at), \
+                    (SELECT CASE WHEN json_valid(e.body) \
+                                 THEN CAST(substr(json_extract(e.body, '$.text'), 1, ?3) AS BLOB) END \
+                     FROM turns t JOIN events e ON e.turn_id = t.id \
+                     WHERE t.session_id = s.id AND e.kind = ?4 \
+                     ORDER BY t.id, e.seq LIMIT 1), \
+                    (SELECT COUNT(*) FROM pending_permissions p \
+                     WHERE p.session_id = s.id AND p.resolved_at IS NULL AND p.tool <> ?5), \
+                    (SELECT COUNT(*) FROM pending_permissions p \
+                     WHERE p.session_id = s.id AND p.resolved_at IS NULL AND p.tool = ?5) \
              FROM sessions s WHERE (?1 IS NULL OR s.cwd = ?1) \
              ORDER BY s.id DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![filter.cwd, limit], |row| {
-            let updated_at = row.get(6)?;
-            Ok(read_session(row)?.map(|record| SessionSummary { record, updated_at }))
-        })?;
+        let title_chars = i64::try_from(MAX_TITLE_CHARS).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(
+            params![filter.cwd, limit, title_chars, USER_MESSAGE_KIND, ASK_TOOL],
+            |row| {
+                let (updated_at, title) = (row.get(6)?, row.get::<_, Option<Vec<u8>>>(7)?);
+                let (approvals, questions) = (row.get(8)?, row.get(9)?);
+                Ok(read_session(row)?.map(|record| SessionSummary {
+                    record,
+                    updated_at,
+                    title: title.and_then(|bytes| clean_title(&bytes)),
+                    pending_approvals: approvals,
+                    pending_questions: questions,
+                }))
+            },
+        )?;
         rows.map(|row| row?).collect()
     }
 

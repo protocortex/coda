@@ -13,6 +13,7 @@ pub mod logs;
 pub mod notify;
 pub mod paste;
 pub mod permission;
+pub mod picker;
 pub mod sessions;
 pub mod status;
 pub mod terminal;

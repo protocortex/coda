@@ -12,13 +12,13 @@ use coda_protocol::methods::{
     DaemonBackendsParams, DaemonBackendsResult, DaemonShutdownParams, DaemonShutdownResult,
     DaemonStatusParams, DaemonStatusResult, GrantAddParams, GrantAddResult, InitializeParams,
     InitializeResult, PermissionRequestParams, PermissionRespondParams, PermissionRespondResult,
-    PingParams, PingResult, SessionCancelParams, SessionCancelResult, SessionCloseParams,
-    SessionCloseResult, SessionCreateParams, SessionCreateResult, SessionListParams,
-    SessionListResult, SessionResumeParams, SessionResumeResult, SessionRewindParams,
-    SessionRewindResult, SessionSendParams, SessionSendResult, SessionSetModeParams,
-    SessionSetModeResult, SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams,
-    SessionSubscribeResult, SessionWorktreeParams, SessionWorktreeResult, UsageSummaryParams,
-    UsageSummaryResult, WorktreeCleanParams, WorktreeCleanResult,
+    PingParams, PingResult, SessionAttention, SessionCancelParams, SessionCancelResult,
+    SessionCloseParams, SessionCloseResult, SessionCreateParams, SessionCreateResult,
+    SessionListParams, SessionListResult, SessionResumeParams, SessionResumeResult,
+    SessionRewindParams, SessionRewindResult, SessionSendParams, SessionSendResult,
+    SessionSetModeParams, SessionSetModeResult, SessionSetModelParams, SessionSetModelResult,
+    SessionSubscribeParams, SessionSubscribeResult, SessionWorktreeParams, SessionWorktreeResult,
+    UsageSummaryParams, UsageSummaryResult, WorktreeCleanParams, WorktreeCleanResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -190,6 +190,31 @@ fn absent_optional_fields_stay_absent_when_serialized() {
         crashed_json,
         json!({"type": "backend_crashed", "session_id": "s-1"})
     );
+}
+
+#[test]
+fn a_session_list_from_an_older_daemon_reads_as_waiting_for_nothing_and_untitled() {
+    // Arrange
+    let legacy = golden("session.list.result.legacy");
+
+    // Act
+    let result: SessionListResult = serde_json::from_value(legacy).unwrap();
+
+    // Assert
+    assert_eq!(result.sessions[0].attention, SessionAttention::None);
+    assert_eq!(result.sessions[0].title, None);
+}
+
+#[test]
+fn an_attention_state_from_a_newer_daemon_reads_as_unknown() {
+    // Arrange
+    let value = json!("failed");
+
+    // Act
+    let attention: SessionAttention = serde_json::from_value(value).unwrap();
+
+    // Assert
+    assert_eq!(attention, SessionAttention::Unknown);
 }
 
 #[test]

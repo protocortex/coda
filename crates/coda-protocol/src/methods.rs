@@ -474,6 +474,23 @@ pub enum SessionStatus {
     Running,
 }
 
+/// What a session waits for from a person.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionAttention {
+    /// Nothing waits for an answer.
+    #[default]
+    None,
+    /// A tool call waits for permission.
+    Approval,
+    /// The model asked a question and waits for the answer.
+    Input,
+    /// A state a newer daemon reports that this client does not know.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Metadata of one stored session; never its content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSummary {
@@ -489,6 +506,14 @@ pub struct SessionSummary {
     pub updated_at: i64,
     /// Whether a turn is running.
     pub status: SessionStatus,
+    /// What the session waits for from a person. A question outranks an approval.
+    /// Absent from daemons that predate it.
+    #[serde(default)]
+    pub attention: SessionAttention,
+    /// The start of the first message the user sent, when there is one; a session
+    /// that has not started has none. Absent from daemons that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Result of [`SESSION_LIST`], newest session first.
