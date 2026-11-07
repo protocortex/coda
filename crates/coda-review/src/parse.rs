@@ -2,7 +2,9 @@
 
 //! Strict parsing of model output into checked findings.
 
-use crate::schema::{DiffScope, Finding, MAX_EFFORT, MIN_EFFORT, ModelOutput, RawFinding, Risk};
+use crate::schema::{
+    ComplianceItem, DiffScope, Finding, MAX_EFFORT, MIN_EFFORT, ModelOutput, RawFinding, Risk,
+};
 
 /// A finding that was dropped, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,9 @@ pub struct Parsed {
     pub rejected: Vec<Rejection>,
     /// Findings dropped only because of the cap.
     pub over_cap: usize,
+    /// Verdicts on linked-issue requirements that have the right shape. Whether they name a
+    /// real issue and quote it is checked later, against the issues.
+    pub compliance: Vec<ComplianceItem>,
 }
 
 /// The output is not in the shape the prompt asked for.
@@ -174,6 +179,11 @@ pub fn parse_model_output(
         findings,
         rejected,
         over_cap,
+        compliance: output
+            .compliance
+            .into_iter()
+            .filter_map(|value| serde_json::from_value(value).ok())
+            .collect(),
     })
 }
 

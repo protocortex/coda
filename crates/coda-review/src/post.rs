@@ -206,6 +206,7 @@ mod tests {
             effort: 2,
             risk: Risk::Medium,
             findings,
+            compliance: vec![],
             coverage: Coverage::default(),
             run: RunDetails::default(),
         }

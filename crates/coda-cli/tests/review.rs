@@ -854,3 +854,26 @@ async fn yes_without_post_and_post_with_staged_are_usage_errors() {
     assert_eq!(yes.code, ExitCode::from(USAGE), "{}", yes.err);
     assert_eq!(staged.code, ExitCode::from(USAGE), "{}", staged.err);
 }
+
+#[tokio::test]
+async fn a_verdict_with_no_linked_issue_behind_it_is_dropped_and_the_section_is_omitted() {
+    // Arrange
+    let reply = json!({
+        "summary": "Adds two lines.", "effort": 1, "risk": "low", "findings": [],
+        "compliance": [{"issue": "#12", "requirement": "Retry three times", "verdict": "fully"}]
+    })
+    .to_string();
+    let rig = rig(&answered(&reply));
+
+    // Act
+    let outcome = review(&rig, &[]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    assert!(!outcome.out.contains("Linked issues"), "{}", outcome.out);
+    assert!(
+        !outcome.out.contains("Retry three times"),
+        "{}",
+        outcome.out
+    );
+}

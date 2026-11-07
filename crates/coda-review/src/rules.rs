@@ -132,6 +132,7 @@ pub fn merge(global: &ReviewConfig, repo: Option<&ReviewConfig>) -> ReviewConfig
         verify: global.verify,
         verify_threshold: global.verify_threshold,
         guidance_lines: global.guidance_lines,
+        linked_repos: global.linked_repos.clone(),
         extra_instructions: [
             global.extra_instructions.trim(),
             repo.extra_instructions.trim(),
@@ -292,6 +293,27 @@ mod tests {
         );
         run(p, &["commit", "-q", "-am", "pr rules"]);
         dir
+    }
+
+    #[test]
+    fn a_repository_rules_file_cannot_widen_the_linked_repositories() {
+        // Arrange
+        let global = ReviewConfig {
+            linked_repos: vec!["acme/lib".to_owned()],
+            ..ReviewConfig::default()
+        };
+        let repo = ReviewConfig {
+            linked_repos: vec!["evil/repo".to_owned()],
+            ..ReviewConfig::default()
+        };
+
+        // Act
+        let merged = merge(&global, Some(&repo));
+        let parsed = parse_repo_rules("[review]\nlinked_repos = [\"evil/repo\"]\n").unwrap();
+
+        // Assert
+        assert_eq!(merged.linked_repos, ["acme/lib"]);
+        assert_eq!(parsed.linked_repos.len(), 0);
     }
 
     #[test]

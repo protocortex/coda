@@ -178,6 +178,28 @@ fn write_finding(out: &mut String, f: &Finding) {
     }
 }
 
+/// The verdicts on the linked issues and the notes on the issues that were skipped. Nothing
+/// when no issue was linked.
+fn write_linked(out: &mut String, review: &Review) {
+    if review.compliance.is_empty() && review.run.skipped_issues.is_empty() {
+        return;
+    }
+    out.push_str("## Linked issues\n\n");
+    for item in &review.compliance {
+        let _ = writeln!(
+            out,
+            "- {} \"{}\": {}",
+            one_line(&item.issue),
+            prose(&one_line(&item.requirement)),
+            item.verdict.words()
+        );
+    }
+    for note in &review.run.skipped_issues {
+        let _ = writeln!(out, "- {}", prose(&one_line(note)));
+    }
+    out.push('\n');
+}
+
 fn write_files(out: &mut String, label: &str, files: &[String]) {
     if files.is_empty() {
         return;
@@ -211,6 +233,7 @@ pub fn to_markdown(review: &Review) -> String {
     for finding in &review.findings {
         write_finding(&mut out, finding);
     }
+    write_linked(&mut out, review);
     out.push_str("## Coverage\n\n");
     write_files(&mut out, "Reviewed", &review.coverage.reviewed);
     write_files(&mut out, "Clipped", &review.coverage.clipped);
@@ -252,11 +275,40 @@ mod tests {
         Category, Confidence, Coverage, Finding, Review, Risk, RunDetails, Severity,
     };
 
+    #[test]
+    fn linked_issue_verdicts_and_skip_notes_get_a_section_and_no_issue_gets_none() {
+        // Arrange
+        let plain = review();
+        let mut linked = review();
+        linked.compliance = vec![crate::schema::ComplianceItem {
+            issue: "#12".to_owned(),
+            requirement: "Retry three times".to_owned(),
+            verdict: crate::schema::Verdict::Partially,
+        }];
+        linked.run.skipped_issues = vec!["#99 skipped: not found".to_owned()];
+        let mut only_skipped = review();
+        only_skipped.run.skipped_issues = vec!["#99 skipped: not found".to_owned()];
+
+        // Act
+        let none = to_markdown(&plain);
+        let some = to_markdown(&linked);
+        let skipped = to_markdown(&only_skipped);
+
+        // Assert
+        assert!(!none.contains("## Linked issues"));
+        assert!(some.contains("## Linked issues"));
+        assert!(some.contains("#12 \"Retry three times\": partially compliant"));
+        assert!(some.contains("#99 skipped: not found"));
+        assert!(skipped.contains("#99 skipped: not found"));
+        assert!(!skipped.contains("compliant"));
+    }
+
     fn review() -> Review {
         Review {
             summary: "Adds a cache.".to_owned(),
             effort: 2,
             risk: Risk::Medium,
+            compliance: vec![],
             findings: vec![Finding {
                 id: "F1".to_owned(),
                 file: "src/a.rs".to_owned(),
@@ -285,6 +337,7 @@ mod tests {
                 verifier_dropped: 0,
                 chunks: 1,
                 partial: false,
+                skipped_issues: vec![],
             },
         }
     }

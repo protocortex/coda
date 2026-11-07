@@ -166,7 +166,7 @@ fn names<T: Copy>(items: &[T], name: fn(T) -> &'static str) -> String {
 }
 
 /// The reply format, as the reviewer is told it.
-fn reply_format(max_findings: usize) -> String {
+fn reply_format(max_findings: usize, with_issues: bool) -> String {
     let severities = names(
         &[
             Severity::Critical,
@@ -194,6 +194,14 @@ fn reply_format(max_findings: usize) -> String {
         Confidence::as_str,
     );
     let risks = names(&[Risk::Low, Risk::Medium, Risk::High], Risk::as_str);
+    let compliance = if with_issues {
+        "\n- \"compliance\": a list with one entry per requirement of the linked issues that the \
+         change should meet, each with \"issue\" (as named above, such as \"#12\"), \"requirement\" \
+         (quoted word for word from that issue) and \"verdict\" (one of \"fully\", \"partially\", \
+         \"not\"). Judge only from the diff; say nothing about a requirement you cannot judge."
+    } else {
+        ""
+    };
     format!(
         "Reply with one JSON object and nothing else, with these keys:\n\
          - \"summary\": a short overview of the change.\n\
@@ -203,7 +211,7 @@ fn reply_format(max_findings: usize) -> String {
          \"file\" (the path as in the diff), \"start_line\" and \"end_line\" (line numbers on the new \
          side, inside the lines shown), \"severity\" (one of {severities}), \"category\" (one of \
          {categories}), \"title\" (one line), \"explanation\", \"suggested_patch\" (replacement code, or \
-         null) and \"confidence\" (one of {confidences}).\n\
+         null) and \"confidence\" (one of {confidences}).{compliance}\n\
          A finding outside the lines shown is dropped. If you find nothing, reply with an empty list."
     )
 }
@@ -246,6 +254,9 @@ pub struct Extras<'a> {
     pub standing: Option<&'a str>,
     /// Instructions for this run, from the person who started the review.
     pub run: Option<&'a str>,
+    /// The linked issues, as [`crate::issues::prompt_section`] wrote them. Their text is
+    /// data written by other people.
+    pub issues: Option<&'a str>,
 }
 
 fn present(text: Option<&str>) -> Option<&str> {
@@ -264,7 +275,7 @@ pub fn input_text(
 ) -> String {
     let mut out = format!(
         "{}\nExample:\n{}\n\n",
-        reply_format(max_findings),
+        reply_format(max_findings, present(extras.issues).is_some()),
         reply_example()
     );
     if let Some(rules) = present(extras.guidance) {
@@ -285,6 +296,10 @@ pub fn input_text(
         out.push_str("Instructions from the person who asked for this review:\n");
         out.push_str(text);
         out.push_str("\n\n");
+    }
+    if let Some(text) = present(extras.issues) {
+        out.push_str(text);
+        out.push('\n');
     }
     if let Some(Part { index, total }) = part {
         let _ = write!(
@@ -391,6 +406,7 @@ pub fn assemble(
         effort: parsed.effort,
         risk: parsed.risk,
         findings: parsed.findings,
+        compliance: parsed.compliance,
         coverage,
         run: RunDetails {
             model: model.to_owned(),
@@ -400,6 +416,7 @@ pub fn assemble(
             verifier_dropped: verifier.map_or(0, |v| v.dropped),
             chunks,
             partial,
+            skipped_issues: Vec::new(),
         },
     }
 }
@@ -423,6 +440,25 @@ mod tests {
             },
             omitted: vec![],
         }
+    }
+
+    #[test]
+    fn the_issues_and_the_compliance_key_are_in_the_prompt_only_when_there_are_issues() {
+        // Arrange
+        let with = Extras {
+            issues: Some("Issue #12: Add retries"),
+            ..Extras::default()
+        };
+
+        // Act
+        let plain = input_text(&packed(), &Extras::default(), 5, None);
+        let linked = input_text(&packed(), &with, 5, None);
+
+        // Assert
+        assert!(!plain.contains("compliance"));
+        assert!(linked.contains("Issue #12: Add retries"));
+        assert!(linked.contains("\"compliance\""));
+        assert!(linked.contains("\"requirement\""));
     }
 
     #[test]
@@ -524,6 +560,7 @@ mod tests {
                 guidance: Some("\n"),
                 standing: Some(" "),
                 run: Some("  \n"),
+                issues: Some(" "),
             },
             5,
             None,
@@ -542,6 +579,7 @@ mod tests {
             guidance: Some("--- AGENTS.md ---\nrule one"),
             standing: Some("always check locks"),
             run: Some("look at the parser"),
+            issues: None,
         };
 
         // Act
@@ -654,6 +692,7 @@ mod tests {
                 reason: "r".to_owned(),
             }],
             over_cap: 2,
+            compliance: vec![],
         };
 
         let merged = Merged {
