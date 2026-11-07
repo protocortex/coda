@@ -14,7 +14,7 @@ use coda_config::hooks::{HookConfig, HookEvent};
 use coda_core::hooks::HookRunner;
 use coda_core::prompt::{Conversation, Prefix};
 use coda_core::tools::{BaseToolsConfig, StoreOriginals, base_tools};
-use coda_core::turn::{StopCondition, TurnConfig, TurnEvent, TurnLoop};
+use coda_core::turn::{Fallback, StopCondition, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision};
 use coda_providers::faux::FauxProvider;
 use coda_providers::gate::PermissionGate;
@@ -51,6 +51,8 @@ pub struct Outcome {
     pub usage_tokens: u64,
     pub shrunk_bytes: u64,
     pub tool_errors: u32,
+    /// Times the loop moved to its fallback model.
+    pub fallbacks: u32,
     pub stop: String,
     pub failure: Option<String>,
 }
@@ -62,6 +64,22 @@ impl PermissionGate for AllowAll {
         std::future::ready(PermissionDecision::AllowOnce)
     }
 }
+
+/// A scripted provider that two models of one loop draw their replies from.
+struct Shared(Arc<FauxProvider>);
+
+impl ModelProvider for Shared {
+    fn stream(
+        &self,
+        request: ModelRequest,
+    ) -> impl Future<Output = Result<ModelStream, ProviderError>> + Send {
+        self.0.stream(request)
+    }
+}
+
+/// The model the loop names for its own and for its fallback.
+const PRIMARY_ALIAS: &str = "primary";
+const FALLBACK_ALIAS: &str = "fallback";
 
 /// A provider that remembers every request it was sent.
 struct Recording<P> {
@@ -106,12 +124,21 @@ fn request_bytes(request: &ModelRequest) -> u64 {
 }
 
 pub async fn run_offline(fixture: &Fixture) -> Outcome {
-    let provider = FauxProvider::new((fixture.script)());
-    run(fixture, provider).await
+    let script = Arc::new(FauxProvider::new((fixture.script)()));
+    let fallback = fixture.fallback.then(|| Shared(Arc::clone(&script)));
+    run_with_fallback(fixture, Shared(script), fallback).await
 }
 
 /// Runs `fixture` against `provider` in a fresh workspace.
 pub async fn run<P: ModelProvider + Send + Sync>(fixture: &Fixture, provider: P) -> Outcome {
+    run_with_fallback(fixture, provider, None).await
+}
+
+async fn run_with_fallback<P: ModelProvider + Send + Sync>(
+    fixture: &Fixture,
+    provider: P,
+    fallback: Option<P>,
+) -> Outcome {
     let dir = tempfile::tempdir().unwrap();
     let workdir = dir.path().join("ws");
     std::fs::create_dir(&workdir).unwrap();
@@ -141,6 +168,17 @@ pub async fn run<P: ModelProvider + Send + Sync>(fixture: &Fixture, provider: P)
     let prefix = Prefix::new(SYSTEM_PROMPT, tools.schemas, "").unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let chain = fallback
+        .into_iter()
+        .map(|provider| Fallback {
+            alias: FALLBACK_ALIAS.to_owned(),
+            provider: Recording {
+                inner: provider,
+                requests: Arc::clone(&requests),
+            },
+            context_window: None,
+        })
+        .collect();
     let mut lp = TurnLoop::new(
         Recording {
             inner: provider,
@@ -160,10 +198,11 @@ pub async fn run<P: ModelProvider + Send + Sync>(fixture: &Fixture, provider: P)
         sender,
     )
     .with_hooks(guard_hooks(fixture))
-    .with_text_tool_calls(fixture.text_calls);
+    .with_text_tool_calls(fixture.text_calls)
+    .with_fallbacks(PRIMARY_ALIAS, chain);
 
     let sent = lp.send(fixture.prompt).await;
-    let (turns, usage_tokens, tool_errors) = count_events(&mut receiver);
+    let (turns, usage_tokens, tool_errors, fallbacks) = count_events(&mut receiver);
     let requests = requests.lock().unwrap().clone();
     let shrunk_bytes = store
         .lock()
@@ -183,7 +222,7 @@ pub async fn run<P: ModelProvider + Send + Sync>(fixture: &Fixture, provider: P)
         ),
     };
     if failure.is_none() {
-        failure = judge(fixture, &workdir, &requests);
+        failure = judge(fixture, &workdir, &requests, fallbacks);
     }
     Outcome {
         name: fixture.name,
@@ -193,6 +232,7 @@ pub async fn run<P: ModelProvider + Send + Sync>(fixture: &Fixture, provider: P)
         usage_tokens,
         shrunk_bytes,
         tool_errors,
+        fallbacks,
         stop,
         failure,
     }
@@ -216,21 +256,30 @@ fn guard_hooks(fixture: &Fixture) -> HookRunner {
     )
 }
 
-fn count_events(receiver: &mut UnboundedReceiver<TurnEvent>) -> (u32, u64, u32) {
-    let (mut turns, mut tokens, mut errors) = (0, 0, 0);
+fn count_events(receiver: &mut UnboundedReceiver<TurnEvent>) -> (u32, u64, u32, u32) {
+    let (mut turns, mut tokens, mut errors, mut fallbacks) = (0, 0, 0, 0);
     while let Ok(event) = receiver.try_recv() {
         match event {
             TurnEvent::Assistant { .. } => turns += 1,
             TurnEvent::Usage(usage) => tokens += usage.input_tokens + usage.output_tokens,
             TurnEvent::ToolFinished { is_error: true, .. } => errors += 1,
+            TurnEvent::ModelFallback { .. } => fallbacks += 1,
             _ => {}
         }
     }
-    (turns, tokens, errors)
+    (turns, tokens, errors, fallbacks)
 }
 
 /// Why the run does not count as a pass, if it does not.
-fn judge(fixture: &Fixture, workdir: &Path, requests: &[ModelRequest]) -> Option<String> {
+fn judge(
+    fixture: &Fixture,
+    workdir: &Path,
+    requests: &[ModelRequest],
+    fallbacks: u32,
+) -> Option<String> {
+    if fixture.fallback && fallbacks != 1 {
+        return Some(format!("the loop fell back {fallbacks} times, not once"));
+    }
     if let Some(marker) = fixture.untrusted {
         let seen = requests.iter().any(|request| {
             request.messages.iter().any(

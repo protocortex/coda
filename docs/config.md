@@ -88,6 +88,28 @@ A name that picks a provider and a model. Both keys are required in a section.
 | `provider` | string | none | The provider that serves the model: `anthropic`, `openai_compat` or `faux`. `claude_code` and `codex` are not accepted. |
 | `model` | string | none | The model id sent to that provider. |
 | `context_window` | integer | none | Optional. The model's context window in tokens. It replaces the built-in value for this provider and model. Must be above 0. Two aliases of the same provider and model must not set different values. A model that is neither listed nor given a value has no known window, so Coda compacts it only after the provider reports an overflow. |
+| `fallback` | array of strings | none | Optional. Aliases to try, in order, when this model fails. See below. |
+
+### Fallback chain
+
+A model that is rate limited, overloaded or unknown to its provider would otherwise end the send with an error. With `fallback`, the loop sends the same request to the next alias instead:
+
+```toml
+[models.main]
+provider = "anthropic"
+model = "claude-sonnet-5-5"
+fallback = ["local"]
+
+[models.local]
+provider = "openai_compat"
+model = "qwen-coder"
+```
+
+A fallback is used when the provider's own retries are spent and the call still fails with a rate limit, a server error or overload (HTTP 429, 5xx, 529), a connection failure that outlasts the retries, or an unknown-model error (an Anthropic `not_found_error`, an OpenAI-compatible 404 whose message names a model, or the code `model_not_found`; a bare 404 is treated as a wrong base URL and ends the send). Other errors, such as a bad key or a refused request, end the send as before. A fallback happens only before the model has said anything: once text, reasoning or a tool call has started to stream, a failure ends the send, so no half answer is thrown away. The send stays on the fallback until it ends, and the next send starts on the first model again. When the chain is used up the send ends with the last error.
+
+Each switch is stored once as a `model_fallback` event that names both aliases and gives the reason, and the terminal UI shows it as a notice. Tokens from every model count against the same budget. The chain belongs to the alias; a session finds it by the provider and model it runs, using the first alias, by name, that names them and has a `fallback` list. Sub-agents started with `task` do not use fallbacks.
+
+The aliases in a chain, and the alias that lists them, must be on `anthropic`, `openai_compat` or `faux`. A chain that names a missing alias, repeats an alias, lists the alias itself or names `claude_code` or `codex` is refused when the file loads. `coda doctor` warns for a fallback whose provider is not enabled; a session leaves such a fallback out and logs why.
 
 The built-in defaults cover `claude-sonnet-5-5` and `claude-sonnet-4-5` (200000 tokens) and `gpt-4o` (128000 tokens).
 

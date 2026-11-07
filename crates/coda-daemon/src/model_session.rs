@@ -25,11 +25,11 @@ use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
 use coda_core::tools::{
     BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index, task_schema,
 };
-use coda_core::turn::{CancelToken, TurnConfig, TurnEvent, TurnLoop};
+use coda_core::turn::{CancelToken, Fallback, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{
     CALL_RECOVERED_KIND, CallRecoveredBody, Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND,
-    GuardContinueBody, GuardLimitBody, HOOK_BLOCKED_KIND, HookBlockedBody, TIMEOUT_KIND,
-    ToolCallStatus, tool_summary,
+    GuardContinueBody, GuardLimitBody, HOOK_BLOCKED_KIND, HookBlockedBody, MODEL_FALLBACK_KIND,
+    ModelFallbackBody, TIMEOUT_KIND, ToolCallStatus, tool_summary,
 };
 use coda_protocol::types::{
     BackendKind, OriginalId, PermissionDecision, SessionId, TokenUsage, TurnId,
@@ -697,6 +697,7 @@ impl ModelSessions {
         } else {
             None
         };
+        let shared_script = faux.clone();
         let (store, workdir) = (self.hub.store_handle(), PathBuf::from(&record.cwd));
         if let Err(error) =
             tokio::task::spawn_blocking(move || refresh_index(&store, &workdir)).await
@@ -740,7 +741,7 @@ impl ModelSessions {
             faux,
             sender.clone(),
         );
-        let turn_loop = factory
+        let mut turn_loop = factory
             .build_loop(
                 0,
                 task::LoopParts {
@@ -763,6 +764,9 @@ impl ModelSessions {
             .with_used_tokens(used)
             .with_resumed(session_started)
             .with_text_tool_calls(self.text_tool_calls(record));
+        if let Some((alias, chain)) = self.fallbacks(record, shared_script.as_ref()) {
+            turn_loop = turn_loop.with_fallbacks(alias, chain);
+        }
         Ok(ModelLoop {
             turn_loop,
             events,
@@ -771,6 +775,52 @@ impl ModelSessions {
             offer,
             problems,
         })
+    }
+
+    /// The alias of the model the session runs and the models it falls back to,
+    /// when an alias gives that model a chain. A fallback that cannot be built,
+    /// because its provider is off or has no key, is left out and logged, so a
+    /// broken chain never stops a session that runs on its first model. A
+    /// scripted fallback draws turns from the same script as the session.
+    fn fallbacks(
+        &self,
+        record: &SessionRecord,
+        script: Option<&Arc<FauxProvider>>,
+    ) -> Option<(String, Vec<Fallback<Provider>>)> {
+        let target = self
+            .registry
+            .select(record.backend, record.model.as_deref())
+            .ok()?;
+        let chain = match self.registry.fallback_chain(&target) {
+            Ok(chain) => chain?,
+            Err(error) => {
+                warn!(session = %record.id, %error, "the fallback chain cannot be used");
+                return None;
+            }
+        };
+        let mut fallbacks = Vec::new();
+        for (alias, next) in chain.targets {
+            let provider = if next.backend == BackendKind::Faux {
+                script.map(|script| Provider::Faux(Arc::clone(script)))
+            } else {
+                let reader = Arc::clone(&self.key_reader);
+                match self.registry.build(&next, move |name| reader(name)) {
+                    Ok(client) => Some(Provider::Api(client)),
+                    Err(error) => {
+                        warn!(session = %record.id, %alias, %error, "a fallback model cannot be used and is left out");
+                        None
+                    }
+                }
+            };
+            if let Some(provider) = provider {
+                fallbacks.push(Fallback {
+                    alias,
+                    provider,
+                    context_window: self.registry.context_window(&next),
+                });
+            }
+        }
+        Some((chain.alias, fallbacks))
     }
 
     /// Whether the provider that serves `record` is set to read a call from a
@@ -978,6 +1028,14 @@ async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Ro
                 how: how.as_str().to_owned()
             }),
         },
+        TurnEvent::ModelFallback { from, to, reason } => Row::Stored {
+            kind: MODEL_FALLBACK_KIND,
+            body: json!(ModelFallbackBody {
+                from: from.clone(),
+                to: to.clone(),
+                reason: reason.clone()
+            }),
+        },
         TurnEvent::Text(_)
         | TurnEvent::Usage(_)
         | TurnEvent::SessionStarted
@@ -1171,6 +1229,7 @@ async fn publish_turn_event(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, 
         TurnEvent::Assistant { .. }
         | TurnEvent::ToolFinished { .. }
         | TurnEvent::ContextOverflow
+        | TurnEvent::ModelFallback { .. }
         | TurnEvent::CallRecovered { .. } => return,
     };
     log_failure(stored);

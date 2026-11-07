@@ -5,6 +5,10 @@
       "turns": 4,
       "tokens": 5700
     },
+    "fell_back_on_rate_limit": {
+      "turns": 2,
+      "tokens": 4202
+    },
     "finished_too_early": {
       "turns": 3,
       "tokens": 4220

@@ -17,6 +17,8 @@ pub use crate::http::{Timing, sse};
 /// Longest piece of an API error message kept in our own errors.
 const MAX_MESSAGE_CHARS: usize = 200;
 /// Error type names the API uses for failures that a later call may survive.
+const HTTP_NOT_FOUND: u16 = 404;
+const NOT_FOUND_ERROR_TYPE: &str = "not_found_error";
 const RETRYABLE_ERROR_TYPES: [&str; 3] = ["overloaded_error", "api_error", "rate_limit_error"];
 /// Message fragments by which the API reports a context overflow.
 const OVERFLOW_MARKERS: [&str; 3] = [
@@ -42,7 +44,13 @@ pub fn classify_status(status: u16, body: &str) -> ProviderError {
         Some(detail) => format!("Anthropic returned HTTP {status}: {}", shorten(&detail)),
         None => format!("Anthropic returned HTTP {status}"),
     };
-    if is_retryable_status(status) {
+    // A 404 with no such body is a wrong base URL, which no other model fixes.
+    let names_missing_model = serde_json::from_str::<Value>(body).is_ok_and(|value| {
+        value.pointer("/error/type").and_then(Value::as_str) == Some(NOT_FOUND_ERROR_TYPE)
+    });
+    if status == HTTP_NOT_FOUND && names_missing_model {
+        ProviderError::UnknownModel { message }
+    } else if is_retryable_status(status) {
         ProviderError::Retryable { message }
     } else {
         ProviderError::Fatal { message }
@@ -55,7 +63,9 @@ pub(crate) fn classify_stream_error(kind: &str, detail: &str) -> ProviderError {
         return ProviderError::ContextWindowExceeded;
     }
     let message = format!("Anthropic stream error ({kind}): {}", shorten(detail));
-    if RETRYABLE_ERROR_TYPES.contains(&kind) {
+    if kind == NOT_FOUND_ERROR_TYPE {
+        ProviderError::UnknownModel { message }
+    } else if RETRYABLE_ERROR_TYPES.contains(&kind) {
         ProviderError::Retryable { message }
     } else {
         ProviderError::Fatal { message }

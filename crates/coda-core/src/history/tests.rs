@@ -3,7 +3,9 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use coda_protocol::events::{COMPACTION_KIND, STREAM_DELTA_KIND, TOOL_CALL_KIND};
+use coda_protocol::events::{
+    COMPACTION_KIND, MODEL_FALLBACK_KIND, STREAM_DELTA_KIND, TOOL_CALL_KIND,
+};
 use coda_protocol::types::{OriginalId, TurnId};
 use coda_store::StoredEvent;
 use serde_json::{Value, json};
@@ -396,6 +398,7 @@ fn bookkeeping_events_are_not_worth_a_warning() {
         (STREAM_DELTA_KIND, json!({"text": "x"})),
         (PERMISSION_REQUEST_KIND, json!({})),
         (MODEL_SWITCHED_KIND, json!({})),
+        (MODEL_FALLBACK_KIND, json!({})),
         (TOOL_CALL_KIND, json!({})),
         assistant("hi", &[]),
     ];

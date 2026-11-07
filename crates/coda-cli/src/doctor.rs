@@ -421,6 +421,7 @@ fn check_config(path: &Path) -> (Check, Option<Config>) {
                 ));
             }
             notes.extend(routing_notes(&parsed.config));
+            notes.extend(fallback_notes(&parsed.config));
             let check = if notes.is_empty() {
                 Check::ok(NAME, "valid")
             } else {
@@ -471,6 +472,30 @@ fn routing_notes(config: &Config) -> Vec<String> {
                 "[routing] {tier} names `{alias}`, which uses {provider}, but the default session \
                  provider is {default}; a `task` call in a session on {default} cannot use it"
             ));
+        }
+    }
+    notes
+}
+
+/// A warning for each fallback alias whose provider is not enabled: the chain
+/// would skip it when a session starts.
+fn fallback_notes(config: &Config) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (name, alias) in &config.models {
+        for target in &alias.fallback {
+            let provider = config
+                .models
+                .get(target)
+                .map(|model| model.provider.as_str());
+            let enabled = provider
+                .and_then(|provider| config.providers.get(provider))
+                .is_some_and(|section| section.enabled);
+            if !enabled {
+                notes.push(format!(
+                    "[models.{name}] falls back to `{target}`, whose provider is not enabled; \
+                     the chain skips it"
+                ));
+            }
         }
     }
     notes

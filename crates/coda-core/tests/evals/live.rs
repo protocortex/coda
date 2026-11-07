@@ -46,7 +46,11 @@ async fn live_fixtures_pass_with_a_real_model() {
     let target = registry.select(BackendKind::Anthropic, None).unwrap();
 
     let mut outcomes = Vec::new();
-    for fixture in fixtures::all() {
+    // A real model cannot be made to fail on cue, so fixtures that script a failure stay offline.
+    for fixture in fixtures::all()
+        .into_iter()
+        .filter(|fixture| !fixture.fallback)
+    {
         let client = registry
             .build(&target, |name| std::env::var(name).ok())
             .unwrap();

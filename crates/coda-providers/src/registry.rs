@@ -71,6 +71,15 @@ pub struct ModelTarget {
     pub model: String,
 }
 
+/// The aliases a model falls back to, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackChain {
+    /// The alias of the model that has the chain.
+    pub alias: String,
+    /// Each fallback alias and what it runs.
+    pub targets: Vec<(String, ModelTarget)>,
+}
+
 /// A client for one model-API provider.
 #[derive(Debug)]
 pub enum ModelClient {
@@ -195,6 +204,51 @@ impl ModelRegistry {
                 .ok_or(RegistryError::NoModel(key))?,
         };
         Ok(ModelTarget { backend, model })
+    }
+
+    /// The fallback chain of the model `target`: the `fallback` list of the first
+    /// alias, by name, that names the same provider and model and has one.
+    /// `None` when no alias gives it a chain.
+    ///
+    /// # Errors
+    /// Returns [`RegistryError::UnknownProvider`] when a listed alias names no
+    /// known provider; config loading already refuses a list that names a
+    /// missing alias or a delegated backend.
+    pub fn fallback_chain(
+        &self,
+        target: &ModelTarget,
+    ) -> Result<Option<FallbackChain>, RegistryError> {
+        let provider = provider_key(target.backend);
+        let Some((name, owner)) = self.aliases.iter().find(|(_, alias)| {
+            provider == Some(alias.provider.as_str())
+                && alias.model == target.model
+                && !alias.fallback.is_empty()
+        }) else {
+            return Ok(None);
+        };
+        let mut targets = Vec::with_capacity(owner.fallback.len());
+        for next in &owner.fallback {
+            let alias = self
+                .aliases
+                .get(next)
+                .ok_or_else(|| RegistryError::UnknownAlias(next.clone()))?;
+            let backend =
+                backend_of(&alias.provider).ok_or_else(|| RegistryError::UnknownProvider {
+                    alias: next.clone(),
+                    provider: alias.provider.clone(),
+                })?;
+            targets.push((
+                next.clone(),
+                ModelTarget {
+                    backend,
+                    model: alias.model.clone(),
+                },
+            ));
+        }
+        Ok(Some(FallbackChain {
+            alias: name.clone(),
+            targets,
+        }))
     }
 
     /// The context window of `target` in tokens: the `context_window` of an
@@ -428,6 +482,43 @@ model = "m"
             // Assert
             assert_eq!((target.backend, target.model.as_str()), (backend, model));
         }
+    }
+
+    #[test]
+    fn a_model_with_a_fallback_list_gets_its_chain_in_order() {
+        let chained = registry(&format!(
+            "{CONFIG}\n[models.sturdy]\nprovider = \"openai_compat\"\nmodel = \"big\"\n\
+             [models.main]\nprovider = \"anthropic\"\nmodel = \"claude-main\"\n\
+             fallback = [\"local\", \"sturdy\", \"fast\"]\n"
+        ));
+
+        let chain = chained
+            .fallback_chain(&target(BackendKind::Anthropic, "claude-main"))
+            .unwrap()
+            .unwrap();
+        let none = chained
+            .fallback_chain(&target(BackendKind::Anthropic, "claude-fast"))
+            .unwrap();
+
+        assert_eq!(chain.alias, "main");
+        assert_eq!(
+            chain.targets,
+            [
+                (
+                    "local".to_owned(),
+                    target(BackendKind::OpenaiCompat, "qwen-coder")
+                ),
+                (
+                    "sturdy".to_owned(),
+                    target(BackendKind::OpenaiCompat, "big")
+                ),
+                (
+                    "fast".to_owned(),
+                    target(BackendKind::Anthropic, "claude-fast")
+                ),
+            ]
+        );
+        assert_eq!(none, None);
     }
 
     #[test]

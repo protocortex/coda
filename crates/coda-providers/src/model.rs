@@ -181,6 +181,13 @@ pub enum ProviderError {
         /// What went wrong.
         message: String,
     },
+    /// The provider does not know the model, so the same request will never
+    /// work on it, though another model may serve it.
+    #[error("unknown model: {message}")]
+    UnknownModel {
+        /// What went wrong.
+        message: String,
+    },
     /// A failure that retrying cannot fix.
     #[error("fatal provider error: {message}")]
     Fatal {
@@ -194,6 +201,14 @@ impl ProviderError {
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         matches!(self, Self::Retryable { .. })
+    }
+
+    /// Whether another model may serve the request when this one cannot: a
+    /// transient failure that outlasted the provider's retries, or a model the
+    /// provider does not know.
+    #[must_use]
+    pub const fn can_fall_back(&self) -> bool {
+        matches!(self, Self::Retryable { .. } | Self::UnknownModel { .. })
     }
 }
 
@@ -320,6 +335,12 @@ mod tests {
                 },
                 true,
             ),
+            (
+                ProviderError::UnknownModel {
+                    message: "x".into(),
+                },
+                false,
+            ),
         ];
 
         for (error, expected) in cases {
@@ -328,6 +349,35 @@ mod tests {
 
             // Assert
             assert_eq!(retryable, expected, "{error}");
+        }
+    }
+
+    #[test]
+    fn only_a_retryable_or_unknown_model_error_can_fall_back() {
+        let cases = [
+            (ProviderError::ContextWindowExceeded, false),
+            (
+                ProviderError::Fatal {
+                    message: "x".into(),
+                },
+                false,
+            ),
+            (
+                ProviderError::Retryable {
+                    message: "x".into(),
+                },
+                true,
+            ),
+            (
+                ProviderError::UnknownModel {
+                    message: "x".into(),
+                },
+                true,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.can_fall_back(), expected, "{error}");
         }
     }
 

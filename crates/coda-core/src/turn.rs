@@ -201,6 +201,16 @@ pub enum TurnEvent {
     /// A marker, not an event. Whoever reads the channel answers it once every
     /// event sent before it is stored, so the sender can write after them.
     Fence(FenceAck),
+    /// The model failed before it said anything and the send moved to the next
+    /// alias in its fallback chain. The same request is sent again, on the new model.
+    ModelFallback {
+        /// The alias that failed.
+        from: String,
+        /// The alias the send moved to.
+        to: String,
+        /// Why the first failed, in the provider's words.
+        reason: String,
+    },
     /// An event of a sub-agent's run, passed up the session's own channel so it
     /// is stored in order with the session's events: after the call that started
     /// the sub-agent and before that call's result.
@@ -363,6 +373,25 @@ pub struct TurnConfig {
     pub compact_threshold_bytes: usize,
 }
 
+/// A model the loop moves to when the one before it in the chain fails.
+pub struct Fallback<P> {
+    /// The `[models]` alias, for events and the TUI.
+    pub alias: String,
+    /// Serves the model.
+    pub provider: P,
+    /// The model's context window, when it is known.
+    pub context_window: Option<u32>,
+}
+
+/// The models of one loop: the primary and the aliases that follow it.
+struct Chain<P> {
+    primary_alias: String,
+    primary_window: Option<u32>,
+    fallbacks: Vec<Fallback<P>>,
+    /// 0 is the primary; `n` is `fallbacks[n - 1]`.
+    active: usize,
+}
+
 /// One session's loop state.
 #[allow(
     clippy::struct_excessive_bools,
@@ -396,6 +425,7 @@ pub struct TurnLoop<P, G> {
     max_guard_continues: u32,
     /// Whether a reply that is one JSON object fitting one tool is a call.
     text_tool_calls: bool,
+    chain: Option<Chain<P>>,
 }
 
 /// How a compaction attempt ended.
@@ -440,7 +470,75 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             guard: LoopGuard::new(LoopGuardConfig::default()),
             max_guard_continues: DEFAULT_MAX_GUARD_CONTINUES,
             text_tool_calls: false,
+            chain: None,
         }
+    }
+
+    /// Names the loop's own model `primary_alias` and gives the models to try, in
+    /// order, when it fails with an error that another model may get past. A send
+    /// moves down the chain for the rest of that send and starts again on the
+    /// primary.
+    #[must_use]
+    pub fn with_fallbacks(
+        mut self,
+        primary_alias: impl Into<String>,
+        fallbacks: Vec<Fallback<P>>,
+    ) -> Self {
+        self.chain = (!fallbacks.is_empty()).then(|| Chain {
+            primary_alias: primary_alias.into(),
+            primary_window: None,
+            fallbacks,
+            active: 0,
+        });
+        self
+    }
+
+    fn provider(&self) -> &P {
+        match &self.chain {
+            Some(chain) if chain.active > 0 => &chain.fallbacks[chain.active - 1].provider,
+            _ => &self.provider,
+        }
+    }
+
+    /// Goes back to the primary model for a new send.
+    fn restore_primary(&mut self) {
+        if let Some(chain) = &mut self.chain
+            && chain.active > 0
+        {
+            chain.active = 0;
+            self.context_window = chain.primary_window;
+        }
+    }
+
+    /// Moves to the next model of the chain after `error`, and says so. Returns
+    /// false when the error is not one a fallback helps with, or the chain ends.
+    fn fall_back(&mut self, error: &TurnError) -> bool {
+        let TurnError::Provider(error) = error else {
+            return false;
+        };
+        let Some(chain) = &mut self.chain else {
+            return false;
+        };
+        if !error.can_fall_back() || chain.active >= chain.fallbacks.len() {
+            return false;
+        }
+        let from = if chain.active == 0 {
+            chain.primary_window = self.context_window;
+            chain.primary_alias.clone()
+        } else {
+            chain.fallbacks[chain.active - 1].alias.clone()
+        };
+        chain.active += 1;
+        let next = &chain.fallbacks[chain.active - 1];
+        let (to, window) = (next.alias.clone(), next.context_window);
+        self.context_window = window;
+        warn!(%from, %to, %error, "the model failed; moving to the next in its fallback chain");
+        self.emit(TurnEvent::ModelFallback {
+            from,
+            to,
+            reason: error.to_string(),
+        });
+        true
     }
 
     /// Lets a reply with no structured call, whose whole text is one JSON object
@@ -558,6 +656,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     pub async fn send(&mut self, text: &str) -> Result<StopCondition, TurnError> {
         self.conversation.push(Message::User(text.to_owned()));
         self.compacted_ahead = false;
+        self.restore_primary();
         self.guard.reset();
         let result = match self.start_session().await {
             Some(stop) => Ok(stop),
@@ -815,7 +914,13 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             }
         }
         loop {
-            let streamed = self.stream_once().await?;
+            let attempt = self.stream_once().await;
+            let streamed = match attempt.streamed {
+                Ok(streamed) => streamed,
+                // Once a reply has begun, a switch would lose what the user saw.
+                Err(error) if !attempt.output_seen && self.fall_back(&error) => continue,
+                Err(error) => return Err(error),
+            };
             if compacted || !matches!(streamed, Streamed::Overflow) {
                 return Ok(streamed);
             }
@@ -828,7 +933,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         }
     }
 
-    async fn stream_once(&mut self) -> Result<Streamed, TurnError> {
+    async fn stream_once(&mut self) -> Attempt {
         let call = info_span!(
             PROVIDER_CALL_SPAN,
             { CODA_SESSION_ID } = %self.config.session,
@@ -840,7 +945,10 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             self.budget.record(usage);
             self.emit(TurnEvent::Usage(usage));
         }
-        streamed
+        Attempt {
+            streamed,
+            output_seen: draft.output_seen,
+        }
     }
 
     /// Compacting ahead is tried once per send, and only when there is
@@ -862,7 +970,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         let (replaced, kept) = (split, messages.len() - split);
         let transcript = summary::render(&messages[..split]);
         let chunk = summary::chunk_bytes(self.context_window);
-        let made = summary::summarize(&self.provider, &self.cancel, &transcript, chunk).await;
+        let made = summary::summarize(self.provider(), &self.cancel, &transcript, chunk).await;
         let made = match made {
             Ok(made) => made,
             Err(CompactError::Cancelled) => return Compacted::Cancelled,
@@ -947,7 +1055,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     /// Streams one model reply, giving up as soon as the user cancels.
     async fn stream_reply(&self, draft: &mut Draft) -> Result<Streamed, TurnError> {
         let opened = tokio::select! {
-            opened = self.provider.stream(self.request()) => opened,
+            opened = self.provider().stream(self.request()) => opened,
             () = self.cancel.cancelled() => return Ok(Streamed::Cancelled),
         };
         let mut stream = match opened {
@@ -984,20 +1092,27 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
     fn apply(&self, reply: &mut Draft, event: ModelEvent) -> Option<StopReason> {
         match event {
             ModelEvent::TextDelta { text } => {
+                reply.output_seen = true;
                 reply.text.push_str(&text);
                 self.emit(TurnEvent::Text(text));
             }
-            ModelEvent::ToolCallStart { call_id, name } => reply.calls.push(ToolCall {
-                id: call_id,
-                name,
-                arguments: String::new(),
-            }),
+            ModelEvent::ToolCallStart { call_id, name } => {
+                reply.output_seen = true;
+                reply.calls.push(ToolCall {
+                    id: call_id,
+                    name,
+                    arguments: String::new(),
+                });
+            }
             ModelEvent::ToolCallArgumentsDelta { call_id, fragment } => {
                 if let Some(call) = reply.calls.iter_mut().find(|call| call.id == call_id) {
                     call.arguments.push_str(&fragment);
                 }
             }
-            ModelEvent::Reasoning { block } => reply.reasoning.push(block),
+            ModelEvent::Reasoning { block } => {
+                reply.output_seen = true;
+                reply.reasoning.push(block);
+            }
             ModelEvent::Usage(usage) => reply.usage = Some(usage),
             ModelEvent::Stop { reason } => return Some(reason),
         }
@@ -1266,6 +1381,14 @@ struct Draft {
     reasoning: Vec<ReasoningBlock>,
     calls: Vec<ToolCall>,
     usage: Option<Usage>,
+    /// Whether the model has said anything: text, reasoning or a call.
+    output_seen: bool,
+}
+
+/// How one request to the model ended.
+struct Attempt {
+    streamed: Result<Streamed, TurnError>,
+    output_seen: bool,
 }
 
 struct Reply {

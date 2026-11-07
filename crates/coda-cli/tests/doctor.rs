@@ -276,6 +276,50 @@ async fn an_unparsable_config_fails_and_an_unknown_key_warns() {
 }
 
 #[tokio::test]
+async fn a_fallback_chain_is_a_failure_on_a_delegated_backend_and_a_warning_on_a_disabled_provider()
+{
+    let chain = |other: &str, section: &str| {
+        format!(
+            "[providers.anthropic]\nenabled = true\n{section}\
+             [models.main]\nprovider = \"anthropic\"\nmodel = \"m\"\nfallback = [\"spare\"]\n\
+             [models.spare]\nprovider = \"{other}\"\nmodel = \"n\"\n"
+        )
+    };
+    for (text, expected, mention) in [
+        (chain("codex", ""), "fail", "models.main.fallback"),
+        (
+            chain(
+                "openai_compat",
+                "[providers.openai_compat]\nenabled = false\n",
+            ),
+            "warn",
+            "spare",
+        ),
+        (
+            chain(
+                "openai_compat",
+                "[providers.openai_compat]\nenabled = true\n",
+            ),
+            "ok",
+            "",
+        ),
+    ] {
+        // Arrange
+        let dir = seeded_home();
+        write_config(dir.path(), &text);
+
+        // Act
+        let (_, report) = doctor(dir.path(), &[]).await;
+
+        // Assert
+        assert_eq!(status(&report, "config"), expected, "{report}");
+        if !mention.is_empty() {
+            assert!(detail(&report, "config").contains(mention), "{report}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn an_enabled_backend_without_its_binary_fails() {
     // Arrange
     let dir = seeded_home();

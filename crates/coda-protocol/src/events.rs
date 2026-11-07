@@ -143,6 +143,22 @@ pub struct CallRecoveredBody {
     pub how: String,
 }
 
+/// Stored event kind of a send that moved from one model alias to the next in
+/// its fallback chain after the first failed. The body is a [`ModelFallbackBody`];
+/// clients show it to the user.
+pub const MODEL_FALLBACK_KIND: &str = "model_fallback";
+
+/// The body of a stored `model_fallback` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFallbackBody {
+    /// The alias that failed.
+    pub from: String,
+    /// The alias the send moved to.
+    pub to: String,
+    /// Why the first failed, in the provider's words.
+    pub reason: String,
+}
+
 /// One rate-limit window of a provider plan, such as `five_hour` or `seven_day`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RateLimitWindow {

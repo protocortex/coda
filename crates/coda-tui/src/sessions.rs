@@ -11,7 +11,7 @@ use coda_config::timing::Timing;
 use coda_protocol::events::{
     CALL_FROM_TEXT, CALL_RECOVERED_KIND, CALL_REPAIRED, CallRecoveredBody, EVENT_NOTIFICATION,
     Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, GuardContinueBody, GuardLimitBody,
-    HOOK_BLOCKED_KIND, HookBlockedBody,
+    HOOK_BLOCKED_KIND, HookBlockedBody, MODEL_FALLBACK_KIND, ModelFallbackBody,
 };
 use coda_protocol::jsonrpc::Notification;
 use coda_protocol::methods::{
@@ -114,8 +114,9 @@ pub fn hook_blocked_from_params(params: &Value) -> Option<String> {
     Some(format!("The turn did not start. {reason}"))
 }
 
-/// Reads a stored `guard_continue`, `guard_limit` or `call_recovered` notification as a notice
-/// that says why the turn went on or stopped, or what was recovered; other kinds give `None`.
+/// Reads a stored `guard_continue`, `guard_limit`, `call_recovered` or `model_fallback`
+/// notification as a notice that says why the turn went on or stopped, what was recovered
+/// or which model took over; other kinds give `None`.
 #[must_use]
 pub fn turn_notice_from_params(params: &Value) -> Option<String> {
     let body = params.get("body")?.as_str()?;
@@ -146,6 +147,12 @@ pub fn turn_notice_from_params(params: &Value) -> Option<String> {
                 CALL_REPAIRED => Some(format!("Repaired the arguments of a call to {tool}.")),
                 _ => None,
             }
+        }
+        MODEL_FALLBACK_KIND => {
+            let switch: ModelFallbackBody = serde_json::from_str(body).ok()?;
+            let (from, to) = (sanitize_line(&switch.from), sanitize_line(&switch.to));
+            let reason = sanitize_line(&switch.reason);
+            Some(format!("Switched from {from} to {to}: {reason}"))
         }
         _ => None,
     }
@@ -909,6 +916,26 @@ mod tests {
         // Assert
         assert_eq!(repaired, "Repaired the arguments of a call to read.");
         assert_eq!(text, "Read a call to read from the model's reply text.");
+    }
+
+    #[test]
+    fn a_model_fallback_becomes_a_notice_naming_both_aliases_and_the_reason() {
+        // Arrange
+        let notification = json!({
+            "kind": MODEL_FALLBACK_KIND,
+            "body": json!(ModelFallbackBody {
+                from: "fast".to_owned(),
+                to: "steady".to_owned(),
+                reason: "HTTP 429\nslow down".to_owned()
+            })
+            .to_string()
+        });
+
+        // Act
+        let notice = turn_notice_from_params(&notification).unwrap();
+
+        // Assert
+        assert_eq!(notice, "Switched from fast to steady: HTTP 429 slow down");
     }
 
     #[test]

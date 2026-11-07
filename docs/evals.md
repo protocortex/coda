@@ -15,6 +15,7 @@ checks the result by running a command in a temporary workspace. They live in
 | `repaired_arguments` | an edit whose arguments have single quotes and a trailing comma, which are repaired and run |
 | `kept_reasoning` | an edit made after a signed thinking block, which goes back with the next request and costs tokens in the baseline |
 | `text_shaped_call` | an edit written as the reply's text, read as a call where the provider allows it |
+| `fell_back_on_rate_limit` | the first model is rate limited before it says anything; the loop moves to its fallback model, which edits the file |
 | `finished_too_early` | the model says it is done before it edits; an `end_turn` guard sends it back, then it edits |
 
 ## Offline run

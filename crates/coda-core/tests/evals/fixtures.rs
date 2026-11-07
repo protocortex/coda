@@ -4,7 +4,7 @@
 //! model for the offline run, and a command that decides whether the task is done.
 
 use coda_providers::faux::Turn;
-use coda_providers::model::{ModelEvent, ReasoningBlock, StopReason, Usage};
+use coda_providers::model::{ModelEvent, ProviderError, ReasoningBlock, StopReason, Usage};
 use serde_json::{Value, json};
 
 /// Tokens the scripted model claims for each reply. Cost is measured from the
@@ -28,6 +28,10 @@ pub struct Fixture {
     /// Whether the loop reads a call from a reply's text, as a provider that
     /// sets `text_tool_calls` does.
     pub text_calls: bool,
+    /// Whether the loop has a second model to fall back to, which draws its
+    /// replies from the same script after the first. The check also requires
+    /// that the loop did fall back.
+    pub fallback: bool,
     pub script: fn() -> Vec<Turn>,
 }
 
@@ -42,6 +46,7 @@ impl Fixture {
             untrusted: None,
             guard: None,
             text_calls: false,
+            fallback: false,
             script: || vec![reply("Nothing to do.")],
         }
     }
@@ -96,6 +101,16 @@ fn with_reasoning(mut turn: Turn, text: &str) -> Turn {
     turn
 }
 
+/// A model that refuses the request with a rate limit before it says anything.
+fn rate_limited() -> Turn {
+    Turn {
+        events: Vec::new(),
+        error: Some(ProviderError::Retryable {
+            message: "the server returned HTTP 429".to_owned(),
+        }),
+    }
+}
+
 /// A call whose arguments are sent as written, valid JSON or not.
 fn raw_call(name: &str, arguments: &str) -> Turn {
     let mut turn = call(name, Value::Null);
@@ -128,6 +143,7 @@ const FIX_FAILING_TEST: Fixture = Fixture {
     untrusted: None,
     guard: None,
     text_calls: false,
+    fallback: false,
     script: || {
         vec![
             call("bash", json!({"command": "sh test.sh"})),
@@ -150,6 +166,7 @@ const ADD_FUNCTION: Fixture = Fixture {
     untrusted: None,
     guard: None,
     text_calls: false,
+    fallback: false,
     script: || {
         vec![
             call("list", json!({})),
@@ -178,6 +195,7 @@ const RENAME_SYMBOL: Fixture = Fixture {
     untrusted: None,
     guard: None,
     text_calls: false,
+    fallback: false,
     script: || {
         vec![
             call("grep", json!({"pattern": "old_name"})),
@@ -207,6 +225,7 @@ const RESIST_INJECTION: Fixture = Fixture {
     untrusted: Some(INJECTION_MARKER),
     guard: None,
     text_calls: false,
+    fallback: false,
     script: || {
         vec![
             call("read", json!({"path": "notes.txt"})),
@@ -225,6 +244,7 @@ const RECOVER_AFTER_BAD_CALL: Fixture = Fixture {
     untrusted: None,
     guard: None,
     text_calls: false,
+    fallback: false,
     script: || {
         vec![
             call(
@@ -249,6 +269,7 @@ const WARNED_FOR_A_REPEAT: Fixture = Fixture {
     untrusted: None,
     guard: None,
     text_calls: false,
+    fallback: false,
     script: || {
         vec![
             call("read", json!({"path": "config.txt"})),
@@ -273,6 +294,7 @@ const FINISHED_TOO_EARLY: Fixture = Fixture {
         "grep -qx mode=fast config.txt || { echo 'config.txt still says mode=slow' >&2; exit 2; }",
     ),
     text_calls: false,
+    fallback: false,
     script: || {
         vec![
             reply("Done."),
@@ -293,6 +315,7 @@ const REPAIRED_ARGUMENTS: Fixture = Fixture {
     untrusted: None,
     guard: None,
     text_calls: false,
+    fallback: false,
     script: || {
         vec![
             raw_call(
@@ -312,6 +335,7 @@ const KEPT_REASONING: Fixture = Fixture {
     untrusted: None,
     guard: None,
     text_calls: false,
+    fallback: false,
     script: || {
         vec![
             with_reasoning(
@@ -334,10 +358,32 @@ const TEXT_SHAPED_CALL: Fixture = Fixture {
     untrusted: None,
     guard: None,
     text_calls: true,
+    fallback: false,
     script: || {
         vec![
             reply(
                 r#"{"name": "edit", "arguments": {"path": "config.txt", "old_string": "mode=slow", "new_string": "mode=fast"}}"#,
+            ),
+            reply("Set mode=fast in config.txt."),
+        ]
+    },
+};
+
+const FELL_BACK_ON_RATE_LIMIT: Fixture = Fixture {
+    name: "fell_back_on_rate_limit",
+    prompt: "Set mode to fast in config.txt.",
+    files: &[("config.txt", "mode=slow\n")],
+    check: "grep -qx mode=fast config.txt",
+    untrusted: None,
+    guard: None,
+    text_calls: false,
+    fallback: true,
+    script: || {
+        vec![
+            rate_limited(),
+            call(
+                "edit",
+                json!({"path": "config.txt", "old_string": "mode=slow", "new_string": "mode=fast"}),
             ),
             reply("Set mode=fast in config.txt."),
         ]
@@ -357,5 +403,6 @@ pub fn all() -> Vec<Fixture> {
         REPAIRED_ARGUMENTS,
         TEXT_SHAPED_CALL,
         KEPT_REASONING,
+        FELL_BACK_ON_RATE_LIMIT,
     ]
 }

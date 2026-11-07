@@ -45,6 +45,7 @@ pub(super) fn faux_alias(config: &mut Config) {
             provider: "faux".to_owned(),
             model: "script-1".to_owned(),
             context_window: None,
+            fallback: Vec::new(),
         },
     );
 }
@@ -403,6 +404,7 @@ async fn a_send_that_began_before_a_switch_builds_on_the_switched_model() {
                 provider: "faux".to_owned(),
                 model: "panic".to_owned(),
                 context_window: None,
+                fallback: Vec::new(),
             },
         );
     });
