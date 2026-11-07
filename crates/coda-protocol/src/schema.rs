@@ -26,6 +26,11 @@ fn add_method<P: JsonSchema, R: JsonSchema>(
     methods.insert(name.to_owned(), json!({"params": params, "result": result}));
 }
 
+/// The methods that start a session from another session.
+fn add_fork_methods(generator: &mut SchemaGenerator, methods: &mut Map<String, Value>) {
+    add_method::<m::SessionForkParams, m::SessionForkResult>(generator, methods, m::SESSION_FORK);
+}
+
 /// The methods that commit, push, watch pull requests and schedule prompts.
 fn add_pull_request_methods(generator: &mut SchemaGenerator, methods: &mut Map<String, Value>) {
     add_method::<m::ScheduleAddParams, m::ScheduleAddResult>(generator, methods, m::SCHEDULE_ADD);
@@ -176,6 +181,7 @@ pub fn protocol_schema() -> Value {
     add_method::<m::GrantAddParams, m::GrantAddResult>(&mut generator, &mut methods, m::GRANT_ADD);
     add_account_and_daemon_methods(&mut generator, &mut methods);
     add_pull_request_methods(&mut generator, &mut methods);
+    add_fork_methods(&mut generator, &mut methods);
 
     let event = generator.subschema_for::<Event>().to_value();
     // Types no method or event reaches still belong to the contract.

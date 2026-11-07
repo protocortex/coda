@@ -8,7 +8,7 @@
 //! removed however the turn ends.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::PathBuf;
@@ -25,8 +25,8 @@ use coda_protocol::methods::{
     AgentRunParams, AgentRunResult, DIFF_REFUSED_CODE, PermissionRespondParams,
     PermissionRespondResult, REWIND_REFUSED_CODE, SESSION_CANCEL, SESSION_SEND, SendMode,
     SessionCancelParams, SessionCancelResult, SessionCloseParams, SessionCloseResult,
-    SessionDiffParams, SessionRewindParams, SessionSendParams, SessionSendResult,
-    SessionSetModeParams, SessionSetModeResult,
+    SessionDiffParams, SessionForkParams, SessionRewindParams, SessionSendParams,
+    SessionSendResult, SessionSetModeParams, SessionSetModeResult,
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::TurnOutcome;
@@ -53,6 +53,7 @@ use crate::backends::{
 };
 mod diff;
 mod drive;
+mod fork;
 mod mode;
 mod queue;
 mod reset;
@@ -112,6 +113,8 @@ const WIND_DOWN_POLL: Duration = Duration::from_millis(10);
 const EVENT_QUEUE_BOUND: usize = 1024;
 /// Bytes of earlier conversation given to a Codex thread that replaces a lost one.
 const MAX_SEED_BYTES: usize = 32 * 1024;
+/// Most ancestors a fork reads history from; a longer chain is cut here.
+const MAX_FORK_DEPTH: usize = 64;
 /// Why a fresh Claude Code conversation has none of the earlier turns.
 const HISTORY_UNREAD_REASON: &str = "the stored conversation could not be read";
 
@@ -152,6 +155,9 @@ pub enum TurnError {
     /// An `agent.run` request that cannot be served as asked. The text is for the caller.
     #[error("{0}")]
     Agent(String),
+    /// A `session.fork` that cannot be done as asked. The text is for the caller.
+    #[error("{0}")]
+    Fork(String),
     #[error(transparent)]
     Hub(#[from] HubError),
     #[error(transparent)]
@@ -164,7 +170,7 @@ impl TurnError {
     pub(crate) fn into_rpc(self) -> ErrorObject {
         match self {
             Self::SessionNotFound(_) => error(SESSION_NOT_FOUND, "Session not found"),
-            Self::Agent(why) => error(INVALID_PARAMS, &why),
+            Self::Agent(why) | Self::Fork(why) => error(INVALID_PARAMS, &why),
             Self::Rewind(why) => error(REWIND_REFUSED_CODE, &why),
             Self::Diff(why) => error(DIFF_REFUSED_CODE, &why),
             Self::Busy(_) => error(TURN_RUNNING, "A turn is already running"),
@@ -695,34 +701,54 @@ impl Turns {
     }
 
     /// The stored conversation, for a new thread to pick up where the lost one stopped.
-    /// `skip` leaves out a turn that is being sent again.
+    /// `skip` leaves out a turn that is being sent again. A forked session is told
+    /// the turns of its parents up to each fork point first.
     async fn carried(&self, session: &SessionId, skip: Option<&TurnId>) -> Carried {
         let mut transcript = Transcript::new(MAX_SEED_BYTES);
         if let Some(turn) = skip {
             transcript = transcript.without_turn(turn.clone());
         }
-        let mut after = 0;
-        loop {
-            let id = session.clone();
-            let page = self
-                .hub
-                .with_store(move |store| {
-                    let next = transcript.apply_page(store, &id, after)?;
-                    Ok((transcript, next))
-                })
-                .await;
-            match page {
-                Ok((back, Some(last))) => {
-                    transcript = back;
-                    after = last;
-                }
-                Ok((back, None)) => return back.render().map_or(Carried::Nothing, Carried::Seed),
-                Err(error) => {
-                    warn!(session = %session, %error, "could not read the conversation for a new Codex thread");
-                    return Carried::Lost;
+        let id = session.clone();
+        let sources = self
+            .hub
+            .with_store(move |store| conversation_sources(store, &id))
+            .await;
+        let Ok(sources) = sources else {
+            warn!(session = %session, "could not read where the session was forked from");
+            return Carried::Lost;
+        };
+        for (source, frozen) in sources {
+            match frozen {
+                Some((last, rolled_back)) => transcript.freeze_at(&last, rolled_back),
+                None => transcript.thaw(),
+            }
+            let mut after = 0;
+            loop {
+                let id = source.clone();
+                let page = self
+                    .hub
+                    .with_store(move |store| {
+                        let next = transcript.apply_page(store, &id, after)?;
+                        Ok((transcript, next))
+                    })
+                    .await;
+                match page {
+                    Ok((back, Some(last))) => {
+                        transcript = back;
+                        after = last;
+                    }
+                    Ok((back, None)) => {
+                        transcript = back;
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(session = %session, %error, "could not read the conversation for a new Codex thread");
+                        return Carried::Lost;
+                    }
                 }
             }
         }
+        transcript.render().map_or(Carried::Nothing, Carried::Seed)
     }
 
     /// Keeps `child` for the session's next turn. A server the pool pushes out,
@@ -1606,6 +1632,33 @@ pub(crate) fn permission_mode(mode: Mode) -> PermissionMode {
     }
 }
 
+/// A session that is part of a conversation, with the fork point and the rolled back
+/// turns to read it at; `None` reads it as it is.
+type ConversationSource = (SessionId, Option<(TurnId, HashSet<TurnId>)>);
+
+/// The sessions whose turns make up `session`'s conversation, oldest first, each
+/// with how to read it: an ancestor as it was at its fork point, then the session
+/// itself as it is.
+fn conversation_sources(
+    store: &coda_store::Store,
+    session: &SessionId,
+) -> Result<Vec<ConversationSource>, StoreError> {
+    let mut sources = vec![(session.clone(), None)];
+    let mut current = session.clone();
+    while let Some(fork) = store.fork_of(&current)? {
+        sources.push((
+            fork.parent.clone(),
+            Some((fork.source_turn, fork.rolled_back)),
+        ));
+        current = fork.parent;
+        if sources.len() > MAX_FORK_DEPTH {
+            break;
+        }
+    }
+    sources.reverse();
+    Ok(sources)
+}
+
 fn not_found_or(e: HubError, session: &SessionId) -> TurnError {
     match e {
         HubError::Store(StoreError::SessionNotFound { .. }) => {
@@ -1740,6 +1793,14 @@ pub(crate) async fn rewind(turns: Option<&Arc<Turns>>, params: Option<Value>) ->
     let turns = turns.ok_or_else(unavailable)?;
     let params: SessionRewindParams = parse_params(params)?;
     let result = turns.rewind(params).await.map_err(TurnError::into_rpc)?;
+    to_value(&result)
+}
+
+/// Answers `session.fork`.
+pub(crate) async fn fork(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
+    let turns = turns.ok_or_else(unavailable)?;
+    let params: SessionForkParams = parse_params(params)?;
+    let result = turns.fork(params).await.map_err(TurnError::into_rpc)?;
     to_value(&result)
 }
 
