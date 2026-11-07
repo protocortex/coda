@@ -4,6 +4,7 @@
 
 use std::fmt::Write as _;
 
+use crate::post::fingerprint;
 use crate::schema::{Finding, MAX_EFFORT, Review};
 use crate::verify::MAX_SCORE;
 
@@ -160,7 +161,7 @@ pub fn overview_markdown(review: &Review) -> String {
 fn write_finding(out: &mut String, f: &Finding) {
     let _ = write!(
         out,
-        "### {} [{}] {}: {}\n\n`{}:{}-{}`, confidence {}{}\n\n{}\n\n",
+        "### {} [{}] {}: {}\n\n`{}:{}-{}`, confidence {}{}, fingerprint {}\n\n{}\n\n",
         f.id,
         f.severity.as_str(),
         f.category.as_str(),
@@ -170,6 +171,7 @@ fn write_finding(out: &mut String, f: &Finding) {
         f.end_line,
         f.confidence.as_str(),
         verdict_note(f),
+        fingerprint(f),
         prose(&f.explanation),
     );
     if let Some(patch) = &f.suggested_patch {
@@ -356,7 +358,7 @@ Adds a cache.
 
 ### F1 [high] bug: Off by one
 
-`src/a.rs:10-12`, confidence medium
+`src/a.rs:10-12`, confidence medium, fingerprint 45fe715cb90812e0
 
 The loop skips the last item.
 
@@ -435,11 +437,11 @@ Model: m1. Input: 900 characters. Findings dropped: 1.
 
         // Assert
         assert!(
-            text.contains("`src/a.rs:10-12`, confidence medium, score 8 of 10: Read a.rs: the loop is off by one. ## Fake\n"),
+            text.contains("`src/a.rs:10-12`, confidence medium, score 8 of 10: Read a.rs: the loop is off by one. ## Fake, fingerprint "),
             "{text}"
         );
         assert!(
-            text.contains("`src/a.rs:10-12`, confidence medium, unverified\n"),
+            text.contains("`src/a.rs:10-12`, confidence medium, unverified, fingerprint "),
             "{text}"
         );
         assert!(

@@ -9,6 +9,7 @@ pub mod diff;
 pub mod guidance;
 pub mod ignore;
 pub mod issues;
+pub mod memory;
 pub mod pack;
 pub mod parse;
 pub mod post;
