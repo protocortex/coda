@@ -2,7 +2,7 @@
 
 //! Model-API sessions end to end through the dispatcher, against the faux provider.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -587,6 +587,55 @@ async fn a_multi_edit_naming_one_outside_path_is_denied_whole() {
     );
     let finished = rig.bodies("tool_finished").await;
     assert_eq!(finished[0]["is_error"], true, "{finished:?}");
+}
+
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn a_model_turn_is_snapshotted_before_and_after_it_edits() {
+    // Arrange
+    let edits = json!({"edits": [
+        {"path": "a.txt", "old_string": "needle", "new_string": "thread"},
+    ]});
+    let calls = tool_turn(&[("c1", "multi_edit", edits)]);
+    let mut rig = Rig::new(Mode::AcceptEdits, &[calls, text_turn("done")]);
+    std::fs::remove_dir(rig.cwd.join(".git")).unwrap();
+    run_git(&rig.cwd, &["init", "-q", "-b", "main"]);
+    run_git(&rig.cwd, &["add", "."]);
+    run_git(&rig.cwd, &["commit", "-q", "-m", "first"]);
+
+    // Act
+    rig.send("change it").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let session = rig.session.clone();
+    let found = rig
+        .hub
+        .with_store(move |store| store.turn_checkpoints(&session))
+        .await
+        .unwrap();
+    let before = found[0].before.as_deref().expect("baseline");
+    let after = found[0].after.as_deref().expect("end snapshot");
+    assert_eq!(
+        run_git(&rig.cwd, &["show", &format!("{before}:a.txt")]),
+        "one needle here\n"
+    );
+    assert_eq!(
+        run_git(&rig.cwd, &["show", &format!("{after}:a.txt")]),
+        "one thread here\n"
+    );
 }
 
 #[tokio::test]

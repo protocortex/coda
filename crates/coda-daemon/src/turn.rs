@@ -51,6 +51,7 @@ use crate::backends::{
 mod drive;
 
 use self::drive::Drive;
+use crate::checkpoint;
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
 use crate::gate::{BrokerGate, Brokers};
 use crate::idle_pool::{IdlePool, MAX_IDLE_SERVERS};
@@ -828,6 +829,7 @@ impl Turns {
             Self::finish(hub, session, &turn, true).await;
             return Err(e);
         }
+        checkpoint::before_turn(hub, session, &turn).await;
         Ok(turn)
     }
 
@@ -933,6 +935,8 @@ impl Turns {
         let ended = within(limit, Self::finish(&self.hub, &session, &turn, failed)).await;
         if ended.is_none() {
             warn!(session = %session, "the store did not answer; the turn is left open");
+        } else {
+            checkpoint::after_turn(&self.hub, &session, &turn).await;
         }
     }
 
