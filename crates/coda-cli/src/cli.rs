@@ -146,6 +146,9 @@ pub enum SessionCommand {
     /// Commit what a session changed; with --push also push the branch, with --pr also open a
     /// draft pull request. Nothing runs until you call it.
     Ship(SessionShipArgs),
+    /// Watch a pull request and wake the session with a message when a check fails, the
+    /// required checks pass, someone else comments or the branch conflicts.
+    Watch(SessionWatchArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -225,6 +228,18 @@ pub struct SessionShipArgs {
     /// Open the pull request ready for review instead of as a draft.
     #[arg(long, requires = "pr")]
     pub ready: bool,
+    /// Print the result as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionWatchArgs {
+    /// The session to wake.
+    pub session: String,
+    /// The pull request, as a number or an https web address.
+    #[arg(long)]
+    pub pr: String,
     /// Print the result as JSON.
     #[arg(long)]
     pub json: bool,

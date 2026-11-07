@@ -68,6 +68,7 @@ use crate::gate::{BrokerGate, Brokers};
 use crate::idle_pool::{IdlePool, MAX_IDLE_SERVERS};
 use crate::model_session::{Limits, ModelError, ModelSessions};
 use crate::pidfile;
+use crate::pr_watches::PrWatches;
 use crate::receipts;
 use crate::subscribe::{Hub, HubError};
 use crate::supervisor::{RestartPolicy, Supervisor, TokioSleeper, Verdict};
@@ -344,6 +345,8 @@ pub struct Turns {
     /// session's server out, so turns of one session never share it at once.
     idle: IdlePool<AgentSession>,
     supervisor: Supervisor,
+    /// The pull request watches that wake sessions.
+    pr_watches: Arc<PrWatches>,
     /// Set once the daemon shuts down, so no crashed backend is restarted.
     stopping: AtomicBool,
 }
@@ -391,8 +394,28 @@ impl Turns {
             request_gate: tokio::sync::Mutex::new(()),
             idle: IdlePool::new(MAX_IDLE_SERVERS),
             supervisor,
+            pr_watches: PrWatches::new(),
             stopping: AtomicBool::new(false),
         });
+        turns.models.set_pr_watches(Arc::clone(&turns.pr_watches));
+        let waking = Arc::downgrade(&turns);
+        turns.pr_watches.set_waker(Arc::new(move |session, text| {
+            if let Some(turns) = waking.upgrade() {
+                tokio::spawn(async move {
+                    let wake = SessionSendParams {
+                        session_id: session.clone(),
+                        text,
+                        max_turns: None,
+                        token_cap: None,
+                        mode: SendMode::Queue,
+                        client_request_id: None,
+                    };
+                    if let Err(error) = turns.send(wake).await {
+                        warn!(session = %session, %error, "could not wake a session for its pull request watch");
+                    }
+                });
+            }
+        }));
         let weak = Arc::downgrade(&turns);
         turns.models.set_on_clean_end(Arc::new(move |session| {
             if let Some(turns) = weak.upgrade() {
@@ -791,6 +814,11 @@ impl Turns {
         agent
             .or_else(|| self.models.turn_state(session))
             .unwrap_or(TurnState::Free)
+    }
+
+    /// The pull request watches that wake sessions.
+    pub(crate) fn pr_watches(&self) -> &Arc<PrWatches> {
+        &self.pr_watches
     }
 
     /// Whether `session` has a turn starting or running.

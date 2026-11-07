@@ -55,6 +55,7 @@ use tracing::{Instrument, Span, info, warn};
 use crate::checkpoint;
 use crate::gate::{BrokerGate, Brokers};
 use crate::idle_pool::IdlePool;
+use crate::pr_watches::{PrWatches, WatchPrTool};
 use crate::ship::{creates_pull_request, ended_cleanly, printed_pull_request};
 use crate::subscribe::{Hub, HubError};
 use crate::trace::backend_span;
@@ -323,6 +324,8 @@ pub struct ModelSessions {
     children: Arc<task::ChildEnv>,
     /// Called with a session whose turn ended cleanly, once the session is free.
     on_clean_end: OnceLock<CleanEnd>,
+    /// The pull request watches the `watch_pr` tool starts; the tool is offered once set.
+    pr_watches: OnceLock<Arc<PrWatches>>,
     /// Where a message steered into each running send goes.
     steers: Mutex<HashMap<SessionId, SteerQueue>>,
 }
@@ -376,8 +379,14 @@ impl ModelSessions {
             carried: Mutex::default(),
             children,
             on_clean_end: OnceLock::new(),
+            pr_watches: OnceLock::new(),
             steers: Mutex::default(),
         })
+    }
+
+    /// Offers the `watch_pr` tool to sessions built from now on. Only the first call counts.
+    pub(crate) fn set_pr_watches(&self, watches: Arc<PrWatches>) {
+        let _ = self.pr_watches.set(watches);
     }
 
     /// Sets what runs after a turn ends cleanly. Only the first call counts.
@@ -889,6 +898,15 @@ impl ModelSessions {
         if let Some(skills) = &offer.skills {
             tools.schemas.push(skill_schema(skills));
             tools.tools = tools.tools.with(Arc::clone(skills) as Arc<dyn Tool>);
+        }
+        if let Some(watches) = self.pr_watches.get() {
+            tools.schemas.push(WatchPrTool::schema());
+            let tool = WatchPrTool::new(
+                Arc::clone(watches),
+                record.id.clone(),
+                PathBuf::from(&record.cwd),
+            );
+            tools.tools = tools.tools.with(Arc::new(tool) as Arc<dyn Tool>);
         }
         let mut schemas = tools.schemas;
         schemas.push(task_schema(&offer.agents));

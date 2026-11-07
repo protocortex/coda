@@ -26,6 +26,16 @@ fn add_method<P: JsonSchema, R: JsonSchema>(
     methods.insert(name.to_owned(), json!({"params": params, "result": result}));
 }
 
+/// The methods that commit, push and watch pull requests.
+fn add_pull_request_methods(generator: &mut SchemaGenerator, methods: &mut Map<String, Value>) {
+    add_method::<m::SessionShipParams, m::SessionShipResult>(generator, methods, m::SESSION_SHIP);
+    add_method::<m::SessionWatchPrParams, m::SessionWatchPrResult>(
+        generator,
+        methods,
+        m::SESSION_WATCH_PR,
+    );
+}
+
 /// The methods about usage, the model, the mode and the daemon itself.
 fn add_account_and_daemon_methods(
     generator: &mut SchemaGenerator,
@@ -132,11 +142,6 @@ pub fn protocol_schema() -> Value {
         &mut methods,
         m::SESSION_WORKTREE,
     );
-    add_method::<m::SessionShipParams, m::SessionShipResult>(
-        &mut generator,
-        &mut methods,
-        m::SESSION_SHIP,
-    );
     add_method::<m::WorktreeCleanParams, m::WorktreeCleanResult>(
         &mut generator,
         &mut methods,
@@ -154,6 +159,7 @@ pub fn protocol_schema() -> Value {
     );
     add_method::<m::GrantAddParams, m::GrantAddResult>(&mut generator, &mut methods, m::GRANT_ADD);
     add_account_and_daemon_methods(&mut generator, &mut methods);
+    add_pull_request_methods(&mut generator, &mut methods);
 
     let event = generator.subschema_for::<Event>().to_value();
     // Types no method or event reaches still belong to the contract.

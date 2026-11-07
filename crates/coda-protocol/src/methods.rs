@@ -45,6 +45,8 @@ pub const SESSION_DIFF: &str = "session.diff";
 pub const SESSION_WORKTREE: &str = "session.worktree";
 /// Commits the changes of a session, and on request pushes the branch and opens a pull request.
 pub const SESSION_SHIP: &str = "session.ship";
+/// Starts a watch of a pull request that wakes the session on news.
+pub const SESSION_WATCH_PR: &str = "session.watch_pr";
 /// Reports, and with `apply` removes, the git worktrees coda made that are no longer needed.
 pub const WORKTREE_CLEAN: &str = "worktree.clean";
 /// Reports, and with `apply` removes, old checkpoint refs.
@@ -86,6 +88,7 @@ pub const METHODS: &[&str] = &[
     SESSION_DIFF,
     SESSION_WORKTREE,
     SESSION_SHIP,
+    SESSION_WATCH_PR,
     WORKTREE_CLEAN,
     CHECKPOINTS_PRUNE,
     PERMISSION_RESPOND,
@@ -531,6 +534,25 @@ pub struct SessionShipResult {
     /// The address of the pull request that was opened, when the action asked for one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<String>,
+}
+
+/// Error code of a [`SESSION_WATCH_PR`] the daemon refused, with the reason as the message.
+pub const WATCH_REFUSED_CODE: i64 = -32012;
+
+/// Parameters of [`SESSION_WATCH_PR`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionWatchPrParams {
+    /// The session to wake. The pull request is read in its working directory.
+    pub session_id: SessionId,
+    /// The pull request, as a number or an https web address.
+    pub pr: String,
+}
+
+/// Result of [`SESSION_WATCH_PR`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionWatchPrResult {
+    /// Every pull request the session watches now, the new one included.
+    pub watching: Vec<String>,
 }
 
 /// Parameters of [`WORKTREE_CLEAN`].
@@ -985,6 +1007,7 @@ mod tests {
             (SESSION_DIFF, "session.diff"),
             (SESSION_WORKTREE, "session.worktree"),
             (SESSION_SHIP, "session.ship"),
+            (SESSION_WATCH_PR, "session.watch_pr"),
             (WORKTREE_CLEAN, "worktree.clean"),
             (CHECKPOINTS_PRUNE, "checkpoints.prune"),
             (PERMISSION_RESPOND, "permission.respond"),
