@@ -89,7 +89,7 @@ Five agents ship in the binary. They are ordinary agent files that are checked b
 | --- | --- | --- | --- |
 | `explore` | `fast` | `code_outline`, `code_read_range`, `code_search`, `code_symbol`, `grep`, `read`, `retrieve` | Finds where something is and how it works. Reports `path:line` places. |
 | `reviewer` | `standard` | the same read-only tools | Reviews code and replies with a JSON report of classified findings (see [The result](#the-result)). |
-| `verifier` | `standard` | the same read-only tools | Checks findings that another reviewer reported against the diff and the code, and replies with a score from 0 to 10 and a one-line reason for each. |
+| `verifier` | `standard` | the same read-only tools | Checks findings that another reviewer reported against the diff and the code, and replies with a score from 0 to 10 and a one-line reason for each. `coda review` uses it (see [docs/config.md](config.md#coda-review)). |
 | `implementer` | `standard` | the read-only tools, `edit` and `bash` | Makes one clear change, runs the build or tests that cover it, and reports what it changed. |
 | `tester` | `fast` | `bash`, `code_read_range`, `grep`, `read`, `retrieve` | Runs the tests or checks it is given and reports passes and failures. It has no `edit` tool, but `bash` can still change files; its prompt tells it to run and report, not to change files. |
 

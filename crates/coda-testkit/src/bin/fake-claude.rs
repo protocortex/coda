@@ -38,7 +38,10 @@
 //! exits non-zero if none appears within two minutes. `reject_resume` makes it exit
 //! at once, before any output, when it is started with `--resume`, and
 //! `reject_resume_of` does it only for a start that resumes that id, and `resume_crash_marker` does the same only the first time (the file remembers it). `prompt_path`
-//! appends every user line it reads to that file.
+//! appends every user line it reads to that file, and `replies` is a list of
+//! `{"when": <text>, "text": <reply>}` entries: a user line that contains `when` is answered
+//! with the `text` of the first such entry as a text delta, so two agents in one run can give
+//! different answers.
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -113,6 +116,17 @@ impl Control {
 
     fn text(&self, key: &str) -> Option<&str> {
         self.0[key].as_str()
+    }
+
+    /// The reply of the first `replies` entry whose `when` the user line contains.
+    fn reply_for(&self, user_line: &str) -> Option<&str> {
+        self.0["replies"].as_array()?.iter().find_map(|entry| {
+            let when = entry["when"].as_str()?;
+            user_line
+                .contains(when)
+                .then(|| entry["text"].as_str())
+                .flatten()
+        })
     }
 
     fn flood(&self) -> bool {
@@ -231,6 +245,13 @@ fn run_turn(
     if user_line.contains(ECHO_TRIGGER)
         && let Some(text) = control.text("echo_text")
     {
+        emit(
+            out,
+            &serde_json::json!({"type":"stream_event","event":{"type":"content_block_delta",
+                "delta":{"type":"text_delta","text":text}}}),
+        )?;
+    }
+    if let Some(text) = control.reply_for(user_line) {
         emit(
             out,
             &serde_json::json!({"type":"stream_event","event":{"type":"content_block_delta",

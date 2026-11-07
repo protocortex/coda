@@ -22,18 +22,19 @@ use coda_config::review::ReviewConfig;
 use coda_core::history::{ASSISTANT_MESSAGE_KIND, CHILD_EVENT_KIND};
 use coda_core::turn::StopCondition;
 use coda_protocol::types::{BackendKind, Mode};
-use coda_review::chunk::{Outcome, merge, plan};
+use coda_review::chunk::{Merged, Outcome, merge, plan};
 use coda_review::diff::{FileDiff, git_diff, git_diff_staged, parse_diff, tracked_files};
 use coda_review::pack::{PackOptions, Packed, main_extension};
-use coda_review::parse::{BadShape, Parsed, answer_object, parse_model_output};
+use coda_review::parse::{BadShape, Parsed, parse_model_output};
 use coda_review::render::{to_json, to_markdown};
 use coda_review::request::{
-    GH_PR_FIELDS, Part, REVIEWER_AGENT, Role, Target, assemble, direct_prompt, input_text,
+    GH_PR_FIELDS, Part, Role, Target, VerifierRun, assemble, direct_prompt, input_text,
     pr_info_from_gh, session_prompt, task_prompt,
 };
 use coda_review::rules::{Rules, default_branch_ref, load};
-use coda_review::schema::{Coverage, DiffScope, MIN_EFFORT, Review, Risk, RunDetails};
+use coda_review::schema::{Coverage, DiffScope, Finding, MIN_EFFORT, Review, Risk, RunDetails};
 use coda_review::skip::Decision;
+use coda_review::verify::{self, Applied, parse_verdicts};
 use serde_json::Value;
 use tracing::info;
 
@@ -42,11 +43,17 @@ use crate::cli::ReviewArgs;
 use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
 use crate::error::CliError;
-use crate::run::{Job, STREAM_DELTA_KIND, Tap, drive, pick_backend, session_cwd, stop_reason};
+use crate::run::{
+    CANCELLED, CLAUDE_CODE_KEY, CODEX_KEY, Finish, Job, STREAM_DELTA_KIND, Tap, drive,
+    pick_backend, session_cwd, stop_reason,
+};
 
 /// Where the packed input is written, relative to the working directory.
 const INPUT_DIR: &str = ".coda/review";
 const INPUT_PARENT_DIR: &str = ".coda";
+/// Names of the files of the reviewer's and of the verifier's input.
+const INPUT_FILE_PREFIX: &str = "input";
+const VERIFY_FILE_PREFIX: &str = "verify";
 /// A review asks the reviewer again once when its answer has the wrong shape.
 const MAX_ATTEMPTS: usize = 2;
 /// A part's findings are not cut where they are read: the merge applies the cap, and it
@@ -116,7 +123,7 @@ pub async fn run(
         .collect();
     // Kept until the review is over, which removes the files.
     let written = if backend.is_model_backend() {
-        Some(InputFiles::write(repo, &inputs)?)
+        Some(InputFiles::write(repo, INPUT_FILE_PREFIX, &inputs)?)
     } else {
         None
     };
@@ -126,6 +133,7 @@ pub async fn run(
     let reviewers: Vec<Live<'_>> = (0..parts.len())
         .map(|n| Live {
             ctx,
+            role: Role::Reviewer,
             backend,
             cwd: &cwd,
             handoff: match &written {
@@ -137,13 +145,21 @@ pub async fn run(
     let results = review_parts(&parts, reviewers, config.review.chunk_concurrency).await;
     let given: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
     let input_chars = inputs.iter().map(|i| i.chars().count()).sum();
-    let review = finish(
-        &parts,
-        results,
-        &given,
-        config.review.max_findings,
-        (&backend_name(backend), input_chars),
-    )?;
+    let (mut merged, model) = merged_review(&parts, results, &given, config.review.max_findings)?;
+    let verified = if config.review.verify && !merged.parsed.findings.is_empty() {
+        let at = Checking {
+            ctx,
+            repo,
+            cwd: &cwd,
+            config: &config,
+            reviewed_on: backend,
+        };
+        Some(check_findings(&at, &parts, &mut merged).await?)
+    } else {
+        None
+    };
+    let model = model.unwrap_or_else(|| backend_name(backend));
+    let review = assemble(merged, &model, input_chars, verified);
     if args.json {
         write!(io.out, "{}", to_json(&review)?)?;
     } else {
@@ -279,6 +295,7 @@ enum Handoff<'a> {
 /// The reviewer run by the daemon.
 struct Live<'a> {
     ctx: &'a Context,
+    role: Role,
     backend: BackendKind,
     cwd: &'a str,
     handoff: Handoff<'a>,
@@ -289,11 +306,13 @@ impl Reviewer for Live<'_> {
         let hint = hint.as_deref();
         let request = match self.handoff {
             Handoff::File(path) => Request {
-                prompt: session_prompt(Role::Reviewer, &task_prompt(Role::Reviewer, path, hint)),
+                prompt: session_prompt(self.role, &task_prompt(self.role, path, hint)),
+                role: self.role,
                 direct: false,
             },
             Handoff::Prompt(input) => Request {
-                prompt: direct_prompt(Role::Reviewer, input, hint),
+                prompt: direct_prompt(self.role, input, hint),
+                role: self.role,
                 direct: true,
             },
         };
@@ -308,9 +327,10 @@ impl Reviewer for Live<'_> {
     }
 }
 
-/// One run of the reviewer.
+/// One run of an agent.
 struct Request {
     prompt: String,
+    role: Role,
     /// Whether the daemon runs the reviewer on the prompt itself, in plan mode, instead of
     /// a session handing the work over through the `task` tool.
     direct: bool,
@@ -340,12 +360,12 @@ async fn until_usable(
 
 type PartResult = Result<(Parsed, Option<String>), CliError>;
 
-/// Reviews one part. A run that fails for any reason but a bad answer is tried once more,
-/// since a model or a connection can fail for a moment; an answer in the wrong shape has
-/// already had its retry.
+/// Reviews one part. A run that fails for any reason but a bad answer or an interrupt is
+/// tried once more, since a model or a connection can fail for a moment; an answer in the
+/// wrong shape has already had its retry.
 async fn review_part(scope: &DiffScope, reviewer: &mut impl Reviewer) -> PartResult {
     match until_usable(scope, reviewer).await {
-        Err(CliError::ReviewOutput(bad)) => Err(CliError::ReviewOutput(bad)),
+        Err(error @ (CliError::ReviewOutput(_) | CliError::RunInterrupted)) => Err(error),
         Err(error) => {
             info!(step = "review", %error, "the run failed, trying the part once more");
             until_usable(scope, reviewer).await
@@ -408,23 +428,109 @@ async fn run_limited<F: Future>(futures: Vec<F>, limit: usize) -> Vec<F::Output>
     done.into_iter().map(|(_, output)| output).collect()
 }
 
-/// Builds the review from the results of the parts. `run` is the model name to give when no
-/// part reported one, and the characters sent.
-fn finish(
+/// Merges the results of the parts. Also returns the model that wrote the first answer.
+fn merged_review(
     parts: &[Packed],
     results: Vec<PartResult>,
     given: &[String],
     max_findings: usize,
-    run: (&str, usize),
-) -> Result<Review, CliError> {
+) -> Result<(Merged, Option<String>), CliError> {
     let (outcomes, model) = collect(parts, results)?;
-    let merged = merge(given, outcomes, max_findings);
-    Ok(assemble(
-        merged,
-        model.as_deref().unwrap_or(run.0),
-        run.1,
-        None,
-    ))
+    Ok((merge(given, outcomes, max_findings), model))
+}
+
+/// Where and how the findings of a review are checked.
+struct Checking<'a> {
+    ctx: &'a Context,
+    repo: &'a Path,
+    cwd: &'a str,
+    config: &'a Config,
+    reviewed_on: BackendKind,
+}
+
+/// Has the verifier check the findings of `merged` against the diff of `parts`, and keeps
+/// what it lets through.
+async fn check_findings(
+    at: &Checking<'_>,
+    parts: &[Packed],
+    merged: &mut Merged,
+) -> Result<VerifierRun, CliError> {
+    let backend = verifier_backend(at.config, at.reviewed_on);
+    let diffs: Vec<&str> = parts.iter().map(|p| p.text.as_str()).collect();
+    let input = verify::input_text(&merged.parsed.findings, &diffs);
+    let file = if backend.is_model_backend() {
+        match InputFiles::write(at.repo, VERIFY_FILE_PREFIX, std::slice::from_ref(&input)) {
+            Ok(file) => Some(file),
+            Err(error) => {
+                info!(step = "verify", %error, "the verifier input could not be written");
+                let findings = std::mem::take(&mut merged.parsed.findings);
+                merged.parsed.findings = verify::apply(findings, None, 0).findings;
+                return Ok(VerifierRun {
+                    backend: backend_name(backend),
+                    dropped: 0,
+                });
+            }
+        }
+    } else {
+        None
+    };
+    let mut live = Live {
+        ctx: at.ctx,
+        role: Role::Verifier,
+        backend,
+        cwd: at.cwd,
+        handoff: match &file {
+            Some(file) => Handoff::File(&file.relative[0]),
+            None => Handoff::Prompt(&input),
+        },
+    };
+    let findings = std::mem::take(&mut merged.parsed.findings);
+    let Applied { findings, dropped } =
+        verify_findings(findings, at.config.review.verify_threshold, &mut live).await?;
+    merged.parsed.findings = findings;
+    Ok(VerifierRun {
+        backend: backend_name(backend),
+        dropped,
+    })
+}
+
+/// The backend that checks the findings: the other of Claude Code and Codex when both are
+/// enabled, so the second look does not come from the model that wrote the first. Otherwise
+/// the backend of the review.
+fn verifier_backend(config: &Config, reviewer: BackendKind) -> BackendKind {
+    let enabled = |key: &str| config.providers.get(key).is_some_and(|p| p.enabled);
+    match reviewer {
+        BackendKind::ClaudeCode if enabled(CODEX_KEY) => BackendKind::CodexAppServer,
+        BackendKind::CodexAppServer | BackendKind::CodexExec if enabled(CLAUDE_CODE_KEY) => {
+            BackendKind::ClaudeCode
+        }
+        _ => reviewer,
+    }
+}
+
+/// Asks the verifier about `findings` once. A verifier that fails or answers in the wrong
+/// shape leaves every finding in place, marked unverified; only an interrupt ends the review.
+async fn verify_findings(
+    findings: Vec<Finding>,
+    threshold: u8,
+    verifier: &mut impl Reviewer,
+) -> Result<Applied, CliError> {
+    info!(
+        step = "verify",
+        findings = findings.len(),
+        "asking the verifier"
+    );
+    let verdicts = match verifier.run(None).await {
+        Ok(answer) => parse_verdicts(&answer.text, &findings)
+            .map_err(|error| info!(step = "verify", %error, "the verifier answer was unusable"))
+            .ok(),
+        Err(CliError::RunInterrupted) => return Err(CliError::RunInterrupted),
+        Err(error) => {
+            info!(step = "verify", %error, "the verifier failed");
+            None
+        }
+    };
+    Ok(verify::apply(findings, verdicts.as_deref(), threshold))
 }
 
 /// Pairs each part with its result. The review fails only when every part did; otherwise a
@@ -445,6 +551,7 @@ fn collect(
                     parsed: Some(parsed),
                 });
             }
+            Err(CliError::RunInterrupted) => return Err(CliError::RunInterrupted),
             Err(error) => {
                 info!(step = "review", %error, "a part could not be reviewed");
                 last_error = Some(error);
@@ -461,8 +568,8 @@ fn collect(
     }
 }
 
-/// Runs the reviewer in a new session and returns what it said. A direct run is the
-/// reviewer on a session in plan mode, where every permission request is denied; its answer
+/// Runs an agent in a new session and returns what it said. A direct run is the
+/// agent on a session in plan mode, where every permission request is denied; its answer
 /// is the text it streamed. Otherwise a session hands the work to the reviewer and the answer
 /// is the reviewer's last reply.
 async fn run_reviewer(
@@ -472,12 +579,17 @@ async fn run_reviewer(
     cwd: &str,
     request: Request,
 ) -> Result<Answer, CliError> {
-    let Request { prompt, direct } = request;
+    let Request {
+        prompt,
+        role,
+        direct,
+    } = request;
+    let agent = role.agent();
     let job = Job {
         prompt,
         cwd: cwd.to_owned(),
         backend: Some(backend),
-        agent: direct.then(|| REVIEWER_AGENT.to_owned()),
+        agent: direct.then(|| agent.to_owned()),
         mode: if direct { Mode::Plan } else { Mode::Default },
         max_turns: None,
         token_cap: None,
@@ -489,7 +601,7 @@ async fn run_reviewer(
             if let Some(piece) = delta_text(kind, body) {
                 streamed.push_str(piece);
             }
-        } else if let Some(text) = reviewer_text(kind, body) {
+        } else if let Some(text) = reply_text(kind, body, agent) {
             reply = Some(text);
         }
     };
@@ -498,6 +610,9 @@ async fn run_reviewer(
         print: false,
     };
     let done = drive(ctx, io, false, job, &mut tap).await?;
+    if was_cancelled(&done.finish) {
+        return Err(CliError::RunInterrupted);
+    }
     let ended_well = !done.finish.failed
         && done
             .finish
@@ -508,19 +623,25 @@ async fn run_reviewer(
         return Err(CliError::ReviewFailed(stop_reason(&done.finish)));
     }
     let text = if direct {
-        Some(answer_object(&streamed).to_owned()).filter(|text| !text.trim().is_empty())
+        Some(role.answer(&streamed).to_owned()).filter(|text| !text.trim().is_empty())
     } else {
         reply
     };
     let Some(text) = text else {
         return Err(CliError::ReviewFailed(format!(
-            "the {REVIEWER_AGENT} agent gave no answer; see the daemon log"
+            "the {agent} agent gave no answer; see the daemon log"
         )));
     };
     Ok(Answer {
         text,
         model: done.model,
     })
+}
+
+/// Whether the user, or a daemon that is stopping, cancelled the run. That ends the review:
+/// it is not a failure to retry or to keep going after.
+fn was_cancelled(finish: &Finish) -> bool {
+    finish.condition.as_deref() == Some(CANCELLED)
 }
 
 /// The text a streamed piece of a direct run holds, when `kind` and `body` are that event.
@@ -531,9 +652,9 @@ fn delta_text<'a>(kind: &str, body: &'a Value) -> Option<&'a str> {
     body["text"].as_str()
 }
 
-/// The text of a reply the reviewer agent wrote, when `kind` and `body` are that event.
-fn reviewer_text(kind: &str, body: &Value) -> Option<String> {
-    if kind != CHILD_EVENT_KIND || body["agent"] != REVIEWER_AGENT {
+/// The text of a reply the agent `agent` wrote, when `kind` and `body` are that event.
+fn reply_text(kind: &str, body: &Value, agent: &str) -> Option<String> {
+    if kind != CHILD_EVENT_KIND || body["agent"] != agent {
         return None;
     }
     if body["kind"] != ASSISTANT_MESSAGE_KIND {
@@ -551,7 +672,7 @@ struct InputFiles {
 }
 
 impl InputFiles {
-    fn write(cwd: &Path, texts: &[String]) -> Result<Self, CliError> {
+    fn write(cwd: &Path, prefix: &str, texts: &[String]) -> Result<Self, CliError> {
         let dir = cwd.join(INPUT_DIR);
         let created_parent = !cwd.join(INPUT_PARENT_DIR).exists();
         let mut files = Self {
@@ -565,7 +686,7 @@ impl InputFiles {
             source,
         })?;
         for (n, text) in texts.iter().enumerate() {
-            let name = input_name(n);
+            let name = input_name(prefix, n);
             let path = dir.join(&name);
             files.relative.push(format!("{INPUT_DIR}/{name}"));
             files.paths.push(path.clone());
@@ -576,12 +697,12 @@ impl InputFiles {
 }
 
 /// The file of the part at `index`, from 0. The first keeps the name it always had.
-fn input_name(index: usize) -> String {
+fn input_name(prefix: &str, index: usize) -> String {
     let pid = std::process::id();
     if index == 0 {
-        format!("input-{pid}.txt")
+        format!("{prefix}-{pid}.txt")
     } else {
-        format!("input-{pid}-{}.txt", index + 1)
+        format!("{prefix}-{pid}-{}.txt", index + 1)
     }
 }
 
@@ -637,25 +758,71 @@ mod tests {
     }
 
     #[test]
+    fn only_a_cancelled_stop_condition_counts_as_an_interrupt() {
+        // Arrange
+        let finish = |condition: Option<&str>| Finish {
+            condition: condition.map(str::to_owned),
+            failed: true,
+            cut_short: false,
+            cause: None,
+            hook_reason: None,
+        };
+
+        // Act and Assert
+        assert!(was_cancelled(&finish(Some(CANCELLED))));
+        assert!(!was_cancelled(&finish(Some("max_turns"))));
+        assert!(!was_cancelled(&finish(None)));
+    }
+
+    #[test]
+    fn a_reply_is_the_answer_of_the_agent_it_names_and_of_no_other() {
+        // Arrange
+        let reply = serde_json::json!({"agent": "verifier", "kind": "assistant_message", "body": {"text": "v"}});
+
+        // Act and Assert
+        assert_eq!(
+            reply_text(CHILD_EVENT_KIND, &reply, "verifier"),
+            Some("v".to_owned())
+        );
+        assert_eq!(reply_text(CHILD_EVENT_KIND, &reply, "reviewer"), None);
+    }
+
+    #[test]
     fn only_the_reviewers_own_reply_is_the_answer() {
         // Arrange
         let reply = |agent: &str, kind: &str| serde_json::json!({"agent": agent, "kind": kind, "body": {"text": "x"}});
 
         // Act and Assert
         assert_eq!(
-            reviewer_text(CHILD_EVENT_KIND, &reply("reviewer", "assistant_message")),
+            reply_text(
+                CHILD_EVENT_KIND,
+                &reply("reviewer", "assistant_message"),
+                "reviewer"
+            ),
             Some("x".to_owned())
         );
         assert_eq!(
-            reviewer_text(CHILD_EVENT_KIND, &reply("explore", "assistant_message")),
+            reply_text(
+                CHILD_EVENT_KIND,
+                &reply("explore", "assistant_message"),
+                "reviewer"
+            ),
             None
         );
         assert_eq!(
-            reviewer_text(CHILD_EVENT_KIND, &reply("reviewer", "tool_finished")),
+            reply_text(
+                CHILD_EVENT_KIND,
+                &reply("reviewer", "tool_finished"),
+                "reviewer"
+            ),
             None
         );
         assert_eq!(
-            reviewer_text("assistant_message", &serde_json::json!({"text": "x"})),
+            reply_text(
+                "assistant_message",
+                &serde_json::json!({"text": "x"}),
+                "reviewer"
+            ),
             None
         );
     }
@@ -667,7 +834,7 @@ mod tests {
         let texts = ["one".to_owned(), "two".to_owned()];
 
         // Act
-        let files = InputFiles::write(dir.path(), &texts).unwrap();
+        let files = InputFiles::write(dir.path(), INPUT_FILE_PREFIX, &texts).unwrap();
         let kept: Vec<String> = files
             .relative
             .iter()
@@ -684,8 +851,9 @@ mod tests {
     fn the_first_input_file_keeps_its_name_and_the_others_are_numbered() {
         // Act and Assert
         let pid = std::process::id();
-        assert_eq!(input_name(0), format!("input-{pid}.txt"));
-        assert_eq!(input_name(1), format!("input-{pid}-2.txt"));
+        assert_eq!(input_name("input", 0), format!("input-{pid}.txt"));
+        assert_eq!(input_name("input", 1), format!("input-{pid}-2.txt"));
+        assert_eq!(input_name("verify", 0), format!("verify-{pid}.txt"));
     }
 
     #[test]
@@ -695,7 +863,7 @@ mod tests {
         fs::create_dir(dir.path().join(INPUT_PARENT_DIR)).unwrap();
 
         // Act
-        drop(InputFiles::write(dir.path(), &["text".to_owned()]).unwrap());
+        drop(InputFiles::write(dir.path(), INPUT_FILE_PREFIX, &["text".to_owned()]).unwrap());
 
         // Assert
         assert!(dir.path().join(INPUT_PARENT_DIR).exists());
@@ -811,6 +979,33 @@ mod tests {
         assert!(recovered.is_ok());
         assert!(matches!(failed, Err(CliError::ReviewFailed(_))));
         assert_eq!(twice.hints.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_part_is_not_tried_again_and_ends_the_review() {
+        // Arrange
+        struct Interrupted(usize);
+        impl Reviewer for Interrupted {
+            fn run(
+                &mut self,
+                _hint: Option<String>,
+            ) -> impl Future<Output = Result<Answer, CliError>> {
+                self.0 += 1;
+                std::future::ready(Err(CliError::RunInterrupted))
+            }
+        }
+        let mut reviewer = Interrupted(0);
+        let results = vec![Ok((parsed_of(GOOD), None)), Err(CliError::RunInterrupted)];
+
+        // Act
+        let part = review_part(&packed().scope, &mut reviewer).await;
+        let parts = two_parts();
+        let collected = collect(&parts, results);
+
+        // Assert
+        assert!(matches!(part, Err(CliError::RunInterrupted)));
+        assert_eq!(reviewer.0, 1);
+        assert!(matches!(collected, Err(CliError::RunInterrupted)));
     }
 
     #[tokio::test]
@@ -936,13 +1131,14 @@ mod tests {
         let given = vec!["a.txt".to_owned(), "b.txt".to_owned()];
 
         // Act
-        let review = finish(&parts, results, &given, 5, ("claude_code", 10)).unwrap();
+        let (merged, model) = merged_review(&parts, results, &given, 5).unwrap();
+        let review = assemble(merged, "claude_code", 10, None);
         let text = to_markdown(&review);
 
         // Assert
+        assert_eq!(model, None);
         assert!(review.run.partial);
         assert_eq!(review.run.chunks, 2);
-        assert_eq!(review.run.model, "claude_code");
         assert_eq!(review.findings.len(), 1);
         assert_eq!(review.coverage.reviewed, ["a.txt"]);
         assert_eq!(review.coverage.left_out, ["b.txt"]);
@@ -950,5 +1146,128 @@ mod tests {
             text.starts_with("# Review\n\n**Partial review:**"),
             "{text}"
         );
+    }
+
+    fn enabled(keys: &[&str]) -> Config {
+        let toml = keys.iter().fold(String::new(), |mut text, key| {
+            let _ = std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!("[providers.{key}]\nenabled = true\n"),
+            );
+            text
+        });
+        Config::from_toml_str(&toml).unwrap().config
+    }
+
+    #[test]
+    fn the_verifier_runs_on_the_other_backend_when_both_are_enabled_else_on_the_same() {
+        // Arrange
+        let both = enabled(&["claude_code", "codex"]);
+        let only_claude = enabled(&["claude_code"]);
+        let only_codex = enabled(&["codex"]);
+
+        // Act and Assert
+        assert_eq!(
+            verifier_backend(&both, BackendKind::ClaudeCode),
+            BackendKind::CodexAppServer
+        );
+        assert_eq!(
+            verifier_backend(&both, BackendKind::CodexAppServer),
+            BackendKind::ClaudeCode
+        );
+        assert_eq!(
+            verifier_backend(&both, BackendKind::CodexExec),
+            BackendKind::ClaudeCode
+        );
+        assert_eq!(
+            verifier_backend(&only_claude, BackendKind::ClaudeCode),
+            BackendKind::ClaudeCode
+        );
+        assert_eq!(
+            verifier_backend(&only_codex, BackendKind::CodexAppServer),
+            BackendKind::CodexAppServer
+        );
+        assert_eq!(
+            verifier_backend(&both, BackendKind::Anthropic),
+            BackendKind::Anthropic
+        );
+        assert_eq!(
+            verifier_backend(&both, BackendKind::Faux),
+            BackendKind::Faux
+        );
+    }
+
+    fn two_findings() -> Vec<Finding> {
+        let one = |id: &str, line: u32| {
+            let text = format!(
+                r#"{{"summary": "s", "effort": 1, "risk": "low", "findings": [{{"file": "a.txt", "start_line": {line}, "end_line": {line}, "severity": "high", "category": "bug", "title": "T{id}", "explanation": "E", "confidence": "high"}}]}}"#
+            );
+            let mut finding = parsed_of(&text).findings.remove(0);
+            finding.id = id.to_owned();
+            finding
+        };
+        vec![one("F1", 1), one("F2", 2)]
+    }
+
+    const VERDICTS: &str = r#"{"verdicts": [{"id": "F1", "score": 0, "reason": "false"}, {"id": "F2", "score": 8, "reason": "real"}]}"#;
+
+    #[tokio::test]
+    async fn the_verifier_drops_a_false_finding_scores_the_rest_and_is_asked_once() {
+        // Arrange
+        let mut verifier = scripted(&[Ok(VERDICTS), Ok(VERDICTS)]);
+
+        // Act
+        let applied = verify_findings(two_findings(), 4, &mut verifier)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(applied.dropped, 1);
+        assert_eq!(applied.findings.len(), 1);
+        assert_eq!(applied.findings[0].title, "TF2");
+        assert_eq!(applied.findings[0].score, Some(8));
+        assert_eq!(verifier.hints.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_verifier_that_fails_or_answers_junk_leaves_the_findings_unverified() {
+        for reply in [Err("down"), Ok("prose"), Ok(r#"{"verdicts": 3}"#)] {
+            // Arrange
+            let mut verifier = scripted(&[reply]);
+
+            // Act
+            let applied = verify_findings(two_findings(), 4, &mut verifier)
+                .await
+                .unwrap();
+
+            // Assert
+            assert_eq!(applied.dropped, 0, "{reply:?}");
+            assert_eq!(applied.findings.len(), 2, "{reply:?}");
+            assert!(applied.findings.iter().all(|f| f.unverified), "{reply:?}");
+            assert!(
+                applied.findings.iter().all(|f| f.score.is_none()),
+                "{reply:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_during_the_verifier_ends_the_review() {
+        // Arrange
+        struct Interrupted;
+        impl Reviewer for Interrupted {
+            fn run(
+                &mut self,
+                _hint: Option<String>,
+            ) -> impl Future<Output = Result<Answer, CliError>> {
+                std::future::ready(Err(CliError::RunInterrupted))
+            }
+        }
+
+        // Act
+        let result = verify_findings(two_findings(), 4, &mut Interrupted).await;
+
+        // Assert
+        assert!(matches!(result, Err(CliError::RunInterrupted)));
     }
 }
