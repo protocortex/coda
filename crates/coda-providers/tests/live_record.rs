@@ -31,6 +31,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use coda_config::config::ClaudeProfile;
 use coda_protocol::events::Event;
 use coda_protocol::types::{PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::{CancelHandle, ClaudeSession, SessionSpec, TurnOutcome};
@@ -302,6 +303,7 @@ async fn record_claude(
         resume: None,
         parent_env: parent_env(),
         read_only: false,
+        profile: ClaudeProfile::Full,
     })
     .expect("could not start the shim");
     let gate = FixedGate::new(decision);
@@ -404,6 +406,7 @@ async fn claude_write_attempt(out: &Path, name: &str, read_only: bool) -> bool {
         resume: None,
         parent_env: parent_env(),
         read_only,
+        profile: ClaudeProfile::Full,
     })
     .expect("could not start the shim");
     let gate = FixedGate::new(PermissionDecision::Deny);

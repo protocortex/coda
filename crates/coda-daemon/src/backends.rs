@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use coda_config::config::Config;
+use coda_config::config::{ClaudeProfile, Config};
 use coda_protocol::types::{BackendKind, SessionId, TurnId};
 use coda_providers::backend::{
     AgentBackend, BackendError, VERIFIED_CLAUDE_CODE_VERSIONS, VERIFIED_CODEX_VERSIONS, locate,
@@ -134,6 +134,17 @@ pub struct SessionStart {
     pub pidfile_dir: PathBuf,
     /// Ban the tools that change files or run commands.
     pub read_only: bool,
+    /// How much of Claude Code's own setup the session keeps.
+    pub profile: ClaudeProfile,
+}
+
+/// The profile `providers.claude_code` asks for; `project` when the section is absent.
+#[must_use]
+pub fn claude_profile(config: &Config) -> ClaudeProfile {
+    config
+        .providers
+        .get(CONFIG_KEY)
+        .map_or_else(ClaudeProfile::default, |section| section.profile)
 }
 
 /// Starts the child and records its pidfile; the child is stopped again if
@@ -152,6 +163,7 @@ pub async fn start_claude_session(start: SessionStart) -> Result<ClaudeSession, 
         resume: start.resume,
         parent_env: start.parent_env,
         read_only: start.read_only,
+        profile: start.profile,
     })?;
     let written = match session.pid() {
         Some(pid) => pidfile::write(&path, pid, &start.binary)
@@ -388,12 +400,12 @@ mod tests {
     use coda_providers::codex_exec::SandboxMode;
     use coda_store::Store;
 
-    use coda_config::config::Config;
+    use coda_config::config::{ClaudeProfile, Config};
 
     use super::{
-        ClaudeCodeBackend, CodexStart, SessionStart, StartError, enabled_agent_backends,
-        pidfile_path, resolve_codex, resolve_codex_off_worker, start_claude_session,
-        start_codex_session,
+        ClaudeCodeBackend, CodexStart, SessionStart, StartError, claude_profile,
+        enabled_agent_backends, pidfile_path, resolve_codex, resolve_codex_off_worker,
+        start_claude_session, start_codex_session,
     };
     use crate::pidfile::{is_same_process, read};
     use crate::reaper::reap;
@@ -416,7 +428,22 @@ mod tests {
             parent_env: Vec::new(),
             pidfile_dir: dir.path().to_path_buf(),
             read_only: false,
+            profile: ClaudeProfile::Full,
         }
+    }
+
+    #[test]
+    fn the_claude_profile_comes_from_its_section_and_defaults_to_project() {
+        // Arrange
+        let lean = Config::from_toml_str("[providers.claude_code]\nprofile = \"lean\"\n")
+            .unwrap()
+            .config;
+
+        // Act
+        let (set, absent) = (claude_profile(&lean), claude_profile(&Config::default()));
+
+        // Assert
+        assert_eq!((set, absent), (ClaudeProfile::Lean, ClaudeProfile::Project));
     }
 
     #[test]

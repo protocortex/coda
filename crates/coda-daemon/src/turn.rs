@@ -47,8 +47,8 @@ use tokio::task::JoinHandle;
 use tracing::{Instrument, info, warn};
 
 use crate::backends::{
-    AgentSession, CodexStart, SessionStart, StartError, pidfile_path, resolve_codex_off_worker,
-    start_claude_session, start_codex_session,
+    AgentSession, CodexStart, SessionStart, StartError, claude_profile, pidfile_path,
+    resolve_codex_off_worker, start_claude_session, start_codex_session,
 };
 mod diff;
 mod drive;
@@ -573,6 +573,7 @@ impl Turns {
                 parent_env,
                 pidfile_dir,
                 read_only: record.mode == Mode::Plan,
+                profile: claude_profile(&self.config.models),
             })
             .await?;
             return Ok(AgentSession::Claude(Box::new(session)));

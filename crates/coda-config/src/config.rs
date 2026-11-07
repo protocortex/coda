@@ -175,6 +175,32 @@ impl MaxTokensField {
     }
 }
 
+/// How much of Claude Code's own setup a `claude_code` session keeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeProfile {
+    /// Claude Code as it starts alone: your user and project settings, MCP servers,
+    /// skills and its full prompt.
+    Full,
+    /// Project settings only, no extra MCP servers and no skills or slash commands.
+    #[default]
+    Project,
+    /// Coda's own short prompt, a short tool list and no settings at all.
+    Lean,
+}
+
+impl ClaudeProfile {
+    /// The value as it appears in `config.toml`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Project => "project",
+            Self::Lean => "lean",
+        }
+    }
+}
+
 /// One `[providers.<backend>]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -191,6 +217,8 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     /// Extra environment variables forwarded to the backend process.
     pub env_passthrough: Vec<String>,
+    /// What a Claude Code session keeps of its own setup; `claude_code` only.
+    pub profile: ClaudeProfile,
     /// Backend versions known to work.
     pub verified_versions: Vec<String>,
     /// Script file replayed by the `faux` backend.
@@ -227,6 +255,7 @@ impl Default for ProviderConfig {
             binary: None,
             api_key_env: None,
             env_passthrough: Vec::new(),
+            profile: ClaudeProfile::default(),
             verified_versions: Vec::new(),
             script: None,
             request_log: None,
