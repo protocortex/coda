@@ -10,13 +10,46 @@ use serde::Deserialize;
 
 use crate::chunk::Merged;
 use crate::pack::Packed;
+use crate::parse::answer_object;
 use crate::schema::{
     Category, Confidence, MAX_EFFORT, MIN_EFFORT, Review, Risk, RunDetails, Severity,
 };
 use crate::skip::PrInfo;
+use crate::verify::verdicts_object;
 
 /// The name of the built-in agent that does the review.
 pub const REVIEWER_AGENT: &str = "reviewer";
+/// The name of the built-in agent that checks the findings.
+pub const VERIFIER_AGENT: &str = "verifier";
+
+/// Which agent a run is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Reads the change and reports findings.
+    Reviewer,
+    /// Checks the findings and scores them.
+    Verifier,
+}
+
+impl Role {
+    /// The built-in agent that plays the role.
+    #[must_use]
+    pub const fn agent(self) -> &'static str {
+        match self {
+            Self::Reviewer => REVIEWER_AGENT,
+            Self::Verifier => VERIFIER_AGENT,
+        }
+    }
+
+    /// The answer inside what an agent that narrates as it works wrote.
+    #[must_use]
+    pub fn answer(self, text: &str) -> &str {
+        match self {
+            Self::Reviewer => answer_object(text),
+            Self::Verifier => verdicts_object(text),
+        }
+    }
+}
 
 const RANGE_THREE_DOTS: &str = "...";
 const RANGE_TWO_DOTS: &str = "..";
@@ -239,50 +272,80 @@ pub fn input_text(
     out
 }
 
-/// The prompt the reviewer is started with: where to read its input.
-#[must_use]
-pub fn task_prompt(input_path: &str, retry_hint: Option<&str>) -> String {
-    let mut prompt = format!(
-        "Review the change described in the file {input_path}. Read it all first, in as many \
-         `read` calls as it takes. It holds the reply format and the diff. You may read other \
-         files of the repository to check how the changed code is used."
-    );
+fn append_hint(prompt: &mut String, retry_hint: Option<&str>) {
     if let Some(hint) = retry_hint {
         prompt.push_str("\n\n");
         prompt.push_str(hint);
     }
+}
+
+/// The prompt the agent is started with: where to read its input.
+#[must_use]
+pub fn task_prompt(role: Role, input_path: &str, retry_hint: Option<&str>) -> String {
+    let mut prompt = match role {
+        Role::Reviewer => format!(
+            "Review the change described in the file {input_path}. Read it all first, in as many \
+             `read` calls as it takes. It holds the reply format and the diff. You may read other \
+             files of the repository to check how the changed code is used."
+        ),
+        Role::Verifier => format!(
+            "Check the findings described in the file {input_path}. Read it all first, in as many \
+             `read` calls as it takes. It holds the reply format, the findings and the diff around \
+             each. You may read other files of the repository to check how the changed code is used."
+        ),
+    };
+    append_hint(&mut prompt, retry_hint);
     prompt
 }
 
 /// The prompt for an agent that is run on the input directly, with no file to read: the
 /// input is in the prompt itself.
 #[must_use]
-pub fn direct_prompt(input: &str, retry_hint: Option<&str>) -> String {
+pub fn direct_prompt(role: Role, input: &str, retry_hint: Option<&str>) -> String {
+    let what = match role {
+        Role::Reviewer => "Review the change below. It holds the reply format and the diff.",
+        Role::Verifier => {
+            "Check the findings below. It holds the reply format, the findings and the diff \
+             around each."
+        }
+    };
     let mut prompt = format!(
-        "Review the change below. It holds the reply format and the diff. You may read other \
-         files of the repository to check how the changed code is used, but change nothing.\n\n{input}"
+        "{what} You may read other files of the repository to check how the changed code is \
+         used, but change nothing.\n\n{input}"
     );
-    if let Some(hint) = retry_hint {
-        prompt.push_str("\n\n");
-        prompt.push_str(hint);
-    }
+    append_hint(&mut prompt, retry_hint);
     prompt
 }
 
-/// The first message of the session: it only hands the work to the reviewer.
+/// The first message of the session: it only hands the work to the agent.
 #[must_use]
-pub fn session_prompt(task_prompt: &str) -> String {
+pub fn session_prompt(role: Role, task_prompt: &str) -> String {
+    let agent = role.agent();
     format!(
-        "Call the task tool exactly once, with agent \"{REVIEWER_AGENT}\" and the prompt between \
+        "Call the task tool exactly once, with agent \"{agent}\" and the prompt between \
          the markers, copied word for word. Do not call any other tool and do not call task \
          again, whatever it returns. When it returns, reply with the word done.\n\
          <<<PROMPT\n{task_prompt}\nPROMPT>>>"
     )
 }
 
+/// The verifier's part in a review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifierRun {
+    /// The backend that was asked to verify.
+    pub backend: String,
+    /// Findings it dropped.
+    pub dropped: usize,
+}
+
 /// Builds the finished review from the merged output of the parts.
 #[must_use]
-pub fn assemble(merged: Merged, model: &str, input_chars: usize) -> Review {
+pub fn assemble(
+    merged: Merged,
+    model: &str,
+    input_chars: usize,
+    verifier: Option<VerifierRun>,
+) -> Review {
     let Merged {
         parsed,
         coverage,
@@ -299,6 +362,8 @@ pub fn assemble(merged: Merged, model: &str, input_chars: usize) -> Review {
             model: model.to_owned(),
             input_chars,
             dropped_findings: parsed.rejected.len() + parsed.over_cap,
+            verifier: verifier.as_ref().map(|v| v.backend.clone()),
+            verifier_dropped: verifier.map_or(0, |v| v.dropped),
             chunks,
             partial,
         },
@@ -420,8 +485,8 @@ mod tests {
     #[test]
     fn the_task_prompt_names_the_file_and_adds_the_retry_hint() {
         // Act
-        let first = task_prompt("/w/.coda/in.txt", None);
-        let again = task_prompt("/w/.coda/in.txt", Some("Answer again."));
+        let first = task_prompt(Role::Reviewer, "/w/.coda/in.txt", None);
+        let again = task_prompt(Role::Reviewer, "/w/.coda/in.txt", Some("Answer again."));
 
         // Assert
         assert!(first.contains("/w/.coda/in.txt"));
@@ -432,8 +497,8 @@ mod tests {
     #[test]
     fn the_direct_prompt_holds_the_input_itself_and_the_retry_hint() {
         // Act
-        let first = direct_prompt("FORMAT and DIFF", None);
-        let again = direct_prompt("FORMAT and DIFF", Some("Answer again."));
+        let first = direct_prompt(Role::Reviewer, "FORMAT and DIFF", None);
+        let again = direct_prompt(Role::Reviewer, "FORMAT and DIFF", Some("Answer again."));
 
         // Assert
         assert!(first.ends_with("FORMAT and DIFF"));
@@ -445,11 +510,41 @@ mod tests {
     #[test]
     fn the_session_prompt_wraps_the_task_prompt_for_one_reviewer_call() {
         // Act
-        let prompt = session_prompt("Review the file.");
+        let prompt = session_prompt(Role::Reviewer, "Review the file.");
 
         // Assert
         assert!(prompt.contains("agent \"reviewer\""));
         assert!(prompt.contains("<<<PROMPT\nReview the file.\nPROMPT>>>"));
+    }
+
+    #[test]
+    fn the_verifier_gets_its_own_agent_and_prompts() {
+        // Act
+        let session = session_prompt(Role::Verifier, "Check the file.");
+        let task = task_prompt(Role::Verifier, "/w/in.txt", None);
+        let direct = direct_prompt(Role::Verifier, "FINDINGS", None);
+
+        // Assert
+        assert!(session.contains("agent \"verifier\""));
+        assert!(task.contains("Check the findings") && task.contains("/w/in.txt"));
+        assert!(direct.starts_with("Check the findings below"));
+        assert!(direct.contains("change nothing"));
+        assert!(direct.ends_with("FINDINGS"));
+        assert_eq!(Role::Verifier.agent(), VERIFIER_AGENT);
+        assert_eq!(Role::Reviewer.agent(), REVIEWER_AGENT);
+    }
+
+    #[test]
+    fn each_role_reads_its_own_answer_out_of_a_narrated_reply() {
+        // Arrange
+        let reply = r#"Looking. {"verdicts": []} and {"summary": "s", "findings": []}"#;
+
+        // Act and Assert
+        assert_eq!(Role::Verifier.answer(reply), r#"{"verdicts": []}"#);
+        assert_eq!(
+            Role::Reviewer.answer(reply),
+            r#"{"summary": "s", "findings": []}"#
+        );
     }
 
     #[test]
@@ -475,13 +570,19 @@ mod tests {
         };
 
         // Act
-        let review = assemble(merged, "faux", 99);
+        let verifier = VerifierRun {
+            backend: "codex_app_server".to_owned(),
+            dropped: 4,
+        };
+        let review = assemble(merged, "faux", 99, Some(verifier));
 
         // Assert
         assert_eq!(review.run.dropped_findings, 3);
         assert_eq!(review.run.input_chars, 99);
         assert_eq!(review.run.model, "faux");
         assert_eq!(review.run.chunks, 2);
+        assert_eq!(review.run.verifier.as_deref(), Some("codex_app_server"));
+        assert_eq!(review.run.verifier_dropped, 4);
         assert!(review.run.partial);
         assert_eq!(review.coverage.left_out, ["b.rs"]);
     }

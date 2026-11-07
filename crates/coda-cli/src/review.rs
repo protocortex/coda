@@ -28,7 +28,7 @@ use coda_review::pack::{PackOptions, Packed, main_extension};
 use coda_review::parse::{BadShape, Parsed, answer_object, parse_model_output};
 use coda_review::render::{to_json, to_markdown};
 use coda_review::request::{
-    GH_PR_FIELDS, Part, REVIEWER_AGENT, Target, assemble, direct_prompt, input_text,
+    GH_PR_FIELDS, Part, REVIEWER_AGENT, Role, Target, assemble, direct_prompt, input_text,
     pr_info_from_gh, session_prompt, task_prompt,
 };
 use coda_review::rules::{Rules, default_branch_ref, load};
@@ -289,11 +289,11 @@ impl Reviewer for Live<'_> {
         let hint = hint.as_deref();
         let request = match self.handoff {
             Handoff::File(path) => Request {
-                prompt: session_prompt(&task_prompt(path, hint)),
+                prompt: session_prompt(Role::Reviewer, &task_prompt(Role::Reviewer, path, hint)),
                 direct: false,
             },
             Handoff::Prompt(input) => Request {
-                prompt: direct_prompt(input, hint),
+                prompt: direct_prompt(Role::Reviewer, input, hint),
                 direct: true,
             },
         };
@@ -419,7 +419,12 @@ fn finish(
 ) -> Result<Review, CliError> {
     let (outcomes, model) = collect(parts, results)?;
     let merged = merge(given, outcomes, max_findings);
-    Ok(assemble(merged, model.as_deref().unwrap_or(run.0), run.1))
+    Ok(assemble(
+        merged,
+        model.as_deref().unwrap_or(run.0),
+        run.1,
+        None,
+    ))
 }
 
 /// Pairs each part with its result. The review fails only when every part did; otherwise a

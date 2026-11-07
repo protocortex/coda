@@ -9,11 +9,12 @@ use std::path::PathBuf;
 use crate::catalog::{DefinitionFile, Kind, Snapshot};
 
 /// File stem and text of each built-in agent.
-const AGENTS: [(&str, &str); 4] = [
+const AGENTS: [(&str, &str); 5] = [
     ("explore", include_str!("../builtin/explore.md")),
     ("implementer", include_str!("../builtin/implementer.md")),
     ("reviewer", include_str!("../builtin/reviewer.md")),
     ("tester", include_str!("../builtin/tester.md")),
+    ("verifier", include_str!("../builtin/verifier.md")),
 ];
 
 /// The built-in files, as if they had been read from a directory.

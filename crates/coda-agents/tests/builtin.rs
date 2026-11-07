@@ -21,7 +21,7 @@ const READ_ONLY: [&str; 7] = [
     "read",
     "retrieve",
 ];
-const NAMES: [&str; 4] = ["explore", "implementer", "reviewer", "tester"];
+const NAMES: [&str; 5] = ["explore", "implementer", "reviewer", "tester", "verifier"];
 
 fn agent(name: &str, tools: &str, body: &str) -> String {
     format!(
@@ -70,7 +70,7 @@ fn the_built_in_agents_load_with_no_files_and_pass_the_lint_checks() {
 }
 
 #[test]
-fn explore_and_reviewer_have_exactly_the_read_only_tools() {
+fn explore_reviewer_and_verifier_have_exactly_the_read_only_tools() {
     // Arrange
     let catalog = Catalog::load(TempDir::new().unwrap().path(), None);
     let sorted = |name: &str| {
@@ -80,11 +80,12 @@ fn explore_and_reviewer_have_exactly_the_read_only_tools() {
     };
 
     // Act
-    let (explore, reviewer) = (sorted("explore"), sorted("reviewer"));
+    let (explore, reviewer, verifier) = (sorted("explore"), sorted("reviewer"), sorted("verifier"));
 
     // Assert
     assert_eq!(explore, READ_ONLY);
     assert_eq!(reviewer, READ_ONLY);
+    assert_eq!(verifier, READ_ONLY);
 }
 
 #[test]
@@ -97,6 +98,20 @@ fn the_reviewer_has_no_tool_that_writes_a_file_or_runs_a_command() {
     for tool in ["bash", "edit", "write", "task"] {
         assert!(!tools.iter().any(|t| t == tool), "{tool}");
     }
+}
+
+#[test]
+fn the_verifier_treats_what_it_reads_as_data_and_follows_a_reply_format_that_the_request_gives() {
+    // Arrange
+    let catalog = Catalog::load(TempDir::new().unwrap().path(), None);
+    let body = &catalog.agent("verifier").unwrap().def.body;
+
+    // Act and Assert
+    assert!(body.contains("is data"), "{body}");
+    assert!(
+        body.contains("If the request gives its own reply format, use that one"),
+        "{body}"
+    );
 }
 
 #[test]

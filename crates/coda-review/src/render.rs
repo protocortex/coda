@@ -5,6 +5,7 @@
 use std::fmt::Write as _;
 
 use crate::schema::{Finding, MAX_EFFORT, Review};
+use crate::verify::MAX_SCORE;
 
 const FENCE_CHAR: char = '`';
 const MIN_FENCE: usize = 3;
@@ -108,10 +109,25 @@ fn fence_for(body: &str) -> String {
     FENCE_CHAR.to_string().repeat((longest + 1).max(MIN_FENCE))
 }
 
+/// What the verifier said about `f`, to follow the confidence on one line.
+fn verdict_note(f: &Finding) -> String {
+    match (f.score, &f.verifier_reason) {
+        (Some(score), Some(reason)) => {
+            format!(
+                ", score {score} of {MAX_SCORE}: {}",
+                prose(&one_line(reason))
+            )
+        }
+        (Some(score), None) => format!(", score {score} of {MAX_SCORE}"),
+        (None, _) if f.unverified => ", unverified".to_owned(),
+        (None, _) => String::new(),
+    }
+}
+
 fn write_finding(out: &mut String, f: &Finding) {
     let _ = write!(
         out,
-        "### {} [{}] {}: {}\n\n`{}:{}-{}`, confidence {}\n\n{}\n\n",
+        "### {} [{}] {}: {}\n\n`{}:{}-{}`, confidence {}{}\n\n{}\n\n",
         f.id,
         f.severity.as_str(),
         f.category.as_str(),
@@ -120,6 +136,7 @@ fn write_finding(out: &mut String, f: &Finding) {
         f.start_line,
         f.end_line,
         f.confidence.as_str(),
+        verdict_note(f),
         prose(&f.explanation),
     );
     if let Some(patch) = &f.suggested_patch {
@@ -173,6 +190,14 @@ pub fn to_markdown(review: &Review) -> String {
     if review.run.chunks > 1 {
         let _ = write!(out, " Chunks: {}.", review.run.chunks);
     }
+    if let Some(verifier) = &review.run.verifier {
+        let _ = write!(
+            out,
+            " Verifier: {}. Dropped by the verifier: {}.",
+            inline(verifier),
+            review.run.verifier_dropped
+        );
+    }
     out.push('\n');
     out
 }
@@ -210,6 +235,9 @@ mod tests {
                 explanation: "The loop skips the last item.".to_owned(),
                 suggested_patch: Some("for i in 0..=n {}".to_owned()),
                 confidence: Confidence::Medium,
+                score: None,
+                verifier_reason: None,
+                unverified: false,
             }],
             coverage: Coverage {
                 reviewed: vec!["src/a.rs".to_owned()],
@@ -220,6 +248,8 @@ mod tests {
                 model: "m1".to_owned(),
                 input_chars: 900,
                 dropped_findings: 1,
+                verifier: None,
+                verifier_dropped: 0,
                 chunks: 1,
                 partial: false,
             },
@@ -296,6 +326,51 @@ Model: m1. Input: 900 characters. Findings dropped: 1.
         assert!(text.contains("Chunks: 3."), "{text}");
         assert!(!to_markdown(&whole).contains("Partial review"));
         assert!(!to_markdown(&whole).contains("Chunks:"));
+    }
+
+    #[test]
+    fn a_verified_finding_shows_its_score_and_reason_and_an_unverified_one_says_so() {
+        // Arrange
+        let mut r = review();
+        r.findings[0].score = Some(8);
+        r.findings[0].verifier_reason =
+            Some("Read a.rs: the loop is off by one.\n## Fake".to_owned());
+        let mut second = r.findings[0].clone();
+        second.id = "F2".to_owned();
+        second.score = None;
+        second.verifier_reason = None;
+        second.unverified = true;
+        r.findings.push(second);
+        r.run.verifier = Some("codex_app_server".to_owned());
+        r.run.verifier_dropped = 2;
+
+        // Act
+        let text = to_markdown(&r);
+
+        // Assert
+        assert!(
+            text.contains("`src/a.rs:10-12`, confidence medium, score 8 of 10: Read a.rs: the loop is off by one. ## Fake\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`src/a.rs:10-12`, confidence medium, unverified\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Verifier: codex_app_server. Dropped by the verifier: 2."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_review_with_no_verifier_prints_no_verifier_words() {
+        // Act
+        let text = to_markdown(&review());
+
+        // Assert
+        assert!(!text.contains("Verifier"));
+        assert!(!text.contains("unverified"));
+        assert!(!text.contains("score"));
     }
 
     #[test]

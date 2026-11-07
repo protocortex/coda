@@ -20,7 +20,7 @@ pub const VENDORED_DIRS: [&str; 4] = ["vendor", "node_modules", "third_party", "
 
 /// The notice about deleted files may use at most 1/N of the budget.
 const NOTICE_SHARE_DIVISOR: usize = 10;
-const NOTICE_TITLE: &str = "Deleted or deletion-only files (content not shown):\n";
+pub(crate) const NOTICE_TITLE: &str = "Deleted or deletion-only files (content not shown):\n";
 /// Room kept for the closing "and N more" line of the notice.
 const MORE_LINE_RESERVE: usize = 40;
 const PATH_SEPARATOR: char = '/';
@@ -117,7 +117,7 @@ fn is_unsafe(c: char) -> bool {
     c.is_control() || LINE_SEPARATORS.contains(&c)
 }
 
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.chars()
         .map(|c| if is_unsafe(c) { '?' } else { c })
         .collect()

@@ -1,0 +1,9 @@
+{
+  "verdicts": [
+    {"id": "F1", "score": 0, "reason": "get is not async and has no await."},
+    {"id": "F2", "score": 7, "reason": "get calls lock().unwrap(), which panics on a poisoned lock."},
+    {"id": "F3", "score": 5, "reason": "The mutex is held only for one lookup, so the cost is small."},
+    {"id": "F4", "score": 0, "reason": "Debug is not needed by any caller in the diff."},
+    {"id": "F5", "score": 2, "reason": "A missing doc comment is a style remark, not a defect."}
+  ]
+}

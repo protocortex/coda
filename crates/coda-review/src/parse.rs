@@ -58,7 +58,7 @@ const MAX_HINT_DETAIL_CHARS: usize = 200;
 
 const FENCE: &str = "```";
 
-fn strip_fence(text: &str) -> &str {
+pub(crate) fn strip_fence(text: &str) -> &str {
     let trimmed = text.trim();
     let Some(rest) = trimmed.strip_prefix(FENCE) else {
         return trimmed;
@@ -78,6 +78,13 @@ const FINDINGS_KEY: &str = "findings";
 /// returned as it is, so the usual shape check reports it.
 #[must_use]
 pub fn answer_object(text: &str) -> &str {
+    last_object_with(text, &[SUMMARY_KEY, FINDINGS_KEY])
+}
+
+/// The last top-level JSON object of `text` that has all of `keys`, or `text` itself when
+/// there is none.
+#[must_use]
+pub fn last_object_with<'a>(text: &'a str, keys: &[&str]) -> &'a str {
     let mut found = None;
     let mut from = 0;
     while let Some(offset) = text[from..].find(OPEN_BRACE) {
@@ -85,9 +92,7 @@ pub fn answer_object(text: &str) -> &str {
         let tail = &text[start..];
         let mut values = serde_json::Deserializer::from_str(tail).into_iter::<serde_json::Value>();
         match values.next() {
-            Some(Ok(value))
-                if value.get(SUMMARY_KEY).is_some() && value.get(FINDINGS_KEY).is_some() =>
-            {
+            Some(Ok(value)) if keys.iter().all(|key| value.get(key).is_some()) => {
                 let end = start + values.byte_offset();
                 found = Some(&text[start..end]);
                 from = end;
@@ -157,6 +162,9 @@ pub fn parse_model_output(
             explanation: raw.explanation,
             suggested_patch: raw.suggested_patch,
             confidence: raw.confidence,
+            score: None,
+            verifier_reason: None,
+            unverified: false,
         })
         .collect();
     Ok(Parsed {

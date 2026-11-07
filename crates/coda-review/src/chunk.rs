@@ -321,6 +321,9 @@ mod tests {
             explanation: "e".to_owned(),
             suggested_patch: None,
             confidence: Confidence::High,
+            score: None,
+            verifier_reason: None,
+            unverified: false,
         }
     }
 

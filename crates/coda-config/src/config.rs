@@ -15,7 +15,7 @@ use crate::loop_guard::{
 };
 use crate::review::{
     CHUNK_CONCURRENCY_KEY, DIFF_BUDGET_CHARS_KEY, MAX_CHUNKS_KEY, MAX_FINDINGS_KEY, REVIEW_KEY,
-    ReviewConfig,
+    ReviewConfig, VERIFY_THRESHOLD_KEY, VERIFY_THRESHOLD_MAX,
 };
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
@@ -444,6 +444,12 @@ impl Config {
             return Err(ConfigError::InvalidValue {
                 path: format!("{REVIEW_KEY}.{MAX_CHUNKS_KEY}"),
                 allowed: "a whole number of chunks above 0".to_owned(),
+            });
+        }
+        if self.review.verify_threshold > VERIFY_THRESHOLD_MAX {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{REVIEW_KEY}.{VERIFY_THRESHOLD_KEY}"),
+                allowed: format!("a score from 0 to {VERIFY_THRESHOLD_MAX}"),
             });
         }
         if self.review.chunk_concurrency == 0 {
@@ -998,6 +1004,28 @@ idle_timeout_ms = 1500
         assert!(
             matches!(&workers_err, ConfigError::InvalidValue { path, .. } if path == "review.chunk_concurrency"),
             "{workers_err}"
+        );
+    }
+
+    #[test]
+    fn review_verifier_is_on_by_default_with_a_threshold_of_four_and_ten_is_the_top() {
+        // Arrange
+        let set = "[review]\nverify = false\nverify_threshold = 7\n";
+        let too_high = "[review]\nverify_threshold = 11\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config;
+        let custom = Config::from_toml_str(set).unwrap().config;
+        let err = Config::from_toml_str(too_high).unwrap_err();
+
+        // Assert
+        assert!(default.review.verify);
+        assert_eq!(default.review.verify_threshold, 4);
+        assert!(!custom.review.verify);
+        assert_eq!(custom.review.verify_threshold, 7);
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { path, .. } if path == "review.verify_threshold"),
+            "{err}"
         );
     }
 
