@@ -639,6 +639,43 @@ async fn a_model_turn_is_snapshotted_before_and_after_it_edits() {
 }
 
 #[tokio::test]
+async fn a_rewound_model_session_sends_the_model_only_the_kept_turns() {
+    // Arrange
+    let script = [text_turn("a1"), text_turn("a2"), text_turn("a3")];
+    let mut rig = Rig::new(Mode::Default, &script);
+    for question in ["q1-kept", "q2-dropped"] {
+        rig.send(question).await;
+        rig.wait_until_idle().await;
+    }
+    let session = rig.session.clone();
+    let first = rig
+        .hub
+        .with_store(move |store| store.turn_checkpoints(&session))
+        .await
+        .unwrap()[0]
+        .turn
+        .clone();
+
+    // Act
+    let answer = rig
+        .call(
+            "session.rewind",
+            json!({"session_id": rig.session, "turn_id": first, "keep_files": true}),
+        )
+        .await;
+    rig.send("q3-next").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    assert_eq!(answer["result"]["turns_rolled_back"], 1);
+    let sent = rig.request_lines().last().unwrap()["messages"].to_string();
+    assert!(sent.contains("q1-kept"), "{sent}");
+    assert!(sent.contains("q3-next"), "{sent}");
+    assert!(!sent.contains("q2-dropped"), "{sent}");
+    assert!(!sent.contains("a2"), "{sent}");
+}
+
+#[tokio::test]
 async fn a_denied_tool_call_does_not_run_and_the_turn_still_ends() {
     // Arrange
     let calls = tool_turn(&[("c1", "bash", json!({"command": "touch ran.txt"}))]);

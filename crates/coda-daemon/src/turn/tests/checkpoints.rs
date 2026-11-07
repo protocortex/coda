@@ -10,7 +10,7 @@ use super::{Rig, relaxed};
 
 const NO_PERMISSION_TURN: &str = "tool-slow";
 
-fn git(rig: &Rig, args: &[&str]) -> String {
+pub(super) fn git(rig: &Rig, args: &[&str]) -> String {
     let out = Command::new("git")
         .args([
             "-c",
@@ -32,7 +32,7 @@ fn git(rig: &Rig, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-fn repo_rig() -> Rig {
+pub(super) fn repo_rig() -> Rig {
     let rig = Rig::new(relaxed(), Vec::new());
     git(&rig, &["init", "-q", "-b", "main"]);
     std::fs::write(rig.cwd.path().join("a.txt"), "one\n").unwrap();
@@ -41,7 +41,7 @@ fn repo_rig() -> Rig {
     rig
 }
 
-async fn checkpoints(rig: &Rig) -> Vec<TurnCheckpoint> {
+pub(super) async fn checkpoints(rig: &Rig) -> Vec<TurnCheckpoint> {
     let session = rig.session.clone();
     rig.hub
         .with_store(move |store| store.turn_checkpoints(&session))

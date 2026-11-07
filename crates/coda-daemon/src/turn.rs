@@ -23,8 +23,8 @@ use coda_protocol::events::Event;
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, INVALID_PARAMS};
 use coda_protocol::methods::{
     AgentRunParams, AgentRunResult, PermissionRespondParams, PermissionRespondResult,
-    SessionCancelParams, SessionCancelResult, SessionCloseParams, SessionCloseResult,
-    SessionSendParams, SessionSendResult,
+    REWIND_REFUSED_CODE, SessionCancelParams, SessionCancelResult, SessionCloseParams,
+    SessionCloseResult, SessionRewindParams, SessionSendParams, SessionSendResult,
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::TurnOutcome;
@@ -49,6 +49,7 @@ use crate::backends::{
     start_claude_session, start_codex_session,
 };
 mod drive;
+mod rewind;
 
 use self::drive::Drive;
 use crate::checkpoint;
@@ -126,6 +127,9 @@ pub enum TurnError {
     Ending(SessionId),
     #[error("session {0} does not use a backend this daemon can run")]
     Unsupported(SessionId),
+    /// A `session.rewind` that cannot be done as asked. The text is for the caller.
+    #[error("{0}")]
+    Rewind(String),
     /// An `agent.run` request that cannot be served as asked. The text is for the caller.
     #[error("{0}")]
     Agent(String),
@@ -142,6 +146,7 @@ impl TurnError {
         match self {
             Self::SessionNotFound(_) => error(SESSION_NOT_FOUND, "Session not found"),
             Self::Agent(why) => error(INVALID_PARAMS, &why),
+            Self::Rewind(why) => error(REWIND_REFUSED_CODE, &why),
             Self::Busy(_) => error(TURN_RUNNING, "A turn is already running"),
             Self::Ending(_) => error(
                 TURN_RUNNING,
@@ -325,6 +330,8 @@ struct Job {
     text: String,
     child: AgentSession,
     gate: BrokerGate,
+    /// The kept turns as text, for a conversation that starts new after a rewind.
+    seed: Option<String>,
 }
 
 impl Turns {
@@ -458,6 +465,7 @@ impl Turns {
             CODEX_BACKEND_NAME
         };
         let mut child = self.start_child(&record, false).await?;
+        let seed = self.rewind_seed(&record).await;
         let turn = match Self::begin(&self.hub, &session_id, &shown).await {
             Ok(turn) => turn,
             Err(e) => {
@@ -481,6 +489,7 @@ impl Turns {
             text: prompt,
             child,
             gate,
+            seed,
         };
         let turns = Arc::clone(self);
         let span = backend_span(&job.session, &job.turn, backend_name);
@@ -641,16 +650,7 @@ impl Turns {
     /// [`TurnError::Ending`] when a cancelled turn does not end in time.
     pub async fn close(&self, session: &SessionId) -> Result<bool, TurnError> {
         self.await_wind_down(session).await?;
-        let server = self.idle.take(session);
-        let released = server.is_some();
-        if let Some(mut server) = server {
-            info!(session = %session, "closing the session's Codex server");
-            let pid = server.pid();
-            stop(&mut server, session).await;
-            remove_pidfile_of(&self.config.pidfile_dir, session, pid);
-        }
-        let dropped = self.models.close(session);
-        Ok(released || dropped)
+        Ok(self.release(session).await)
     }
 
     /// Whether any backend is enabled for new sessions.
@@ -843,6 +843,7 @@ impl Turns {
             text,
             child,
             gate,
+            seed,
         } = job;
         let (tx, rx) = mpsc::channel(EVENT_QUEUE_BOUND);
         self.queues().insert(session.clone(), tx.downgrade());
@@ -873,7 +874,8 @@ impl Turns {
             &text,
             (&watched, &watchdog),
             (child, emit),
-        );
+        )
+        .with_seed(seed);
         let verdict = self.supervisor.run(&mut drive).await;
         if let Verdict::Exhausted { restarts } = verdict {
             warn!(session = %session, turn = %turn, restarts, "restart cap reached; failing the turn");
@@ -923,15 +925,7 @@ impl Turns {
         if let Some(Err(e)) = &outcome {
             warn!(session = %session, error = %e, "the turn failed");
         }
-        // A cancelled turn is the user's choice, not a failure; a watchdog abort is one.
-        // An event that could not be stored leaves a hole in the log, which is a failure too.
-        let failed = timed_out
-            || store_failures > 0
-            || match &outcome {
-                Some(Ok(TurnOutcome::Completed { is_error })) => *is_error,
-                Some(Ok(TurnOutcome::Cancelled)) => false,
-                _ => true,
-            };
+        let failed = turn_failed(timed_out || store_failures > 0, &outcome);
         let ended = within(limit, Self::finish(&self.hub, &session, &turn, failed)).await;
         if ended.is_none() {
             warn!(session = %session, "the store did not answer; the turn is left open");
@@ -970,6 +964,18 @@ impl Turns {
             warn!(session = %session, error = %e, "could not record the end of the turn");
         }
     }
+}
+
+/// Whether a turn failed. A cancelled turn is the user's choice, not a failure; a
+/// watchdog abort is one, and so is an event that could not be stored, which
+/// leaves a hole in the log. `hole_or_abort` says either happened.
+fn turn_failed(hole_or_abort: bool, outcome: &drive::Outcome) -> bool {
+    hole_or_abort
+        || match outcome {
+            Some(Ok(TurnOutcome::Completed { is_error })) => *is_error,
+            Some(Ok(TurnOutcome::Cancelled)) => false,
+            _ => true,
+        }
 }
 
 /// Runs `work` on its own task, holding `slot` until it ends or panics.
@@ -1412,6 +1418,14 @@ pub(crate) async fn close(turns: Option<&Arc<Turns>>, params: Option<Value>) -> 
         .await
         .map_err(TurnError::into_rpc)?;
     to_value(&SessionCloseResult { closed })
+}
+
+/// Answers `session.rewind`.
+pub(crate) async fn rewind(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
+    let turns = turns.ok_or_else(unavailable)?;
+    let params: SessionRewindParams = parse_params(params)?;
+    let result = turns.rewind(params).await.map_err(TurnError::into_rpc)?;
+    to_value(&result)
 }
 
 /// Answers `permission.respond`.

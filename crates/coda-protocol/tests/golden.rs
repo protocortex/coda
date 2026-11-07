@@ -14,9 +14,9 @@ use coda_protocol::methods::{
     PermissionRespondParams, PermissionRespondResult, PingParams, PingResult, SessionCancelParams,
     SessionCancelResult, SessionCloseParams, SessionCloseResult, SessionCreateParams,
     SessionCreateResult, SessionListParams, SessionListResult, SessionResumeParams,
-    SessionResumeResult, SessionSendParams, SessionSendResult, SessionSetModelParams,
-    SessionSetModelResult, SessionSubscribeParams, SessionSubscribeResult, UsageSummaryParams,
-    UsageSummaryResult,
+    SessionResumeResult, SessionRewindParams, SessionRewindResult, SessionSendParams,
+    SessionSendResult, SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams,
+    SessionSubscribeResult, UsageSummaryParams, UsageSummaryResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -98,6 +98,11 @@ golden_tests! {
     session_cancel_result: "session.cancel.result" => SessionCancelResult,
     session_close_params: "session.close.params" => SessionCloseParams,
     session_close_result: "session.close.result" => SessionCloseResult,
+    session_rewind_params: "session.rewind.params" => SessionRewindParams,
+    session_rewind_params_base: "session.rewind.params.base" => SessionRewindParams,
+    session_rewind_params_keep: "session.rewind.params.keep" => SessionRewindParams,
+    session_rewind_result: "session.rewind.result" => SessionRewindResult,
+    session_rewind_result_kept: "session.rewind.result.kept" => SessionRewindResult,
     session_subscribe_params: "session.subscribe.params" => SessionSubscribeParams,
     session_subscribe_result: "session.subscribe.result" => SessionSubscribeResult,
     session_list_params: "session.list.params" => SessionListParams,

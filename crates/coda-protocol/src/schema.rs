@@ -74,6 +74,11 @@ pub fn protocol_schema() -> Value {
         &mut methods,
         m::SESSION_CLOSE,
     );
+    add_method::<m::SessionRewindParams, m::SessionRewindResult>(
+        &mut generator,
+        &mut methods,
+        m::SESSION_REWIND,
+    );
     add_method::<m::PermissionRespondParams, m::PermissionRespondResult>(
         &mut generator,
         &mut methods,

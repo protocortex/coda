@@ -71,6 +71,7 @@ fn relaxed() -> Timing {
 mod checkpoints;
 mod restarts;
 mod resume;
+mod rewind;
 
 struct Rig {
     sleeper: Arc<RecordingSleeper>,

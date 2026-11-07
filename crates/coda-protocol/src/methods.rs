@@ -31,6 +31,8 @@ pub const SESSION_SUBSCRIBE: &str = "session.subscribe";
 pub const SESSION_RESUME: &str = "session.resume";
 /// Releases what the daemon holds for an idle session; its events stay stored.
 pub const SESSION_CLOSE: &str = "session.close";
+/// Restores the files and rolls back the conversation to the end of an earlier turn.
+pub const SESSION_REWIND: &str = "session.rewind";
 /// Lists stored sessions, without their content.
 pub const SESSION_LIST: &str = "session.list";
 /// Answers a pending permission request.
@@ -61,6 +63,7 @@ pub const METHODS: &[&str] = &[
     SESSION_RESUME,
     SESSION_LIST,
     SESSION_CLOSE,
+    SESSION_REWIND,
     PERMISSION_RESPOND,
     GRANT_ADD,
     USAGE_SUMMARY,
@@ -112,6 +115,9 @@ pub struct Capabilities {
     /// The daemon honors `force` on `session.cancel`.
     #[serde(default)]
     pub force_cancel: bool,
+    /// The daemon serves `session.rewind`.
+    #[serde(default)]
+    pub rewind: bool,
 }
 
 /// Result of [`INITIALIZE`].
@@ -220,6 +226,44 @@ pub struct SessionCloseParams {
 pub struct SessionCloseResult {
     /// Whether the session held a backend server or conversation that was released.
     pub closed: bool,
+}
+
+/// Error code of a [`SESSION_REWIND`] the daemon refused, with the reason as the
+/// message: no snapshot for that turn, another running session in the same
+/// folder, a held `index.lock`, or a folder that is not a git repository.
+pub const REWIND_REFUSED_CODE: i64 = -32007;
+
+/// Parameters of [`SESSION_REWIND`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionRewindParams {
+    /// Session to rewind. It must have no turn running.
+    pub session_id: SessionId,
+    /// The turn to go back to: the files return to how this turn left them and
+    /// the turns after it are rolled back. Omit it to go back to before the
+    /// first turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    /// Leave the working tree as it is and roll back the conversation only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_files: bool,
+    /// Restore the files only and keep every turn in the conversation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_conversation: bool,
+}
+
+/// Result of [`SESSION_REWIND`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionRewindResult {
+    /// Whether the working tree was restored.
+    pub files_restored: bool,
+    /// How many turns were newly rolled back. They stay stored and shown, and the
+    /// conversation the backend is given leaves them out.
+    pub turns_rolled_back: u64,
+    /// The private git ref that holds the files as they were just before the
+    /// restore, so work made since the last turn can be brought back with
+    /// `git restore --source <ref>`. Absent when the files were not restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_as: Option<String>,
 }
 
 /// Parameters of [`SESSION_SUBSCRIBE`].
@@ -505,6 +549,7 @@ mod tests {
             (SESSION_RESUME, "session.resume"),
             (SESSION_LIST, "session.list"),
             (SESSION_CLOSE, "session.close"),
+            (SESSION_REWIND, "session.rewind"),
             (PERMISSION_RESPOND, "permission.respond"),
             (GRANT_ADD, "grant.add"),
             (USAGE_SUMMARY, "usage.summary"),
