@@ -167,6 +167,15 @@ mod offline {
     }
 
     #[tokio::test]
+    async fn the_question_fixture_asks_and_finishes_without_a_tool_error() {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "asked_the_user");
+        assert_eq!(outcome.tool_errors, 0, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
     async fn a_rate_limit_with_no_fallback_fails_the_fixture() {
         let mut fixture = fixtures::all()
             .into_iter()

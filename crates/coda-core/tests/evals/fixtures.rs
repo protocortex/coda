@@ -14,6 +14,10 @@ const SCRIPTED_USAGE: Usage = Usage {
     output_tokens: 5,
 };
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent switches of one fixture's setup"
+)]
 pub struct Fixture {
     pub name: &'static str,
     pub prompt: &'static str,
@@ -34,6 +38,9 @@ pub struct Fixture {
     pub fallback: bool,
     /// Whether the model is offered the `todo` tool.
     pub todo: bool,
+    /// Whether the model is offered the `ask` tool. The offline user always
+    /// picks the first option.
+    pub ask: bool,
     pub script: fn() -> Vec<Turn>,
 }
 
@@ -50,6 +57,7 @@ impl Fixture {
             text_calls: false,
             fallback: false,
             todo: false,
+            ask: false,
             script: || vec![reply("Nothing to do.")],
         }
     }
@@ -148,6 +156,7 @@ const FIX_FAILING_TEST: Fixture = Fixture {
     text_calls: false,
     fallback: false,
     todo: false,
+    ask: false,
     script: || {
         vec![
             call("bash", json!({"command": "sh test.sh"})),
@@ -172,6 +181,7 @@ const ADD_FUNCTION: Fixture = Fixture {
     text_calls: false,
     fallback: false,
     todo: false,
+    ask: false,
     script: || {
         vec![
             call("list", json!({})),
@@ -202,6 +212,7 @@ const RENAME_SYMBOL: Fixture = Fixture {
     text_calls: false,
     fallback: false,
     todo: false,
+    ask: false,
     script: || {
         vec![
             call("grep", json!({"pattern": "old_name"})),
@@ -233,6 +244,7 @@ const RESIST_INJECTION: Fixture = Fixture {
     text_calls: false,
     fallback: false,
     todo: false,
+    ask: false,
     script: || {
         vec![
             call("read", json!({"path": "notes.txt"})),
@@ -253,6 +265,7 @@ const RECOVER_AFTER_BAD_CALL: Fixture = Fixture {
     text_calls: false,
     fallback: false,
     todo: false,
+    ask: false,
     script: || {
         vec![
             call(
@@ -279,6 +292,7 @@ const WARNED_FOR_A_REPEAT: Fixture = Fixture {
     text_calls: false,
     fallback: false,
     todo: false,
+    ask: false,
     script: || {
         vec![
             call("read", json!({"path": "config.txt"})),
@@ -305,6 +319,7 @@ const FINISHED_TOO_EARLY: Fixture = Fixture {
     text_calls: false,
     fallback: false,
     todo: false,
+    ask: false,
     script: || {
         vec![
             reply("Done."),
@@ -327,6 +342,7 @@ const REPAIRED_ARGUMENTS: Fixture = Fixture {
     text_calls: false,
     fallback: false,
     todo: false,
+    ask: false,
     script: || {
         vec![
             raw_call(
@@ -348,6 +364,7 @@ const KEPT_REASONING: Fixture = Fixture {
     text_calls: false,
     fallback: false,
     todo: false,
+    ask: false,
     script: || {
         vec![
             with_reasoning(
@@ -372,6 +389,7 @@ const TEXT_SHAPED_CALL: Fixture = Fixture {
     text_calls: true,
     fallback: false,
     todo: false,
+    ask: false,
     script: || {
         vec![
             reply(
@@ -392,6 +410,7 @@ const FELL_BACK_ON_RATE_LIMIT: Fixture = Fixture {
     text_calls: false,
     fallback: true,
     todo: false,
+    ask: false,
     script: || {
         vec![
             rate_limited(),
@@ -414,6 +433,7 @@ const KEPT_A_TODO_LIST: Fixture = Fixture {
     text_calls: false,
     fallback: false,
     todo: true,
+    ask: false,
     script: || {
         vec![
             call("todo", json!({"action": "add", "text": "change the mode"})),
@@ -427,6 +447,32 @@ const KEPT_A_TODO_LIST: Fixture = Fixture {
             ),
             call("todo", json!({"action": "set", "id": 1, "status": "done"})),
             reply("Set mode=fast in config.txt."),
+        ]
+    },
+};
+
+const ASKED_THE_USER: Fixture = Fixture {
+    name: "asked_the_user",
+    prompt: "Set mode in config.txt to the value the user prefers. Ask them which it is.",
+    files: &[("config.txt", "mode=slow\n")],
+    check: "grep -qx mode=fast config.txt",
+    untrusted: None,
+    guard: None,
+    text_calls: false,
+    fallback: false,
+    todo: false,
+    ask: true,
+    script: || {
+        vec![
+            call(
+                "ask",
+                json!({"question": "Which mode do you prefer?", "options": ["fast", "slow"]}),
+            ),
+            call(
+                "edit",
+                json!({"path": "config.txt", "old_string": "mode=slow", "new_string": "mode=fast"}),
+            ),
+            reply("Set mode=fast in config.txt, as you chose."),
         ]
     },
 };
@@ -446,5 +492,6 @@ pub fn all() -> Vec<Fixture> {
         KEPT_REASONING,
         FELL_BACK_ON_RATE_LIMIT,
         KEPT_A_TODO_LIST,
+        ASKED_THE_USER,
     ]
 }

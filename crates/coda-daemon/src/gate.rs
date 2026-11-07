@@ -17,7 +17,7 @@ use coda_core::broker::{
 use coda_protocol::events::{Event, TIMEOUT_KIND};
 use coda_protocol::methods::PermissionRespondParams;
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
-use coda_providers::gate::PermissionGate;
+use coda_providers::gate::{AskAnswer, PermissionGate};
 use coda_providers::tool_request::ToolRequest;
 use coda_store::{EventRecord, NewPending, SessionRecord};
 use tokio::sync::broadcast::Receiver;
@@ -106,7 +106,15 @@ impl Brokers {
             );
             return false;
         }
-        match broker.answer(&params.request_id, params.decision).await {
+        let answered = broker
+            .answer_question(
+                &params.request_id,
+                params.decision,
+                params.choice,
+                params.no_terminal,
+            )
+            .await;
+        match answered {
             Ok(()) => true,
             Err(e) => {
                 warn!(request = %params.request_id, error = %e, "permission answer not accepted");
@@ -208,6 +216,15 @@ impl PermissionGate for BrokerGate {
         }
         .await
     }
+
+    async fn ask(&self, question: &str, options: &[String]) -> AskAnswer {
+        Watched {
+            inner: Box::pin(self.broker.ask_user(question, options)),
+            gate: self,
+            done: false,
+        }
+        .await
+    }
 }
 
 /// A request that tells subscribers about its prompt when it is dropped
@@ -218,8 +235,8 @@ struct Watched<'a, F> {
     done: bool,
 }
 
-impl<F: Future<Output = PermissionDecision>> Future for Watched<'_, F> {
-    type Output = PermissionDecision;
+impl<F: Future> Future for Watched<'_, F> {
+    type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let polled = self.inner.as_mut().poll(cx);
@@ -484,6 +501,8 @@ mod tests {
                     session_id: record.id.clone(),
                     request_id: id.clone(),
                     decision,
+                    choice: None,
+                    no_terminal: false,
                 })
                 .await
         }
@@ -716,6 +735,8 @@ mod tests {
                 session_id: record.id.clone(),
                 request_id: notice.id.clone(),
                 decision: PermissionDecision::AllowOnce,
+                choice: None,
+                no_terminal: false,
             })
             .await;
 
@@ -795,6 +816,8 @@ mod tests {
                 session_id: stranger.id.clone(),
                 request_id: notice.id.clone(),
                 decision: PermissionDecision::AllowAlways,
+                choice: None,
+                no_terminal: false,
             })
             .await;
 

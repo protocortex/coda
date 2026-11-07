@@ -944,6 +944,7 @@ mod tests {
             repo_path: "/work/repo".to_owned(),
             command: "cargo test".to_owned(),
             agent: None,
+            options: Vec::new(),
             truncated: false,
         })
     }
@@ -1075,6 +1076,7 @@ mod tests {
                 session_id: SessionId::new("s-1"),
                 request_id: RequestId::new("r-1"),
                 decision: PermissionDecision::AllowAlways,
+                choice: None,
             })]
         );
     }

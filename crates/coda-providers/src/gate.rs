@@ -9,6 +9,21 @@ use coda_protocol::types::PermissionDecision;
 
 use crate::tool_request::ToolRequest;
 
+/// How a question the model put to the user ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskAnswer {
+    /// The user picked an option, counted from 0.
+    Chose(usize),
+    /// The user answered without picking one.
+    Declined,
+    /// No answer came before the prompt timed out.
+    TimedOut,
+    /// The client has no user to ask, as `coda run` has none.
+    NoTerminal,
+    /// This gate cannot ask a question at all.
+    Unavailable,
+}
+
 /// Answers the permission requests a backend raises.
 ///
 /// An implementation applies [`decide`](crate::policy::decide) and, on a
@@ -17,6 +32,12 @@ use crate::tool_request::ToolRequest;
 pub trait PermissionGate: Send + Sync {
     /// Decides one request.
     fn request(&self, request: &ToolRequest) -> impl Future<Output = PermissionDecision> + Send;
+
+    /// Puts a question with `options` to the user and waits for the answer. A
+    /// gate with no one to ask says so, and the caller tells the model.
+    fn ask(&self, _question: &str, _options: &[String]) -> impl Future<Output = AskAnswer> + Send {
+        std::future::ready(AskAnswer::Unavailable)
+    }
 
     /// The backend wrote something, whether or not it became an event; it is alive.
     fn progress(&self) {}
@@ -33,6 +54,10 @@ pub trait PermissionGate: Send + Sync {
 impl<G: PermissionGate> PermissionGate for Arc<G> {
     fn request(&self, request: &ToolRequest) -> impl Future<Output = PermissionDecision> + Send {
         (**self).request(request)
+    }
+
+    fn ask(&self, question: &str, options: &[String]) -> impl Future<Output = AskAnswer> + Send {
+        (**self).ask(question, options)
     }
 
     fn progress(&self) {

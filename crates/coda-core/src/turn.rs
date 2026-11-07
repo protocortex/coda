@@ -14,7 +14,7 @@ use coda_config::hooks::HookEvent;
 use coda_config::loop_guard::LoopGuardConfig;
 use coda_protocol::events::{CALL_FROM_TEXT, CALL_REPAIRED, TodoItem};
 use coda_protocol::types::{OriginalId, PermissionDecision, SessionId};
-use coda_providers::gate::PermissionGate;
+use coda_providers::gate::{AskAnswer, PermissionGate};
 use coda_providers::model::{
     ModelEvent, ModelProvider, ModelRequest, ProviderError, ReasoningBlock, RequestMessage,
     RequestToolCall, StopReason, ToolSchema as ModelToolSchema, Usage,
@@ -22,6 +22,7 @@ use coda_providers::model::{
 use coda_providers::tool_request::{Tool as RequestTool, ToolRequest};
 use coda_store::Store;
 use coda_telemetry::attrs::{CODA_SESSION_ID, CODA_TOOL_NAME};
+use coda_tools::ask as ask_tool;
 use coda_tools::todo::{self as todo_tool, TodoList};
 use coda_tools::{Tool, skill as skill_tool, task as task_tool};
 use serde_json::Value;
@@ -47,6 +48,14 @@ pub(crate) const SKIPPED: &str = "not run: the turn stopped before this call";
 pub(crate) const EMPTY_ARGUMENTS: &str = "{}";
 /// Stored for a send that ended before the model replied, so roles keep alternating.
 pub(crate) const NO_REPLY: &str = "[no reply: the turn stopped early]";
+/// What the model is told when it calls `ask` in a loop that may not ask the user.
+const NO_ASK: &str = "the ask tool is not available here: sub-agents cannot ask the user";
+/// What the model is told when nobody can answer a question.
+const NO_ONE_TO_ASK: &str = "ask is not available here: no one is at a terminal to answer";
+/// What the model is told when the user answered without picking an option.
+const NOT_CHOSEN: &str = "The user did not choose an option.";
+/// What the model is told when a question timed out.
+const NOT_ANSWERED: &str = "The user did not answer in time.";
 /// What the model is told when it calls `todo` in a loop that keeps no list.
 const NO_TODOS: &str = "the todo tool is not available here: sub-agents keep no todo list";
 /// What the model is told when it calls `task` in a session that cannot dispatch.
@@ -436,6 +445,8 @@ pub struct TurnLoop<P, G> {
     chain: Option<Chain<P>>,
     /// The model's todo list; `None` where `todo` is not offered.
     todos: Option<Mutex<TodoList>>,
+    /// Whether the model may put a question to the user with `ask`.
+    asks: bool,
 }
 
 /// How a compaction attempt ended.
@@ -482,6 +493,54 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             text_tool_calls: false,
             chain: None,
             todos: None,
+            asks: false,
+        }
+    }
+
+    /// Lets the model put a question to the user with the `ask` tool. Left off
+    /// for a sub-agent, which has no way to reach the user.
+    #[must_use]
+    pub fn with_ask(mut self) -> Self {
+        self.asks = true;
+        self
+    }
+
+    /// Runs an `ask` call: the question goes to the gate, which carries it to
+    /// the user the way a permission prompt goes, with the same timeout.
+    async fn run_ask(&self, call: &ToolCall) -> ToolOutcome {
+        if !self.asks {
+            return ToolOutcome::error(NO_ASK.to_owned());
+        }
+        let args = match parse_arguments(call).and_then(|input| {
+            ask_tool::parse(&input).map_err(|error| ToolOutcome::error(error.to_string()))
+        }) {
+            Ok(args) => args,
+            Err(refusal) => return refusal,
+        };
+        let answer = tokio::select! {
+            answer = self.gate.ask(&args.question, &args.options) => answer,
+            () = self.cancel.cancelled() => {
+                info!("question cancelled");
+                return ToolOutcome::error(PROMPT_CANCELLED.to_owned());
+            }
+        };
+        let note = |text: String| ToolOutcome {
+            text,
+            is_error: false,
+            usage: None,
+            original: None,
+            raw_digest: None,
+        };
+        match answer {
+            AskAnswer::Chose(index) => match args.options.get(index) {
+                Some(option) => note(format!("The user chose option {}: {option}", index + 1)),
+                None => note(NOT_CHOSEN.to_owned()),
+            },
+            AskAnswer::Declined => note(NOT_CHOSEN.to_owned()),
+            AskAnswer::TimedOut => note(NOT_ANSWERED.to_owned()),
+            AskAnswer::NoTerminal | AskAnswer::Unavailable => {
+                ToolOutcome::error(NO_ONE_TO_ASK.to_owned())
+            }
         }
     }
 
@@ -1338,6 +1397,9 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         }
         if call.name == todo_tool::NAME {
             return self.run_todo(call);
+        }
+        if call.name == ask_tool::NAME {
+            return self.run_ask(call).await;
         }
         let Some(tool) = self.tools.tools.get(call.name.as_str()) else {
             return ToolOutcome::error(format!("unknown tool {}", call.name));

@@ -1435,6 +1435,7 @@ async fn a_store_user_is_not_blocked_while_the_index_walk_runs() {
     assert_eq!(indexed_symbols(&rig, "f5"), 1);
 }
 
+mod ask;
 mod catalog;
 mod fallback;
 mod hooks;
