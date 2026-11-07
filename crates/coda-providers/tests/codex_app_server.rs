@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use coda_protocol::events::Event;
+use coda_protocol::events::{Event, ToolCallStatus};
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
 use coda_providers::claude_session::{CancelHandle, ENV_ALLOWLIST, TurnOutcome};
 use coda_providers::codex_app_server::{AppServerError, AppServerSpec, CodexAppServerSession};
@@ -851,4 +851,61 @@ async fn a_server_that_died_mid_turn_is_reported_and_cannot_take_another_turn() 
         }]
     ));
     assert!(!reusable);
+}
+
+fn tool_call(status: ToolCallStatus) -> Event {
+    Event::ToolCall {
+        session_id: SessionId::new("s-1"),
+        turn_id: TurnId::new("t-1"),
+        id: "item-7".to_owned(),
+        name: "Bash".to_owned(),
+        summary: Some("ls".to_owned()),
+        status,
+    }
+}
+
+fn tool_calls(events: &[Event]) -> Vec<Event> {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::ToolCall { .. }))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_command_sends_a_start_and_a_finish_event() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+
+    // Act
+    let (_, events) = turn(&mut session, "tool-quick").await;
+
+    // Assert
+    assert_eq!(
+        tool_calls(&events),
+        vec![
+            tool_call(ToolCallStatus::Started),
+            tool_call(ToolCallStatus::Succeeded)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_command_that_ends_failed_finishes_as_failed() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+
+    // Act
+    let (_, events) = turn(&mut session, "tool-error").await;
+
+    // Assert
+    assert_eq!(
+        tool_calls(&events),
+        vec![
+            tool_call(ToolCallStatus::Started),
+            tool_call(ToolCallStatus::Failed)
+        ]
+    );
 }

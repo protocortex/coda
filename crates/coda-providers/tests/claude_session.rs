@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use coda_protocol::events::{Event, InterruptCause, UsageWindowKind};
+use coda_protocol::events::{Event, InterruptCause, ToolCallStatus, UsageWindowKind};
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
 use coda_providers::claude_code::Diagnostic;
 use coda_providers::claude_session::{
@@ -198,6 +198,96 @@ async fn usage_and_rate_limit_reports_become_events() {
     let limit = limit.expect("no rate_limit event");
     assert_eq!(limit.status, "allowed");
     assert_eq!(limit.windows[0].utilization_bps, 900);
+}
+
+fn tool_call(status: ToolCallStatus) -> Event {
+    Event::ToolCall {
+        session_id: SessionId::new("s-1"),
+        turn_id: TurnId::new("t-1"),
+        id: "toolu-1".to_owned(),
+        name: "Bash".to_owned(),
+        summary: Some("ls".to_owned()),
+        status,
+    }
+}
+
+#[tokio::test]
+async fn a_tool_call_sends_a_start_and_a_finish_event_in_order() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    let (outcome, events) = turn(&mut session, &gate, "tool-quick").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Completed { is_error: false });
+    let calls: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, Event::ToolCall { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            tool_call(ToolCallStatus::Started),
+            tool_call(ToolCallStatus::Succeeded)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_ends_the_open_call_as_failed_before_the_interrupt() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let handle = session.cancel_handle();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+    let mut events = Vec::new();
+
+    // Act
+    let outcome = tokio::time::timeout(
+        TURN_TIMEOUT,
+        session.run_turn(&TurnId::new("t-1"), "tool-hang", &gate, &mut |event| {
+            if matches!(
+                event,
+                Event::ToolCall {
+                    status: ToolCallStatus::Started,
+                    ..
+                }
+            ) {
+                handle.cancel();
+            }
+            events.push(event);
+        }),
+    )
+    .await
+    .expect("cancel did not end the turn")
+    .unwrap();
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Cancelled);
+    let failed = events
+        .iter()
+        .position(|e| *e == tool_call(ToolCallStatus::Failed))
+        .expect("the open call was not ended");
+    assert!(matches!(events[failed + 1], Event::TurnInterrupted { .. }));
+}
+
+#[tokio::test]
+async fn a_tool_result_marked_as_an_error_finishes_the_call_as_failed() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    let (_, events) = turn(&mut session, &gate, "tool-error").await;
+
+    // Assert
+    assert!(events.contains(&tool_call(ToolCallStatus::Failed)));
+    assert!(!events.contains(&tool_call(ToolCallStatus::Succeeded)));
 }
 
 #[tokio::test]

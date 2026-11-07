@@ -91,6 +91,8 @@ pub struct InitializeParams {
 /// `usage`, `rate_limit` and `usage_limit` details, so a session on another
 /// backend never sends them even when the flag is true. A client must not wait
 /// for one.
+// Each flag is a field of the wire format, so they cannot become one enum.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Capabilities {
     /// The daemon can report the full usage of a turn, including cache tokens.
@@ -103,6 +105,10 @@ pub struct Capabilities {
     /// Only Claude Code sessions do.
     #[serde(default)]
     pub usage_limit_events: bool,
+    /// The daemon can send `tool_call` events. Claude Code, Codex and coda's own
+    /// loop do; a backend without tool calls never does.
+    #[serde(default)]
+    pub tool_call_events: bool,
 }
 
 /// Result of [`INITIALIZE`].

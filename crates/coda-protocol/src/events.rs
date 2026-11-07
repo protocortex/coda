@@ -2,8 +2,10 @@
 
 //! Notifications the daemon pushes to subscribed clients.
 //!
-//! Every variant except [`Event::StreamDelta`] is content-free: it names
-//! sessions, turns and tools but never prompts, arguments or outputs.
+//! Every variant except [`Event::StreamDelta`] and [`Event::ToolCall`] is
+//! content-free: it names sessions, turns and tools but never prompts, arguments
+//! or outputs. A tool call carries a short summary of what it works on, such as
+//! a command line or a path, cut to [`MAX_TOOL_SUMMARY_CHARS`].
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -38,6 +40,50 @@ pub const COMPACTION_KIND: &str = "compaction";
 pub const RATE_LIMIT_KIND: &str = "rate_limit";
 /// Stored event kind of a turn that ended because the plan limit was hit.
 pub const USAGE_LIMIT_KIND: &str = "usage_limit";
+/// Stored event kind of a tool call that started or finished.
+pub const TOOL_CALL_KIND: &str = "tool_call";
+/// Longest tool summary, in characters. A longer one is cut and ends in `...`.
+pub const MAX_TOOL_SUMMARY_CHARS: usize = 80;
+const SUMMARY_ELLIPSIS: &str = "...";
+/// Input fields that name what a tool works on, in the order a summary prefers them.
+const SUMMARY_FIELDS: [&str; 7] = [
+    "command",
+    "file_path",
+    "pattern",
+    "query",
+    "url",
+    "path",
+    "description",
+];
+
+/// A short, one-line summary of what a tool call works on, from its JSON input:
+/// the first of `command`, `file_path`, `pattern`, `query`, `url`, `path` and
+/// `description` that holds text. `None` when none does.
+#[must_use]
+pub fn tool_summary(input: &serde_json::Value) -> Option<String> {
+    SUMMARY_FIELDS
+        .iter()
+        .find_map(|field| input[field].as_str().and_then(summary_of))
+}
+
+/// The first non-blank line of `text` without control characters, cut to
+/// [`MAX_TOOL_SUMMARY_CHARS`]. `None` when `text` has no such line.
+#[must_use]
+pub fn summary_of(text: &str) -> Option<String> {
+    let line: String = text
+        .lines()
+        .map(|line| line.chars().filter(|c| !c.is_control()).collect::<String>())
+        .map(|line| line.trim().to_owned())
+        .find(|line| !line.is_empty())?;
+    if line.chars().count() <= MAX_TOOL_SUMMARY_CHARS {
+        return Some(line);
+    }
+    let keep = MAX_TOOL_SUMMARY_CHARS - SUMMARY_ELLIPSIS.len();
+    let mut cut: String = line.chars().take(keep).collect();
+    cut.push_str(SUMMARY_ELLIPSIS);
+    Some(cut)
+}
+
 /// Stored event kind of the reason a blocking `session_start` hook stopped a turn.
 /// The body is a [`HookBlockedBody`]; clients show it to the user and never to the model.
 pub const HOOK_BLOCKED_KIND: &str = "hook_blocked";
@@ -154,6 +200,22 @@ impl UsageWindowKind {
             _ => Self::Unknown,
         }
     }
+}
+
+/// Where a tool call stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ToolCallStatus {
+    /// The call began and has no result yet.
+    Started,
+    /// The call finished and the tool reported no error.
+    Succeeded,
+    /// The call finished with an error, or was denied.
+    Failed,
+    /// A status this peer does not know, sent by a newer one.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a turn was cut short.
@@ -332,6 +394,25 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reset_at: Option<u64>,
     },
+    /// A tool call started or finished. A call sends one event for each, with the
+    /// same `id`, `name` and `summary`. A turn that ends in `turn_interrupted` or
+    /// `backend_crashed` first ends its open calls as `failed`. Only the session's
+    /// own calls are reported, not those of a sub-agent it started.
+    ToolCall {
+        /// Session of the turn.
+        session_id: SessionId,
+        /// The turn that made the call.
+        turn_id: TurnId,
+        /// The backend's id for the call; a start and its finish share it.
+        id: String,
+        /// The tool's name as its backend calls it, such as `Bash` or `bash`.
+        name: String,
+        /// What the call works on, cut to [`MAX_TOOL_SUMMARY_CHARS`], when it has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        /// Whether the call began, or how it ended.
+        status: ToolCallStatus,
+    },
     /// An event of a type this peer does not know, sent by a newer one.
     #[serde(other)]
     Unknown,
@@ -360,6 +441,7 @@ mod tests {
             COMPACTION_KIND,
             RATE_LIMIT_KIND,
             USAGE_LIMIT_KIND,
+            TOOL_CALL_KIND,
         ];
 
         for kind in kinds {
@@ -370,6 +452,7 @@ mod tests {
                 "usage": {"input_tokens": 0, "output_tokens": 0},
                 "summary": "1", "replaced_messages": 0, "kept_messages": 0,
                 "limit": {"status": "allowed"}, "window": "five_hour",
+                "id": "c", "name": "Bash", "status": "started",
             });
             let event: Event = serde_json::from_value(fields).unwrap();
 
@@ -417,6 +500,44 @@ mod tests {
             // Assert
             assert_eq!(written, json!(cause.as_str()));
         }
+    }
+
+    #[test]
+    fn a_summary_takes_the_first_field_that_names_the_work() {
+        let input = json!({"description": "last", "path": "src/a.rs", "command": ""});
+        let search = json!({"pattern": "TODO", "path": "src"});
+        assert_eq!(tool_summary(&search), Some("TODO".to_owned()));
+
+        assert_eq!(tool_summary(&input), Some("src/a.rs".to_owned()));
+        assert_eq!(
+            tool_summary(&json!({"command": "cargo test"})),
+            Some("cargo test".to_owned())
+        );
+        assert_eq!(tool_summary(&json!({"other": "x"})), None);
+        assert_eq!(tool_summary(&json!("text")), None);
+    }
+
+    #[test]
+    fn a_summary_keeps_the_first_line_and_cuts_a_long_one() {
+        let long = "x".repeat(MAX_TOOL_SUMMARY_CHARS + 20);
+
+        let cut = summary_of(&long).unwrap();
+
+        assert_eq!(cut.chars().count(), MAX_TOOL_SUMMARY_CHARS);
+        assert!(cut.ends_with("..."));
+        assert_eq!(
+            summary_of("\n  ls -la  \nsecond"),
+            Some("ls -la".to_owned())
+        );
+        assert_eq!(summary_of("  \n "), None);
+        assert_eq!(summary_of("ls\x1b[31m\r"), Some("ls[31m".to_owned()));
+        assert_eq!(
+            summary_of(&"é".repeat(MAX_TOOL_SUMMARY_CHARS))
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_TOOL_SUMMARY_CHARS
+        );
     }
 
     #[test]

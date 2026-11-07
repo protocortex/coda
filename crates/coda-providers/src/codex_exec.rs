@@ -31,6 +31,7 @@ use crate::claude_session::{
 use crate::emit::Emit;
 use crate::gate::PermissionGate;
 use crate::jsonl::{DiagnosticLog, Framed, LineFramer, bounded};
+use crate::tool_call::{CallInfo, ToolCalls, codex_call, codex_failed};
 
 const EXEC_ARGS: &[&str] = &["exec", "--json", "--sandbox"];
 const RESUME_ARG: &str = "resume";
@@ -190,11 +191,17 @@ pub enum CodexMessage {
     ToolStarted {
         /// Codex's item id.
         id: String,
+        /// The tool's name, such as `Bash`.
+        name: String,
+        /// What the item works on, when it says.
+        summary: Option<String>,
     },
     /// The item that started has completed.
     ToolFinished {
         /// Codex's item id.
         id: String,
+        /// Whether the item failed, was declined, or a command exited non-zero.
+        failed: bool,
     },
     /// A complete assistant message; `exec` has no text deltas.
     AgentMessage(String),
@@ -263,12 +270,19 @@ impl CodexParser {
             "item.completed" if value["item"]["type"] == "agent_message" => value["item"]["text"]
                 .as_str()
                 .map(|text| CodexMessage::AgentMessage(text.to_owned())),
-            "item.started" if is_tool_item(&value["item"]) => value["item"]["id"]
-                .as_str()
-                .map(|id| CodexMessage::ToolStarted { id: id.to_owned() }),
-            "item.completed" if is_tool_item(&value["item"]) => value["item"]["id"]
-                .as_str()
-                .map(|id| CodexMessage::ToolFinished { id: id.to_owned() }),
+            "item.started" if is_tool_item(&value["item"]) => {
+                let id = value["item"]["id"].as_str()?.to_owned();
+                let CallInfo { name, summary } = codex_call(&value["item"])?;
+                Some(CodexMessage::ToolStarted { id, name, summary })
+            }
+            "item.completed" if is_tool_item(&value["item"]) => {
+                value["item"]["id"]
+                    .as_str()
+                    .map(|id| CodexMessage::ToolFinished {
+                        id: id.to_owned(),
+                        failed: codex_failed(&value["item"]),
+                    })
+            }
             "turn.completed" => Some(CodexMessage::TurnCompleted(usage_of(&value["usage"]))),
             "turn.failed" => Some(CodexMessage::TurnFailed),
             // Known events coda has no use for.
@@ -308,6 +322,7 @@ pub struct CodexExecSession {
     cancel: Arc<watch::Sender<bool>>,
     backend_session_id: Option<String>,
     spawn_hook: Option<HookSlot>,
+    tool_calls: ToolCalls,
     closed: bool,
 }
 
@@ -317,6 +332,7 @@ impl CodexExecSession {
     pub fn new(spec: CodexSpec) -> Self {
         Self {
             backend_session_id: spec.resume.clone(),
+            tool_calls: ToolCalls::new(spec.session_id.clone()),
             spec,
             child: None,
             stderr: None,
@@ -385,6 +401,7 @@ impl CodexExecSession {
                 .await;
         }
         self.parser = CodexParser::new();
+        self.tool_calls.clear();
         let spawned = self.spawn()?;
         self.announce_spawn().await?;
         self.supervise(turn_id, text, gate, emit, spawned).await
@@ -439,7 +456,7 @@ impl CodexExecSession {
                 }
             };
             if read == 0 {
-                return self.crashed(emit).await;
+                return self.crashed(turn_id, emit).await;
             }
             gate.progress();
             for message in self.parser.feed(&buffer[..read]) {
@@ -539,8 +556,19 @@ impl CodexExecSession {
         let turn_id = turn_id.clone();
         match message {
             CodexMessage::ThreadStarted { thread_id } => self.backend_session_id = Some(thread_id),
-            CodexMessage::ToolStarted { id } => gate.tool_started(&id),
-            CodexMessage::ToolFinished { id } => gate.tool_finished(&id),
+            CodexMessage::ToolStarted { id, name, summary } => {
+                gate.tool_started(&id);
+                let info = CallInfo { name, summary };
+                if let Some(event) = self.tool_calls.started(&turn_id, &id, info) {
+                    emit.emit(event).await;
+                }
+            }
+            CodexMessage::ToolFinished { id, failed } => {
+                gate.tool_finished(&id);
+                if let Some(event) = self.tool_calls.finished(&turn_id, &id, failed) {
+                    emit.emit(event).await;
+                }
+            }
             CodexMessage::AgentMessage(text) => {
                 emit.emit(Event::StreamDelta {
                     session_id,
@@ -585,6 +613,9 @@ impl CodexExecSession {
     ) -> Result<TurnOutcome, CodexError> {
         // Stop the backend before the event, which may wait for room in a full queue.
         let stopped = self.reap(Duration::ZERO).await;
+        for event in self.tool_calls.fail_open(turn_id) {
+            emit.emit(event).await;
+        }
         emit.emit(Event::TurnInterrupted {
             session_id: self.spec.session_id.clone(),
             turn_id: turn_id.clone(),
@@ -595,7 +626,11 @@ impl CodexExecSession {
         Ok(TurnOutcome::Cancelled)
     }
 
-    async fn crashed(&mut self, emit: &mut impl Emit) -> Result<TurnOutcome, CodexError> {
+    async fn crashed(
+        &mut self,
+        turn_id: &TurnId,
+        emit: &mut impl Emit,
+    ) -> Result<TurnOutcome, CodexError> {
         let exit_code = self
             .reap(EXIT_GRACE)
             .await?
@@ -604,6 +639,9 @@ impl CodexExecSession {
             Some(tail) => tail.finish().await,
             None => None,
         };
+        for event in self.tool_calls.fail_open(turn_id) {
+            emit.emit(event).await;
+        }
         emit.emit(Event::BackendCrashed {
             session_id: self.spec.session_id.clone(),
             exit_code,
@@ -788,7 +826,8 @@ mod tests {
                 },
                 CodexMessage::AgentMessage("hi".to_owned()),
                 CodexMessage::ToolFinished {
-                    id: "i1".to_owned()
+                    id: "i1".to_owned(),
+                    failed: false,
                 },
                 CodexMessage::TurnCompleted(TokenUsage {
                     input_tokens: 5,
@@ -806,7 +845,7 @@ mod tests {
     fn a_started_command_is_a_tool_in_flight_and_other_started_items_are_not() {
         // Arrange
         let mut parser = CodexParser::new();
-        let command = r#"{"type":"item.started","item":{"id":"i1","type":"command_execution"}}"#;
+        let command = r#"{"type":"item.started","item":{"id":"i1","type":"command_execution","command":"ls"}}"#;
         let message = r#"{"type":"item.started","item":{"id":"i2","type":"agent_message"}}"#;
 
         // Act
@@ -816,7 +855,9 @@ mod tests {
         assert_eq!(
             messages,
             vec![CodexMessage::ToolStarted {
-                id: "i1".to_owned()
+                id: "i1".to_owned(),
+                name: "Bash".to_owned(),
+                summary: Some("ls".to_owned()),
             }]
         );
     }

@@ -20,7 +20,8 @@
 //! `approve-file`, `approve-nocmd`, `approve-unknown`, `approve-heartbeat`, `approve-close`,
 //! `other-request`, `tool-slow` and `tool-hang`, and its wire shapes are SYNTHETIC too.
 //! `tool-slow` starts a command item, stays silent for `TOOL_SLOW` and completes it;
-//! `tool-hang` starts one and never completes it. `stream-long` streams lines that carry no text
+//! `tool-hang` starts one and never completes it. `tool-quick` completes one at once and
+//! `tool-error` ends one as failed. `stream-long` streams lines that carry no text
 //! (reasoning deltas, `item.updated`) for longer than the idle limits the tests use.
 //! `exec` takes all three prompts, and also `message-hang`, which parks the process
 //! after the agent message.
@@ -155,6 +156,23 @@ fn run_turn(args: &[String], prompt: &str, out: &mut impl Write) -> io::Result<(
         }
         std::thread::sleep(TOOL_SLOW);
         emit(out, &json!({"type": "item.completed", "item": item}))?;
+    }
+    if prompt.contains("tool-quick") || prompt.contains("tool-error") {
+        let failed = prompt.contains("tool-error");
+        let item = |status: &str, exit_code: Option<i32>| {
+            json!({"id": "item_7", "type": "command_execution", "command": "ls",
+                "status": status, "exit_code": exit_code})
+        };
+        emit(
+            out,
+            &json!({"type": "item.started", "item": item("in_progress", None)}),
+        )?;
+        let done = if failed {
+            item("failed", Some(1))
+        } else {
+            item("completed", Some(0))
+        };
+        emit(out, &json!({"type": "item.completed", "item": done}))?;
     }
     if prompt.contains("stream-long") {
         for _ in 0..STREAM_STEPS {
@@ -506,6 +524,43 @@ mod app_server {
         std::process::exit(0);
     }
 
+    /// Runs the command a `tool-*` prompt asks for. True when the turn is over, because
+    /// the command never ends and the client interrupted it.
+    fn scripted_command(stream: &mut UnixStream, prompt: &str) -> io::Result<bool> {
+        let slow = prompt.contains("tool-slow") || prompt.contains("tool-hang");
+        let quick = prompt.contains("tool-quick") || prompt.contains("tool-error");
+        if !slow && !quick {
+            return Ok(false);
+        }
+        let item = |id: &str, status: &str| json!({"id": id, "type": "commandExecution", "command": "ls", "status": status});
+        if slow {
+            let item = item("item-6", "inProgress");
+            notify(stream, "item/started", &json!({"item": item}))?;
+            if prompt.contains("tool-hang") {
+                await_interrupt(stream)?;
+                return Ok(true);
+            }
+            std::thread::sleep(TOOL_SLOW);
+            return notify(stream, "item/completed", &json!({"item": item})).map(|()| false);
+        }
+        notify(
+            stream,
+            "item/started",
+            &json!({"item": item("item-7", "inProgress")}),
+        )?;
+        let end = if prompt.contains("tool-error") {
+            "failed"
+        } else {
+            "completed"
+        };
+        notify(
+            stream,
+            "item/completed",
+            &json!({"item": item("item-7", end)}),
+        )?;
+        Ok(false)
+    }
+
     fn run_turn(stream: &mut UnixStream, prompt: &str) -> io::Result<()> {
         if prompt.contains("crash") {
             std::process::exit(CRASH_EXIT_CODE);
@@ -591,14 +646,8 @@ mod app_server {
                 notify(stream, "item/reasoning/textDelta", &json!({"delta": "hm"}))?;
             }
         }
-        if prompt.contains("tool-slow") || prompt.contains("tool-hang") {
-            let item = json!({"id": "item-6", "type": "commandExecution", "command": "ls"});
-            notify(stream, "item/started", &json!({"item": item}))?;
-            if prompt.contains("tool-hang") {
-                return await_interrupt(stream);
-            }
-            std::thread::sleep(TOOL_SLOW);
-            notify(stream, "item/completed", &json!({"item": item}))?;
+        if scripted_command(stream, prompt)? {
+            return Ok(());
         }
         if prompt.contains("approve-file") {
             let item = json!({"id": "item-2", "type": "fileChange",

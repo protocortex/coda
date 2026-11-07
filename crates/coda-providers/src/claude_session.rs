@@ -23,6 +23,7 @@ use crate::claude_code::{
 };
 use crate::emit::Emit;
 use crate::gate::PermissionGate;
+use crate::tool_call::{CallInfo, ToolCalls};
 
 /// Only flags proven against a live binary; `--permission-mode` is left out on purpose.
 const CLAUDE_FLAGS: &[&str] = &[
@@ -156,6 +157,7 @@ pub struct ClaudeSession {
     backend_session_id: Option<String>,
     /// The window a rejected rate-limit report named, until the turn's result.
     limit_hit: Option<(UsageWindowKind, Option<u64>)>,
+    tool_calls: ToolCalls,
     /// Carries the backend id to watchers the moment it is reported.
     backend_id_tx: watch::Sender<Option<String>>,
     closed: bool,
@@ -208,6 +210,7 @@ impl ClaudeSession {
             backlog: VecDeque::new(),
             pending: HashMap::new(),
             cancel: Arc::new(watch::channel(false).0),
+            tool_calls: ToolCalls::new(spec.session_id.clone()),
             session_id: spec.session_id,
             cwd: spec.cwd,
             backend_session_id: None,
@@ -269,6 +272,7 @@ impl ClaudeSession {
                 .interrupted(turn_id, InterruptCause::Cancelled, emit)
                 .await;
         }
+        self.tool_calls.clear();
         let user = json!({"type": "user", "message": {"role": "user", "content": text}});
         if !self.write_line(&user.to_string()).await? {
             return self
@@ -304,7 +308,7 @@ impl ClaudeSession {
                 }
             };
             if read == 0 {
-                return self.crashed(emit).await;
+                return self.crashed(turn_id, emit).await;
             }
             gate.progress();
             self.backlog.extend(self.parser.feed(&buffer[..read]));
@@ -398,8 +402,19 @@ impl ClaudeSession {
                 })
                 .await;
             }
-            Message::ToolStarted { id } => gate.tool_started(&id),
-            Message::ToolFinished { id } => gate.tool_finished(&id),
+            Message::ToolStarted { id, name, summary } => {
+                gate.tool_started(&id);
+                let info = CallInfo { name, summary };
+                if let Some(event) = self.tool_calls.started(turn_id, &id, info) {
+                    emit.emit(event).await;
+                }
+            }
+            Message::ToolFinished { id, failed } => {
+                gate.tool_finished(&id);
+                if let Some(event) = self.tool_calls.finished(turn_id, &id, failed) {
+                    emit.emit(event).await;
+                }
+            }
             Message::Result { is_error } => {
                 if let Some((window, reset_at)) = self.limit_hit.take().filter(|_| is_error) {
                     emit.emit(Event::UsageLimit {
@@ -489,6 +504,9 @@ impl ClaudeSession {
     ) -> Result<TurnOutcome, AdapterError> {
         // Stop the backend before the event, which may wait for room in a full queue.
         let stopped = self.shutdown().await;
+        for event in self.tool_calls.fail_open(turn_id) {
+            emit.emit(event).await;
+        }
         emit.emit(Event::TurnInterrupted {
             session_id: self.session_id.clone(),
             turn_id: turn_id.clone(),
@@ -499,7 +517,11 @@ impl ClaudeSession {
         Ok(TurnOutcome::Cancelled)
     }
 
-    async fn crashed(&mut self, emit: &mut impl Emit) -> Result<TurnOutcome, AdapterError> {
+    async fn crashed(
+        &mut self,
+        turn_id: &TurnId,
+        emit: &mut impl Emit,
+    ) -> Result<TurnOutcome, AdapterError> {
         self.closed = true;
         self.stdin = None;
         let pid = self.child.id();
@@ -514,6 +536,9 @@ impl ClaudeSession {
             Err(_) => self.kill_and_reap().await?,
         };
         let exit_code = status.and_then(|status| status.code());
+        for event in self.tool_calls.fail_open(turn_id) {
+            emit.emit(event).await;
+        }
         emit.emit(Event::BackendCrashed {
             session_id: self.session_id.clone(),
             exit_code,

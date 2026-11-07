@@ -28,7 +28,7 @@ use coda_core::tools::{
 use coda_core::turn::{CancelToken, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{
     Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND, GuardContinueBody, GuardLimitBody,
-    HOOK_BLOCKED_KIND, HookBlockedBody, TIMEOUT_KIND,
+    HOOK_BLOCKED_KIND, HookBlockedBody, TIMEOUT_KIND, ToolCallStatus, tool_summary,
 };
 use coda_protocol::types::{
     BackendKind, OriginalId, PermissionDecision, SessionId, TokenUsage, TurnId,
@@ -964,6 +964,8 @@ async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Ro
 /// the log keeps the order the loop produced.
 #[derive(Default)]
 struct StreamedText {
+    /// What the turn's calls work on, until each call finishes.
+    summaries: HashMap<String, Option<String>>,
     text: String,
     /// When the oldest unstored chunk was held; `None` while nothing is held.
     since: Option<tokio::time::Instant>,
@@ -979,13 +981,57 @@ impl StreamedText {
     ) {
         let TurnEvent::Text(chunk) = event else {
             self.flush(hub, session, turn).await;
+            let calls = self.tool_calls(session, turn, &event);
             publish_turn_event(hub, session, turn, event).await;
+            for call in calls {
+                log_failure(store_event(hub, session, turn, &call).await);
+            }
             return;
         };
         self.since.get_or_insert_with(tokio::time::Instant::now);
         self.text.push_str(&chunk);
         if self.text.len() >= MAX_DELTA_CHUNK_BYTES {
             self.flush(hub, session, turn).await;
+        }
+    }
+
+    /// The `tool_call` events that go with `event`: a start for each call the model
+    /// made, and the finish of a call that ended.
+    fn tool_calls(&mut self, session: &SessionId, turn: &TurnId, event: &TurnEvent) -> Vec<Event> {
+        let call = |id: &str, name: &str, summary: Option<String>, status| Event::ToolCall {
+            session_id: session.clone(),
+            turn_id: turn.clone(),
+            id: id.to_owned(),
+            name: name.to_owned(),
+            summary,
+            status,
+        };
+        match event {
+            TurnEvent::Assistant { tool_calls, .. } => tool_calls
+                .iter()
+                .map(|made| {
+                    let summary = serde_json::from_str(&made.arguments)
+                        .ok()
+                        .and_then(|input: Value| tool_summary(&input));
+                    self.summaries.insert(made.id.clone(), summary.clone());
+                    call(&made.id, &made.name, summary, ToolCallStatus::Started)
+                })
+                .collect(),
+            TurnEvent::ToolFinished {
+                tool,
+                call_id,
+                is_error,
+                ..
+            } => {
+                let summary = self.summaries.remove(call_id).flatten();
+                let status = if *is_error {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Succeeded
+                };
+                vec![call(call_id, tool, summary, status)]
+            }
+            _ => Vec::new(),
         }
     }
 
