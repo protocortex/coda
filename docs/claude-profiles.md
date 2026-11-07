@@ -1,20 +1,25 @@
 # Claude Code profiles
 
 `[providers.claude_code] profile` decides how much of Claude Code's own setup a
-session keeps. Coda starts your installed, unmodified `claude` with documented
-flags only. It never reads or forwards your login.
+session keeps. Coda starts your installed, unmodified `claude` with flags it has
+tested against the real binary. It never sees the token `claude auth login`
+produces.
 
-A plain `claude -p` sends about 35k prompt tokens before your first word. The
-profiles cut that down.
+A plain `claude -p` sends tens of thousands of prompt tokens before your first
+word. The profiles cut that down.
 
 | Profile | Flags it adds | Prompt size | What you lose |
 | --- | --- | --- | --- |
-| `full` | none | about 35k tokens | nothing; this is Claude Code as it starts alone |
-| `project` (default) | `--setting-sources project --strict-mcp-config --disable-slash-commands` | about 19.5k tokens plus the repository's `CLAUDE.md` | user and local settings, MCP servers, skills and slash commands |
-| `lean` | the flags of `project`, but with no settings source at all, plus `--system-prompt <Coda's short prompt>` and `--tools Read,Grep,Glob,Edit,Write,Bash` | about 0.6k tokens plus about 1.5k per tool | all settings, and every tool outside that list |
+| `full` | none | 26.8k tokens | nothing; this is Claude Code as it starts alone |
+| `project` (default) | `--setting-sources project --strict-mcp-config --disable-slash-commands` | 22.3k tokens plus the repository's `CLAUDE.md` | user and local settings, MCP servers, skills and slash commands |
+| `lean` | the flags of `project`, but with no settings source at all, plus `--system-prompt <Coda's short prompt>` and `--tools Read,Grep,Glob,Edit,Write,Bash` | 5.2k tokens with those six tools | all settings, and every tool outside that list |
 
-The sizes are earlier live measurements. The opt-in live probes (#139) check them
-again after each `claude` upgrade.
+The sizes are what `claude` 2.1.296 reported on 2026-11-08 for a one word reply
+on the `haiku` model in an empty folder, counting input, cache reads and cache
+writes. They change with the model, the version and the user's setup. The opt-in
+live probes (`docs/live-recording.md`) check them again after each `claude`
+upgrade and fail when `project` is over 25k, `lean` is over 12k, or the order
+`lean` < `project` < `full` no longer holds.
 
 `project` and `lean` read no user settings, so hooks and allow rules in your user
 settings do not apply to Coda sessions. Choose `full` to keep them.
