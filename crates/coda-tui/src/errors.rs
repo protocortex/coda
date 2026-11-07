@@ -162,7 +162,7 @@ pub fn usage_limit_text(window: UsageWindowKind, remaining: Option<Duration>) ->
 }
 
 /// `format_duration`, in days and hours from a day up.
-fn long_duration(left: Duration) -> String {
+pub(crate) fn long_duration(left: Duration) -> String {
     let seconds = left.as_secs();
     if seconds < SECONDS_PER_DAY {
         return format_duration(left);

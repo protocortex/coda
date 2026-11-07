@@ -130,6 +130,11 @@ pub const STEPS: &[Step] = &[
         introduced_in: "0.1.0",
         sql: include_str!("schema_v19.sql"),
     },
+    Step {
+        seq: 20,
+        introduced_in: "0.1.0",
+        sql: include_str!("schema_v20.sql"),
+    },
 ];
 
 /// Brings `conn` up to the current schema and records this binary's release.
@@ -399,7 +404,7 @@ mod tests {
     fn reopening_with_the_same_release_runs_no_step() {
         // Arrange
         let mut conn = Connection::open_in_memory().unwrap();
-        let steps = with_extra(&[step(20, "0.5.0", count_table())]);
+        let steps = with_extra(&[step(21, "0.5.0", count_table())]);
         migrate_with(&mut conn, &steps, BINARY).unwrap();
         assert_eq!(ran(&conn), 1);
 
@@ -414,11 +419,11 @@ mod tests {
     fn only_steps_newer_than_the_recorded_release_run() {
         // Arrange
         let mut conn = Connection::open_in_memory().unwrap();
-        let old = with_extra(&[step(20, "0.5.0", count_table())]);
+        let old = with_extra(&[step(21, "0.5.0", count_table())]);
         migrate_with(&mut conn, &old, "0.5.0").unwrap();
         let newer = with_extra(&[
-            step(20, "0.5.0", count_table()),
-            step(21, "0.6.0", count_table()),
+            step(21, "0.5.0", count_table()),
+            step(22, "0.6.0", count_table()),
         ]);
 
         // Act
@@ -433,14 +438,14 @@ mod tests {
     fn a_step_list_with_a_release_newer_than_the_binary_is_rejected() {
         // Arrange
         let mut conn = Connection::open_in_memory().unwrap();
-        let steps = with_extra(&[step(20, "2.0.0", count_table())]);
+        let steps = with_extra(&[step(21, "2.0.0", count_table())]);
 
         // Act
         let err = migrate_with(&mut conn, &steps, BINARY).unwrap_err();
 
         // Assert
         assert!(
-            matches!(err, StoreError::StepFromFuture { seq: 20, .. }),
+            matches!(err, StoreError::StepFromFuture { seq: 21, .. }),
             "{err}"
         );
         assert_eq!(user_version(&conn), 0);
@@ -451,7 +456,7 @@ mod tests {
         // Arrange
         let mut conn = Connection::open_in_memory().unwrap();
         migrate_with(&mut conn, STEPS, "3.0.0").unwrap();
-        let steps = with_extra(&[step(20, "1.0.0", count_table())]);
+        let steps = with_extra(&[step(21, "1.0.0", count_table())]);
 
         // Act
         let err = migrate_with(&mut conn, &steps, BINARY).unwrap_err();
@@ -469,13 +474,13 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate_with(&mut conn, STEPS, "0.1.0").unwrap();
         let steps = with_extra(&[
-            step(20, "0.5.0", count_table()),
+            step(21, "0.5.0", count_table()),
             step(
-                21,
+                22,
                 "0.6.0",
                 "INSERT INTO ran VALUES (2); INSERT INTO no_such_table VALUES (1);",
             ),
-            step(22, "0.7.0", count_table()),
+            step(23, "0.7.0", count_table()),
         ]);
 
         // Act
@@ -483,7 +488,7 @@ mod tests {
 
         // Assert
         assert!(matches!(err, StoreError::Sqlite(_)), "{err}");
-        assert_eq!(user_version(&conn), 20);
+        assert_eq!(user_version(&conn), 21);
         assert_eq!(ran(&conn), 1);
         assert_eq!(last_release(&conn).as_deref(), Some("0.1.0"));
     }
@@ -493,14 +498,14 @@ mod tests {
         // Arrange
         let mut conn = Connection::open_in_memory().unwrap();
         migrate_with(&mut conn, STEPS, BINARY).unwrap();
-        let steps = with_extra(&[step(20, BINARY, count_table())]);
+        let steps = with_extra(&[step(21, BINARY, count_table())]);
 
         // Act
         migrate_with(&mut conn, &steps, BINARY).unwrap();
 
         // Assert
         assert_eq!(ran(&conn), 1);
-        assert_eq!(user_version(&conn), 20);
+        assert_eq!(user_version(&conn), 21);
         assert_eq!(last_release(&conn).as_deref(), Some(BINARY));
     }
 
@@ -508,16 +513,16 @@ mod tests {
     fn steps_out_of_order_are_rejected_before_any_write() {
         for extra in [
             vec![
-                step(20, "0.5.0", count_table()),
-                step(21, "0.4.0", count_table()),
+                step(21, "0.5.0", count_table()),
+                step(22, "0.4.0", count_table()),
+            ],
+            vec![
+                step(22, "0.5.0", count_table()),
+                step(21, "0.5.0", count_table()),
             ],
             vec![
                 step(21, "0.5.0", count_table()),
-                step(20, "0.5.0", count_table()),
-            ],
-            vec![
-                step(20, "0.5.0", count_table()),
-                step(20, "0.5.0", count_table()),
+                step(21, "0.5.0", count_table()),
             ],
         ] {
             // Arrange
@@ -538,7 +543,7 @@ mod tests {
         // Arrange
         let mut conn = Connection::open_in_memory().unwrap();
         migrate_with(&mut conn, STEPS, "1.0.0+a").unwrap();
-        let steps = with_extra(&[step(20, "1.0.0+z", count_table())]);
+        let steps = with_extra(&[step(21, "1.0.0+z", count_table())]);
 
         // Act
         migrate_with(&mut conn, &steps, "1.0.0+b").unwrap();
