@@ -92,6 +92,7 @@ jobs:
       - run: bash scripts/tests/check-conflict-markers.test.sh
       - run: bash scripts/tests/check-leaked-daemons.test.sh
       - run: bash scripts/tests/ci-aggregate.test.sh
+      - run: bash scripts/tests/smoke-binary.test.sh
 
   zizmor:
     runs-on: ubuntu-latest
