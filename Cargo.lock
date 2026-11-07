@@ -450,6 +450,7 @@ name = "coda-selfhost"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "coda-testkit",
  "serde_json",
  "signal-hook",
  "tempfile",

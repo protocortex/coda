@@ -88,6 +88,10 @@ fn start_grandchild() -> io::Result<()> {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the fake provider simulates provider latency in real time"
+)]
 fn park() -> ! {
     loop {
         std::thread::sleep(PARK_INTERVAL);
@@ -116,6 +120,10 @@ fn write_report(args: &[String], prompt: &str) -> io::Result<()> {
     std::fs::write(path, report.to_string())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the fake provider simulates provider latency in real time"
+)]
 fn run_turn(args: &[String], prompt: &str, out: &mut impl Write) -> io::Result<()> {
     let thread_id = if prompt.contains("hostile") {
         HOSTILE_THREAD_ID.to_owned()
@@ -348,6 +356,10 @@ mod app_server {
         send(stream, &json!({"method": method, "params": params}))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fake provider simulates provider latency in real time"
+    )]
     fn accept(path: &str) -> io::Result<UnixStream> {
         let listener = UnixListener::bind(path)?;
         listener.set_nonblocking(true)?;
@@ -549,6 +561,10 @@ mod app_server {
 
     /// Runs the command a `tool-*` prompt asks for. True when the turn is over, because
     /// the command never ends and the client interrupted it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fake provider simulates provider latency in real time"
+    )]
     fn scripted_command(stream: &mut UnixStream, prompt: &str) -> io::Result<bool> {
         let slow = prompt.contains("tool-slow") || prompt.contains("tool-hang");
         let quick = prompt.contains("tool-quick") || prompt.contains("tool-error");
@@ -643,6 +659,10 @@ mod app_server {
         )
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fake provider simulates provider latency in real time"
+    )]
     fn run_turn(stream: &mut UnixStream, prompt: &str) -> io::Result<()> {
         if prompt.contains("crash") {
             std::process::exit(CRASH_EXIT_CODE);

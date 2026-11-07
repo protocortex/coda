@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "wait on an event, or use the Sleeper seam; a real wait needs #[expect] with a reason" },
+]

@@ -2718,6 +2718,10 @@ mod tests {
     const TICK: Duration = Duration::from_millis(20);
 
     #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test thread holds the store while a real timer fires"
+    )]
     async fn deleting_a_withheld_original_leaves_the_async_threads_free_while_the_store_is_busy() {
         // Arrange
         let fixture = Fixture::new();

@@ -170,6 +170,10 @@ fn is_alive(pid: &str) -> bool {
 
 /// Waits, up to `STOP_LIMIT`, for `pid` to exit, so the directory it uses can
 /// be removed safely.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "waits for a real process to exit"
+)]
 fn wait_gone(pid: &str) {
     let deadline = Instant::now() + STOP_LIMIT;
     while is_alive(pid) && Instant::now() < deadline {

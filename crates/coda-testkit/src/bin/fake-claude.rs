@@ -203,6 +203,10 @@ fn close_stdout() -> io::Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the fake provider simulates provider latency in real time"
+)]
 fn park() -> ! {
     loop {
         std::thread::sleep(PARK_INTERVAL);
@@ -365,6 +369,10 @@ fn run_tool_flaky(control: &Control, out: &mut impl Write) -> io::Result<()> {
 }
 
 /// Streams tool input and thinking, which carry no text, for longer than the idle limits.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the fake provider simulates provider latency in real time"
+)]
 fn stream_long(out: &mut impl Write) -> io::Result<()> {
     for step in 0..STREAM_STEPS {
         std::thread::sleep(STREAM_STEP);
@@ -401,6 +409,10 @@ fn run_quick_tool(is_error: bool, out: &mut impl Write) -> io::Result<()> {
 }
 
 /// A tool Claude Code runs without asking: announced, silent, then reported.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the fake provider simulates provider latency in real time"
+)]
 fn run_unasked_tool(user_line: &str, out: &mut impl Write) -> io::Result<()> {
     emit(
         out,
@@ -433,6 +445,10 @@ fn write_report(path: PathBuf) -> io::Result<()> {
     std::fs::write(path, report.to_string())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the fake provider simulates provider latency in real time"
+)]
 fn main() -> io::Result<()> {
     if std::env::args().any(|arg| arg == "--version") {
         println!("{VERSION}");

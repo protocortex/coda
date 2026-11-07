@@ -273,6 +273,10 @@ async fn closing_a_session_forgets_the_limits_kept_for_its_evicted_conversation(
 }
 
 #[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test thread holds a lock for a real interval"
+)]
 async fn an_evicted_conversation_is_never_out_of_the_pool_without_its_state_kept() {
     // Arrange
     let script = [read_turn(), text_turn("done")];
