@@ -512,7 +512,12 @@ impl Link {
             since_seq,
         )
         .await?;
-        let previous = std::mem::replace(&mut self.owned, created_here.then_some(id));
+        let keeps_owner = self.owned.as_ref() == Some(&id);
+        let previous = if keeps_owner {
+            None
+        } else {
+            std::mem::replace(&mut self.owned, created_here.then_some(id))
+        };
         if let Some(previous) = previous {
             self.release(previous, SWITCH_CLOSE_WAIT).await;
         }
@@ -723,7 +728,7 @@ impl Link {
 #[cfg(test)]
 mod tests {
     use coda_protocol::events::HookBlockedBody;
-    use coda_protocol::methods::SessionStatus;
+    use coda_protocol::methods::{SessionAttention, SessionStatus};
     use serde_json::json;
 
     use super::*;
@@ -739,6 +744,8 @@ mod tests {
             created_at: updated_at,
             updated_at,
             status: SessionStatus::Idle,
+            attention: SessionAttention::None,
+            title: None,
         }
     }
 

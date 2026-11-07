@@ -7,10 +7,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use coda_protocol::events::ASK_TOOL;
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, RequestId, SessionId, TurnId};
 use coda_store::{
-    Clock, EventRecord, GrantKey, NewDecision, NewPending, NewSession, SavingRecord, SessionFilter,
-    Store, StoreError, UsageRecord, UsageSummary,
+    Clock, EventRecord, GrantKey, MAX_TITLE_CHARS, NewDecision, NewPending, NewSession,
+    SavingRecord, SessionFilter, Store, StoreError, UsageRecord, UsageSummary,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -1026,6 +1027,144 @@ fn summaries_report_the_last_activity_and_filter_by_cwd() {
     assert_eq!(seen, vec![(&busy, T0 + 7_000), (&quiet, T0)]);
     assert_eq!(all.len(), 3);
     assert_eq!(all[0].record.id, other);
+}
+
+fn user_message(text: &str) -> String {
+    serde_json::json!({ "text": text }).to_string()
+}
+
+#[test]
+fn a_summary_titles_the_session_with_the_start_of_its_first_message() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let asked = store.create_session(&new_session("/a")).unwrap();
+    let silent = store.create_session(&new_session("/a")).unwrap();
+    let odd = store.create_session(&new_session("/a")).unwrap();
+    let long = store.create_session(&new_session("/a")).unwrap();
+    for (session, body) in [
+        (&asked, user_message("fix the parser")),
+        (&odd, "not json".to_owned()),
+        (&long, user_message(&"w".repeat(MAX_TITLE_CHARS + 50))),
+    ] {
+        let turn = store.begin_turn(session).unwrap();
+        store
+            .append_event(session, &turn, &event("user_message", &body))
+            .unwrap();
+        let later = store.begin_turn(session).unwrap();
+        store
+            .append_event(
+                session,
+                &later,
+                &event("user_message", &user_message("second")),
+            )
+            .unwrap();
+    }
+
+    // Act
+    let all = store
+        .list_session_summaries(&SessionFilter::default(), 10)
+        .unwrap();
+    let title_of = |id: &SessionId| {
+        all.iter()
+            .find(|s| &s.record.id == id)
+            .and_then(|s| s.title.clone())
+    };
+
+    // Assert
+    assert_eq!(title_of(&asked).as_deref(), Some("fix the parser"));
+    assert_eq!(title_of(&silent), None);
+    assert_eq!(title_of(&odd), None);
+    assert_eq!(
+        title_of(&long).map(|t| t.chars().count()),
+        Some(MAX_TITLE_CHARS)
+    );
+}
+
+#[test]
+fn a_summary_survives_a_first_message_that_is_not_clean_text() {
+    // Arrange
+    let (dir, mut store) = open_store();
+    let bad = store.create_session(&new_session("/a")).unwrap();
+    let blank = store.create_session(&new_session("/a")).unwrap();
+    let wide = store.create_session(&new_session("/a")).unwrap();
+    let turn = store.begin_turn(&bad).unwrap();
+    store
+        .append_event(&bad, &turn, &event("user_message", &user_message("x")))
+        .unwrap();
+    let turn = store.begin_turn(&blank).unwrap();
+    store
+        .append_event(
+            &blank,
+            &turn,
+            &event("user_message", &user_message("  \n ")),
+        )
+        .unwrap();
+    let turn = store.begin_turn(&wide).unwrap();
+    let text = "\u{e9}".repeat(MAX_TITLE_CHARS + 5);
+    store
+        .append_event(&wide, &turn, &event("user_message", &user_message(&text)))
+        .unwrap();
+    let raw = Connection::open(dir.path().join("data/coda.db")).unwrap();
+    raw.execute(
+        "UPDATE events SET body = CAST('{\"text\":\"' || char(255) AS BLOB) || CAST('\"}' AS BLOB) \
+         WHERE kind = 'user_message' AND body LIKE '%\"x\"%'",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+
+    // Act
+    let all = store
+        .list_session_summaries(&SessionFilter::default(), 10)
+        .unwrap();
+    let title_of = |id: &SessionId| {
+        all.iter()
+            .find(|s| &s.record.id == id)
+            .and_then(|s| s.title.clone())
+    };
+
+    // Assert
+    assert_eq!(all.len(), 3);
+    assert_eq!(title_of(&blank), None);
+    assert_eq!(
+        title_of(&wide).map(|t| t.chars().count()),
+        Some(MAX_TITLE_CHARS)
+    );
+}
+
+#[test]
+fn a_summary_counts_the_open_approvals_and_questions_of_its_session() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = store.create_session(&new_session("/a")).unwrap();
+    let other = store.create_session(&new_session("/a")).unwrap();
+    let done = store.add_pending(&new_pending(&session, "ls")).unwrap();
+    store
+        .resolve_pending(&done, PermissionDecision::AllowOnce)
+        .unwrap();
+    store
+        .add_pending(&new_pending(&session, "cargo test"))
+        .unwrap();
+    store
+        .add_pending(&new_pending(&session, "cargo fmt"))
+        .unwrap();
+    let mut question = new_pending(&session, "which one?");
+    question.tool = ASK_TOOL.to_owned();
+    store.add_pending(&question).unwrap();
+
+    // Act
+    let all = store
+        .list_session_summaries(&SessionFilter::default(), 10)
+        .unwrap();
+    let counts = |id: &SessionId| {
+        all.iter()
+            .find(|s| &s.record.id == id)
+            .map(|s| (s.pending_approvals, s.pending_questions))
+    };
+
+    // Assert
+    assert_eq!(counts(&session), Some((2, 1)));
+    assert_eq!(counts(&other), Some((0, 0)));
 }
 
 #[test]

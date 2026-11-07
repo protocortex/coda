@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 use coda_protocol::methods::{
-    SessionCreateParams, SessionCreateResult, SessionListParams, SessionListResult,
-    SessionResumeParams, SessionResumeResult, SessionStatus, SessionSummary, SessionWorktreeParams,
-    SessionWorktreeResult, WORKTREE_REFUSED_CODE, WorktreeCleanParams,
+    SessionAttention, SessionCreateParams, SessionCreateResult, SessionListParams,
+    SessionListResult, SessionResumeParams, SessionResumeResult, SessionStatus, SessionSummary,
+    SessionWorktreeParams, SessionWorktreeResult, WORKTREE_REFUSED_CODE, WorktreeCleanParams,
 };
 use coda_protocol::types::{SessionId, SessionInfo};
 use coda_store::{
@@ -283,6 +283,13 @@ fn summary(stored: StoredSummary, running: &impl Fn(&SessionId) -> bool) -> Sess
     } else {
         SessionStatus::Idle
     };
+    let attention = if stored.pending_questions > 0 {
+        SessionAttention::Input
+    } else if stored.pending_approvals > 0 {
+        SessionAttention::Approval
+    } else {
+        SessionAttention::None
+    };
     SessionSummary {
         id: stored.record.id,
         backend: stored.record.backend,
@@ -290,6 +297,8 @@ fn summary(stored: StoredSummary, running: &impl Fn(&SessionId) -> bool) -> Sess
         created_at: stored.record.created_at,
         updated_at: stored.updated_at,
         status,
+        attention,
+        title: stored.title,
     }
 }
 
@@ -439,6 +448,75 @@ mod tests {
         assert_eq!(listed[0]["backend"], json!("claude_code"));
         assert!(listed[0]["created_at"].is_i64() && listed[0]["updated_at"].is_i64());
         assert_eq!(everything["sessions"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn listing_reports_what_a_session_waits_for_and_its_title() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let hub = open_hub(&dir);
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let made = create(Some(&hub), Some(params(&cwd))).await.unwrap();
+            ids.push(SessionId::new(made["session"]["id"].as_str().unwrap()));
+        }
+        let (idle, asked, approval, both) = (&ids[0], &ids[1], &ids[2], &ids[3]);
+        let pending = |session: &SessionId, tool: &str| coda_store::NewPending {
+            session: session.clone(),
+            tool: tool.to_owned(),
+            repo_path: cwd.clone(),
+            command: "x".to_owned(),
+            agent: None,
+            reason: None,
+        };
+        let (a, b, c, d) = (asked.clone(), approval.clone(), both.clone(), idle.clone());
+        let (question, call) = (
+            pending(&a, coda_protocol::events::ASK_TOOL),
+            pending(&b, "bash"),
+        );
+        let (both_question, both_call) = (
+            pending(&c, coda_protocol::events::ASK_TOOL),
+            pending(&c, "bash"),
+        );
+        hub.with_store_mut(move |store| {
+            store.add_pending(&question)?;
+            store.add_pending(&call)?;
+            store.add_pending(&both_question)?;
+            store.add_pending(&both_call)?;
+            let turn = store.begin_turn(&d)?;
+            store.append_event(
+                &d,
+                &turn,
+                &coda_store::EventRecord {
+                    kind: "user_message".to_owned(),
+                    body: json!({"text": "fix the parser"}).to_string(),
+                },
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Act
+        let listed = list(Some(&hub), |_| false, Some(json!({}))).await.unwrap();
+
+        // Assert
+        let by_id = |id: &SessionId| {
+            listed["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"] == json!(id))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id(idle)["attention"], "none");
+        assert_eq!(by_id(idle)["title"], "fix the parser");
+        assert_eq!(by_id(asked)["attention"], "input");
+        assert_eq!(by_id(approval)["attention"], "approval");
+        assert_eq!(by_id(both)["attention"], "input");
+        assert!(by_id(approval).get("title").is_none());
     }
 
     #[tokio::test]

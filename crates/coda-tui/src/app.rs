@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use coda_config::tui::NotifyMode;
 use coda_protocol::events::{Event, InterruptCause, TodoItem};
-use coda_protocol::methods::{Capabilities, SessionStatus, SessionSummary};
+use coda_protocol::methods::{Capabilities, SessionSummary};
 use coda_protocol::types::{BackendKind, Mode, SessionInfo, TurnId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -24,6 +24,7 @@ use crate::input::{Input, Stashed};
 use crate::notify;
 use crate::paste;
 use crate::permission::{Overlay, PermissionPrompt, sanitize_line};
+use crate::picker::{self, Picker};
 use crate::sessions::LinkCommand;
 use crate::status::{Status, mode_name};
 use crate::todos;
@@ -126,6 +127,8 @@ pub struct App {
     connection: ConnectionState,
     chat: Chat,
     input: Input,
+    /// The session picker, while it is open.
+    picker: Option<Picker>,
     /// The folder the session works in, once a session has started.
     cwd: Option<String>,
     status: Status,
@@ -164,6 +167,7 @@ impl App {
             connection: ConnectionState::Connecting,
             chat: Chat::new(),
             input: Input::new(),
+            picker: None,
             cwd: None,
             status: Status::new(),
             overlay: Overlay::default(),
@@ -289,7 +293,7 @@ impl App {
                 }
             }
             LinkEvent::UserMessage(text) => self.chat.push_user(text),
-            LinkEvent::Sessions(sessions) => self.show_sessions(&sessions),
+            LinkEvent::Sessions(sessions) => self.open_picker(&sessions),
             LinkEvent::Notice(text) => self.chat.push_notice(text),
             LinkEvent::Capabilities(capabilities) => self.capabilities = Some(capabilities),
             LinkEvent::Todos(items) => self.todos = items,
@@ -409,6 +413,17 @@ impl App {
         if self.overlay.is_active() {
             if let Some(answer) = self.overlay.handle_key(key, now) {
                 self.send(LinkCommand::Respond(answer));
+            }
+        } else if ctrl && key.code == KeyCode::Char('k') {
+            self.toggle_picker();
+        } else if let Some(open) = self.picker.as_mut() {
+            match open.handle_key(key) {
+                picker::Action::None => {}
+                picker::Action::Close => self.picker = None,
+                picker::Action::Resume(id) => {
+                    self.picker = None;
+                    self.send(LinkCommand::Resume(id));
+                }
             }
         } else if ctrl && key.code == KeyCode::Char('d') {
             let lost = matches!(self.connection, ConnectionState::Disconnected(_));
@@ -658,16 +673,26 @@ impl App {
         }
     }
 
-    fn show_sessions(&mut self, sessions: &[SessionSummary]) {
+    /// Opens the picker on `sessions`, or says there are none.
+    fn open_picker(&mut self, sessions: &[SessionSummary]) {
         if sessions.is_empty() {
             self.chat.push_notice(NO_SESSIONS.to_owned());
+        } else {
+            self.picker = Some(Picker::new(sessions, picker::now_ms()));
         }
-        for session in sessions {
-            self.chat.push_notice(session_line(session));
+    }
+
+    /// Closes the picker, or asks the daemon for the sessions to open it on.
+    fn toggle_picker(&mut self) {
+        if self.picker.take().is_none() {
+            self.send(LinkCommand::ListSessions);
         }
     }
 
     pub fn handle_paste(&mut self, pasted: &str) {
+        if self.picker.is_some() {
+            return;
+        }
         self.idle_ctrl_c_at = None;
         self.hint = None;
         let large = pasted.len() >= paste::LARGE_PASTE_BYTES;
@@ -771,11 +796,18 @@ impl App {
         if let Some(live) = live {
             frame.render_widget(Paragraph::new(live), live_row);
         }
-        self.input.render(frame, input, !self.overlay.is_active());
+        self.input.render(
+            frame,
+            input,
+            !self.overlay.is_active() && self.picker.is_none(),
+        );
         frame.render_widget(Paragraph::new(self.connection_text(now)), connection);
         let activity = self.activity(now);
         self.status.render_with(frame, status, activity.as_deref());
         self.overlay.render(frame, frame.area());
+        if let Some(open) = self.picker.as_ref().filter(|_| !self.overlay.is_active()) {
+            open.render(frame, frame.area());
+        }
     }
 
     fn connection_text(&self, now: Instant) -> String {
@@ -797,15 +829,6 @@ impl App {
     }
 }
 
-fn session_line(session: &SessionSummary) -> String {
-    let status = match session.status {
-        SessionStatus::Running => "running",
-        SessionStatus::Idle => "idle",
-        _ => "unknown",
-    };
-    format!("{} | {status} | {}", session.id, session.cwd)
-}
-
 impl Default for App {
     fn default() -> Self {
         Self::new()
@@ -819,7 +842,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use coda_protocol::events::ToolCallStatus;
-    use coda_protocol::methods::{Capabilities, SessionStatus, SessionSummary};
+    use coda_protocol::methods::{Capabilities, SessionAttention, SessionStatus, SessionSummary};
     use coda_protocol::types::{
         Mode, PermissionDecision, RequestId, SessionId, TokenUsage, TurnId,
     };
@@ -1453,28 +1476,172 @@ mod tests {
         assert!(shown.contains("could not send"), "{shown}");
     }
 
-    #[test]
-    fn a_replayed_user_message_and_a_session_list_are_shown_in_the_transcript() {
-        // Arrange
-        let mut app = App::new();
-        let summary = SessionSummary {
-            id: SessionId::new("s-7"),
+    fn listed(id: &str, title: &str, attention: SessionAttention) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::new(id),
             backend: BackendKind::Faux,
             cwd: "/work".to_owned(),
             created_at: 1,
             updated_at: 2,
             status: SessionStatus::Running,
-        };
+            attention,
+            title: Some(title.to_owned()),
+        }
+    }
+
+    fn tall_screen(app: &App) -> String {
+        crate::test_support::screen(120, 20, |frame| app.render(frame))
+    }
+
+    #[test]
+    fn a_replayed_user_message_stays_in_the_transcript_under_the_session_picker() {
+        // Arrange
+        let mut app = App::new();
 
         // Act
         app.handle_event(LinkEvent::UserMessage("hello again".to_owned()));
-        app.handle_event(LinkEvent::Sessions(vec![summary]));
+        let before = tall_screen(&app);
+        app.handle_event(LinkEvent::Sessions(vec![listed(
+            "s-7",
+            "fix it",
+            SessionAttention::None,
+        )]));
 
         // Assert
-        let shown = screen(&app);
-        assert!(shown.contains("hello again"), "{shown}");
-        assert!(shown.contains("s-7"), "{shown}");
-        assert!(shown.contains("running"), "{shown}");
+        assert!(before.contains("hello again"), "{before}");
+        let shown = tall_screen(&app);
+        assert!(shown.contains("Sessions"), "{shown}");
+        assert!(shown.contains("working"), "{shown}");
+        assert!(shown.contains("fix it #s-7"), "{shown}");
+    }
+
+    #[test]
+    fn a_session_list_with_nothing_in_it_says_so_and_opens_no_picker() {
+        // Arrange
+        let mut app = App::new();
+
+        // Act
+        app.handle_event(LinkEvent::Sessions(Vec::new()));
+
+        // Assert
+        let shown = tall_screen(&app);
+        assert!(shown.contains("the daemon has no sessions"), "{shown}");
+        assert!(!shown.contains("Esc closes"), "{shown}");
+    }
+
+    #[test]
+    fn control_k_asks_for_the_sessions_and_closes_the_picker_when_it_is_open() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+
+        // Act
+        app.handle_key(key_with(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        let asked = sent(&mut commands);
+        app.handle_event(LinkEvent::Sessions(vec![listed(
+            "s-7",
+            "fix it",
+            SessionAttention::None,
+        )]));
+        let open = tall_screen(&app);
+        app.handle_key(key_with(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        let closed = tall_screen(&app);
+
+        // Assert
+        assert_eq!(asked, vec![LinkCommand::ListSessions]);
+        assert!(open.contains("Esc closes"), "{open}");
+        assert!(!closed.contains("Esc closes"), "{closed}");
+        assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+    }
+
+    #[test]
+    fn keys_go_to_the_open_picker_and_enter_resumes_the_chosen_session() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        app.handle_event(LinkEvent::Sessions(vec![
+            listed("s-1", "alpha", SessionAttention::None),
+            listed("s-2", "beta", SessionAttention::Approval),
+        ]));
+
+        // Act
+        type_line_keys(&mut app, "alp");
+        let narrowed = tall_screen(&app);
+        app.handle_key(press(KeyCode::Enter));
+
+        // Assert
+        assert!(narrowed.contains("filter: alp"), "{narrowed}");
+        assert!(!narrowed.contains("beta"), "{narrowed}");
+        assert_eq!(
+            sent(&mut commands),
+            vec![LinkCommand::Resume(SessionId::new("s-1"))]
+        );
+        assert_eq!(app.input.text(), "");
+        assert!(!tall_screen(&app).contains("Esc closes"));
+    }
+
+    #[test]
+    fn a_paste_while_the_picker_is_open_does_not_reach_the_hidden_prompt() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        app.handle_event(LinkEvent::Sessions(vec![listed(
+            "s-1",
+            "alpha",
+            SessionAttention::None,
+        )]));
+
+        // Act
+        app.handle_paste("secret text");
+
+        // Assert
+        assert_eq!(app.input.text(), "");
+    }
+
+    #[test]
+    fn escape_closes_the_picker_and_keeps_what_was_typed_in_the_prompt() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        app.handle_paste("half a thought");
+        app.handle_event(LinkEvent::Sessions(vec![listed(
+            "s-1",
+            "alpha",
+            SessionAttention::None,
+        )]));
+
+        // Act
+        app.handle_key(press(KeyCode::Esc));
+
+        // Assert
+        assert!(!tall_screen(&app).contains("Esc closes"));
+        assert_eq!(app.input.text(), "half a thought");
+        assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+    }
+
+    #[test]
+    fn a_permission_prompt_takes_the_keys_before_the_picker() {
+        // Arrange
+        let (mut app, mut commands) = armed();
+        app.handle_event(LinkEvent::Sessions(vec![listed(
+            "s-1",
+            "alpha",
+            SessionAttention::None,
+        )]));
+        app.handle_event(prompt("r-1"));
+        tall_screen(&app);
+
+        // Act
+        app.handle_key(press(KeyCode::Char('y')));
+
+        // Assert
+        let sent = sent(&mut commands);
+        assert!(
+            matches!(sent.as_slice(), [LinkCommand::Respond(_)]),
+            "{sent:?}"
+        );
+    }
+
+    fn type_line_keys(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(press(KeyCode::Char(ch)));
+        }
     }
 
     fn wide_screen(app: &App) -> String {

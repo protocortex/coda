@@ -25,12 +25,12 @@ const COMMANDS: [&str; 10] = [
     "quit",
 ];
 /// The built-in commands as `/help` lists them.
-const BUILT_IN_HELP: &str = "Built-in commands: /sessions, /new, /resume <id>, /model <alias>, /backend [name], /plan [save <path>], /implement, /review [target], /help, /quit";
+const BUILT_IN_HELP: &str = "Built-in commands: /sessions or Ctrl+K, /new, /resume <id>, /model <alias>, /backend [name], /plan [save <path>], /implement, /review [target], /help, /quit";
 
 /// A command the user can type instead of a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// List the sessions this client knows.
+    /// Open the session picker.
     Sessions,
     /// Start a fresh session.
     New,
