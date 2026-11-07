@@ -16,6 +16,7 @@ pub mod model_session;
 pub mod pidfile;
 mod pr_watch;
 mod pr_watch_gh;
+mod pr_watch_review;
 mod pr_watches;
 pub mod reaper;
 mod receipts;

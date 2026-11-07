@@ -45,6 +45,19 @@ pub enum PrState {
     Closed,
 }
 
+/// What the newest commit of the pull request is, as far as a review is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadKind {
+    /// A commit a person wrote.
+    Normal,
+    /// A merge commit.
+    Merge,
+    /// A commit by a bot.
+    Bot,
+    /// The commit could not be read, so it is not reviewed.
+    Unknown,
+}
+
 /// What one read of the pull request found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -57,6 +70,12 @@ pub struct Snapshot {
     pub required_passed: bool,
     /// Identifiers of the comments and reviews written by someone else.
     pub others_comments: Vec<String>,
+    /// The newest commit of the branch.
+    pub head: String,
+    /// The pull request is a draft.
+    pub draft: bool,
+    /// What the newest commit is.
+    pub head_kind: HeadKind,
 }
 
 /// Reads the pull request being watched.
@@ -96,6 +115,8 @@ pub struct Decision {
     pub wake: Option<String>,
     /// Set when the watch ends after this read.
     pub stop: Option<StopReason>,
+    /// The new head commit, when a push came that is worth an incremental review.
+    pub review: Option<String>,
 }
 
 /// What a watch has already told the session, and the counts that end it.
@@ -108,9 +129,36 @@ pub struct Tracker {
     comment_only_wakes: u32,
     failed_reads: u32,
     started: bool,
+    last_head: Option<String>,
+    /// A head that came with a push and has not been reviewed or ruled out yet.
+    unreviewed: Option<String>,
 }
 
 impl Tracker {
+    /// The head to review after this read, if a push is waiting and can be reviewed now.
+    fn review_for(&mut self, snapshot: &Snapshot) -> Option<String> {
+        let changed = self
+            .last_head
+            .replace(snapshot.head.clone())
+            .is_some_and(|old| old != snapshot.head)
+            && !snapshot.head.is_empty();
+        if changed {
+            self.unreviewed = Some(snapshot.head.clone());
+        }
+        let head = self.unreviewed.clone()?;
+        match (snapshot.draft, snapshot.head_kind) {
+            (false, HeadKind::Normal) => {
+                self.unreviewed = None;
+                Some(head)
+            }
+            (false, HeadKind::Merge | HeadKind::Bot) => {
+                self.unreviewed = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// Decides what one read means. `subject` names the pull request in a message.
     pub fn on_read(&mut self, read: Result<Snapshot, String>, subject: &str) -> Decision {
         let Ok(snapshot) = read else {
@@ -119,6 +167,7 @@ impl Tracker {
             return Decision {
                 wake: stop.map(|reason| stopped(subject, reason)),
                 stop,
+                review: None,
             };
         };
         self.failed_reads = 0;
@@ -127,6 +176,7 @@ impl Tracker {
             PrState::Closed => return finished(subject, StopReason::Closed),
             PrState::Open => {}
         }
+        let review = self.review_for(&snapshot);
         let mut news = Vec::new();
         let new_failures: Vec<&String> = snapshot
             .failed_checks
@@ -175,7 +225,10 @@ impl Tracker {
             ));
         }
         if news.is_empty() {
-            return Decision::default();
+            return Decision {
+                review,
+                ..Decision::default()
+            };
         }
         if comments_only {
             self.comment_only_wakes += 1;
@@ -191,6 +244,7 @@ impl Tracker {
         Decision {
             wake: Some(text),
             stop,
+            review,
         }
     }
 }
@@ -206,13 +260,32 @@ fn finished(subject: &str, reason: StopReason) -> Decision {
     Decision {
         wake: Some(stopped(subject, reason)),
         stop: Some(reason),
+        review: None,
+    }
+}
+
+/// Runs an incremental review of a pull request after a push.
+pub trait Reviewer {
+    /// Reviews the pull request at `head` and returns the message that tells the
+    /// session what came of it.
+    fn review(&self, head: &str) -> impl Future<Output = String> + Send;
+}
+
+/// Stands in where reviews are off.
+pub struct NoReview;
+
+impl Reviewer for NoReview {
+    fn review(&self, _head: &str) -> impl Future<Output = String> + Send {
+        std::future::ready(String::new())
     }
 }
 
 /// Reads the pull request every `interval` and passes each wake message to
-/// `wake`, until a stop rule ends the watch. Returns why it ended.
-pub async fn run<R: PrReader>(
+/// `wake`, until a stop rule ends the watch. With a `reviewer`, a push that is worth
+/// a review starts one and its message is passed on too. Returns why it ended.
+pub async fn run<R: PrReader, V: Reviewer>(
     reader: &R,
+    reviewer: Option<&V>,
     subject: &str,
     interval: Duration,
     mut wake: impl FnMut(String),
@@ -222,6 +295,12 @@ pub async fn run<R: PrReader>(
         let decision = tracker.on_read(reader.read().await, subject);
         if let Some(text) = decision.wake {
             wake(text);
+        }
+        if let (Some(head), Some(reviewer)) = (decision.review, reviewer) {
+            let text = reviewer.review(&head).await;
+            if !text.is_empty() {
+                wake(text);
+            }
         }
         if let Some(reason) = decision.stop {
             return reason;
@@ -245,6 +324,16 @@ mod tests {
             failed_checks: Vec::new(),
             required_passed: false,
             others_comments: Vec::new(),
+            head: "a".to_owned(),
+            draft: false,
+            head_kind: HeadKind::Normal,
+        }
+    }
+
+    fn pushed(head: &str) -> Snapshot {
+        Snapshot {
+            head: head.to_owned(),
+            ..open()
         }
     }
 
@@ -505,6 +594,193 @@ mod tests {
         assert!(last.wake.is_some());
     }
 
+    #[test]
+    fn a_push_after_the_first_read_asks_for_a_review_and_the_first_read_does_not() {
+        // Arrange
+        let mut tracker = Tracker::default();
+
+        // Act
+        let first = tracker.on_read(Ok(pushed("a")), PR);
+        let same = tracker.on_read(Ok(pushed("a")), PR);
+        let push = tracker.on_read(Ok(pushed("b")), PR);
+
+        // Assert
+        assert_eq!(first.review, None);
+        assert_eq!(same.review, None);
+        assert_eq!(push.review.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_push_by_a_bot_a_merge_commit_or_an_unreadable_commit_asks_for_no_review() {
+        for kind in [HeadKind::Bot, HeadKind::Merge, HeadKind::Unknown] {
+            // Arrange
+            let mut tracker = Tracker::default();
+            tracker.on_read(Ok(pushed("a")), PR);
+
+            // Act
+            let push = tracker.on_read(
+                Ok(Snapshot {
+                    head_kind: kind,
+                    ..pushed("b")
+                }),
+                PR,
+            );
+
+            // Assert
+            assert_eq!(push.review, None, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_push_to_a_draft_is_reviewed_when_the_draft_becomes_ready() {
+        // Arrange
+        let mut tracker = Tracker::default();
+        tracker.on_read(Ok(pushed("a")), PR);
+        tracker.on_read(
+            Ok(Snapshot {
+                draft: true,
+                ..pushed("b")
+            }),
+            PR,
+        );
+
+        // Act
+        let ready = tracker.on_read(Ok(pushed("b")), PR);
+        let later = tracker.on_read(Ok(pushed("b")), PR);
+
+        // Assert
+        assert_eq!(ready.review.as_deref(), Some("b"));
+        assert_eq!(later.review, None);
+    }
+
+    #[test]
+    fn a_push_whose_commit_could_not_be_read_is_reviewed_once_it_can() {
+        // Arrange
+        let mut tracker = Tracker::default();
+        tracker.on_read(Ok(pushed("a")), PR);
+        let unknown = tracker.on_read(
+            Ok(Snapshot {
+                head_kind: HeadKind::Unknown,
+                ..pushed("b")
+            }),
+            PR,
+        );
+
+        // Act
+        let known = tracker.on_read(Ok(pushed("b")), PR);
+
+        // Assert
+        assert_eq!(unknown.review, None);
+        assert_eq!(known.review.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_push_to_a_draft_asks_for_no_review() {
+        // Arrange
+        let mut tracker = Tracker::default();
+        tracker.on_read(Ok(pushed("a")), PR);
+
+        // Act
+        let push = tracker.on_read(
+            Ok(Snapshot {
+                draft: true,
+                ..pushed("b")
+            }),
+            PR,
+        );
+
+        // Assert
+        assert_eq!(push.review, None);
+    }
+
+    struct Recording {
+        heads: Mutex<Vec<String>>,
+    }
+
+    impl Reviewer for Recording {
+        fn review(&self, head: &str) -> impl Future<Output = String> + Send {
+            self.heads.lock().unwrap().push(head.to_owned());
+            std::future::ready(format!("reviewed {head}"))
+        }
+    }
+
+    fn script(reads: Vec<Snapshot>) -> Scripted {
+        let mut all: Vec<Result<Snapshot, String>> = reads.into_iter().map(Ok).collect();
+        all.push(Ok(Snapshot {
+            state: PrState::Merged,
+            ..open()
+        }));
+        Scripted {
+            reads: Mutex::new(all),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_loop_reviews_a_normal_push_and_passes_the_result_on() {
+        // Arrange
+        let reader = script(vec![pushed("a"), pushed("b")]);
+        let reviewer = Recording {
+            heads: Mutex::default(),
+        };
+        let mut woken = Vec::new();
+
+        // Act
+        run(&reader, Some(&reviewer), PR, Duration::ZERO, |text| {
+            woken.push(text);
+        })
+        .await;
+
+        // Assert
+        assert_eq!(*reviewer.heads.lock().unwrap(), ["b"]);
+        assert!(woken.contains(&"reviewed b".to_owned()), "{woken:?}");
+    }
+
+    #[tokio::test]
+    async fn the_loop_starts_no_review_for_a_bot_a_draft_or_a_merge_commit() {
+        // Arrange
+        let reader = script(vec![
+            pushed("a"),
+            Snapshot {
+                head_kind: HeadKind::Bot,
+                ..pushed("b")
+            },
+            Snapshot {
+                head_kind: HeadKind::Merge,
+                ..pushed("c")
+            },
+            Snapshot {
+                draft: true,
+                ..pushed("d")
+            },
+        ]);
+        let reviewer = Recording {
+            heads: Mutex::default(),
+        };
+
+        // Act
+        run(&reader, Some(&reviewer), PR, Duration::ZERO, |_| {}).await;
+
+        // Assert
+        assert!(reviewer.heads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_reviews_off_a_normal_push_runs_nothing() {
+        // Arrange
+        let reader = script(vec![pushed("a"), pushed("b")]);
+        let mut woken = Vec::new();
+
+        // Act
+        run(&reader, None::<&Recording>, PR, Duration::ZERO, |text| {
+            woken.push(text);
+        })
+        .await;
+
+        // Assert
+        assert_eq!(woken.len(), 1, "{woken:?}");
+        assert!(woken[0].contains("merged"), "{woken:?}");
+    }
+
     struct Scripted {
         reads: Mutex<Vec<Result<Snapshot, String>>>,
     }
@@ -534,7 +810,10 @@ mod tests {
         let mut woken = Vec::new();
 
         // Act
-        let reason = run(&reader, PR, Duration::ZERO, |text| woken.push(text)).await;
+        let reason = run(&reader, None::<&NoReview>, PR, Duration::ZERO, |text| {
+            woken.push(text);
+        })
+        .await;
 
         // Assert
         assert_eq!(reason, StopReason::Merged);

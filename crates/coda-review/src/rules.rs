@@ -134,6 +134,7 @@ pub fn merge(global: &ReviewConfig, repo: Option<&ReviewConfig>) -> ReviewConfig
         guidance_lines: global.guidance_lines,
         linked_repos: global.linked_repos.clone(),
         hook: global.hook.clone(),
+        watch: global.watch.clone(),
         routing: global.routing.clone(),
         check_commands: global.check_commands.clone(),
         incremental_min_commits: global.incremental_min_commits,
@@ -313,6 +314,19 @@ mod tests {
         // Assert
         assert!(!merged.hook.enabled);
         assert!(!merged.hook.block_on_high);
+    }
+
+    #[test]
+    fn a_repository_rules_file_cannot_turn_the_pull_request_watch_review_on() {
+        // Arrange
+        let global = ReviewConfig::default();
+        let repo = parse_repo_rules("[review.watch]\nenabled = true\n").unwrap();
+
+        // Act
+        let merged = merge(&global, Some(&repo));
+
+        // Assert
+        assert!(!merged.watch.enabled);
     }
 
     #[test]
