@@ -16,7 +16,7 @@ use coda_config::timing::Timing;
 use coda_protocol::codec::{CodecError, encode_message};
 use coda_protocol::jsonrpc::{Id, Message, Outcome, Request, Version};
 use coda_protocol::methods::{
-    INITIALIZE, InitializeParams, InitializeResult, PROTOCOL_VERSION, SESSION_CLOSE,
+    Capabilities, INITIALIZE, InitializeParams, InitializeResult, PROTOCOL_VERSION, SESSION_CLOSE,
     SESSION_SUBSCRIBE, SessionCloseParams, SessionCloseResult, SessionSubscribeParams,
     SessionSubscribeResult,
 };
@@ -55,6 +55,7 @@ pub struct Client {
     outbound: mpsc::Sender<Vec<u8>>,
     next_id: AtomicI64,
     request_timeout: Duration,
+    capabilities: Capabilities,
     _tasks: JoinSet<()>,
 }
 
@@ -69,8 +70,8 @@ impl Client {
     /// [`ClientError::ProtocolMismatch`] if the daemon speaks another protocol
     /// version, or any error of [`Self::request`] from the handshake itself.
     pub async fn connect(socket_path: &Path, timing: Timing) -> Result<Self, ClientError> {
-        let client = Self::connect_unchecked(socket_path, timing).await?;
-        client.handshake().await?;
+        let mut client = Self::connect_unchecked(socket_path, timing).await?;
+        client.capabilities = client.handshake().await?;
         Ok(client)
     }
 
@@ -101,11 +102,12 @@ impl Client {
             outbound,
             next_id: AtomicI64::new(1),
             request_timeout: timing.idle_timeout,
+            capabilities: Capabilities::default(),
             _tasks: tasks,
         })
     }
 
-    async fn handshake(&self) -> Result<(), ClientError> {
+    async fn handshake(&self) -> Result<Capabilities, ClientError> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION,
             client_name: CLIENT_NAME.to_owned(),
@@ -118,7 +120,14 @@ impl Client {
             });
         }
         debug!(daemon_version = %result.daemon_version, "connected to the daemon");
-        Ok(())
+        Ok(result.capabilities)
+    }
+
+    /// What the daemon said it can do at the handshake. A client made without
+    /// the handshake knows nothing, so every feature is off.
+    #[must_use]
+    pub fn capabilities(&self) -> Capabilities {
+        self.capabilities
     }
 
     /// Calls `method` and decodes its result.

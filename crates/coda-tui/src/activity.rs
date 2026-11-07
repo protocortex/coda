@@ -12,6 +12,7 @@ use crate::work::format_duration;
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const STOPPING: &str = "Stopping";
 const NOT_RESPONDING: &str = "not responding, press Ctrl+C again to force stop";
+const NOT_RESPONDING_NO_FORCE: &str = "not responding";
 const FORCING: &str = "Forcing stop";
 const WORKING: &str = "Working";
 
@@ -22,30 +23,39 @@ pub enum Stage {
     Stopping,
     /// Asked for, and the turn did not end in time. Another Ctrl+C forces it.
     NotResponding,
-    /// The user forced it; the daemon is killing the backend.
+    /// The user forced it a moment ago; the daemon is ending the turn.
     Forcing,
 }
 
-/// The stage of a stop asked for at `asked`, seen at `now`.
+/// The stage of a stop asked for at `asked`, seen at `now`. A force counts
+/// from the moment it was sent, and one that did not end the turn in time is
+/// offered again.
 #[must_use]
 pub fn stage(asked: Instant, forced: bool, now: Instant) -> Stage {
-    if forced {
-        Stage::Forcing
-    } else if now.saturating_duration_since(asked) >= STOP_TIMEOUT {
+    if now.saturating_duration_since(asked) >= STOP_TIMEOUT {
         Stage::NotResponding
+    } else if forced {
+        Stage::Forcing
     } else {
         Stage::Stopping
     }
 }
 
 /// What the status line says about a turn that runs. `stop` is when the user
-/// asked to stop it, and whether they forced it.
+/// asked to stop it, or last forced it, and whether that was a force.
+/// `can_force` is whether the daemon honors a force.
 #[must_use]
-pub fn status_text(began: Instant, stop: Option<(Instant, bool)>, now: Instant) -> String {
+pub fn status_text(
+    began: Instant,
+    stop: Option<(Instant, bool)>,
+    can_force: bool,
+    now: Instant,
+) -> String {
     if let Some((asked, forced)) = stop {
         return match stage(asked, forced, now) {
             Stage::Stopping => STOPPING,
-            Stage::NotResponding => NOT_RESPONDING,
+            Stage::NotResponding if can_force => NOT_RESPONDING,
+            Stage::NotResponding => NOT_RESPONDING_NO_FORCE,
             Stage::Forcing => FORCING,
         }
         .to_owned();
@@ -70,9 +80,9 @@ mod tests {
     fn a_running_turn_reads_working_with_its_time() {
         let t0 = Instant::now();
 
-        assert_eq!(status_text(t0, None, t0), "Working");
-        assert_eq!(status_text(t0, None, t0 + secs(9)), "Working 9s");
-        assert_eq!(status_text(t0, None, t0 + secs(64)), "Working 1m 04s");
+        assert_eq!(status_text(t0, None, true, t0), "Working");
+        assert_eq!(status_text(t0, None, true, t0 + secs(9)), "Working 9s");
+        assert_eq!(status_text(t0, None, true, t0 + secs(64)), "Working 1m 04s");
     }
 
     #[test]
@@ -80,7 +90,7 @@ mod tests {
         let t0 = Instant::now();
         let asked = t0 + secs(10);
 
-        let text = status_text(t0, Some((asked, false)), asked + secs(1));
+        let text = status_text(t0, Some((asked, false)), true, asked + secs(1));
 
         assert_eq!(text, "Stopping");
     }
@@ -90,7 +100,7 @@ mod tests {
         let t0 = Instant::now();
         let asked = t0 + secs(10);
 
-        let text = status_text(t0, Some((asked, false)), asked + STOP_TIMEOUT);
+        let text = status_text(t0, Some((asked, false)), true, asked + STOP_TIMEOUT);
 
         assert_eq!(text, "not responding, press Ctrl+C again to force stop");
     }
@@ -99,9 +109,27 @@ mod tests {
     fn a_forced_stop_says_so_at_once() {
         let t0 = Instant::now();
 
-        let text = status_text(t0, Some((t0, true)), t0 + secs(1));
+        let text = status_text(t0, Some((t0, true)), true, t0 + secs(1));
 
         assert_eq!(text, "Forcing stop");
+    }
+
+    #[test]
+    fn a_force_that_did_not_end_the_turn_offers_the_force_again() {
+        let t0 = Instant::now();
+
+        let text = status_text(t0, Some((t0, true)), true, t0 + STOP_TIMEOUT);
+
+        assert_eq!(text, "not responding, press Ctrl+C again to force stop");
+    }
+
+    #[test]
+    fn a_daemon_that_cannot_force_is_not_asked_to() {
+        let t0 = Instant::now();
+
+        let text = status_text(t0, Some((t0, false)), false, t0 + STOP_TIMEOUT);
+
+        assert_eq!(text, "not responding");
     }
 
     #[test]

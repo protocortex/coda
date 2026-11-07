@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -25,7 +26,7 @@ use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
 use coda_core::tools::{
     BaseToolsConfig, StoreOriginals, ToolsError, base_tools, refresh_index, task_schema,
 };
-use coda_core::turn::{CancelToken, Fallback, TurnConfig, TurnEvent, TurnLoop};
+use coda_core::turn::{CancelToken, Fallback, StopCondition, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{
     CALL_RECOVERED_KIND, CallRecoveredBody, Event, GUARD_CONTINUE_KIND, GUARD_LIMIT_KIND,
     GuardContinueBody, GuardLimitBody, HOOK_BLOCKED_KIND, HookBlockedBody, MODEL_FALLBACK_KIND,
@@ -43,8 +44,9 @@ use coda_store::{EventRecord, SessionRecord, StoreError};
 use coda_tools::bash::{DEFAULT_ENV_ALLOWLIST, allowlisted_env};
 use coda_tools::{Tool, skill};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tracing::{Instrument, info, warn};
+use tracing::{Instrument, Span, info, warn};
 
 use crate::gate::{BrokerGate, Brokers};
 use crate::idle_pool::IdlePool;
@@ -68,6 +70,8 @@ const MAX_IDLE_LOOPS: usize = 64;
 /// How long a shutdown waits for cancelled sends to wind down.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+/// How long a forced cancel waits for the store to record the end of the turn.
+const FORCED_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a model-API session could not be started.
 #[derive(Debug, thiserror::Error)]
@@ -226,10 +230,54 @@ impl ModelLoop {
 struct Slot {
     sessions: Arc<ModelSessions>,
     session: SessionId,
+    gate: Arc<ForceGate>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GateState {
+    Open,
+    Forced,
+    Shut,
+}
+
+/// Lets a forced cancel take a turn task away from its send, until the send
+/// has its outcome and is on its way to record the end of the turn itself.
+struct ForceGate {
+    state: Mutex<GateState>,
+    wake: Notify,
+}
+
+impl ForceGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(GateState::Open),
+            wake: Notify::new(),
+        })
+    }
+
+    /// Asks the task to give up on its turn. Nothing happens once the send has shut the gate.
+    fn force(&self) {
+        let mut state = lock(&self.state);
+        if *state == GateState::Open {
+            *state = GateState::Forced;
+            self.wake.notify_one();
+        }
+    }
+
+    /// Called by the send when it has its outcome. `false` when a force came
+    /// first, so the task is about to be dropped and the send must not record anything.
+    fn shut(&self) -> bool {
+        let mut state = lock(&self.state);
+        if *state == GateState::Open {
+            *state = GateState::Shut;
+        }
+        *state == GateState::Shut
+    }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
+        lock(&self.sessions.forces).remove(&self.session);
         let armed = self
             .sessions
             .running()
@@ -256,6 +304,8 @@ pub struct ModelSessions {
     /// Present from the moment a send reserves the session, with its cancel
     /// token and turn once it runs; never held across an await.
     running: Mutex<HashMap<SessionId, Reservation<(CancelToken, TurnId)>>>,
+    /// The gate of each reserved session, for a cancel that did not take.
+    forces: Mutex<HashMap<SessionId, Arc<ForceGate>>>,
     /// Idle conversations, least recently used first.
     loops: IdlePool<ModelLoop>,
     /// Limits and spent tokens of conversations a rebuild dropped, until the
@@ -306,6 +356,7 @@ impl ModelSessions {
             env,
             key_reader,
             running: Mutex::default(),
+            forces: Mutex::default(),
             loops: IdlePool::new(MAX_IDLE_LOOPS),
             carried: Mutex::default(),
             children,
@@ -366,14 +417,57 @@ impl ModelSessions {
         let span = backend_span(&session, &turn, backend_name(record.backend));
         let sessions = Arc::clone(self);
         let task_turn = turn.clone();
+        let gate = Arc::clone(&slot.gate);
+        self.drive(
+            slot,
+            turn.clone(),
+            span,
+            sessions.run(model_loop, session, task_turn, text, gate),
+        );
+        Ok(turn)
+    }
+
+    /// Runs `work`, the send of `turn`, on its own task. A forced cancel drops
+    /// `work` and ends the turn here, so a send stuck where a cancel cannot
+    /// reach it still lets the session go.
+    fn drive(
+        self: &Arc<Self>,
+        slot: Slot,
+        turn: TurnId,
+        span: Span,
+        work: impl Future<Output = ()> + Send + 'static,
+    ) {
+        let gate = Arc::clone(&slot.gate);
+        let sessions = Arc::clone(self);
         tokio::spawn(
             async move {
-                let _slot = slot;
-                sessions.run(model_loop, session, task_turn, text).await;
+                tokio::select! {
+                    biased;
+                    () = gate.wake.notified() => {
+                        warn!(session = %slot.session, turn = %turn, "the turn did not stop; giving up on it");
+                        sessions.end_forced(&slot.session, &turn).await;
+                    }
+                    () = work => {}
+                }
             }
             .instrument(span),
         );
-        Ok(turn)
+    }
+
+    /// Records the end of a turn that was given up on, as cancelled. A store
+    /// that does not answer cannot keep the session busy for good.
+    async fn end_forced(&self, session: &SessionId, turn: &TurnId) {
+        let body = json!({ "condition": StopCondition::Cancelled.as_str() });
+        let record = async {
+            log_failure(publish_kind(&self.hub, session, turn, TURN_STOPPED_KIND, &body).await);
+            close_turn(&self.hub, session, turn, false).await;
+        };
+        if tokio::time::timeout(FORCED_CLOSE_TIMEOUT, record)
+            .await
+            .is_err()
+        {
+            warn!(session = %session, turn = %turn, "could not record the end of the turn in time");
+        }
     }
 
     /// Switches an idle model-API session to the alias `alias`.
@@ -448,6 +542,16 @@ impl ModelSessions {
             Some(reservation) => reservation.request_cancel(|(cancel, _)| cancel.cancel()),
             None => false,
         }
+    }
+
+    /// Cancels like [`Self::cancel`], then gives up on the turn task at once
+    /// instead of waiting for it to notice. For a stop that did not take.
+    pub fn force_cancel(&self, session: &SessionId) -> bool {
+        let cancelled = self.cancel(session);
+        if cancelled && let Some(gate) = lock(&self.forces).get(session) {
+            gate.force();
+        }
+        cancelled
     }
 
     /// Drops the idle conversation of `session`; `false` when it held none.
@@ -535,9 +639,12 @@ impl ModelSessions {
             }
             std::collections::hash_map::Entry::Vacant(vacant) => vacant.insert(reservation),
         };
+        let gate = ForceGate::new();
+        lock(&self.forces).insert(session.clone(), Arc::clone(&gate));
         Ok(Slot {
             sessions: Arc::clone(self),
             session: session.clone(),
+            gate,
         })
     }
 
@@ -839,6 +946,7 @@ impl ModelSessions {
         session: SessionId,
         turn: TurnId,
         text: String,
+        gate: Arc<ForceGate>,
     ) {
         let ModelLoop {
             turn_loop, events, ..
@@ -860,6 +968,10 @@ impl ModelSessions {
                 }
             }
         };
+        if !gate.shut() {
+            // The forced end is recorded by the task that holds this future.
+            std::future::pending::<()>().await;
+        }
         while let Ok(event) = events.try_recv() {
             streamed.publish(&self.hub, &session, &turn, event).await;
         }
