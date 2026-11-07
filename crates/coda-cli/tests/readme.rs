@@ -26,8 +26,14 @@ const TEST_TAG: &str = "coda-test";
 const OUTPUT_TAG: &str = "coda-output";
 const CONFIG_TAG: &str = "coda-config";
 const NOTICE_HEADING: &str = "## Account risk notice";
-const NOTICE_SENTENCES: [&str; 4] = [
-    "Coda has not verified that the Anthropic terms allow this use of the `claude` binary.",
+const NOTICE_SENTENCES: [&str; 10] = [
+    "https://code.claude.com/docs/en/legal-and-compliance",
+    "https://support.claude.com/en/articles/15036540",
+    "Coda read both on 2026-11-08.",
+    "Coda drives your installed, unmodified `claude`",
+    "Coda never sees the token that `claude auth login` produces",
+    "that session bills API rates, not your plan",
+    "Coda has not asked Anthropic to confirm that this use is allowed",
     "Coda has not verified that the OpenAI terms allow this use of the `codex` binary.",
     "You must check the terms for your account yourself.",
     "The claude_code and codex backends stay disabled until you enable them.",

@@ -10,7 +10,9 @@ License: Apache-2.0. See `LICENSE` and [docs/licensing.md](docs/licensing.md).
 
 Coda can drive the `claude` and `codex` programs you have installed. If you sign in to them with a subscription, Coda uses that subscription on your behalf.
 
-Coda has not verified that the Anthropic terms allow this use of the `claude` binary. Coda has not verified that the OpenAI terms allow this use of the `codex` binary. You must check the terms for your account yourself. A mistake can put your account at risk.
+Anthropic states its rules for Claude Code on [Legal and compliance](https://code.claude.com/docs/en/legal-and-compliance) and in Help Center article [15036540](https://support.claude.com/en/articles/15036540), "Use the Claude Agent SDK with your Claude plan". Coda read both on 2026-11-08. Coda drives your installed, unmodified `claude` with flags it has tested against the real binary. You sign in to it yourself, with your own account, through Anthropic's own flow (`claude auth login`, or `coda login`, which only starts that command). Coda never sees the token that `claude auth login` produces, and it never reads or stores one. It does not offer a Claude login of its own. Coda starts `claude` with a short list of environment variables, so an API key in your shell reaches it only if you list `ANTHROPIC_API_KEY` under `env_passthrough`; Coda hands such a variable to `claude` as it is, and that session bills API rates, not your plan. When you are signed in with your plan, use through `claude -p` still counts against your plan limits, as that article says. Coda has not asked Anthropic to confirm that this use is allowed, and the terms can change.
+
+Coda has not verified that the OpenAI terms allow this use of the `codex` binary. You must check the terms for your account yourself. A mistake can put your account at risk.
 
 The claude_code and codex backends stay disabled until you enable them. Set `enabled = true` under `[providers.claude_code]` or `[providers.codex]` only after you have read the terms. The `anthropic`, `openai_compat` and `faux` providers use an API key or a script, not a subscription.
 
