@@ -569,6 +569,7 @@ fn new_pending(session: &SessionId, command: &str) -> NewPending {
         repo_path: "/repo".to_owned(),
         command: command.to_owned(),
         agent: None,
+        reason: None,
     }
 }
 
@@ -700,6 +701,26 @@ fn decisions_are_recorded_and_listed_for_a_session() {
         .collect();
     assert_eq!(got, vec![("ls", true), ("rm -rf x", false)]);
     assert_eq!(decisions[0].decided_at, T0);
+}
+
+#[test]
+fn a_pending_request_keeps_the_reason_the_backend_gave() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let session = store.create_session(&new_session("/a")).unwrap();
+    let with_reason = NewPending {
+        reason: Some("May I create hello.txt?".to_owned()),
+        ..new_pending(&session, "touch hello.txt")
+    };
+    store.add_pending(&with_reason).unwrap();
+    store.add_pending(&new_pending(&session, "ls")).unwrap();
+
+    // Act
+    let listed = store.list_pending(&session).unwrap();
+
+    // Assert
+    let reasons: Vec<_> = listed.iter().map(|p| p.reason.as_deref()).collect();
+    assert_eq!(reasons, [Some("May I create hello.txt?"), None]);
 }
 
 #[test]

@@ -79,6 +79,8 @@ pub struct PermissionAsk {
     pub tool_name: String,
     /// The tool's arguments, as given.
     pub input: Value,
+    /// What Claude Code says the call is for, when it says.
+    pub description: Option<String>,
 }
 
 /// Something skipped while parsing; never carries message content.
@@ -255,6 +257,7 @@ impl StreamParser {
             request_id: request_id.to_owned(),
             tool_name: tool_name.to_owned(),
             input: request["input"].clone(),
+            description: request["description"].as_str().map(str::to_owned),
         }))
     }
 }
@@ -415,6 +418,7 @@ pub fn map_tool(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
         target_paths,
         command,
         cwd: cwd.to_path_buf(),
+        reason: None,
     }
 }
 
@@ -636,6 +640,7 @@ mod tests {
                     request_id: "r1".to_owned(),
                     tool_name: "Bash".to_owned(),
                     input: json!({"command":"ls"}),
+                    description: None,
                 }),
                 Message::Result { is_error: true },
             ]

@@ -14,6 +14,7 @@
 //! `$HOME/.claude/.credentials.json` for writing and writes one byte, and
 //! `echo-text` sends the control file's `echo_text` back as a text delta, and `delta_burst`
 //! makes every turn send that many one-character text deltas before it goes on.
+//! `askdie` exits right after it asks for permission, before any answer, and
 //! `tooldie` exits right after the tool call is answered, and `vanish` deletes
 //! its own binary before crashing like `crash`, so it cannot be started again.
 //! `tool-slow` runs a tool that needs no permission: it announces a `tool_use`,
@@ -72,6 +73,7 @@ const RESUME_FLAG: &str = "--resume";
 const CRASH_TRIGGER: &str = "crash";
 const FLAKY_TRIGGER: &str = "flaky";
 const TOOL_DIE_TRIGGER: &str = "tooldie";
+const ASK_DIE_TRIGGER: &str = "askdie";
 const VANISH_TRIGGER: &str = "vanish";
 const NOISE_TRIGGER: &str = "noise";
 const CRASH_EXIT_CODE: i32 = 3;
@@ -295,8 +297,12 @@ fn run_turn(
     emit(
         out,
         &serde_json::json!({"type":"control_request","request_id":REQUEST_ID,
-            "request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}),
+            "request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},
+                "description":"List the files"}}),
     )?;
+    if user_line.contains(ASK_DIE_TRIGGER) {
+        std::process::exit(CRASH_EXIT_CODE);
+    }
     let Some(response) = lines.next().transpose()? else {
         return Ok(());
     };

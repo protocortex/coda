@@ -19,6 +19,8 @@ pub struct NewPending {
     pub command: String,
     /// Name of the sub-agent that asks; `None` for the session's own call.
     pub agent: Option<String>,
+    /// Why the backend asks, in its own words; `None` when it gave no reason.
+    pub reason: Option<String>,
 }
 
 /// A queued permission request.
@@ -32,6 +34,8 @@ pub struct PendingPermission {
     pub command: String,
     /// Name of the sub-agent that asks; `None` for the session's own call.
     pub agent: Option<String>,
+    /// Why the backend asks, in its own words; `None` when it gave no reason.
+    pub reason: Option<String>,
     /// Request time in milliseconds since the Unix epoch.
     pub requested_at: i64,
 }
@@ -56,14 +60,15 @@ impl Store {
         let session_row = self.existing_session_row(&new.session)?;
         self.connection().execute(
             "INSERT INTO pending_permissions \
-             (session_id, tool, repo_path, command, agent, requested_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (session_id, tool, repo_path, command, agent, reason, requested_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 session_row,
                 new.tool,
                 new.repo_path,
                 new.command,
                 new.agent,
+                new.reason,
                 self.clock.now_ms()
             ],
         )?;
@@ -138,7 +143,7 @@ impl Store {
     pub fn list_pending(&self, session: &SessionId) -> Result<Vec<PendingPermission>, StoreError> {
         let session_row = self.existing_session_row(session)?;
         let mut stmt = self.connection().prepare(
-            "SELECT id, tool, repo_path, command, agent, requested_at FROM pending_permissions \
+            "SELECT id, tool, repo_path, command, agent, reason, requested_at FROM pending_permissions \
              WHERE session_id = ?1 AND resolved_at IS NULL ORDER BY id",
         )?;
         let rows = stmt.query_map([session_row], |row| {
@@ -149,7 +154,8 @@ impl Store {
                 repo_path: row.get(2)?,
                 command: row.get(3)?,
                 agent: row.get(4)?,
-                requested_at: row.get(5)?,
+                reason: row.get(5)?,
+                requested_at: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
