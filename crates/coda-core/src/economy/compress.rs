@@ -17,6 +17,10 @@ const JSON_HEAD_ITEMS: usize = 2;
 const JSON_TAIL_ITEMS: usize = 2;
 /// Context lines kept on each side of a changed diff line.
 const DIFF_CONTEXT_LINES: usize = 1;
+/// Changed lines kept at each end of a run too long to keep whole.
+const DIFF_RUN_KEEP_LINES: usize = 20;
+/// Fewest lines a cut must leave out, so the marker is never longer than what it hides.
+const DIFF_RUN_MIN_OMITTED: usize = 10;
 /// Start of every omission marker, so a second pass can tell them from content.
 const MARKER_PREFIX: &str = "[... ";
 /// Lowercase words that make a line or item worth keeping.
@@ -88,16 +92,20 @@ pub fn compress_log(input: &[u8]) -> String {
     join_lines(&kept, &text)
 }
 
-/// Shrinks a unified diff, keeping every header, hunk header and changed line.
+/// Shrinks a unified diff, keeping every header and hunk header.
 ///
-/// Context lines survive only next to a change. Invalid UTF-8 is replaced with U+FFFD.
+/// Context lines survive only next to a change. A run of changed lines that
+/// has `2 * DIFF_RUN_KEEP_LINES + DIFF_RUN_MIN_OMITTED` lines or more keeps its
+/// first and last `DIFF_RUN_KEEP_LINES` lines, so a rewritten file does not fill
+/// the context. Invalid UTF-8 is replaced with U+FFFD.
 #[must_use]
 pub fn compress_diff(input: &[u8]) -> String {
     let text = String::from_utf8_lossy(input);
     let lines: Vec<&str> = text.lines().collect();
     let in_hunk = hunk_flags(&lines);
     let is_context = |i: usize| in_hunk[i] && (lines[i].is_empty() || lines[i].starts_with(' '));
-    let keep: Vec<bool> = (0..lines.len())
+    let is_change = |i: usize| in_hunk[i] && !is_context(i) && !lines[i].starts_with("@@");
+    let mut keep: Vec<bool> = (0..lines.len())
         .map(|i| {
             if !is_context(i) {
                 return true;
@@ -107,9 +115,50 @@ pub fn compress_diff(input: &[u8]) -> String {
             (from..=to).any(|near| near != i && !is_context(near) && !lines[near].starts_with("@@"))
         })
         .collect();
-    let owned = lines.into_iter().map(str::to_owned).collect();
-    let kept = collapse(owned, &keep, |n| marker(n, "context lines"));
+    let mut start = 0;
+    while start < lines.len() {
+        if !is_change(start) {
+            start += 1;
+            continue;
+        }
+        let end = (start..lines.len())
+            .find(|&i| !is_change(i))
+            .unwrap_or(lines.len());
+        if end - start >= 2 * DIFF_RUN_KEEP_LINES + DIFF_RUN_MIN_OMITTED {
+            keep[start + DIFF_RUN_KEEP_LINES..end - DIFF_RUN_KEEP_LINES].fill(false);
+        }
+        start = end;
+    }
+    let mut kept = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if keep[i] {
+            kept.push(lines[i].to_owned());
+            i += 1;
+            continue;
+        }
+        let first = i;
+        while i < lines.len() && !keep[i] {
+            i += 1;
+        }
+        if is_context(first) {
+            kept.push(marker(i - first, "context lines"));
+        } else {
+            kept.push(changed_marker(&lines[first..i]));
+        }
+    }
     join_lines(&kept, &text)
+}
+
+/// The marker for a cut run of changed lines, which says how many were removed and added.
+fn changed_marker(omitted: &[&str]) -> String {
+    let count = |sign: char| omitted.iter().filter(|line| line.starts_with(sign)).count();
+    format!(
+        "{MARKER_PREFIX}{} changed lines omitted: {} removed, {} added]",
+        omitted.len(),
+        count('-'),
+        count('+')
+    )
 }
 
 /// Flags the lines that follow a hunk header, where a leading space means context.
@@ -218,6 +267,7 @@ pub fn compress_json_array(input: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     const LOG: &str = "l1\nl2\nl3\nl4\nl5\nl6\nl7 error: boom\nl8\nl9\nl10\nl11\nl12\n";
     const LOG_COMPRESSED: &str = "l1\nl2\nl3\n[... 3 lines omitted]\nl7 error: boom\n\
@@ -255,6 +305,81 @@ mod tests {
 
         // Assert
         assert_eq!(out, DIFF_COMPRESSED);
+    }
+
+    fn long_added_file(lines: usize) -> String {
+        let body = (1..=lines).fold(String::new(), |mut body, n| {
+            let _ = writeln!(body, "+line {n}");
+            body
+        });
+        format!("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -0,0 +1,{lines} @@\n{body}")
+    }
+
+    #[test]
+    fn diff_cuts_the_middle_of_a_long_run_of_changes_and_keeps_both_ends() {
+        // Arrange
+        let input = long_added_file(100);
+
+        // Act
+        let out = compress_diff(input.as_bytes());
+
+        // Assert
+        assert!(out.contains("+line 1\n"), "{out}");
+        assert!(out.contains("+line 20\n"), "{out}");
+        assert!(
+            out.contains("[... 60 changed lines omitted: 0 removed, 60 added]\n"),
+            "{out}"
+        );
+        assert!(out.contains("+line 81\n"), "{out}");
+        assert!(out.ends_with("+line 100\n"), "{out}");
+        assert!(!out.contains("+line 21\n"), "{out}");
+    }
+
+    #[test]
+    fn diff_keeps_a_run_of_changes_that_is_not_long() {
+        // Arrange
+        let input = long_added_file(49);
+
+        // Act
+        let out = compress_diff(input.as_bytes());
+
+        // Assert
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn the_marker_of_a_cut_run_counts_removed_and_added_lines() {
+        // Arrange
+        let lines = |sign: char| {
+            (1..=30).fold(String::new(), |mut text, n| {
+                let _ = writeln!(text, "{sign}line {n}");
+                text
+            })
+        };
+        let (removed, added) = (lines('-'), lines('+'));
+        let input =
+            format!("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,30 +1,30 @@\n{removed}{added}");
+
+        // Act
+        let out = compress_diff(input.as_bytes());
+
+        // Assert
+        assert!(
+            out.contains("[... 20 changed lines omitted: 10 removed, 10 added]\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn compressing_a_diff_with_a_cut_run_twice_changes_nothing() {
+        // Arrange
+        let once = compress_diff(long_added_file(100).as_bytes());
+
+        // Act
+        let twice = compress_diff(once.as_bytes());
+
+        // Assert
+        assert_eq!(twice, once);
     }
 
     #[test]

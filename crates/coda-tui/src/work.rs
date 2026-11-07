@@ -28,7 +28,7 @@ const EDIT_TOOLS: [&str; 6] = [
     "notebookedit",
     "apply_patch",
 ];
-const READ_TOOLS: [&str; 11] = [
+const READ_TOOLS: [&str; 13] = [
     "read",
     "grep",
     "glob",
@@ -40,6 +40,8 @@ const READ_TOOLS: [&str; 11] = [
     "code_read_range",
     "code_search",
     "code_symbol",
+    "git_status",
+    "git_diff",
 ];
 
 /// How the work of a turn is grouped in the fold, most important first.

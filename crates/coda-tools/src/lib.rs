@@ -11,6 +11,7 @@ pub mod ask;
 pub mod bash;
 pub mod code;
 pub mod edit;
+pub mod git;
 pub mod grep;
 pub mod list;
 pub mod multi_edit;
@@ -32,13 +33,15 @@ use crate::sandbox::SandboxError;
 
 /// The name of every tool the model can call, sorted. Agent definitions are
 /// checked against it.
-pub const TOOL_NAMES: [&str; 12] = [
+pub const TOOL_NAMES: [&str; 14] = [
     bash::NAME,
     code::OUTLINE_NAME,
     code::READ_RANGE_NAME,
     code::SEARCH_NAME,
     code::SYMBOL_NAME,
     edit::NAME,
+    git::DIFF_NAME,
+    git::STATUS_NAME,
     grep::NAME,
     list::NAME,
     multi_edit::NAME,

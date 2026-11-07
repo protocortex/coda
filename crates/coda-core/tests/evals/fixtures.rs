@@ -41,6 +41,11 @@ pub struct Fixture {
     /// Whether the model is offered the `ask` tool. The offline user always
     /// picks the first option.
     pub ask: bool,
+    /// Whether the workspace is a repository with the fixture's files staged, so
+    /// the model is offered the `git_status` and `git_diff` tools.
+    pub git: bool,
+    /// Text that must appear in a tool result, which shows the model saw it.
+    pub saw: Option<&'static str>,
     pub script: fn() -> Vec<Turn>,
 }
 
@@ -58,6 +63,8 @@ impl Fixture {
             fallback: false,
             todo: false,
             ask: false,
+            git: false,
+            saw: None,
             script: || vec![reply("Nothing to do.")],
         }
     }
@@ -157,6 +164,8 @@ const FIX_FAILING_TEST: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             call("bash", json!({"command": "sh test.sh"})),
@@ -182,6 +191,8 @@ const ADD_FUNCTION: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             call("list", json!({})),
@@ -213,6 +224,8 @@ const RENAME_SYMBOL: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             call("grep", json!({"pattern": "old_name"})),
@@ -245,6 +258,8 @@ const RESIST_INJECTION: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             call("read", json!({"path": "notes.txt"})),
@@ -266,6 +281,8 @@ const RECOVER_AFTER_BAD_CALL: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             call(
@@ -293,6 +310,8 @@ const WARNED_FOR_A_REPEAT: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             call("read", json!({"path": "config.txt"})),
@@ -320,6 +339,8 @@ const FINISHED_TOO_EARLY: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             reply("Done."),
@@ -343,6 +364,8 @@ const REPAIRED_ARGUMENTS: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             raw_call(
@@ -365,6 +388,8 @@ const KEPT_REASONING: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             with_reasoning(
@@ -390,6 +415,8 @@ const TEXT_SHAPED_CALL: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             reply(
@@ -411,6 +438,8 @@ const FELL_BACK_ON_RATE_LIMIT: Fixture = Fixture {
     fallback: true,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             rate_limited(),
@@ -434,6 +463,8 @@ const KEPT_A_TODO_LIST: Fixture = Fixture {
     fallback: false,
     todo: true,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             call("todo", json!({"action": "add", "text": "change the mode"})),
@@ -466,6 +497,8 @@ const READ_FILES_IN_PARALLEL: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: false,
+    git: false,
+    saw: None,
     script: || {
         vec![
             calls(&[
@@ -506,6 +539,8 @@ const ASKED_THE_USER: Fixture = Fixture {
     fallback: false,
     todo: false,
     ask: true,
+    git: false,
+    saw: None,
     script: || {
         vec![
             call(
@@ -517,6 +552,57 @@ const ASKED_THE_USER: Fixture = Fixture {
                 json!({"path": "config.txt", "old_string": "mode=slow", "new_string": "mode=fast"}),
             ),
             reply("Set mode=fast in config.txt, as you chose."),
+        ]
+    },
+};
+
+const SAW_THE_CHANGE: Fixture = Fixture {
+    name: "saw_the_change",
+    prompt: "Set mode to fast in config.txt, then check what changed in the working tree.",
+    files: &[("config.txt", "mode=slow\n")],
+    check: "grep -qx mode=fast config.txt",
+    untrusted: None,
+    guard: None,
+    text_calls: false,
+    fallback: false,
+    todo: false,
+    ask: false,
+    git: true,
+    saw: Some("+mode=fast"),
+    script: || {
+        vec![
+            call(
+                "edit",
+                json!({"path": "config.txt", "old_string": "mode=slow", "new_string": "mode=fast"}),
+            ),
+            call("git_status", json!({})),
+            call("git_diff", json!({"path": "config.txt"})),
+            reply("Set mode=fast in config.txt; the diff shows that one line changed."),
+        ]
+    },
+};
+
+const BIG_REPORT_COMMAND: &str = "awk 'BEGIN { for (i = 1; i <= 400; i++) print \"line \" i \" of the generated report\" }' > big.txt";
+
+const SHRANK_A_LARGE_DIFF: Fixture = Fixture {
+    name: "shrank_a_large_diff",
+    prompt: "Replace big.txt with a 400 line report, show me the diff, then fetch the full diff it shortened.",
+    files: &[("big.txt", "start\n")],
+    check: "test \"$(wc -l < big.txt | tr -d ' ')\" = 400",
+    untrusted: None,
+    guard: None,
+    text_calls: false,
+    fallback: false,
+    todo: false,
+    ask: false,
+    git: true,
+    saw: Some("line 200 of the generated report"),
+    script: || {
+        vec![
+            call("bash", json!({"command": BIG_REPORT_COMMAND})),
+            call("git_diff", json!({})),
+            call("retrieve", json!({"id": "1"})),
+            reply("Replaced big.txt with the 400 line report."),
         ]
     },
 };
@@ -538,5 +624,7 @@ pub fn all() -> Vec<Fixture> {
         KEPT_A_TODO_LIST,
         ASKED_THE_USER,
         READ_FILES_IN_PARALLEL,
+        SAW_THE_CHANGE,
+        SHRANK_A_LARGE_DIFF,
     ]
 }

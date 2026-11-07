@@ -91,9 +91,14 @@ pub fn decide(input: &PolicyInput<'_>) -> Verdict {
     }
     match input.tool {
         // Skill reads only the definitions the user already admitted for the session.
-        Tool::Retrieve | Tool::CodeSearch | Tool::CodeSymbol | Tool::CodeOutline | Tool::Skill => {
-            Verdict::Allow
-        }
+        // The git tools run a fixed read-only command that ignores the repository's own programs.
+        Tool::Retrieve
+        | Tool::CodeSearch
+        | Tool::CodeSymbol
+        | Tool::CodeOutline
+        | Tool::Skill
+        | Tool::GitStatus
+        | Tool::GitDiff => Verdict::Allow,
         Tool::Unknown(_) => Verdict::Prompt,
         Tool::Bash => grant_or_prompt(input.granted),
         Tool::Read | Tool::Grep | Tool::List | Tool::CodeReadRange => {
@@ -588,6 +593,8 @@ fn bash_and_scope_rows(rows: &mut Rows, mode: PermissionMode) {
         Tool::CodeSymbol,
         Tool::CodeOutline,
         Tool::Skill,
+        Tool::GitStatus,
+        Tool::GitDiff,
     ] {
         rows.add(
             "session scope tool",

@@ -49,6 +49,14 @@
       "turns": 2,
       "tokens": 2832
     },
+    "saw_the_change": {
+      "turns": 4,
+      "tokens": 6395
+    },
+    "shrank_a_large_diff": {
+      "turns": 4,
+      "tokens": 10536
+    },
     "text_shaped_call": {
       "turns": 2,
       "tokens": 2809
