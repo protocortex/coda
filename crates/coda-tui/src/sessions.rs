@@ -65,6 +65,8 @@ pub enum LinkCommand {
     Send(String),
     /// Cancel the running turn of the current session.
     Cancel,
+    /// Cancel the running turn and kill the backend at once, for a stop that did not take.
+    ForceCancel,
     /// Answer a permission request.
     Respond(PermissionAnswer),
     /// Start a fresh session and follow it.
@@ -500,7 +502,8 @@ impl Link {
     async fn handle(&mut self, command: LinkCommand) {
         let outcome = match command {
             LinkCommand::Send(text) => self.send(text).await,
-            LinkCommand::Cancel => self.cancel().await,
+            LinkCommand::Cancel => self.cancel(false).await,
+            LinkCommand::ForceCancel => self.cancel(true).await,
             LinkCommand::Respond(answer) => self.respond(answer).await,
             LinkCommand::ListSessions => self
                 .list(None, None)
@@ -603,12 +606,15 @@ impl Link {
             .map_err(|e| ("send the message", e))
     }
 
-    async fn cancel(&self) -> Result<(), (&'static str, ClientError)> {
+    async fn cancel(&self, force: bool) -> Result<(), (&'static str, ClientError)> {
         let Some(session_id) = self.current() else {
             return Ok(());
         };
         self.client
-            .request::<_, SessionCancelResult>(SESSION_CANCEL, &SessionCancelParams { session_id })
+            .request::<_, SessionCancelResult>(
+                SESSION_CANCEL,
+                &SessionCancelParams { session_id, force },
+            )
             .await
             .map(|_| ())
             .map_err(|e| ("cancel the turn", e))

@@ -605,6 +605,19 @@ impl Turns {
         }
     }
 
+    /// Cancels like [`Self::cancel`], then kills the backend's process group at
+    /// once instead of waiting for it to answer the cancel. For a stop that did not take.
+    pub async fn force_cancel(&self, session: &SessionId) -> bool {
+        let cancelled = self.cancel(session);
+        if cancelled {
+            let path = pidfile_path(&self.config.pidfile_dir, session);
+            if crate::reaper::kill_recorded(&path).await {
+                info!(session = %session, "killed the backend after a forced cancel");
+            }
+        }
+        cancelled
+    }
+
     /// Releases what the daemon holds for an idle `session`: its pooled backend
     /// server and its idle model conversation. Stored events stay, so the session
     /// can be reopened and sent to again. Returns whether anything was released;
@@ -1340,12 +1353,15 @@ pub(crate) async fn run_agent(turns: Option<&Arc<Turns>>, params: Option<Value>)
 }
 
 /// Answers `session.cancel`.
-pub(crate) fn cancel(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
+pub(crate) async fn cancel(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
     let turns = turns.ok_or_else(unavailable)?;
     let params: SessionCancelParams = parse_params(params)?;
-    to_value(&SessionCancelResult {
-        cancelled: turns.cancel(&params.session_id),
-    })
+    let cancelled = if params.force {
+        turns.force_cancel(&params.session_id).await
+    } else {
+        turns.cancel(&params.session_id)
+    };
+    to_value(&SessionCancelResult { cancelled })
 }
 
 /// Answers `session.close`.

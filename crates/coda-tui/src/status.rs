@@ -51,12 +51,21 @@ impl Status {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        self.render_with(frame, area, None);
+    }
+
+    /// Draws the status line with what the running turn is doing after it.
+    pub fn render_with(&self, frame: &mut Frame, area: Rect, activity: Option<&str>) {
         let backend = self.backend.map_or(NO_BACKEND, backend_name);
         let model = self.model.as_deref().unwrap_or(NO_MODEL);
-        let line = format!(
+        let mut line = format!(
             "{backend} | {model} | in {} out {}",
             self.usage.input_tokens, self.usage.output_tokens
         );
+        if let Some(activity) = activity {
+            line.push_str(" | ");
+            line.push_str(activity);
+        }
         frame.render_widget(Paragraph::new(line), area);
     }
 }

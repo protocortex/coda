@@ -13,6 +13,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Paragraph};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::activity::{self, Stage};
 use crate::chat::Chat;
 use crate::commands::{self, Command, CommandError, Resolved, UserCommands};
 use crate::input::Input;
@@ -82,6 +83,8 @@ pub struct App {
     link: Option<UnboundedSender<LinkCommand>>,
     turn_running: bool,
     work: WorkLog,
+    /// When the user asked to stop the turn, and whether they forced it.
+    stop: Option<(Instant, bool)>,
     setup_shown: bool,
     user_commands: UserCommands,
     quit: bool,
@@ -102,6 +105,7 @@ impl App {
             link: None,
             turn_running: false,
             work: WorkLog::new(),
+            stop: None,
             setup_shown: false,
             user_commands: UserCommands::default(),
             quit: false,
@@ -276,7 +280,7 @@ impl App {
             self.send(LinkCommand::Respond(answer));
         }
         if self.turn_running {
-            self.send(LinkCommand::Cancel);
+            self.stop_turn(now);
         }
         if busy {
             self.idle_ctrl_c_at = None;
@@ -294,6 +298,32 @@ impl App {
             self.idle_ctrl_c_at = Some(now);
             self.hint = Some((now, QUIT_CONFIRM_NOTICE));
         }
+    }
+
+    /// Asks the daemon to cancel the turn. Once a stop has gone unanswered for
+    /// [`activity::STOP_TIMEOUT`], the next press forces it.
+    fn stop_turn(&mut self, now: Instant) {
+        let offered = self.stop.is_some_and(|(asked, forced)| {
+            activity::stage(asked, forced, now) == Stage::NotResponding
+        });
+        if offered {
+            if let Some((asked, _)) = self.stop {
+                self.stop = Some((asked, true));
+            }
+            self.send(LinkCommand::ForceCancel);
+        } else {
+            self.stop.get_or_insert((now, false));
+            self.send(LinkCommand::Cancel);
+        }
+    }
+
+    /// What the status line says about the running turn.
+    fn activity(&self, now: Instant) -> Option<String> {
+        if !self.turn_running {
+            return None;
+        }
+        let began = self.work.began().unwrap_or(now);
+        Some(activity::status_text(began, self.stop, now))
     }
 
     fn handle_prompt_key(&mut self, key: KeyEvent) {
@@ -329,6 +359,7 @@ impl App {
         // A send while a turn runs is refused by the daemon, so it must not reset the turn's log.
         if !self.turn_running {
             self.work.begin(Instant::now());
+            self.stop = None;
         }
         self.turn_running = true;
         if !self.send(LinkCommand::Send(text.to_owned())) {
@@ -420,7 +451,8 @@ impl App {
         }
         self.input.render(frame, input);
         frame.render_widget(Paragraph::new(self.connection_text(now)), connection);
-        self.status.render(frame, status);
+        let activity = self.activity(now);
+        self.status.render_with(frame, status, activity.as_deref());
         self.overlay.render(frame, frame.area());
     }
 
@@ -1679,5 +1711,116 @@ mod tests {
 
         // Assert
         assert_eq!(app.work_line(t0), None);
+    }
+
+    fn wide_screen_at(app: &App, now: Instant) -> String {
+        crate::test_support::screen(120, 8, |frame| app.render_at(frame, now))
+    }
+
+    /// An app with a turn that began at `t0`.
+    fn working(t0: Instant) -> (App, UnboundedReceiver<LinkCommand>) {
+        let (mut app, mut commands) = linked();
+        type_line(&mut app, "go");
+        sent(&mut commands);
+        app.work.begin(t0);
+        (app, commands)
+    }
+
+    #[test]
+    fn a_running_turn_shows_working_with_its_time_on_the_status_line() {
+        // Arrange
+        let t0 = Instant::now();
+        let (app, _commands) = working(t0);
+
+        // Act
+        let shown = wide_screen_at(&app, t0 + Duration::from_secs(64));
+
+        // Assert
+        assert!(shown.contains("| Working 1m 04s"), "{shown}");
+    }
+
+    #[test]
+    fn an_idle_app_shows_no_working_state() {
+        let app = App::new();
+
+        let shown = wide_screen_at(&app, Instant::now());
+
+        assert!(!shown.contains("Working"), "{shown}");
+    }
+
+    #[test]
+    fn ctrl_c_in_a_turn_shows_stopping_then_offers_the_force_after_the_timeout() {
+        // Arrange
+        let t0 = Instant::now();
+        let (mut app, _commands) = working(t0);
+
+        // Act
+        app.handle_key_at(ctrl_c(), t0);
+        let early = wide_screen_at(&app, t0 + Duration::from_secs(1));
+        let late = wide_screen_at(&app, t0 + activity::STOP_TIMEOUT);
+
+        // Assert
+        assert!(early.contains("Stopping"), "{early}");
+        assert!(!early.contains("Working"), "{early}");
+        assert!(
+            late.contains("not responding, press Ctrl+C again to force stop"),
+            "{late}"
+        );
+    }
+
+    #[test]
+    fn a_second_ctrl_c_inside_the_timeout_cancels_again_and_after_it_forces() {
+        // Arrange
+        let t0 = Instant::now();
+        let (mut app, mut commands) = working(t0);
+
+        // Act
+        app.handle_key_at(ctrl_c(), t0);
+        app.handle_key_at(ctrl_c(), t0 + Duration::from_secs(1));
+        let early = sent(&mut commands);
+        app.handle_key_at(ctrl_c(), t0 + activity::STOP_TIMEOUT);
+        let forced = sent(&mut commands);
+        let after = wide_screen_at(&app, t0 + activity::STOP_TIMEOUT);
+
+        // Assert
+        assert_eq!(early, vec![LinkCommand::Cancel, LinkCommand::Cancel]);
+        assert_eq!(forced, vec![LinkCommand::ForceCancel]);
+        assert!(after.contains("Forcing stop"), "{after}");
+    }
+
+    #[test]
+    fn a_press_after_the_force_cancels_again_and_never_forces_twice() {
+        // Arrange
+        let t0 = Instant::now();
+        let (mut app, mut commands) = working(t0);
+        app.handle_key_at(ctrl_c(), t0);
+        app.handle_key_at(ctrl_c(), t0 + activity::STOP_TIMEOUT);
+        sent(&mut commands);
+
+        // Act
+        app.handle_key_at(ctrl_c(), t0 + 2 * activity::STOP_TIMEOUT);
+
+        // Assert
+        assert_eq!(sent(&mut commands), vec![LinkCommand::Cancel]);
+    }
+
+    #[test]
+    fn the_stop_state_goes_when_the_turn_ends_and_does_not_reach_the_next_turn() {
+        // Arrange
+        let t0 = Instant::now();
+        let (mut app, mut commands) = working(t0);
+        app.handle_key_at(ctrl_c(), t0);
+
+        // Act
+        app.handle_event_at(turn_ended(), t0 + Duration::from_secs(1));
+        let idle = wide_screen_at(&app, t0 + Duration::from_secs(2));
+        type_line(&mut app, "again");
+        sent(&mut commands);
+        let next = wide_screen_at(&app, Instant::now());
+
+        // Assert
+        assert!(!idle.contains("Stopping"), "{idle}");
+        assert!(next.contains("Working"), "{next}");
+        assert!(!next.contains("Stopping"), "{next}");
     }
 }

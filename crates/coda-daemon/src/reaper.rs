@@ -92,6 +92,20 @@ pub async fn reap_orphans(dir: &Path) -> ReapReport {
     reap_backends(dir, &Live).await
 }
 
+/// Kills the backend group recorded at `path`, for a stop that did not take. The pid
+/// must still be the process the record describes. The pidfile stays, since the turn
+/// that owns the backend removes it when it ends. Returns whether a group was killed.
+pub async fn kill_recorded(path: &Path) -> bool {
+    kill_recorded_with(path, &Live).await
+}
+
+async fn kill_recorded_with(path: &Path, procs: &impl Processes) -> bool {
+    match pidfile::read(path) {
+        Ok(record) => matches!(reconcile(procs, &record).await, Outcome::Killed),
+        Err(_) => false,
+    }
+}
+
 /// What the pidfiles in a directory say about the backends they record.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OrphanSurvey {
@@ -276,7 +290,7 @@ mod tests {
     use rustix::io::Errno;
     use rustix::process::Pid;
 
-    use super::{Processes, ReapReport, reap, reap_backends};
+    use super::{Processes, ReapReport, kill_recorded, reap, reap_backends};
     use crate::pidfile::{self, PidRecord, ProcessState};
     use crate::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
 
@@ -552,6 +566,48 @@ mod tests {
         // Assert
         assert_eq!(report.stale, 1);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_forced_stop_kills_the_recorded_group_and_leaves_the_pidfile_to_the_turn() {
+        // Arrange
+        let rig = Rig::new();
+        let (mut child, path) = rig.orphan("1.pid", |_| {}).await;
+
+        // Act
+        let killed = kill_recorded(&path).await;
+
+        // Assert
+        let status = tokio::time::timeout(WAIT, child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(killed);
+        assert!(!status.success());
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_forced_stop_spares_a_recycled_pid_and_a_missing_pidfile() {
+        // Arrange
+        let rig = Rig::new();
+        let (child, path) = rig
+            .orphan("1.pid", |record| record.process_name = "other".to_owned())
+            .await;
+
+        // Act
+        let recycled = kill_recorded(&path).await;
+        let missing = kill_recorded(&rig.run_dir().join("none.pid")).await;
+
+        // Assert
+        assert!(!recycled);
+        assert!(!missing);
+        assert!(
+            rustix::process::test_kill_process(
+                Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap()).unwrap()
+            )
+            .is_ok()
+        );
     }
 
     #[tokio::test]

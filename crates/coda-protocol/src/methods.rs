@@ -109,6 +109,9 @@ pub struct Capabilities {
     /// loop do; a backend without tool calls never does.
     #[serde(default)]
     pub tool_call_events: bool,
+    /// The daemon honors `force` on `session.cancel`.
+    #[serde(default)]
+    pub force_cancel: bool,
 }
 
 /// Result of [`INITIALIZE`].
@@ -188,6 +191,11 @@ pub type AgentRunResult = SessionSendResult;
 pub struct SessionCancelParams {
     /// Target session.
     pub session_id: SessionId,
+    /// Also kill the backend's process group at once, for a stop that did not
+    /// take. Only a daemon that reports `force_cancel` honors it; an older one
+    /// ignores it and cancels as usual.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
 }
 
 /// Result of [`SESSION_CANCEL`].

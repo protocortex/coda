@@ -480,6 +480,7 @@ async fn follow(
 async fn cancel_turn(client: &Client, session: &SessionId) -> bool {
     let params = SessionCancelParams {
         session_id: session.clone(),
+        force: false,
     };
     let cancelled: Result<SessionCancelResult, _> = client.request(SESSION_CANCEL, &params).await;
     match cancelled {

@@ -154,7 +154,7 @@ impl Dispatcher {
             }
             SESSION_SEND => turn::send(self.turns.as_ref(), params).await,
             AGENT_RUN => turn::run_agent(self.turns.as_ref(), params).await,
-            SESSION_CANCEL => turn::cancel(self.turns.as_ref(), params),
+            SESSION_CANCEL => turn::cancel(self.turns.as_ref(), params).await,
             SESSION_CLOSE => turn::close(self.turns.as_ref(), params).await,
             SESSION_SET_MODEL => registry::set_model(self.turns.as_ref(), params).await,
             PERMISSION_RESPOND => turn::respond(self.turns.as_ref(), params).await,
@@ -274,6 +274,7 @@ fn initialize(params: Option<Value>) -> HandlerFuture {
                 rate_limit_events: true,
                 usage_limit_events: true,
                 tool_call_events: true,
+                force_cancel: true,
             },
         })
     })
@@ -339,6 +340,7 @@ mod tests {
         assert_eq!(result["capabilities"]["rate_limit_events"], json!(true));
         assert_eq!(result["capabilities"]["usage_limit_events"], json!(true));
         assert_eq!(result["capabilities"]["tool_call_events"], json!(true));
+        assert_eq!(result["capabilities"]["force_cancel"], json!(true));
     }
 
     #[tokio::test]

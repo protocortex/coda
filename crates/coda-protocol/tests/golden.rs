@@ -94,6 +94,7 @@ golden_tests! {
     agent_run_params: "agent.run.params" => AgentRunParams,
     agent_run_result: "agent.run.result" => AgentRunResult,
     session_cancel_params: "session.cancel.params" => SessionCancelParams,
+    session_cancel_params_force: "session.cancel.params.force" => SessionCancelParams,
     session_cancel_result: "session.cancel.result" => SessionCancelResult,
     session_close_params: "session.close.params" => SessionCloseParams,
     session_close_result: "session.close.result" => SessionCloseResult,
