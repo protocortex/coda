@@ -323,6 +323,12 @@ pub struct PermissionRequestParams {
     /// the question. Empty for a tool call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+    /// What the backend or its model says the call is for, cut to 500
+    /// characters. Absent when it gave nothing, as coda's own loop does. A
+    /// client shows it apart from `command` and as a claim, since the text is
+    /// not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Parameters of [`PERMISSION_RESPOND`].

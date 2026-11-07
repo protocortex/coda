@@ -12,6 +12,8 @@ use std::time::Duration;
 use coda_protocol::events::{Event, InterruptCause, UsageWindowKind};
 use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TurnId};
 use rustix::process::{Pid, Signal, kill_process_group};
+use std::pin::pin;
+
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -24,6 +26,7 @@ use crate::claude_code::{
 use crate::emit::Emit;
 use crate::gate::PermissionGate;
 use crate::tool_call::{CallInfo, ToolCalls};
+use crate::tool_request::{ToolRequest, reason_from};
 
 /// Only flags proven against a live binary; `--permission-mode` is left out on purpose.
 const CLAUDE_FLAGS: &[&str] = &[
@@ -454,12 +457,28 @@ impl ClaudeSession {
         gate: &G,
         emit: &mut impl Emit,
     ) -> Result<Option<TurnOutcome>, AdapterError> {
-        let request = map_tool(&ask.tool_name, &ask.input, &self.cwd);
+        let request = ToolRequest {
+            reason: reason_from(ask.description.as_deref()),
+            ..map_tool(&ask.tool_name, &ask.input, &self.cwd)
+        };
         self.pending.insert(ask.request_id.clone(), ask.input);
-        let decision = tokio::select! {
-            decision = gate.request(&request) => decision,
-            () = cancelled(self.cancel.subscribe()) => {
-                return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await.map(Some);
+        let mut waiting = pin!(gate.request(&request));
+        let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+        // The read stays in the select so a process that dies while the user is
+        // deciding is seen at once, not after the answer.
+        let decision = loop {
+            tokio::select! {
+                decision = &mut waiting => break decision,
+                () = cancelled(self.cancel.subscribe()) => {
+                    return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await.map(Some);
+                }
+                read = self.stdout.read(&mut buffer) => {
+                    let read = read?;
+                    if read == 0 {
+                        return self.crashed(turn_id, emit).await.map(Some);
+                    }
+                    self.backlog.extend(self.parser.feed(&buffer[..read]));
+                }
             }
         };
         let allowed = matches!(

@@ -1679,6 +1679,7 @@ fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
             .and_then(Value::as_str)
             .map(str::to_owned),
         cwd: cwd.to_owned(),
+        reason: None,
     }
 }
 

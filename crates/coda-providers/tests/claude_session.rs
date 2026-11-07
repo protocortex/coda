@@ -169,6 +169,21 @@ async fn an_allowed_request_is_approved_and_the_turn_completes() {
 }
 
 #[tokio::test]
+async fn the_description_claude_gives_for_a_request_becomes_its_reason() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = FixedGate::new(PermissionDecision::AllowOnce);
+
+    // Act
+    turn(&mut session, &gate, "run ls").await;
+
+    // Assert
+    let seen = gate.seen.lock().unwrap();
+    assert_eq!(seen[0].reason.as_deref(), Some("List the files"));
+}
+
+#[tokio::test]
 async fn usage_and_rate_limit_reports_become_events() {
     // Arrange
     let fixture = Fixture::new();
@@ -366,6 +381,37 @@ async fn a_process_exit_mid_turn_emits_backend_crashed() {
         will_restart: false,
         detail: None,
     }));
+}
+
+#[tokio::test]
+async fn a_process_exit_while_a_permission_request_waits_emits_backend_crashed() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut session = ClaudeSession::spawn(fixture.spec(env(&[]))).unwrap();
+    let gate = PendingGate {
+        cancel_on_request: None,
+    };
+    let mut events = Vec::new();
+
+    // Act
+    let outcome = tokio::time::timeout(
+        TURN_TIMEOUT,
+        session.run_turn(&TurnId::new("t-1"), "askdie", &gate, &mut |event| {
+            events.push(event);
+        }),
+    )
+    .await
+    .expect("the turn kept waiting for an answer from a dead process")
+    .unwrap();
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Crashed { exit_code: Some(3) });
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::BackendCrashed { .. })),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]

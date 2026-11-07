@@ -115,6 +115,7 @@ fn pending_frame(pending: &PendingPermission) -> Result<Vec<u8>, HubError> {
             repo_path: pending.repo_path.clone(),
             command: pending.command.clone(),
             agent: pending.agent.clone(),
+            reason: None,
         },
     ))
 }
@@ -138,6 +139,7 @@ fn request_params(request: &RequestId, pending: &NewPending) -> PermissionReques
         command,
         agent: pending.agent.clone(),
         options,
+        reason: pending.reason.clone(),
     }
 }
 
@@ -761,6 +763,7 @@ mod tests {
                 repo_path: "/work".to_owned(),
                 command: command.to_owned(),
                 agent: None,
+                reason: None,
             }
         }
 

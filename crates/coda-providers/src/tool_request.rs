@@ -62,6 +62,17 @@ impl Tool {
     }
 }
 
+/// Most characters of a backend's reason that are kept.
+pub const MAX_REASON_CHARS: usize = 500;
+
+/// The reason a backend gave for a request, trimmed and cut to
+/// [`MAX_REASON_CHARS`]. Blank text gives `None`.
+#[must_use]
+pub fn reason_from(text: Option<&str>) -> Option<String> {
+    let trimmed = text?.trim();
+    (!trimmed.is_empty()).then(|| trimmed.chars().take(MAX_REASON_CHARS).collect())
+}
+
 /// One permission request, independent of the backend that raised it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRequest {
@@ -73,6 +84,8 @@ pub struct ToolRequest {
     pub command: Option<String>,
     /// Working directory the tool runs in.
     pub cwd: PathBuf,
+    /// Why the backend asks, in its own words, when it says.
+    pub reason: Option<String>,
 }
 
 #[cfg(test)]
@@ -105,6 +118,30 @@ mod tests {
             // Assert
             assert_eq!(name, expected);
         }
+    }
+
+    #[test]
+    fn a_reason_is_trimmed_and_blank_or_missing_text_gives_none() {
+        // Act
+        let kept = reason_from(Some("  May I?\n"));
+        let blank = reason_from(Some("  \n"));
+        let missing = reason_from(None);
+
+        // Assert
+        assert_eq!(kept.as_deref(), Some("May I?"));
+        assert_eq!((blank, missing), (None, None));
+    }
+
+    #[test]
+    fn a_long_reason_is_cut_on_a_character_boundary() {
+        // Arrange
+        let long = "é".repeat(MAX_REASON_CHARS + 10);
+
+        // Act
+        let kept = reason_from(Some(&long)).unwrap();
+
+        // Assert
+        assert_eq!(kept.chars().count(), MAX_REASON_CHARS);
     }
 
     #[test]

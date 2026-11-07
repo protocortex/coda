@@ -206,4 +206,8 @@ fn the_permission_request_schema_documents_the_command_and_names_the_agent() {
         properties["agent"]["description"].is_string(),
         "the schema has no documented agent field"
     );
+    assert!(
+        properties["reason"]["description"].is_string(),
+        "the schema has no documented reason field"
+    );
 }

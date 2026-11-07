@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use coda_protocol::events::{Event, TodoItem};
+use coda_protocol::events::{Event, InterruptCause, TodoItem};
 use coda_protocol::methods::{Capabilities, SessionStatus, SessionSummary};
 use coda_protocol::types::{BackendKind, SessionInfo};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -215,10 +215,17 @@ impl App {
             Event::Approve { request_id, .. }
             | Event::Deny { request_id, .. }
             | Event::Timeout { request_id, .. } => self.overlay.resolve(request_id),
-            Event::Result { .. } | Event::TurnInterrupted { .. } => self.turn_running = false,
+            Event::Result { .. } => self.turn_running = false,
+            Event::TurnInterrupted { cause, .. } => {
+                self.turn_running = false;
+                if *cause == Some(InterruptCause::BackendLost) {
+                    self.overlay.backend_gone();
+                }
+            }
             // A restart keeps the same turn going, so only a final crash ends it.
             Event::BackendCrashed { will_restart, .. } => {
                 self.turn_running &= *will_restart;
+                self.overlay.backend_gone();
             }
             _ => {}
         }
@@ -945,6 +952,7 @@ mod tests {
             command: "cargo test".to_owned(),
             agent: None,
             options: Vec::new(),
+            reason: None,
             truncated: false,
         })
     }
@@ -1191,6 +1199,50 @@ mod tests {
             will_restart,
             detail: None,
         })
+    }
+
+    fn backend_lost() -> LinkEvent {
+        LinkEvent::Session(Event::TurnInterrupted {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new("t-1"),
+            cause: Some(InterruptCause::BackendLost),
+        })
+    }
+
+    #[test]
+    fn a_cancelled_turn_does_not_claim_the_backend_process_is_gone() {
+        // Arrange
+        let (mut app, _commands) = armed();
+        app.handle_event(prompt("r-1"));
+
+        // Act
+        app.handle_event(turn_ended());
+        let shown = wide_screen(&app);
+
+        // Assert
+        assert!(!shown.contains("backend process is gone"), "{shown}");
+    }
+
+    #[test]
+    fn a_backend_that_crashes_or_is_interrupted_leaves_its_open_prompt_unanswerable() {
+        for gone in [crashed(false), backend_lost()] {
+            // Arrange
+            let (mut app, mut commands) = armed();
+            app.handle_event(prompt("r-1"));
+
+            // Act
+            app.handle_event(gone);
+            let shown = wide_screen(&app);
+            app.handle_key(key(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            ));
+
+            // Assert
+            assert!(shown.contains("backend process is gone"), "{shown}");
+            assert_eq!(sent(&mut commands), vec![]);
+        }
     }
 
     #[test]

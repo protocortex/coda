@@ -79,6 +79,8 @@ pub struct PendingNotice {
     pub command: String,
     /// The sub-agent that asks, or `None` for the session's own call.
     pub agent: Option<String>,
+    /// Why the backend asks, in its own words, when it says.
+    pub reason: Option<String>,
 }
 
 /// The canonical git root of `cwd`, or `cwd` itself canonicalized when it is
@@ -305,6 +307,7 @@ impl Broker {
                 tool: p.tool,
                 command: p.command,
                 agent: p.agent,
+                reason: p.reason,
             })
             .collect())
     }
@@ -426,6 +429,7 @@ impl Broker {
             target_paths: Vec::new(),
             command: Some(command),
             cwd: self.config.cwd.clone(),
+            reason: None,
         };
         let ask = Ask {
             request: &request,
@@ -522,10 +526,12 @@ impl Broker {
             repo_path: self.repo(),
             command: ask.text(),
             agent: ask.agent_name(),
+            reason: ask.request.reason.clone(),
         };
         let notice_tool = new.tool.clone();
         let command = new.command.clone();
         let agent = new.agent.clone();
+        let reason = new.reason.clone();
         let mut waiting = self.waiting.lock().await;
         let id = self
             .with_store(move |store| store.add_pending(&new))
@@ -545,6 +551,7 @@ impl Broker {
             tool: notice_tool,
             command,
             agent,
+            reason,
         });
         Ok((id, rx))
     }
@@ -565,6 +572,7 @@ impl Broker {
                 tool: ask.request.tool.name().to_owned(),
                 command: ask.text(),
                 agent: ask.agent_name(),
+                reason: ask.request.reason.clone(),
             });
             return PermissionDecision::Deny;
         }
@@ -858,6 +866,7 @@ mod tests {
                 target_paths: Vec::new(),
                 command: Some(command.to_owned()),
                 cwd: self.real("/ws/x"),
+                reason: None,
             }
         }
 
@@ -867,6 +876,7 @@ mod tests {
                 target_paths: vec![PathBuf::from(path)],
                 command: None,
                 cwd: self.real("/ws"),
+                reason: None,
             }
         }
 
@@ -919,6 +929,7 @@ mod tests {
                 .collect(),
             command: row.command.clone(),
             cwd: fixture.real(&row.cwd.to_string_lossy()),
+            reason: None,
         }
     }
 
@@ -967,6 +978,42 @@ mod tests {
             .unwrap()
             .unwrap();
         (notice, answered)
+    }
+
+    #[tokio::test]
+    async fn the_reason_a_backend_gives_reaches_the_notice_and_the_stored_request() {
+        // Arrange
+        let fixture = Fixture::new();
+        let broker = Arc::new(
+            fixture
+                .broker(fixture.config("/ws", PermissionMode::Prompt))
+                .await,
+        );
+        let request = ToolRequest {
+            reason: Some("May I run the tests?".to_owned()),
+            ..fixture.bash("cargo test")
+        };
+        let mut notices = broker.subscribe();
+        let asking = {
+            let broker = Arc::clone(&broker);
+            tokio::spawn(async move { broker.request(&request).await })
+        };
+
+        // Act
+        let notice = tokio::time::timeout(ANSWER_WAIT, notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = broker.pending().await.unwrap();
+        broker
+            .answer(&notice.id, PermissionDecision::Deny)
+            .await
+            .unwrap();
+        asking.await.unwrap();
+
+        // Assert
+        assert_eq!(notice.reason.as_deref(), Some("May I run the tests?"));
+        assert_eq!(stored[0].reason.as_deref(), Some("May I run the tests?"));
     }
 
     #[tokio::test]
@@ -1502,6 +1549,7 @@ mod tests {
             target_paths: vec![cwd.join(path)],
             command: None,
             cwd: cwd.clone(),
+            reason: None,
         };
 
         // Act
@@ -1519,6 +1567,7 @@ mod tests {
             target_paths: vec![target],
             command: None,
             cwd: cwd.to_path_buf(),
+            reason: None,
         }
     }
 
@@ -1801,6 +1850,7 @@ mod tests {
                     repo_path: "/ws".to_owned(),
                     command: "cargo test".to_owned(),
                     agent: None,
+                    reason: None,
                 })
                 .unwrap();
         });
@@ -1858,6 +1908,7 @@ mod tests {
             target_paths: Vec::new(),
             command: None,
             cwd: fixture.real("/ws"),
+            reason: None,
         };
 
         // Act

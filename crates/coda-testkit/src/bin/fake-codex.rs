@@ -459,6 +459,9 @@ mod app_server {
         if let Some(offered) = control_value("available_decisions") {
             params["availableDecisions"] = offered;
         }
+        if let Some(reason) = control_value("reason") {
+            params["reason"] = reason;
+        }
         let request = json!({"id": "approval-1", "method": method, "params": params});
         send(stream, &request)
     }

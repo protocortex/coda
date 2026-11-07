@@ -342,6 +342,7 @@ impl Announce {
             repo_path: self.repo.clone(),
             command: notice.command,
             agent: notice.agent,
+            reason: notice.reason,
         };
         if let Err(e) = self.hub.announce_pending(&turn, &notice.id, pending).await {
             warn!(session = %self.session, request = %notice.id, error = %e, "could not announce a permission request; denying it");
@@ -539,6 +540,7 @@ mod tests {
             target_paths: vec![PathBuf::from(path)],
             command: None,
             cwd: fixture.real(cwd),
+            reason: None,
         }
     }
 
@@ -555,6 +557,7 @@ mod tests {
                 .collect(),
             command: row.command.clone(),
             cwd: fixture.real(&row.cwd.to_string_lossy()),
+            reason: None,
         }
     }
 
@@ -793,6 +796,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_prompt_reaches_subscribers_with_the_reason_the_backend_gave() {
+        // Arrange
+        let fixture = Fixture::new();
+        let (record, broker) = fixture
+            .broker_waiting("/ws/x", Mode::Default, ANSWER_WAIT)
+            .await;
+        let gate = fixture.gate(&record, &broker);
+        let (conn, mut outbox) = fixture.hub.connect();
+        conn.subscribe(&record.id, Some(0), None).await.unwrap();
+        let mut notices = broker.subscribe();
+        let asking = tokio::spawn({
+            let request = ToolRequest {
+                reason: Some("May I change a.rs?".to_owned()),
+                ..edit(&fixture, "src/a.rs", "/ws")
+            };
+            async move { gate.request(&request).await }
+        });
+        let notice = tokio::time::timeout(ANSWER_WAIT, notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Act
+        let announced = tokio::time::timeout(ANSWER_WAIT, async {
+            loop {
+                let frame = outbox.events.recv().await.unwrap();
+                if let Ok(Message::Notification(n)) = decode_message(&frame[HEADER_LEN..])
+                    && n.method == PERMISSION_REQUEST_NOTIFICATION
+                {
+                    return n.params.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        fixture
+            .answer(&record, &notice.id, PermissionDecision::Deny)
+            .await;
+        asking.await.unwrap();
+
+        // Assert
+        assert_eq!(announced["reason"], "May I change a.rs?");
+    }
+
+    #[tokio::test]
     async fn an_answer_naming_another_sessions_request_is_refused() {
         // Arrange
         let fixture = Fixture::new();
@@ -858,6 +906,7 @@ mod tests {
                     repo_path: "/r".to_owned(),
                     command: "ls".to_owned(),
                     agent: None,
+                    reason: None,
                 })
             })
             .await

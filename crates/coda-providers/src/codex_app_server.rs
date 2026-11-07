@@ -46,7 +46,7 @@ use crate::codex_exec::{SandboxMode, SpawnHook};
 use crate::emit::Emit;
 use crate::gate::PermissionGate;
 use crate::tool_call::{ToolCalls, codex_call, codex_failed};
-use crate::tool_request::{Tool, ToolRequest};
+use crate::tool_request::{Tool, ToolRequest, reason_from};
 use crate::websocket::{
     FrameReader, Incoming, MAX_HEAD_BYTES, WsError, close_frame, parse_upgrade_response,
     pong_frame, text_frame, upgrade_request,
@@ -789,6 +789,7 @@ impl CodexAppServerSession {
             .map(PathBuf::from)
             .or_else(|| item.and_then(|item| item.cwd.clone()))
             .unwrap_or_else(|| self.cwd.clone());
+        let reason = reason_from(params["reason"].as_str());
         match method {
             "item/commandExecution/requestApproval" => Some(ToolRequest {
                 tool: Tool::Bash,
@@ -799,6 +800,7 @@ impl CodexAppServerSession {
                     .or_else(|| item.and_then(|item| item.command.clone()))
                     .filter(|command| !command.trim().is_empty()),
                 cwd,
+                reason,
             }),
             "item/fileChange/requestApproval" => Some(ToolRequest {
                 tool: Tool::Edit,
@@ -807,6 +809,7 @@ impl CodexAppServerSession {
                     .unwrap_or_default(),
                 command: None,
                 cwd,
+                reason,
             }),
             _ => None,
         }

@@ -258,6 +258,27 @@ async fn a_declined_command_approval_answers_decline_and_the_turn_reports_it() {
     assert_eq!(seen[0].command.as_deref(), Some("rm -rf build"));
 }
 
+#[tokio::test]
+async fn the_reason_codex_gives_for_an_approval_reaches_the_gate() {
+    // Arrange
+    let fixture = Fixture::new(&json!({"reason": "May I remove the build directory?"}));
+    let mut session = fixture.session().await;
+    let gate = FixedGate::new(PermissionDecision::Deny);
+
+    // Act
+    try_turn(&mut session, &gate, "approve-command")
+        .await
+        .0
+        .unwrap();
+
+    // Assert
+    let seen = gate.seen.lock().unwrap();
+    assert_eq!(
+        seen[0].reason.as_deref(),
+        Some("May I remove the build directory?")
+    );
+}
+
 /// Denies one command approval that offered `offered`; returns the answer the server saw.
 async fn denial_answer(offered: Value) -> Value {
     let fixture = Fixture::new(&json!({"available_decisions": offered}));
