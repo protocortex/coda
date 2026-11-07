@@ -10,8 +10,6 @@ use super::checkpoints::{checkpoints, git, repo_rig};
 use super::{Rig, relaxed};
 
 const NO_PERMISSION_TURN: &str = "tool-slow";
-/// A coverage run makes the fake backend write this file into the session folder.
-const COVERAGE_DATA: &str = ".profraw";
 
 async fn finished_turn(rig: &mut Rig, text: &str) {
     rig.send(text).await;
@@ -45,7 +43,6 @@ fn paths(answer: &Value) -> Vec<String> {
         .unwrap()
         .iter()
         .map(|file| file["path"].as_str().unwrap().to_owned())
-        .filter(|path| !path.ends_with(COVERAGE_DATA))
         .collect()
 }
 
