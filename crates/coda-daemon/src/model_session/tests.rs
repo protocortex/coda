@@ -1540,3 +1540,48 @@ async fn text_streamed_before_a_tool_call_is_stored_before_the_call() {
     );
     assert_eq!(rig.bodies("stream_delta").await[0]["text"], "looking");
 }
+
+/// How long the store stays busy while the loop streams text and asks.
+const SLOW_STORE: Duration = Duration::from_millis(400);
+
+#[tokio::test]
+async fn a_permission_request_is_stored_after_the_text_and_reply_before_it_with_a_slow_store() {
+    // Arrange
+    let mut asking = tool_turn(&[("c2", "bash", json!({"command": "true"}))]);
+    asking["events"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, json!({"type": "text_delta", "text": "about to run"}));
+    let mut rig = Rig::new(Mode::Default, &[read_turn(), asking, text_turn("done")]);
+    let log = rig.data.path().join(REQUEST_LOG);
+    let store = rig.hub.store_handle();
+    // The store goes busy as the second model call starts, so the text, the
+    // reply and the request all queue up behind it.
+    let busy = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while std::fs::read_to_string(&log).map_or(0, |lines| lines.lines().count()) < 2 {
+            assert!(started.elapsed() < WAIT, "the second model call never came");
+        }
+        let _held = store.lock().unwrap();
+        std::thread::sleep(SLOW_STORE);
+    });
+
+    // Act
+    rig.send("go").await;
+    let request = rig.wait_for_pending().await;
+    busy.join().unwrap();
+    rig.respond(&request, "allow_once").await;
+    rig.wait_for("result").await;
+    rig.wait_until_idle().await;
+
+    // Assert
+    let kinds: Vec<String> = rig.events().await.into_iter().map(|e| e.kind).collect();
+    let asked = kinds
+        .iter()
+        .position(|k| k == "permission_request")
+        .unwrap();
+    let before: Vec<&str> = kinds[..asked].iter().map(String::as_str).collect();
+    let replies = before.iter().filter(|k| **k == "assistant_message").count();
+    assert_eq!(replies, 2, "{kinds:?}");
+    assert!(before.contains(&"stream_delta"), "{kinds:?}");
+}
