@@ -151,6 +151,9 @@ pub struct Capabilities {
     /// The daemon serves `mode: queue` on `session.send` and `session.queue`.
     #[serde(default)]
     pub queued_sends: bool,
+    /// The daemon serves `mode: steer` on `session.send`.
+    #[serde(default)]
+    pub steer: bool,
 }
 
 /// Result of [`INITIALIZE`].
@@ -218,6 +221,10 @@ pub enum SendMode {
     /// client resumes it with [`SESSION_QUEUE`] or sends a new message that
     /// ends cleanly. A message queued with limits keeps them.
     Queue,
+    /// Add the message to the turn that is running, so the agent reads it before
+    /// it goes on. Refused when no turn is running or the backend cannot take
+    /// one. A message that reaches a turn as it ends may not be read.
+    Steer,
 }
 
 impl SendMode {
@@ -236,6 +243,9 @@ pub struct SessionSendResult {
     /// The message was queued and has not started.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub queued: bool,
+    /// The message was added to the running turn, which `turn_id` names.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub steered: bool,
 }
 
 /// Parameters of [`SESSION_QUEUE`].

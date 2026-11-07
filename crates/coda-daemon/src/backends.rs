@@ -24,6 +24,7 @@ use coda_providers::codex::{
 use coda_providers::detect::DetectedBinary;
 use coda_providers::emit::Emit;
 use coda_providers::gate::PermissionGate;
+use coda_providers::steer::SteerHandle;
 
 use crate::pidfile::{self, PidfileError};
 
@@ -314,6 +315,16 @@ impl AgentSession {
         match self {
             Self::Claude(session) => session.pid(),
             Self::Codex(session) => session.pid(),
+        }
+    }
+
+    /// A handle that adds a user message to the running turn. `None` for a
+    /// backend that cannot take one mid-turn.
+    #[must_use]
+    pub fn steer_handle(&self) -> Option<SteerHandle> {
+        match self {
+            Self::Claude(session) => Some(session.steer_handle()),
+            Self::Codex(session) => session.steer_handle(),
         }
     }
 

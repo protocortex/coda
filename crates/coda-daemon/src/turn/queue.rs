@@ -30,6 +30,8 @@ pub struct Sent {
     /// The turn started, or for a queued message the latest turn of the session.
     pub turn: TurnId,
     pub queued: bool,
+    /// The message was added to the running turn.
+    pub steered: bool,
 }
 
 impl Sent {
@@ -37,6 +39,7 @@ impl Sent {
         Self {
             turn,
             queued: false,
+            steered: false,
         }
     }
 }
@@ -93,7 +96,11 @@ impl Turns {
             .with_store(move |store| store.latest_turn(&id))
             .await?;
         let turn = latest.ok_or_else(|| TurnError::Busy(session))?;
-        Ok(Sent { turn, queued: true })
+        Ok(Sent {
+            turn,
+            queued: true,
+            steered: false,
+        })
     }
 
     /// Starts the next waiting message of `session` on its own task, once the

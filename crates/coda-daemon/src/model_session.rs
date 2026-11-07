@@ -23,6 +23,7 @@ use coda_core::history::{
 };
 pub use coda_core::history::{CONTEXT_OVERFLOW_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND};
 use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
+use coda_core::steer::SteerQueue;
 use coda_core::tools::{
     BaseToolsConfig, StoreOriginals, ToolsError, ask_schema, base_tools, refresh_index,
     task_schema, todo_schema,
@@ -42,7 +43,7 @@ use coda_providers::model::{ModelProvider, ModelRequest, ModelStream, ProviderEr
 use coda_providers::registry::{
     ANTHROPIC_KEY, ModelClient, ModelRegistry, OPENAI_COMPAT_KEY, RegistryError, provider_key,
 };
-use coda_store::{EventRecord, SessionRecord, StoreError};
+use coda_store::{EventRecord, NewQueued, SessionRecord, StoreError};
 use coda_tools::bash::{DEFAULT_ENV_ALLOWLIST, allowlisted_env};
 use coda_tools::{Tool, skill};
 use serde_json::{Value, json};
@@ -56,7 +57,8 @@ use crate::idle_pool::IdlePool;
 use crate::subscribe::{Hub, HubError};
 use crate::trace::backend_span;
 use crate::turn::{
-    DELTA_WINDOW, MAX_DELTA_CHUNK_BYTES, Reservation, TurnError, TurnState, Turns, store_event,
+    DELTA_WINDOW, MAX_DELTA_CHUNK_BYTES, Reservation, STEERED_FIELD, TurnError, TurnState, Turns,
+    USER_MESSAGE_KIND, store_event,
 };
 
 mod task;
@@ -281,6 +283,7 @@ impl ForceGate {
 impl Drop for Slot {
     fn drop(&mut self) {
         lock(&self.sessions.forces).remove(&self.session);
+        lock(&self.sessions.steers).remove(&self.session);
         let armed = self
             .sessions
             .running()
@@ -318,6 +321,8 @@ pub struct ModelSessions {
     children: Arc<task::ChildEnv>,
     /// Called with a session whose turn ended cleanly, once the session is free.
     on_clean_end: OnceLock<CleanEnd>,
+    /// Where a message steered into each running send goes.
+    steers: Mutex<HashMap<SessionId, SteerQueue>>,
 }
 
 /// What runs after a turn ends cleanly and frees its session.
@@ -369,6 +374,7 @@ impl ModelSessions {
             carried: Mutex::default(),
             children,
             on_clean_end: OnceLock::new(),
+            steers: Mutex::default(),
         })
     }
 
@@ -427,6 +433,7 @@ impl ModelSessions {
         let cancel = model_loop.turn_loop.cancel_token();
         cancel.reset();
         slot.arm((cancel, turn.clone()));
+        lock(&self.steers).insert(session.clone(), model_loop.turn_loop.steer_queue());
         self.keep_prompt(&session, &text).await;
         let span = backend_span(&session, &turn, backend_name(record.backend));
         let sessions = Arc::clone(self);
@@ -553,6 +560,21 @@ impl ModelSessions {
         log_failure(publish_kind(&self.hub, session, &turn, MODEL_SWITCHED_KIND, &body).await);
         let id = session.clone();
         Ok(self.hub.with_store(move |s| s.load_session(&id)).await?)
+    }
+
+    /// Adds `text` to the running send of `session` and returns its turn. `None`
+    /// when no send is running, or it is already ending.
+    pub(crate) fn steer(&self, session: &SessionId, text: &str) -> Option<TurnId> {
+        let turn = {
+            let running = self.running();
+            let reservation = running.get(session)?;
+            if reservation.state() != TurnState::Live {
+                return None;
+            }
+            reservation.armed().map(|(_, turn)| turn.clone())?
+        };
+        lock(&self.steers).get(session)?.push(text.to_owned());
+        Some(turn)
     }
 
     /// Cancels the running send of `session`; `false` when none is running.
@@ -984,6 +1006,31 @@ impl ModelSessions {
             .is_some_and(|section| section.text_tool_calls)
     }
 
+    /// Queues the steered messages the loop ended before reading, so each starts
+    /// as a turn of its own instead of being lost.
+    async fn requeue_unread_steers(&self, session: &SessionId, model_loop: &ModelLoop) {
+        lock(&self.steers).remove(session);
+        for text in model_loop.turn_loop.steer_queue().take() {
+            let (id, queued) = (session.clone(), text);
+            let stored = self
+                .hub
+                .with_store_mut(move |store| {
+                    store.enqueue_message(
+                        &id,
+                        NewQueued {
+                            text: &queued,
+                            max_turns: None,
+                            token_cap: None,
+                        },
+                    )
+                })
+                .await;
+            if let Err(error) = stored {
+                warn!(session = %session, %error, "could not queue a steered message the turn did not read");
+            }
+        }
+    }
+
     /// The named steps of a running send: drive the loop while storing its
     /// events, expire orphaned prompts, record the end.
     async fn run(
@@ -1036,6 +1083,7 @@ impl ModelSessions {
         if let Some(reservation) = self.running().get_mut(&session) {
             reservation.wind_down();
         }
+        self.requeue_unread_steers(&session, &model_loop).await;
         close_turn(&self.hub, &session, &turn, failed).await;
         self.keep_loop(session, model_loop);
         clean
@@ -1177,6 +1225,10 @@ async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Ro
                 body: tool_finished_body(tool, call_id, original.as_ref(), *is_error),
             }
         }
+        TurnEvent::Steered(text) => Row::Stored {
+            kind: USER_MESSAGE_KIND,
+            body: json!({ "text": text, STEERED_FIELD: true }),
+        },
         TurnEvent::ContextOverflow => Row::Stored {
             kind: CONTEXT_OVERFLOW_KIND,
             body: json!({}),
@@ -1417,6 +1469,7 @@ async fn publish_turn_event(
         // Stored above, as plain rows, or held by `StreamedText` for the usage that follows.
         TurnEvent::Context { .. }
         | TurnEvent::Assistant { .. }
+        | TurnEvent::Steered(_)
         | TurnEvent::ToolFinished { .. }
         | TurnEvent::ContextOverflow
         | TurnEvent::ModelFallback { .. }

@@ -36,7 +36,8 @@
 //! prompt it got under `prompts`, and in `stall` waits for `turn/interrupt`
 //! (`grandchild` parks instead, so only a kill ends it). `available_decisions` is
 //! sent with approval requests, `reject_turn_start` refuses `turn/start`, `hang_after_cancel` parks after a `cancel` answer,
-//! and `ignore_interrupt` makes the app-server park on `turn/interrupt`.
+//! and `ignore_interrupt` makes the app-server park on `turn/interrupt`. A `stall` turn also
+//! ends, completed, when it gets `turn/steer`, which it records under `steer_params`.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -446,6 +447,13 @@ mod app_server {
                     };
                     send(&mut stream, &reply)?;
                 }
+                "turn/steer" => {
+                    update_report("steer_params", params)?;
+                    send(
+                        &mut stream,
+                        &json!({"id": id, "result": {"turnId": "turn-1"}}),
+                    )?;
+                }
                 "turn/start" if control_value("reject_turn_start").is_some() => send(
                     &mut stream,
                     &json!({"id": id, "error": {"code": -32000, "message": "refused"}}),
@@ -547,6 +555,14 @@ mod app_server {
             let message = read_json(stream)?;
             if message["method"] == "turn/interrupt" {
                 return end_interrupted(stream, &message);
+            }
+            if message["method"] == "turn/steer" {
+                update_report("steer_params", &message["params"])?;
+                send(
+                    stream,
+                    &json!({"id": message["id"], "result": {"turnId": "turn-1"}}),
+                )?;
+                return complete(stream);
             }
         }
     }

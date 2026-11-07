@@ -147,10 +147,10 @@ async fn send(
             text: prompt,
             max_turns: args.max_turns,
             token_cap: args.token_cap,
-            mode: if args.queue {
-                SendMode::Queue
-            } else {
-                SendMode::Start
+            mode: match (args.queue, args.steer) {
+                (true, _) => SendMode::Queue,
+                (_, true) => SendMode::Steer,
+                _ => SendMode::Start,
             },
         };
         let sent: SessionSendResult = client.request(SESSION_SEND, &params).await?;
@@ -159,10 +159,15 @@ async fn send(
                 "session_id": session,
                 "turn_id": sent.turn_id,
                 "queued": sent.queued,
+                "steered": sent.steered,
             });
             writeln!(io.out, "{out}")?;
         } else {
-            let note = if sent.queued { " (queued)" } else { "" };
+            let note = match (sent.queued, sent.steered) {
+                (true, _) => " (queued)",
+                (_, true) => " (steered)",
+                _ => "",
+            };
             writeln!(io.out, "{}{note}", sent.turn_id)?;
         }
         return Ok(ExitCode::SUCCESS);

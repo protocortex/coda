@@ -189,6 +189,10 @@ pub struct SessionListArgs {
 }
 
 #[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is its own option on the command line"
+)]
 pub struct SessionSendArgs {
     /// The session to message.
     pub session: String,
@@ -202,6 +206,10 @@ pub struct SessionSendArgs {
     /// that turn ends, instead of refusing.
     #[arg(long, conflicts_with = "wait")]
     pub queue: bool,
+    /// Add the message to the turn that is running, so the agent reads it before
+    /// it goes on. Refused when no turn is running.
+    #[arg(long, conflicts_with_all = ["wait", "queue"])]
+    pub steer: bool,
     /// Print a JSON object instead of text.
     #[arg(long)]
     pub json: bool,
@@ -542,6 +550,8 @@ mod tests {
         };
         assert!(send.queue);
         assert!(refused.is_err());
+        let steer = Cli::try_parse_from(["coda", "session", "send", "s1", "--steer", "--queue"]);
+        assert!(steer.is_err());
     }
 
     #[test]

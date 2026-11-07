@@ -75,6 +75,7 @@ mod queue;
 mod restarts;
 mod resume;
 mod rewind;
+mod steer;
 
 struct Rig {
     sleeper: Arc<RecordingSleeper>,

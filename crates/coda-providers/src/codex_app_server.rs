@@ -51,6 +51,7 @@ use crate::codex_exec::{SandboxMode, SpawnHook};
 use crate::codex_limits::{self, READ_METHOD, UPDATED_METHOD};
 use crate::emit::Emit;
 use crate::gate::PermissionGate;
+use crate::steer::{self, SteerHandle, SteerInbox};
 use crate::tool_call::{ToolCalls, codex_call, codex_failed};
 use crate::tool_request::{Tool, ToolRequest, reason_from};
 use crate::websocket::{
@@ -92,6 +93,14 @@ const SERVER_DIED_DETAIL: &str =
     "the Codex app-server exited during the turn; the next turn starts a new server";
 const INTERRUPT_METHOD: &str = "turn/interrupt";
 const ACCOUNT_METHOD: &str = "account/read";
+
+/// What a wait for the server's next message ended with.
+enum Wait {
+    Message(Message),
+    Ended,
+    TimedOut,
+}
+const STEER_METHOD: &str = "turn/steer";
 /// How long a server gets to end an interrupted or cancelled turn before its group is killed.
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -313,6 +322,9 @@ pub struct CodexAppServerSession {
     reader: FrameReader,
     socket_dir: tempfile::TempDir,
     cancel: Arc<watch::Sender<bool>>,
+    steer: SteerHandle,
+    /// Taken for the length of a turn, so the turn can wait on it.
+    steer_inbox: Option<SteerInbox>,
     session_id: SessionId,
     cwd: PathBuf,
     thread_id: String,
@@ -376,12 +388,15 @@ impl CodexAppServerSession {
             message
         });
         guard.0 = None;
+        let (steer, steer_inbox) = steer::channel();
         Ok(Self {
             child: Some(child),
             stream,
             reader,
             socket_dir,
             cancel: Arc::new(watch::channel(false).0),
+            steer,
+            steer_inbox: Some(steer_inbox),
             tool_calls: ToolCalls::new(spec.session_id.clone()),
             session_id: spec.session_id,
             cwd: spec.cwd,
@@ -456,6 +471,13 @@ impl CodexAppServerSession {
         CancelHandle::new(Arc::clone(&self.cancel))
     }
 
+    /// A handle that adds a user message to the running turn from another task,
+    /// sent to the server as `turn/steer`.
+    #[must_use]
+    pub fn steer_handle(&self) -> SteerHandle {
+        self.steer.clone()
+    }
+
     /// The server's process id, until it has been reaped.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
@@ -517,9 +539,18 @@ impl CodexAppServerSession {
             return Ok(TurnOutcome::Cancelled);
         }
         let cancel = self.cancel.subscribe();
-        let result = tokio::select! {
-            result = self.drive(turn_id, text, gate, emit) => result,
-            () = cancelled(cancel) => return self.interrupted(turn_id, emit).await,
+        let mut inbox = self
+            .steer_inbox
+            .take()
+            .unwrap_or_else(|| steer::channel().1);
+        steer::clear(&mut inbox);
+        let driven = tokio::select! {
+            result = self.drive(turn_id, text, gate, emit, &mut inbox) => Some(result),
+            () = cancelled(cancel) => None,
+        };
+        self.steer_inbox = Some(inbox);
+        let Some(result) = driven else {
+            return self.interrupted(turn_id, emit).await;
         };
         match result {
             Ok(Some(outcome)) => Ok(outcome),
@@ -562,6 +593,7 @@ impl CodexAppServerSession {
         text: &str,
         gate: &G,
         emit: &mut impl Emit,
+        inbox: &mut SteerInbox,
     ) -> Result<Option<TurnOutcome>, AppServerError> {
         self.plan.hit = None;
         self.plan.stopped = false;
@@ -586,22 +618,25 @@ impl CodexAppServerSession {
         self.context = None;
         // Set once a `cancel` answer promised that the server ends the turn.
         let mut deadline: Option<Instant> = None;
+        // Messages to steer in, held until the server has named the turn.
+        let mut steers: Vec<String> = Vec::new();
         loop {
-            let message = match deadline {
-                None => self.next_message().await?,
-                Some(deadline) => {
-                    if let Ok(message) = timeout_at(deadline, self.next_message()).await {
-                        message?
-                    } else {
+            let message = tokio::select! {
+                message = self.next_before(deadline) => match message? {
+                    Wait::Message(message) => message,
+                    Wait::TimedOut => {
                         warn!("the Codex app-server did not end the cancelled turn; killing it");
                         self.stop().await?;
                         emit.emit(self.result(turn_id, true)).await;
                         return Ok(Some(TurnOutcome::Completed { is_error: true }));
                     }
+                    Wait::Ended => return Ok(None),
+                },
+                Some(text) = inbox.recv() => {
+                    steers.push(text);
+                    self.send_steers(&mut steers).await?;
+                    continue;
                 }
-            };
-            let Some(message) = message else {
-                return Ok(None);
             };
             gate.progress();
             match message {
@@ -631,6 +666,7 @@ impl CodexAppServerSession {
                 } if id == turn_request => {
                     self.server_turn = result["turn"]["id"].as_str().map(str::to_owned);
                     self.turn_accepted = true;
+                    self.send_steers(&mut steers).await?;
                 }
                 Message::Response {
                     id, failed: true, ..
@@ -648,6 +684,35 @@ impl CodexAppServerSession {
                 Message::Response { .. } => {}
             }
         }
+    }
+
+    /// The next message, unless the connection ends or `deadline` passes first.
+    async fn next_before(&mut self, deadline: Option<Instant>) -> Result<Wait, AppServerError> {
+        let next = match deadline {
+            None => self.next_message().await,
+            Some(deadline) => match timeout_at(deadline, self.next_message()).await {
+                Ok(next) => next,
+                Err(_) => return Ok(Wait::TimedOut),
+            },
+        };
+        Ok(next?.map_or(Wait::Ended, Wait::Message))
+    }
+
+    /// Sends each waiting steer message as `turn/steer`, once the turn has an id.
+    /// The server refuses one that arrives after its turn ended; that is ignored.
+    async fn send_steers(&mut self, steers: &mut Vec<String>) -> Result<(), AppServerError> {
+        let Some(turn) = self.server_turn.clone() else {
+            return Ok(());
+        };
+        for text in steers.drain(..) {
+            let params = json!({
+                "threadId": self.thread_id,
+                "expectedTurnId": turn,
+                "input": [{"type": "text", "text": text}],
+            });
+            self.send_request(STEER_METHOD, params).await?;
+        }
+        Ok(())
     }
 
     /// Reports a limits snapshot, and remembers it when it says a window ran out.

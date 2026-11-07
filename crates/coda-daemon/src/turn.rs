@@ -55,10 +55,12 @@ mod drive;
 mod mode;
 mod queue;
 mod rewind;
+mod steer;
 
 use self::drive::Drive;
 pub use self::queue::Sent;
 pub(crate) use self::queue::session_queue;
+pub(crate) use self::steer::STEERED_FIELD;
 use crate::checkpoint;
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
 use crate::gate::{BrokerGate, Brokers};
@@ -313,6 +315,7 @@ impl TurnSlot {
 impl Drop for TurnSlot {
     fn drop(&mut self) {
         self.turns.running().remove(&self.session);
+        self.turns.steers().remove(&self.session);
     }
 }
 
@@ -327,6 +330,8 @@ pub struct Turns {
     running: Mutex<HashMap<SessionId, Reservation<CancelHandle>>>,
     /// The backends' own session ids, so the next turn resumes the conversation.
     backend_ids: Mutex<HashMap<SessionId, String>>,
+    /// Where a message steered into each running agent turn goes.
+    steers: Mutex<HashMap<SessionId, steer::AgentSteer>>,
     /// The event queue of each running turn, to count what is waiting.
     queues: Mutex<HashMap<SessionId, mpsc::WeakSender<Queued>>>,
     /// Held while a queued message is read, started and removed.
@@ -377,6 +382,7 @@ impl Turns {
             running: Mutex::default(),
             backend_ids: Mutex::default(),
             queues: Mutex::default(),
+            steers: Mutex::default(),
             queue_gate: tokio::sync::Mutex::new(()),
             idle: IdlePool::new(MAX_IDLE_SERVERS),
             supervisor,
@@ -402,6 +408,7 @@ impl Turns {
         match params.mode {
             SendMode::Start => self.send_now(params).await.map(Sent::started),
             SendMode::Queue => self.send_queued(params).await,
+            SendMode::Steer => self.send_steer(params).await,
         }
     }
 
@@ -528,6 +535,13 @@ impl Turns {
             Arc::new(Mutex::new(turn.clone())),
         );
         slot.arm(cancel);
+        self.steers().insert(
+            session_id.clone(),
+            steer::AgentSteer {
+                turn: turn.clone(),
+                handle: child.steer_handle(),
+            },
+        );
         let job = Job {
             record,
             session: session_id,
@@ -1446,6 +1460,7 @@ pub(crate) async fn send(turns: Option<&Arc<Turns>>, params: Option<Value>) -> H
     to_value(&SessionSendResult {
         turn_id: sent.turn,
         queued: sent.queued,
+        steered: sent.steered,
     })
 }
 
@@ -1459,6 +1474,7 @@ pub(crate) async fn run_agent(turns: Option<&Arc<Turns>>, params: Option<Value>)
     to_value(&AgentRunResult {
         turn_id,
         queued: false,
+        steered: false,
     })
 }
 

@@ -195,6 +195,10 @@ impl<'a, E: Emit> Drive<'a, E> {
         if let Some(reservation) = self.turns.running().get_mut(&self.record.id) {
             reservation.rearm(cancel.clone());
         }
+        // A steer must reach the new child, not the one that crashed.
+        if let Some(target) = self.turns.steers().get_mut(&self.record.id) {
+            target.handle = self.child.steer_handle();
+        }
         // A cancel that landed after the check above hit the old handle, so hand it on.
         if stopped() {
             cancel.cancel();

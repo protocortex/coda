@@ -21,6 +21,7 @@ use coda_providers::claude_session::{CancelHandle, ENV_ALLOWLIST, TurnOutcome};
 use coda_providers::codex_app_server::{AppServerError, AppServerSpec, CodexAppServerSession};
 use coda_providers::codex_exec::SandboxMode;
 use coda_providers::gate::PermissionGate;
+use coda_providers::steer::SteerHandle;
 use coda_providers::tool_request::{Tool, ToolRequest};
 use serde_json::{Value, json};
 
@@ -841,6 +842,58 @@ async fn a_cancel_interrupts_the_turn_and_the_server_takes_the_next_one() {
     assert_eq!(fixture.report()["interrupt_params"]["turnId"], "turn-1");
     assert_eq!(next, TurnOutcome::Completed { is_error: false });
     assert_eq!(session.pid(), pid);
+}
+
+fn steer_once_prompted(fixture: &Fixture, handle: SteerHandle) -> tokio::task::JoinHandle<bool> {
+    let report = fixture.cwd.path().join(REPORT_FILE);
+    tokio::spawn(async move {
+        loop {
+            let prompted = fs::read_to_string(&report)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .is_some_and(|value| value["prompts"].is_array());
+            if prompted {
+                return handle.steer("and use tabs");
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_steer_is_sent_to_the_running_turn_by_its_id() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+    let steering = steer_once_prompted(&fixture, session.steer_handle());
+
+    // Act
+    let (outcome, _) = turn(&mut session, "stall").await;
+
+    // Assert
+    assert!(steering.await.unwrap());
+    assert_eq!(outcome, TurnOutcome::Completed { is_error: false });
+    let sent = &fixture.report()["steer_params"];
+    assert_eq!(sent["expectedTurnId"], "turn-1");
+    assert_eq!(sent["threadId"], "fake-thread-1");
+    assert_eq!(sent["input"][0]["text"], "and use tabs");
+}
+
+#[tokio::test]
+async fn a_steer_sent_between_turns_is_not_carried_into_the_next_one() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+    assert!(session.steer_handle().steer("too early"));
+
+    // Act
+    let (outcome, _) = turn(&mut session, "plain").await;
+    let (after, _) = turn(&mut session, "after").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Completed { is_error: false });
+    assert_eq!(after, TurnOutcome::Completed { is_error: false });
+    assert!(fixture.report()["steer_params"].is_null());
 }
 
 #[tokio::test]
