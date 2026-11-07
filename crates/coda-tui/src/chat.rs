@@ -15,6 +15,8 @@ use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::work::Fold;
+
 const USER_PREFIX: &str = "you: ";
 const NOTICE_PREFIX: &str = "! ";
 const DROPPED_MARKER: &str = "[older messages dropped]";
@@ -23,18 +25,32 @@ const MAX_ENTRIES: usize = 1000;
 /// Text bytes kept across all entries; the newest entry always stays.
 const MAX_BYTES: usize = 1024 * 1024;
 const TAB_WIDTH: usize = 4;
+const EXPAND_HINT: &str = "(ctrl+o to expand)";
+const DETAIL_INDENT: &str = "  ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Entry {
     User(String),
-    Assistant { turn: TurnId, text: String },
+    Assistant {
+        turn: TurnId,
+        text: String,
+    },
     Notice(String),
+    /// A settled turn's work as one line, with a line per call behind it.
+    Fold {
+        line: String,
+        details: Vec<String>,
+        expanded: bool,
+    },
 }
 
 impl Entry {
     fn text_len(&self) -> usize {
         match self {
             Self::User(text) | Self::Notice(text) | Self::Assistant { text, .. } => text.len(),
+            Self::Fold { line, details, .. } => {
+                line.len() + details.iter().map(String::len).sum::<usize>()
+            }
         }
     }
 
@@ -43,6 +59,21 @@ impl Entry {
             Self::User(text) => format!("{USER_PREFIX}{text}"),
             Self::Assistant { text, .. } => text.clone(),
             Self::Notice(text) => format!("{NOTICE_PREFIX}{text}"),
+            Self::Fold {
+                line,
+                details,
+                expanded,
+            } => match (*expanded, details.is_empty()) {
+                (_, true) => line.clone(),
+                (false, false) => format!("{line} {EXPAND_HINT}"),
+                (true, false) => {
+                    let calls: Vec<_> = details
+                        .iter()
+                        .map(|detail| format!("{DETAIL_INDENT}{detail}"))
+                        .collect();
+                    format!("{line}\n{}", calls.join("\n"))
+                }
+            },
         }
     }
 }
@@ -103,6 +134,32 @@ impl Chat {
     pub fn push_notice(&mut self, text: impl Into<String>) {
         self.push(Entry::Notice(text.into()));
         self.top.set(None);
+    }
+
+    /// Adds a settled turn's work, folded into one line.
+    pub fn push_fold(&mut self, fold: Fold) {
+        self.push(Entry::Fold {
+            line: fold.line,
+            details: fold.details,
+            expanded: false,
+        });
+    }
+
+    /// Expands the newest fold, or folds it again.
+    pub fn toggle_fold(&mut self) {
+        let newest = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|slot| matches!(slot.entry, Entry::Fold { .. }));
+        if let Some(Slot {
+            entry: Entry::Fold { expanded, .. },
+            wrapped,
+        }) = newest
+        {
+            *expanded = !*expanded;
+            *wrapped.get_mut() = None;
+        }
     }
 
     /// Forgets everything shown, for a different session.
@@ -392,6 +449,73 @@ mod tests {
 
         // Assert
         assert_eq!(draw(&chat, WIDTH, HEIGHT).trim(), "");
+    }
+
+    fn fold() -> Fold {
+        Fold {
+            line: "Worked for 3s: ran 2 commands".to_owned(),
+            details: vec!["Bash: ls".to_owned(), "Bash: pwd (failed)".to_owned()],
+        }
+    }
+
+    #[test]
+    fn a_fold_shows_its_line_and_the_key_to_expand_it() {
+        // Arrange
+        let mut chat = Chat::new();
+
+        // Act
+        chat.push_fold(fold());
+
+        // Assert
+        let shown = draw(&chat, 60, HEIGHT);
+        assert!(
+            shown.contains("Worked for 3s: ran 2 commands (ctrl+o to expand)"),
+            "{shown}"
+        );
+        assert!(!shown.contains("Bash: ls"), "{shown}");
+    }
+
+    #[test]
+    fn expanding_the_newest_fold_lists_its_calls_and_collapsing_hides_them() {
+        // Arrange
+        let mut chat = Chat::new();
+        chat.push_fold(fold());
+
+        // Act
+        chat.toggle_fold();
+        let open = draw(&chat, 60, HEIGHT);
+        chat.toggle_fold();
+        let closed = draw(&chat, 60, HEIGHT);
+
+        // Assert
+        assert!(open.contains("  Bash: ls"), "{open}");
+        assert!(open.contains("  Bash: pwd (failed)"), "{open}");
+        assert!(!open.contains("ctrl+o"), "{open}");
+        assert!(!closed.contains("Bash: ls"), "{closed}");
+    }
+
+    #[test]
+    fn toggling_with_no_fold_does_nothing() {
+        let mut chat = Chat::new();
+        chat.push_user("hi");
+
+        chat.toggle_fold();
+
+        assert!(draw(&chat, 20, HEIGHT).contains("you: hi"));
+    }
+
+    #[test]
+    fn a_fold_with_no_calls_has_nothing_to_expand() {
+        let mut chat = Chat::new();
+        chat.push_fold(Fold {
+            line: "Worked".to_owned(),
+            details: Vec::new(),
+        });
+
+        let shown = draw(&chat, 60, HEIGHT);
+
+        assert!(shown.contains("Worked"), "{shown}");
+        assert!(!shown.contains("ctrl+o"), "{shown}");
     }
 
     #[test]

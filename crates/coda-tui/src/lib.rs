@@ -11,6 +11,7 @@ pub mod permission;
 pub mod sessions;
 pub mod status;
 pub mod terminal;
+pub mod work;
 
 #[cfg(test)]
 mod test_support;

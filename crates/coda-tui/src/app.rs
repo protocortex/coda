@@ -19,6 +19,7 @@ use crate::input::Input;
 use crate::permission::{Overlay, PermissionPrompt};
 use crate::sessions::LinkCommand;
 use crate::status::Status;
+use crate::work::WorkLog;
 
 const TITLE: &str = " coda (/quit to exit) ";
 /// How long after an idle Ctrl+C a second one still quits.
@@ -80,6 +81,7 @@ pub struct App {
     overlay: Overlay,
     link: Option<UnboundedSender<LinkCommand>>,
     turn_running: bool,
+    work: WorkLog,
     setup_shown: bool,
     user_commands: UserCommands,
     quit: bool,
@@ -99,6 +101,7 @@ impl App {
             overlay: Overlay::default(),
             link: None,
             turn_running: false,
+            work: WorkLog::new(),
             setup_shown: false,
             user_commands: UserCommands::default(),
             quit: false,
@@ -152,6 +155,10 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: LinkEvent) {
+        self.handle_event_at(event, Instant::now());
+    }
+
+    fn handle_event_at(&mut self, event: LinkEvent, now: Instant) {
         match event {
             LinkEvent::Connected => self.connection = ConnectionState::Connected,
             LinkEvent::Failed(reason) => self.connection = ConnectionState::Failed(reason),
@@ -159,14 +166,16 @@ impl App {
                 self.connection = ConnectionState::Disconnected(reason);
                 self.overlay = Overlay::default();
                 self.turn_running = false;
+                self.work.reset();
             }
-            LinkEvent::Session(event) => self.apply_session_event(&event),
+            LinkEvent::Session(event) => self.apply_session_event(&event, now),
             LinkEvent::Permission(prompt) => self.overlay.push(prompt, Instant::now()),
             LinkEvent::SessionStarted(info) => {
                 self.chat.clear();
                 self.status.set_session(info.backend, info.model);
                 self.overlay = Overlay::default();
                 self.turn_running = false;
+                self.work.reset();
             }
             LinkEvent::ModelSwitched(info) => {
                 self.chat.push_notice(format!(
@@ -183,7 +192,7 @@ impl App {
         }
     }
 
-    fn apply_session_event(&mut self, event: &Event) {
+    fn apply_session_event(&mut self, event: &Event, now: Instant) {
         match event {
             Event::Approve { request_id, .. }
             | Event::Deny { request_id, .. }
@@ -197,6 +206,14 @@ impl App {
         }
         self.chat.apply(event);
         self.status.apply(event);
+        if let Some(fold) = self.work.apply(event, now) {
+            self.chat.push_fold(fold);
+        }
+    }
+
+    /// The live line, when a tool runs or a prompt waits for an answer.
+    fn work_line(&self, now: Instant) -> Option<String> {
+        self.work.live(now, self.overlay.is_active())
     }
 
     /// Sends to the daemon link. A dead link can no longer answer prompts or
@@ -240,6 +257,8 @@ impl App {
             if lost || self.input.text().is_empty() {
                 self.quit = true;
             }
+        } else if ctrl && key.code == KeyCode::Char('o') {
+            self.chat.toggle_fold();
         } else if key.code == KeyCode::Esc {
             self.input.clear();
         } else {
@@ -307,6 +326,10 @@ impl App {
     /// Sends `text` as the user's message. `typed` is what to restore to the
     /// input when the link is closed, so it can be sent again.
     fn send_message(&mut self, text: &str, typed: &str) {
+        // A send while a turn runs is refused by the daemon, so it must not reset the turn's log.
+        if !self.turn_running {
+            self.work.begin(Instant::now());
+        }
         self.turn_running = true;
         if !self.send(LinkCommand::Send(text.to_owned())) {
             self.input.handle_paste(typed);
@@ -379,8 +402,10 @@ impl App {
     }
 
     fn render_at(&self, frame: &mut Frame, now: Instant) {
-        let [body, input, connection, status] = Layout::vertical([
+        let live = self.work_line(now);
+        let [body, live_row, input, connection, status] = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(u16::from(live.is_some())),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -390,6 +415,9 @@ impl App {
         let transcript = block.inner(body);
         frame.render_widget(block, body);
         self.chat.render(frame, transcript);
+        if let Some(live) = live {
+            frame.render_widget(Paragraph::new(live), live_row);
+        }
         self.input.render(frame, input);
         frame.render_widget(Paragraph::new(self.connection_text(now)), connection);
         self.status.render(frame, status);
@@ -436,6 +464,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use coda_protocol::events::ToolCallStatus;
     use coda_protocol::methods::{SessionStatus, SessionSummary};
     use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -1476,5 +1505,179 @@ mod tests {
         // Assert
         assert!(by_ctrl_c.should_quit());
         assert!(by_command.should_quit());
+    }
+
+    fn tool_event(id: &str, name: &str, summary: &str, status: ToolCallStatus) -> LinkEvent {
+        LinkEvent::Session(Event::ToolCall {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new("t-1"),
+            id: id.to_owned(),
+            name: name.to_owned(),
+            summary: Some(summary.to_owned()),
+            status,
+        })
+    }
+
+    fn turn_result() -> LinkEvent {
+        LinkEvent::Session(Event::Result {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new("t-1"),
+            is_error: false,
+        })
+    }
+
+    #[test]
+    fn the_running_tool_shows_on_a_live_line_with_its_time() {
+        // Arrange
+        let mut app = App::new();
+        let t0 = Instant::now();
+
+        // Act
+        app.handle_event_at(
+            tool_event("1", "Bash", "cargo test", ToolCallStatus::Started),
+            t0,
+        );
+        let shown = screen_at(&app, t0 + Duration::from_secs(12));
+
+        // Assert
+        assert!(shown.contains("running cargo test 12s"), "{shown}");
+    }
+
+    #[test]
+    fn the_live_line_goes_when_the_tool_ends() {
+        // Arrange
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle_event_at(tool_event("1", "Bash", "ls", ToolCallStatus::Started), t0);
+
+        // Act
+        app.handle_event_at(tool_event("1", "Bash", "ls", ToolCallStatus::Succeeded), t0);
+
+        // Assert
+        let shown = screen_at(&app, t0 + Duration::from_secs(5));
+        assert!(!shown.contains("running"), "{shown}");
+    }
+
+    #[test]
+    fn a_settled_turn_folds_into_one_line_in_the_transcript() {
+        // Arrange
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle_event_at(tool_event("1", "Bash", "ls", ToolCallStatus::Started), t0);
+        app.handle_event_at(tool_event("1", "Bash", "ls", ToolCallStatus::Succeeded), t0);
+        app.handle_event_at(tool_event("2", "Edit", "a.rs", ToolCallStatus::Started), t0);
+        app.handle_event_at(
+            tool_event("2", "Edit", "a.rs", ToolCallStatus::Succeeded),
+            t0,
+        );
+
+        // Act
+        app.handle_event_at(turn_result(), t0 + Duration::from_secs(192));
+
+        // Assert
+        let shown = screen_at(&app, t0 + Duration::from_secs(192));
+        assert!(
+            shown.contains("Worked for 3m 12s: ran 1 command"),
+            "{shown}"
+        );
+        assert!(shown.contains("ctrl+o to expand"), "{shown}");
+    }
+
+    #[test]
+    fn ctrl_o_expands_the_fold_and_again_folds_it() {
+        // Arrange
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle_event_at(
+            tool_event("1", "Bash", "ls -la", ToolCallStatus::Started),
+            t0,
+        );
+        app.handle_event_at(
+            tool_event("1", "Bash", "ls -la", ToolCallStatus::Succeeded),
+            t0,
+        );
+        app.handle_event_at(turn_result(), t0);
+        let ctrl_o = key(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        );
+
+        // Act
+        app.handle_key(ctrl_o);
+        let open = screen(&app);
+        app.handle_key(ctrl_o);
+        let closed = screen(&app);
+
+        // Assert
+        assert!(open.contains("Bash: ls -la"), "{open}");
+        assert!(!closed.contains("Bash: ls -la"), "{closed}");
+        assert_eq!(app.input.text(), "");
+    }
+
+    #[test]
+    fn a_pending_approval_shows_a_wait_and_no_fold() {
+        // Arrange
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle_event_at(tool_event("1", "Bash", "rm x", ToolCallStatus::Started), t0);
+
+        // Act
+        app.handle_event_at(prompt("r-1"), t0);
+        let waiting = app.work_line(t0 + Duration::from_secs(30));
+
+        // Assert
+        assert_eq!(waiting.as_deref(), Some("waiting for approval"));
+    }
+
+    #[test]
+    fn an_interrupted_turn_says_stopped_and_never_finished() {
+        // Arrange
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle_event_at(
+            tool_event("1", "Bash", "sleep 9", ToolCallStatus::Started),
+            t0,
+        );
+
+        // Act
+        app.handle_event_at(turn_ended(), t0 + Duration::from_secs(3));
+
+        // Assert
+        let shown = screen_at(&app, t0 + Duration::from_secs(3));
+        assert!(shown.contains("Stopped after 3s: 1 cut short"), "{shown}");
+        assert!(!shown.contains("finished"), "{shown}");
+    }
+
+    #[test]
+    fn a_message_sent_during_a_turn_keeps_the_work_so_far() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        type_line(&mut app, "go");
+        let t0 = Instant::now();
+        app.handle_event_at(tool_event("1", "Bash", "ls", ToolCallStatus::Started), t0);
+
+        // Act
+        type_line(&mut app, "again");
+
+        // Assert
+        assert_eq!(
+            app.work_line(t0 + Duration::from_secs(2)).as_deref(),
+            Some("running ls 2s")
+        );
+    }
+
+    #[test]
+    fn a_new_session_drops_the_work_of_the_old_one() {
+        // Arrange
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle_event_at(tool_event("1", "Bash", "ls", ToolCallStatus::Started), t0);
+
+        // Act
+        app.handle_event_at(LinkEvent::SessionStarted(session("s-2")), t0);
+
+        // Assert
+        assert_eq!(app.work_line(t0), None);
     }
 }
