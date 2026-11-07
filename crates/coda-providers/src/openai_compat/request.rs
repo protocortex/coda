@@ -159,6 +159,7 @@ mod tests {
         let settings = RequestSettings {
             model: "m".to_owned(),
             max_tokens: LIMIT,
+            thinking_budget_tokens: None,
             system: String::new(),
             tools: Vec::new(),
         };

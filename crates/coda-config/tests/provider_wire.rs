@@ -8,6 +8,10 @@ fn section(body: &str) -> String {
     format!("[providers.local]\nenabled = true\n{body}")
 }
 
+fn anthropic_section(body: &str) -> String {
+    format!("[providers.anthropic]\nenabled = true\n{body}")
+}
+
 #[test]
 fn unset_keys_keep_the_built_in_wire_shape() {
     // Arrange
@@ -92,4 +96,69 @@ fn a_zero_output_limit_is_refused_naming_the_key() {
             if path == "providers.local.max_output_tokens"),
         "{err}"
     );
+}
+
+#[test]
+fn a_thinking_budget_is_parsed_and_unset_by_default() {
+    // Arrange
+    let set = section("thinking_budget_tokens = 2048\n");
+    let unset = section("");
+
+    // Act
+    let set = Config::from_toml_str(&set).unwrap().config;
+    let unset = Config::from_toml_str(&unset).unwrap().config;
+
+    // Assert
+    assert_eq!(set.providers["local"].thinking_budget_tokens, Some(2048));
+    assert_eq!(unset.providers["local"].thinking_budget_tokens, None);
+}
+
+#[test]
+fn a_thinking_budget_must_be_at_least_the_minimum_and_below_the_output_limit() {
+    let cases = [
+        "thinking_budget_tokens = 1023\n",
+        "thinking_budget_tokens = 8192\n",
+        "max_output_tokens = 4096\nthinking_budget_tokens = 4096\n",
+    ];
+    for body in cases {
+        // Arrange
+        let text = anthropic_section(body);
+
+        // Act
+        let err = Config::from_toml_str(&text).unwrap_err();
+
+        // Assert
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { path, .. }
+                if path == "providers.anthropic.thinking_budget_tokens"),
+            "{body}: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_thinking_budget_just_below_the_output_limit_is_accepted() {
+    // Arrange
+    let text = anthropic_section("max_output_tokens = 4096\nthinking_budget_tokens = 4095\n");
+
+    // Act
+    let config = Config::from_toml_str(&text).unwrap().config;
+
+    // Assert
+    assert_eq!(
+        config.providers["anthropic"].thinking_budget_tokens,
+        Some(4095)
+    );
+}
+
+#[test]
+fn a_thinking_budget_on_another_provider_is_not_checked() {
+    // Arrange
+    let text = section("thinking_budget_tokens = 5\n");
+
+    // Act
+    let config = Config::from_toml_str(&text).unwrap().config;
+
+    // Assert
+    assert_eq!(config.providers["local"].thinking_budget_tokens, Some(5));
 }

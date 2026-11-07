@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use coda_config::config::{Config, ModelAlias, ProviderConfig};
+use coda_config::config::{Config, DEFAULT_MAX_OUTPUT_TOKENS, ModelAlias, ProviderConfig};
 use coda_protocol::types::BackendKind;
 
 use crate::anthropic::Timing;
@@ -34,7 +34,6 @@ pub const FAUX_KEY: &str = "faux";
 
 const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-5-5";
-const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
 
 /// Why a model could not be selected or its client could not be built.
 #[derive(Debug, thiserror::Error)]
@@ -297,6 +296,7 @@ impl ModelRegistry {
                 .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
             system: String::new(),
             tools: Vec::new(),
+            thinking_budget_tokens: section.thinking_budget_tokens,
         };
         if target.backend == BackendKind::Anthropic {
             let options = AnthropicOptions {

@@ -68,6 +68,7 @@ fn settings(system: &str, tools: Vec<ToolSchema>) -> RequestSettings {
     RequestSettings {
         model: "test-model".to_owned(),
         max_tokens: 64,
+        thinking_budget_tokens: None,
         system: system.to_owned(),
         tools,
     }
@@ -926,4 +927,23 @@ fn a_request_without_reasoning_is_byte_identical_to_before() {
             {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
         ])
     );
+}
+
+#[test]
+fn the_body_asks_for_thinking_only_when_a_budget_is_set() {
+    // Arrange
+    let mut with_budget = settings("", Vec::new());
+    with_budget.thinking_budget_tokens = Some(2048);
+    let without_budget = settings("", Vec::new());
+
+    // Act
+    let on = build_body(&with_budget, &request());
+    let off = build_body(&without_budget, &request());
+
+    // Assert
+    assert_eq!(
+        on["thinking"],
+        json!({"type": "enabled", "budget_tokens": 2048})
+    );
+    assert!(off.get("thinking").is_none(), "{off}");
 }

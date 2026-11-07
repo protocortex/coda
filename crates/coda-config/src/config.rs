@@ -20,6 +20,11 @@ use crate::review::{
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
 
+/// Output limit of a model request when `max_output_tokens` is unset.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
+/// The least thinking budget the Anthropic API accepts.
+pub const MIN_THINKING_BUDGET_TOKENS: u32 = 1024;
+const ANTHROPIC_KEY: &str = "anthropic";
 const DEFAULT_MAX_TURNS: u32 = 50;
 const DEFAULT_TOKEN_CAP: u64 = 1_000_000;
 /// Times an `end_turn` hook may send the model back to work in one send.
@@ -188,6 +193,9 @@ pub struct ProviderConfig {
     pub allow_wider_sandbox: bool,
     /// Output token limit of a model request; the built-in limit when unset.
     pub max_output_tokens: Option<u32>,
+    /// Tokens the model may spend thinking before it answers; the request asks
+    /// for no thinking when unset. `anthropic` only.
+    pub thinking_budget_tokens: Option<u32>,
     /// Request field that carries the output limit; `openai_compat` only.
     pub max_tokens_field: MaxTokensField,
     /// Whether the request asks for token usage in the stream; `openai_compat` only.
@@ -213,6 +221,7 @@ impl Default for ProviderConfig {
             sandbox: None,
             allow_wider_sandbox: false,
             max_output_tokens: None,
+            thinking_budget_tokens: None,
             max_tokens_field: MaxTokensField::default(),
             stream_usage: true,
             text_tool_calls: false,
@@ -473,6 +482,22 @@ impl Config {
                     path: format!("{PROVIDERS_KEY}.{name}.max_output_tokens"),
                     allowed: "a whole number of tokens above 0".to_owned(),
                 });
+            }
+            if let Some(budget) = section
+                .thinking_budget_tokens
+                .filter(|_| name == ANTHROPIC_KEY)
+            {
+                let limit = section
+                    .max_output_tokens
+                    .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+                if !(MIN_THINKING_BUDGET_TOKENS..limit).contains(&budget) {
+                    return Err(ConfigError::InvalidValue {
+                        path: format!("{PROVIDERS_KEY}.{name}.thinking_budget_tokens"),
+                        allowed: format!(
+                            "a whole number of tokens from {MIN_THINKING_BUDGET_TOKENS} up to, not including, the output limit ({limit})"
+                        ),
+                    });
+                }
             }
         }
         Ok(())
