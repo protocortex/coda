@@ -199,7 +199,42 @@ pub(crate) async fn drive(
         .await?;
     let model = created.session.model;
     let session = created.session.id;
-    let mut events = client.subscribe(&session, Some(0)).await?;
+    let delivery = Delivery {
+        prompt,
+        agent,
+        max_turns,
+        token_cap,
+    };
+    let finish = send_and_follow(ctx, &client, &session, delivery, Some(0), io, tap).await?;
+    Ok(Done { finish, model })
+}
+
+/// The message of one turn and its limits.
+pub(crate) struct Delivery {
+    pub(crate) prompt: String,
+    pub(crate) agent: Option<String>,
+    pub(crate) max_turns: Option<u32>,
+    pub(crate) token_cap: Option<u64>,
+}
+
+/// Subscribes to `session` from `since_seq`, sends `delivery`, follows the turn
+/// to its end and releases the session.
+pub(crate) async fn send_and_follow(
+    ctx: &Context,
+    client: &Client,
+    session: &SessionId,
+    delivery: Delivery,
+    since_seq: Option<u64>,
+    io: &mut Io<'_>,
+    tap: &mut Tap<'_>,
+) -> Result<Finish, CliError> {
+    let Delivery {
+        prompt,
+        agent,
+        max_turns,
+        token_cap,
+    } = delivery;
+    let mut events = client.subscribe(session, since_seq).await?;
     // Registered before the send so an interrupt during it is never lost, and
     // not earlier so Ctrl-C still stops the run while the daemon starts.
     let mut interrupts = signal(SignalKind::interrupt())?;
@@ -235,8 +270,8 @@ pub(crate) async fn drive(
         _ = interrupts.recv() => {
             interrupted = true;
             cancel_during_send(
-                &client,
-                &session,
+                client,
+                session,
                 connect_unchecked(ctx),
                 send,
                 &mut interrupts,
@@ -246,9 +281,9 @@ pub(crate) async fn drive(
     }
     info!(step = "follow", session = %session, "following the turn");
     let follow = follow(
-        &client,
+        client,
         &mut events,
-        &session,
+        session,
         &mut interrupts,
         interrupted,
         io,
@@ -262,10 +297,10 @@ pub(crate) async fn drive(
         follow.await?
     };
     info!(step = "close_session", session = %session, "releasing the session");
-    if let Err(failure) = client.close_session(&session).await {
+    if let Err(failure) = client.close_session(session).await {
         warn!(session = %session, error = %failure, "could not close the session; the daemon evicts it later");
     }
-    Ok(Done { finish, model })
+    Ok(finish)
 }
 
 /// Cancels a turn whose send the daemon has not answered yet, then waits for
@@ -341,7 +376,7 @@ fn command_args(
 }
 
 /// The prompt flag, or else all of the input.
-fn read_prompt(io: &mut Io<'_>, flag: Option<String>) -> Result<String, CliError> {
+pub(crate) fn read_prompt(io: &mut Io<'_>, flag: Option<String>) -> Result<String, CliError> {
     let prompt = if let Some(prompt) = flag {
         prompt
     } else {
@@ -520,17 +555,22 @@ async fn deny(client: &Client, params: Value) -> Result<(), CliError> {
     Ok(())
 }
 
-fn report(finish: &Finish, io: &mut Io<'_>) -> std::io::Result<ExitCode> {
-    // A delegated backend reports a result without a stop condition.
-    let code = match (finish.condition.as_deref(), finish.failed) {
-        (Some(condition), _) => exit_code(condition),
-        (None, false) => exit::RUN_END_TURN,
-        (None, true) => exit::RUN_OTHER,
-    };
+pub(crate) fn report(finish: &Finish, io: &mut Io<'_>) -> std::io::Result<ExitCode> {
+    let code = finish_code(finish);
     if code == exit::RUN_OTHER {
         writeln!(io.err, "coda: {}", stop_reason(finish))?;
     }
     Ok(ExitCode::from(code))
+}
+
+/// The exit code of a followed turn.
+pub(crate) fn finish_code(finish: &Finish) -> u8 {
+    // A delegated backend reports a result without a stop condition.
+    match (finish.condition.as_deref(), finish.failed) {
+        (Some(condition), _) => exit_code(condition),
+        (None, false) => exit::RUN_END_TURN,
+        (None, true) => exit::RUN_OTHER,
+    }
 }
 
 /// Why a turn did not end normally, in a sentence.

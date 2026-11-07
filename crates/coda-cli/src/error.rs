@@ -65,6 +65,8 @@ pub enum CliError {
         name: String,
         source: coda_agents::ExpandError,
     },
+    #[error("no session has the id {id}")]
+    SessionNotFound { id: String },
     #[error("the connection to the daemon was lost before the run ended")]
     RunInterrupted,
     #[error("the daemon has {activity}; use --force to restart it anyway")]

@@ -142,12 +142,15 @@ kill "$(coda status | sed -n 's/^pid: //p')"
 | `coda status` | Show the daemon pid, version and uptime. It fails if no daemon runs. |
 | `coda ping` | Print `pong` if a daemon answers. It fails if no daemon runs. |
 | `coda run` | Run one prompt to completion. Flags: `--prompt`, `--command`, `--args`, `--cwd`, `--mode`, `--max-turns`, `--token-cap`. Without `--prompt` or `--command` it reads the prompt from standard input. `--command <name>` runs a command file and `--args` fills its `$ARGUMENTS`; without `--args`, piped standard input does (see [docs/agents.md](docs/agents.md)). |
+| `coda session list` | List stored sessions, newest first, as lines or with `--json` as an array. Flags: `--cwd`, `--limit`, `--json`. It asks a running daemon. |
+| `coda session send` | Send a message to a session, from `--prompt` or else standard input, and print the turn id. With `--wait` it follows the turn and exits with the codes of `coda run`. Flags: `--prompt`, `--wait`, `--json`, `--max-turns`, `--token-cap`. With `--json` and `--wait` it prints one object with `stop`, `exit_code` and `text`. |
+| `coda session show` | Print a session's conversation, or with `--json` the session and its stored events. It reads the database, so it works without a daemon. |
 | `coda review` | Review a change and print the findings. Takes a pull request number or URL, a branch, a range such as `main...topic`, or nothing for the current branch against the default branch. Flags: `--staged`, `--instructions`, `--json`, `--backend`, `--cwd`, and `--force` to review a pull request that a skip rule would skip. It posts nothing and edits nothing. See [docs/config.md](docs/config.md#coda-review). |
 | `coda grant add` | Allow one command in a repository permanently. Flags: `--repo`, `--cwd`, `--tool`. |
 | `coda usage` | Show token usage and savings. `--session` limits it to one session. It asks a running daemon, or reads the database when none runs. |
 | `coda doctor` | Check the socket, lock, orphaned backends, database, schema, database release, config and backends. `--repair` removes a stale socket and kills orphaned backends. `--json` prints JSON. |
 
-`coda run`, `coda grant add`, `coda tui` and bare `coda` start a daemon if none is running. `coda daemon restart` starts one too. `coda status`, `coda ping`, `coda usage` and `coda doctor` do not start one.
+`coda run`, `coda session send`, `coda grant add`, `coda tui` and bare `coda` start a daemon if none is running. `coda daemon restart` starts one too. `coda status`, `coda ping`, `coda usage`, `coda session list`, `coda session show` and `coda doctor` do not start one.
 
 `coda run` picks its backend from the config. It uses the faux provider if `[providers.faux]` is enabled, and the anthropic provider otherwise. It does not pick `openai_compat`, `claude_code` or `codex`.
 
