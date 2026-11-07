@@ -123,6 +123,12 @@ impl Brokers {
         }
     }
 
+    /// Drops the broker of `session`, so the next use builds one under the
+    /// session's current mode.
+    pub fn forget(&self, session: &SessionId) {
+        self.map().remove(session);
+    }
+
     fn known(&self, session: &SessionId) -> Option<Arc<Broker>> {
         self.map().get(session).cloned()
     }

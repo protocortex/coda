@@ -156,6 +156,33 @@ fn setting_the_model_of_a_nonexistent_session_is_session_not_found() {
 }
 
 #[test]
+fn set_session_mode_updates_the_stored_mode() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+    let id = store.create_session(&new_session("/a")).unwrap();
+
+    // Act
+    store.set_session_mode(&id, Mode::Plan).unwrap();
+
+    // Assert
+    assert_eq!(store.load_session(&id).unwrap().mode, Mode::Plan);
+}
+
+#[test]
+fn setting_the_mode_of_a_nonexistent_session_is_session_not_found() {
+    // Arrange
+    let (_dir, mut store) = open_store();
+
+    // Act
+    let err = store
+        .set_session_mode(&SessionId::new("7"), Mode::Plan)
+        .unwrap_err();
+
+    // Assert
+    assert!(matches!(err, StoreError::SessionNotFound { .. }));
+}
+
+#[test]
 fn appends_return_increasing_sequence_numbers_and_load_in_order() {
     // Arrange
     let (_dir, mut store) = open_store();

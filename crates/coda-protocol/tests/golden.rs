@@ -15,9 +15,9 @@ use coda_protocol::methods::{
     SessionCancelResult, SessionCloseParams, SessionCloseResult, SessionCreateParams,
     SessionCreateResult, SessionListParams, SessionListResult, SessionResumeParams,
     SessionResumeResult, SessionRewindParams, SessionRewindResult, SessionSendParams,
-    SessionSendResult, SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams,
-    SessionSubscribeResult, SessionWorktreeParams, SessionWorktreeResult, UsageSummaryParams,
-    UsageSummaryResult,
+    SessionSendResult, SessionSetModeParams, SessionSetModeResult, SessionSetModelParams,
+    SessionSetModelResult, SessionSubscribeParams, SessionSubscribeResult, SessionWorktreeParams,
+    SessionWorktreeResult, UsageSummaryParams, UsageSummaryResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -122,6 +122,8 @@ golden_tests! {
     usage_summary_params: "usage.summary.params" => UsageSummaryParams,
     usage_summary_params_all_sessions: "usage.summary.params.all_sessions" => UsageSummaryParams,
     usage_summary_result: "usage.summary.result" => UsageSummaryResult,
+    session_set_mode_params: "session.set_mode.params" => SessionSetModeParams,
+    session_set_mode_result: "session.set_mode.result" => SessionSetModeResult,
     session_set_model_params: "session.set_model.params" => SessionSetModelParams,
     session_set_model_result: "session.set_model.result" => SessionSetModelResult,
     daemon_backends_params: "daemon.backends.params" => DaemonBackendsParams,

@@ -3,7 +3,7 @@
 //! The status line: backend, model and tokens used.
 
 use coda_protocol::events::Event;
-use coda_protocol::types::{BackendKind, ContextFill, TokenUsage};
+use coda_protocol::types::{BackendKind, ContextFill, Mode, TokenUsage};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
@@ -12,6 +12,10 @@ const NO_BACKEND: &str = "no backend";
 const NO_MODEL: &str = "no model";
 /// For a backend added to the protocol after this client was built.
 const UNKNOWN_BACKEND: &str = "unknown backend";
+/// For a mode added to the protocol after this client was built.
+const UNKNOWN_MODE: &str = "unknown";
+const PLAN_MODE: &str = "plan mode";
+const PLAN_READY: &str = "plan ready";
 const PERCENT: u128 = 100;
 const THOUSAND: u32 = 1_000;
 const MILLION: u32 = 1_000_000;
@@ -22,6 +26,8 @@ pub struct Status {
     model: Option<String>,
     usage: TokenUsage,
     context: Option<ContextFill>,
+    mode: Mode,
+    plan_ready: bool,
 }
 
 impl Status {
@@ -35,6 +41,26 @@ impl Status {
         self.model = model;
         self.usage = TokenUsage::default();
         self.context = None;
+        self.mode = Mode::Default;
+        self.plan_ready = false;
+    }
+
+    /// Shows the mode the session is in. Leaving plan mode drops the ready plan.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        if mode != Mode::Plan {
+            self.plan_ready = false;
+        }
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Shows whether a finished plan is waiting for `/implement`.
+    pub fn set_plan_ready(&mut self, ready: bool) {
+        self.plan_ready = ready;
     }
 
     /// Shows `model` while keeping the backend and the tokens used so far.
@@ -76,6 +102,14 @@ impl Status {
             line.push_str(" | ");
             line.push_str(&meter);
         }
+        if self.mode == Mode::Plan {
+            line.push_str(" | ");
+            line.push_str(if self.plan_ready {
+                PLAN_READY
+            } else {
+                PLAN_MODE
+            });
+        }
         if let Some(activity) = activity {
             line.push_str(" | ");
             line.push_str(activity);
@@ -105,6 +139,16 @@ fn window_text(tokens: u32) -> String {
         format!("{}k", tokens / THOUSAND)
     } else {
         tokens.to_string()
+    }
+}
+
+/// The mode as the user reads it.
+pub(crate) fn mode_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Default => "default",
+        Mode::Plan => "plan",
+        Mode::AcceptEdits => "accept-edits",
+        _ => UNKNOWN_MODE,
     }
 }
 
@@ -165,6 +209,63 @@ mod tests {
 
         // Assert
         assert_eq!(shown.trim_end(), "no backend | no model | in 0 out 0");
+    }
+
+    #[test]
+    fn a_plan_mode_session_says_so_and_the_default_mode_says_nothing() {
+        // Arrange
+        let mut status = Status::new();
+        status.set_session(BackendKind::ClaudeCode, Some("sonnet".to_owned()));
+
+        // Act
+        status.set_mode(Mode::Plan);
+        let planning = draw(&status, 60);
+        status.set_mode(Mode::Default);
+        let normal = draw(&status, 60);
+
+        // Assert
+        assert_eq!(
+            planning.trim_end(),
+            "claude_code | sonnet | in 0 out 0 | plan mode"
+        );
+        assert_eq!(normal.trim_end(), "claude_code | sonnet | in 0 out 0");
+    }
+
+    #[test]
+    fn a_plan_that_is_ready_says_so_and_leaving_plan_mode_clears_it() {
+        // Arrange
+        let mut status = Status::new();
+        status.set_session(BackendKind::ClaudeCode, Some("sonnet".to_owned()));
+        status.set_mode(Mode::Plan);
+
+        // Act
+        status.set_plan_ready(true);
+        let ready = draw(&status, 60);
+        status.set_mode(Mode::Default);
+        let left = draw(&status, 60);
+
+        // Assert
+        assert_eq!(
+            ready.trim_end(),
+            "claude_code | sonnet | in 0 out 0 | plan ready"
+        );
+        assert_eq!(left.trim_end(), "claude_code | sonnet | in 0 out 0");
+    }
+
+    #[test]
+    fn a_new_session_starts_in_the_default_mode_until_it_reports_another() {
+        // Arrange
+        let mut status = Status::new();
+        status.set_mode(Mode::Plan);
+
+        // Act
+        status.set_session(BackendKind::ClaudeCode, None);
+
+        // Assert
+        assert_eq!(
+            draw(&status, 60).trim_end(),
+            "claude_code | no model | in 0 out 0"
+        );
     }
 
     #[test]

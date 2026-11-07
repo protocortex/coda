@@ -12,7 +12,7 @@ use coda_daemon::server::{Server, ServerConfig};
 use coda_daemon::subscribe::Hub;
 use coda_daemon::turn::{TurnConfig, Turns};
 use coda_daemon::watchdog;
-use coda_protocol::types::{BackendKind, SessionInfo};
+use coda_protocol::types::{BackendKind, Mode, SessionInfo};
 use coda_store::Store;
 use coda_tui::app::LinkEvent;
 use coda_tui::sessions::{LinkCommand, LinkConfig, TRANSCRIPT_NOT_CARRIED, run_link};
@@ -302,4 +302,87 @@ async fn backend_rejects_an_unknown_and_a_disabled_backend() {
         );
         assert!(notice.contains("anthropic, faux"), "{notice}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_changes_the_mode_of_the_session_the_link_follows() {
+    // Arrange
+    let rig = Rig::start();
+    let mut link = rig.link();
+    let session = link.started().await;
+
+    // Act
+    link.send(LinkCommand::SetMode {
+        mode: Mode::Plan,
+        then: None,
+    });
+    let changed = link
+        .wait_for(|event| match event {
+            LinkEvent::ModeChanged { info, started_turn } => Some((info, started_turn)),
+            _ => None,
+        })
+        .await;
+
+    // Assert
+    assert_eq!(changed.0.id, session.id);
+    assert_eq!(changed.0.mode, Mode::Plan);
+    assert!(!changed.1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn implement_changes_the_mode_and_then_sends_its_message() {
+    // Arrange
+    let rig = Rig::start();
+    let mut link = rig.link();
+    link.started().await;
+    link.send(LinkCommand::SetMode {
+        mode: Mode::Plan,
+        then: None,
+    });
+    link.wait_for(|event| matches!(event, LinkEvent::ModeChanged { .. }).then_some(()))
+        .await;
+
+    // Act
+    link.send(LinkCommand::SetMode {
+        mode: Mode::Default,
+        then: Some("go ahead".to_owned()),
+    });
+    let changed = link
+        .wait_for(|event| match event {
+            LinkEvent::ModeChanged { info, started_turn } => Some((info, started_turn)),
+            _ => None,
+        })
+        .await;
+    let echoed = link
+        .wait_for(|event| match event {
+            LinkEvent::UserMessage(text) => Some(text),
+            _ => None,
+        })
+        .await;
+
+    // Assert
+    assert_eq!(changed.0.mode, Mode::Default);
+    assert!(changed.1);
+    assert_eq!(echoed, "go ahead");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mode_change_is_refused_while_a_turn_is_running_and_sends_nothing() {
+    // Arrange
+    let rig = Rig::start();
+    let mut link = rig.link();
+    link.started().await;
+    link.send(LinkCommand::Send("run the tool".to_owned()));
+    link.wait_for(|event| matches!(event, LinkEvent::Permission(_)).then_some(()))
+        .await;
+
+    // Act
+    link.send(LinkCommand::SetMode {
+        mode: Mode::Plan,
+        then: Some("go ahead".to_owned()),
+    });
+    let notice = link.notice_containing("could not change the mode").await;
+
+    // Assert
+    assert!(notice.contains("A turn is already running"), "{notice}");
 }

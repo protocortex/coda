@@ -43,6 +43,8 @@ pub const PERMISSION_RESPOND: &str = "permission.respond";
 pub const GRANT_ADD: &str = "grant.add";
 /// Reports token usage.
 pub const USAGE_SUMMARY: &str = "usage.summary";
+/// Changes the autonomy mode of an idle session.
+pub const SESSION_SET_MODE: &str = "session.set_mode";
 /// Switches the model of a session.
 pub const SESSION_SET_MODEL: &str = "session.set_model";
 /// Lists the backends a session can start on.
@@ -70,6 +72,7 @@ pub const METHODS: &[&str] = &[
     PERMISSION_RESPOND,
     GRANT_ADD,
     USAGE_SUMMARY,
+    SESSION_SET_MODE,
     SESSION_SET_MODEL,
     DAEMON_BACKENDS,
     DAEMON_STATUS,
@@ -121,6 +124,9 @@ pub struct Capabilities {
     /// The daemon serves `session.rewind`.
     #[serde(default)]
     pub rewind: bool,
+    /// The daemon serves `session.set_mode`.
+    #[serde(default)]
+    pub set_mode: bool,
 }
 
 /// Result of [`INITIALIZE`].
@@ -468,6 +474,23 @@ pub struct UsageSummaryResult {
     pub saved_bytes: u64,
 }
 
+/// Parameters of [`SESSION_SET_MODE`]. The daemon refuses the change while a
+/// turn runs and tells no other subscriber of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionSetModeParams {
+    /// Target session.
+    pub session_id: SessionId,
+    /// Mode to change to. It applies from the next turn.
+    pub mode: Mode,
+}
+
+/// Result of [`SESSION_SET_MODE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionSetModeResult {
+    /// The session after the change.
+    pub session: SessionInfo,
+}
+
 /// Parameters of [`SESSION_SET_MODEL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSetModelParams {
@@ -582,6 +605,7 @@ mod tests {
             (PERMISSION_RESPOND, "permission.respond"),
             (GRANT_ADD, "grant.add"),
             (USAGE_SUMMARY, "usage.summary"),
+            (SESSION_SET_MODE, "session.set_mode"),
             (SESSION_SET_MODEL, "session.set_model"),
             (DAEMON_BACKENDS, "daemon.backends"),
             (DAEMON_STATUS, "daemon.status"),

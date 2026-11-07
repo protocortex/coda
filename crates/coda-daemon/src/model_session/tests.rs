@@ -1526,6 +1526,7 @@ mod ask;
 mod catalog;
 mod fallback;
 mod hooks;
+mod mode;
 mod reasoning;
 mod skills;
 mod switch;
