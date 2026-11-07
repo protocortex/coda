@@ -23,17 +23,19 @@ const PRIMARY: &str = "primary";
 const SECONDARY: &str = "secondary";
 const FIVE_HOUR_MINUTES: u64 = 300;
 const SEVEN_DAY_MINUTES: u64 = 10_080;
+const MONTH_MINUTES: u64 = 43_200;
 const FIVE_HOUR: &str = "five_hour";
 const SEVEN_DAY: &str = "seven_day";
+const MONTHLY: &str = "monthly";
 const BASIS_POINTS_PER_PERCENT: u32 = 100;
 const FULL_BASIS_POINTS: u32 = 10_000;
 
 /// The limits of a snapshot, or `None` when it names no window and no stop.
 ///
-/// A window is named by its length, so a five-hour window is `five_hour`
-/// whichever slot Codex put it in; a length coda has no name for keeps the slot
-/// name. The status is `rejected` when Codex says a limit was reached or a
-/// window is full.
+/// A window is named by its length, so a five-hour window is `five_hour` and a
+/// thirty-day one is `monthly` whichever slot Codex put it in; a length coda
+/// has no name for keeps the slot name. The status is `rejected` when Codex
+/// says a limit was reached or a window is full.
 pub(crate) fn rate_limit(snapshot: &Value) -> Option<RateLimit> {
     let windows: Vec<RateLimitWindow> = [PRIMARY, SECONDARY]
         .into_iter()
@@ -65,6 +67,7 @@ fn window(slot: &str, value: &Value) -> Option<RateLimitWindow> {
         name: match value["windowDurationMins"].as_u64() {
             Some(FIVE_HOUR_MINUTES) => FIVE_HOUR.to_owned(),
             Some(SEVEN_DAY_MINUTES) => SEVEN_DAY.to_owned(),
+            Some(MONTH_MINUTES) => MONTHLY.to_owned(),
             _ => slot.to_owned(),
         },
         utilization_bps: percent.saturating_mul(BASIS_POINTS_PER_PERCENT),
@@ -81,6 +84,21 @@ pub(crate) fn is_usage_limit_error(error: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_thirty_day_window_is_the_monthly_window_in_whichever_slot_it_comes() {
+        // Arrange
+        let in_primary = json!({"primary": {"usedPercent": 8, "windowDurationMins": 43200}});
+        let in_secondary = json!({"secondary": {"usedPercent": 8, "windowDurationMins": 43200}});
+
+        // Act
+        let first = rate_limit(&in_primary).unwrap();
+        let second = rate_limit(&in_secondary).unwrap();
+
+        // Assert
+        assert_eq!(first.windows[0].name, "monthly");
+        assert_eq!(second.windows[0].name, "monthly");
+    }
 
     #[test]
     fn windows_are_named_by_their_length_and_scaled_to_basis_points() {
