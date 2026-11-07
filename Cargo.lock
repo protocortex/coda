@@ -500,6 +500,7 @@ dependencies = [
  "coda-protocol",
  "globset",
  "regex",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",

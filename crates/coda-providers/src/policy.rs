@@ -100,7 +100,8 @@ pub fn decide(input: &PolicyInput<'_>) -> Verdict {
         | Tool::GitStatus
         | Tool::GitDiff => Verdict::Allow,
         Tool::Unknown(_) => Verdict::Prompt,
-        Tool::Bash => grant_or_prompt(input.granted),
+        // A fetch reaches the network, so like a command it needs a grant for its exact address.
+        Tool::Bash | Tool::Fetch => grant_or_prompt(input.granted),
         Tool::Read | Tool::Grep | Tool::List | Tool::CodeReadRange => {
             if all_inside(input.targets) {
                 Verdict::Allow
@@ -605,6 +606,22 @@ fn bash_and_scope_rows(rows: &mut Rows, mode: PermissionMode) {
             Verdict::Allow,
         );
     }
+    rows.add(
+        "fetch with no grant",
+        mode,
+        Tool::Fetch,
+        Vec::new(),
+        false,
+        Verdict::Prompt,
+    );
+    rows.add(
+        "fetch with a grant for its address",
+        mode,
+        Tool::Fetch,
+        Vec::new(),
+        true,
+        Verdict::Allow,
+    );
     rows.add(
         "unknown tool WebFetch",
         mode,

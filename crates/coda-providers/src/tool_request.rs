@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use coda_tools::{git, skill};
+use coda_tools::{fetch, git, skill};
 
 /// A tool a backend asks permission to run, after name mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +39,8 @@ pub enum Tool {
     GitStatus,
     /// Show the working tree's diff; read only.
     GitDiff,
+    /// Read one web page the user listed in the configuration.
+    Fetch,
     /// A tool coda has no mapping for, with the backend's own name.
     Unknown(String),
 }
@@ -63,6 +65,7 @@ impl Tool {
             Self::Skill => skill::NAME,
             Self::GitStatus => git::STATUS_NAME,
             Self::GitDiff => git::DIFF_NAME,
+            Self::Fetch => fetch::NAME,
             Self::Unknown(name) => name,
         }
     }
@@ -117,6 +120,7 @@ mod tests {
             (Tool::Skill, "skill"),
             (Tool::GitStatus, "git_status"),
             (Tool::GitDiff, "git_diff"),
+            (Tool::Fetch, "fetch"),
         ];
 
         for (tool, expected) in cases {
