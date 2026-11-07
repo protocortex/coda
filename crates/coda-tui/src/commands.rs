@@ -12,8 +12,9 @@ use crate::permission::sanitize;
 const SLASH: char = '/';
 const PLAN_SAVE: &str = "save";
 /// The commands the UI itself runs. They win over a command file of the same name.
-const COMMANDS: [&str; 10] = [
+const COMMANDS: [&str; 11] = [
     "sessions",
+    "diff",
     "new",
     "resume",
     "model",
@@ -25,7 +26,7 @@ const COMMANDS: [&str; 10] = [
     "quit",
 ];
 /// The built-in commands as `/help` lists them.
-const BUILT_IN_HELP: &str = "Built-in commands: /sessions or Ctrl+K, /new, /resume <id>, /model <alias>, /backend [name], /plan [save <path>], /implement, /review [target], /help, /quit";
+const BUILT_IN_HELP: &str = "Built-in commands: /sessions or Ctrl+K, /new, /resume <id>, /model <alias>, /backend [name], /plan [save <path>], /implement, /diff, /review [target], /help, /quit";
 
 /// A command the user can type instead of a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,8 @@ pub enum Command {
     PlanSave(String),
     /// Leave plan mode and tell the agent to carry the plan out.
     Implement,
+    /// Show what the last turn changed.
+    Diff,
     /// Ask the reviewer agent to review a change; the text is what to review, or empty.
     Review(String),
     /// List the built-in commands and the ones from command files.
@@ -147,6 +150,7 @@ pub fn parse(line: &str) -> Result<Option<Command>, CommandError> {
             parse_plan(rest)?
         }
         "implement" => Command::Implement,
+        "diff" => Command::Diff,
         "review" => Command::Review(
             line.trim()
                 .strip_prefix(word)
@@ -157,7 +161,7 @@ pub fn parse(line: &str) -> Result<Option<Command>, CommandError> {
         _ => return Err(CommandError::Unknown(word.to_owned())),
     };
     match (&command, words.next()) {
-        (Command::Model(_) | Command::Backend(_) | Command::Implement, Some(_)) => {
+        (Command::Model(_) | Command::Backend(_) | Command::Implement | Command::Diff, Some(_)) => {
             Err(CommandError::ExtraArguments(word.to_owned()))
         }
         _ => Ok(Some(command)),
@@ -478,6 +482,7 @@ mod tests {
         for (line, expected) in [
             ("/plan", Ok(Some(Command::Plan))),
             ("/implement", Ok(Some(Command::Implement))),
+            ("/diff", Ok(Some(Command::Diff))),
             ("/plan add a cache", Err(CommandError::PlanUsage)),
             (
                 "/implement now",
