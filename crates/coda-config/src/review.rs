@@ -76,6 +76,8 @@ pub struct ReviewConfig {
     /// Repositories (`org/repo`) whose issues a pull request may link to and have read
     /// into the review. Issues of the pull request's own repository are always read.
     pub linked_repos: Vec<String>,
+    /// The review before a push, started by the hook `coda hooks install review` writes.
+    pub hook: ReviewHook,
     /// Files left out of a review.
     pub ignore: ReviewIgnore,
     /// Pull requests that are not reviewed.
@@ -96,10 +98,22 @@ impl Default for ReviewConfig {
             incremental_min_minutes: DEFAULT_INCREMENTAL_MIN_MINUTES,
             extra_instructions: String::new(),
             linked_repos: Vec::new(),
+            hook: ReviewHook::default(),
             ignore: ReviewIgnore::default(),
             skip: ReviewSkip::default(),
         }
     }
+}
+
+/// The `[review.hook]` section. Both switches are off until set, and only the global config
+/// sets them: a repository's own rules file cannot turn a review on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ReviewHook {
+    /// Whether the pre-push hook reviews anything. Off, the hook does nothing.
+    pub enabled: bool,
+    /// Whether a finding of severity high or critical stops the push.
+    pub block_on_high: bool,
 }
 
 /// The `[review.ignore]` section.

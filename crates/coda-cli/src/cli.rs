@@ -45,6 +45,9 @@ pub enum Command {
     /// Exit codes: 0 reviewed or skipped by a rule, 64 bad usage, 70 the review
     /// failed.
     Review(ReviewArgs),
+    /// Write or remove the git hooks that start a review.
+    #[command(subcommand)]
+    Hooks(HooksCommand),
     /// List, message and read stored sessions from a script.
     ///
     /// `send --wait` uses the exit codes of `coda run`; the other commands exit
@@ -65,6 +68,28 @@ pub enum Command {
     /// Check, list and trust agent, skill and command definitions.
     #[command(subcommand)]
     Agents(AgentsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HooksCommand {
+    /// Write the hook. It reviews nothing until `[review.hook] enabled = true` is set.
+    Install(HookArgs),
+    /// Delete the hook, when coda wrote it.
+    Remove(HookArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct HookArgs {
+    /// Which hook.
+    #[arg(value_enum)]
+    pub name: HookName,
+}
+
+/// The hooks coda can write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HookName {
+    /// A pre-push hook that reviews the commits about to be pushed.
+    Review,
 }
 
 #[derive(Debug, Subcommand)]
@@ -249,6 +274,11 @@ pub struct ReviewArgs {
     /// when too little is new. Needs a pull request target.
     #[arg(long, conflicts_with = "staged")]
     pub incremental: bool,
+    /// What the pre-push hook runs: review the commits not yet pushed (`@{u}..HEAD`), print
+    /// the findings, and exit 23 when a finding of severity high or critical remains and
+    /// `[review.hook] block_on_high` is set. Does nothing unless `[review.hook] enabled` is set.
+    #[arg(long, conflicts_with_all = ["target", "staged", "post", "incremental", "dismiss"])]
+    pub hook: bool,
     /// Dismiss the finding of this pull request that starts with this fingerprint, so later
     /// reviews leave it out, and stop. May be given more than once.
     #[arg(long, value_name = "FINGERPRINT", conflicts_with_all = ["staged", "post", "incremental"])]

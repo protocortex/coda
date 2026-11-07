@@ -133,6 +133,7 @@ pub fn merge(global: &ReviewConfig, repo: Option<&ReviewConfig>) -> ReviewConfig
         verify_threshold: global.verify_threshold,
         guidance_lines: global.guidance_lines,
         linked_repos: global.linked_repos.clone(),
+        hook: global.hook.clone(),
         incremental_min_commits: global.incremental_min_commits,
         incremental_min_minutes: global.incremental_min_minutes,
         extra_instructions: [
@@ -295,6 +296,21 @@ mod tests {
         );
         run(p, &["commit", "-q", "-am", "pr rules"]);
         dir
+    }
+
+    #[test]
+    fn a_repository_rules_file_cannot_turn_the_push_hook_on() {
+        // Arrange
+        let global = ReviewConfig::default();
+        let repo =
+            parse_repo_rules("[review.hook]\nenabled = true\nblock_on_high = true\n").unwrap();
+
+        // Act
+        let merged = merge(&global, Some(&repo));
+
+        // Assert
+        assert!(!merged.hook.enabled);
+        assert!(!merged.hook.block_on_high);
     }
 
     #[test]

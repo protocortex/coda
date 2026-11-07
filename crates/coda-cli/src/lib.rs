@@ -11,6 +11,7 @@ mod doctor;
 mod error;
 pub mod exit;
 mod grant;
+mod hooks_cmd;
 mod init;
 mod review;
 mod review_issues;
@@ -73,6 +74,7 @@ async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<ExitCode, C
         Some(Command::Doctor(args)) => return doctor::run(ctx, io, args).await,
         Some(Command::Review(args)) => return review::run(ctx, io, force, args).await,
         Some(Command::Agents(command)) => return agents::run(ctx, io, &command),
+        Some(Command::Hooks(command)) => return hooks_cmd::run(ctx, io, &command),
         Some(Command::Session(command)) => return session::run(ctx, io, force, command).await,
         None if ctx.is_tty => tui_cmd::open(ctx, io, force).await,
         None => status::start(ctx, io, force).await,

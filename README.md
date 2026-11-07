@@ -147,6 +147,7 @@ kill "$(coda status | sed -n 's/^pid: //p')"
 | `coda session show` | Print a session's conversation, or with `--json` the session and its stored events. It reads the database, so it works without a daemon. |
 | `coda session rewind` | Put the files back as an earlier turn left them and roll the later turns back. `--to <turn>` names the turn, `--to base` goes back to before the first turn. Flags: `--to`, `--keep-files` (roll back the conversation only), `--keep-conversation` (restore the files only), `--json`. See [Checkpoints](#checkpoints). |
 | `coda review` | Review a change and print the findings. Takes a pull request number or URL, a branch, a range such as `main...topic`, or nothing for the current branch against the default branch. Flags: `--staged`, `--instructions`, `--json`, `--backend`, `--cwd`, `--force` to review a pull request that a skip rule would skip, and `--incremental` and `--dismiss` (see the config docs), and `--post` (with `--yes` when there is no terminal) to put the findings on the pull request as a pending review and a summary comment, as your own `gh` login, after a preview you confirm. Without `--post` it posts nothing and edits nothing. See [docs/config.md](docs/config.md#coda-review). |
+| `coda hooks install review` | Write a git pre-push hook that runs `coda review --hook`. It reviews nothing until `[review.hook] enabled = true` is set in the config. `coda hooks remove review` deletes it, and only when coda wrote it. See [docs/config.md](docs/config.md#reviewhook). |
 | `coda grant add` | Allow one command in a repository permanently. Flags: `--repo`, `--cwd`, `--tool`. |
 | `coda usage` | Show token usage and savings. `--session` limits it to one session. It asks a running daemon, or reads the database when none runs. |
 | `coda doctor` | Check the socket, lock, orphaned backends, database, schema, database release, config and backends. `--repair` removes a stale socket and kills orphaned backends. `--json` prints JSON. |
@@ -172,7 +173,7 @@ Every command accepts `--force`, but it only matters in three cases. `coda revie
 | 64 | Bad usage. |
 | 70 | The run itself failed. |
 
-`coda review`: 0 reviewed, or skipped by a rule, or nothing to review; 64 bad usage; 70 the review failed (no reachable backend, the run stopped early, or the reviewer did not answer in the review format twice).
+`coda review`: 0 reviewed, or skipped by a rule, or nothing to review; 23 with `--hook`, a finding of severity high or critical remains and `[review.hook] block_on_high` is set; 64 bad usage; 70 the review failed (no reachable backend, the run stopped early, or the reviewer did not answer in the review format twice).
 
 `coda doctor`: 0 healthy, 20 at least one check failed, 21 only warnings, 64 bad usage, 70 the check itself failed.
 
