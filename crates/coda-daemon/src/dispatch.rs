@@ -21,7 +21,8 @@ use coda_protocol::methods::{
     DaemonShutdownResult, GRANT_ADD, INITIALIZE, InitializeParams, InitializeResult,
     PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult, SESSION_CANCEL, SESSION_CLOSE,
     SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_REWIND, SESSION_SEND, SESSION_SET_MODEL,
-    SESSION_SUBSCRIBE, SessionSubscribeParams, SessionSubscribeResult, USAGE_SUMMARY,
+    SESSION_SUBSCRIBE, SESSION_WORKTREE, SessionSubscribeParams, SessionSubscribeResult,
+    USAGE_SUMMARY,
 };
 use coda_protocol::types::SessionId;
 use serde::de::DeserializeOwned;
@@ -36,6 +37,7 @@ use crate::subscribe::{Connection, Hub, HubError, Outbox};
 use crate::trace::{request_span, session_span};
 use crate::turn::{self, Turns};
 use crate::usage_rpc;
+use crate::worktree::Worktrees;
 
 /// `initialize` was called with a protocol version the daemon does not speak.
 pub const PROTOCOL_VERSION_MISMATCH: i64 = -32001;
@@ -50,6 +52,7 @@ pub struct Dispatcher {
     hub: Option<Arc<Hub>>,
     state: Option<Arc<DaemonState>>,
     turns: Option<Arc<Turns>>,
+    worktrees: Option<Arc<Worktrees>>,
 }
 
 impl Default for Dispatcher {
@@ -71,6 +74,7 @@ impl Dispatcher {
             hub: None,
             state: None,
             turns: None,
+            worktrees: None,
         }
     }
 
@@ -99,6 +103,14 @@ impl Dispatcher {
     #[must_use]
     pub fn with_turns(mut self, turns: Arc<Turns>) -> Self {
         self.turns = Some(turns);
+        self
+    }
+
+    /// Also answers `session.worktree`, and puts back the checkout of a session
+    /// whose worktree was removed before it is resumed or sent to.
+    #[must_use]
+    pub fn with_worktrees(mut self, worktrees: Arc<Worktrees>) -> Self {
+        self.worktrees = Some(worktrees);
         self
     }
 
@@ -142,11 +154,25 @@ impl Dispatcher {
         let Request {
             id, method, params, ..
         } = request;
+        if matches!(method.as_str(), SESSION_RESUME | SESSION_SEND | AGENT_RUN) {
+            let ready = session_rpc::ensure_checkout(
+                self.hub.as_ref(),
+                self.worktrees.as_ref(),
+                params.as_ref(),
+            )
+            .await;
+            if let Err(e) = ready {
+                return Some(Response::failure(id, e));
+            }
+        }
         let outcome = match method.as_str() {
             GRANT_ADD => grants_rpc::add_grant(self.hub.as_ref(), params).await,
             USAGE_SUMMARY => usage_rpc::summarize(self.hub.as_ref(), params).await,
             SESSION_CREATE => session_rpc::create(self.hub.as_ref(), params).await,
             SESSION_RESUME => session_rpc::resume(self.hub.as_ref(), params).await,
+            SESSION_WORKTREE => {
+                session_rpc::worktree(self.hub.as_ref(), self.worktrees.as_ref(), params).await
+            }
             SESSION_LIST => {
                 let turns = self.turns.as_ref();
                 let running = |id: &SessionId| turns.is_some_and(|t| t.is_running(id));
@@ -591,6 +617,58 @@ mod tests {
     fn dispatcher_with_empty_store(dir: &tempfile::TempDir) -> Dispatcher {
         let store = coda_store::Store::open(&dir.path().join("data")).unwrap();
         Dispatcher::new().with_hub(Hub::new(store, crate::subscribe::DEFAULT_QUEUE_CAPACITY))
+    }
+
+    #[tokio::test]
+    async fn a_send_to_a_session_whose_worktree_was_removed_puts_it_back_first() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first"]);
+        let trees = Arc::new(Worktrees::new(dir.path().join("trees"), Vec::new()));
+        let dispatcher = dispatcher_with_empty_store(&dir).with_worktrees(trees);
+        let create = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"session.create","params":{{"backend":"claude_code","cwd":{:?},"mode":"plan"}}}}"#,
+            repo.canonicalize().unwrap().display().to_string()
+        );
+        let id = result_of(call_on(&dispatcher, &create).await)["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let moved = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"session.worktree","params":{{"session_id":"{id}"}}}}"#
+        );
+        let made = result_of(call_on(&dispatcher, &moved).await);
+        let folder = std::path::PathBuf::from(made["session"]["cwd"].as_str().unwrap());
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        // Act
+        for method in ["session.resume", "session.send", "agent.run"] {
+            std::fs::remove_dir_all(&folder).ok();
+            let request = format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"{method}","params":{{"session_id":"{id}","text":"hi","agent":"x"}}}}"#
+            );
+            let _ = call_on(&dispatcher, &request).await;
+
+            // Assert
+            assert!(folder.join("a.txt").exists(), "{method}");
+        }
     }
 
     const CREATE_REQUEST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"session.create","params":{"backend":"claude_code","cwd":"/","model":"m-1","mode":"plan"}}"#;

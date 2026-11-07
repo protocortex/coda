@@ -44,6 +44,18 @@ pub struct SessionFilter {
     pub cwd: Option<String>,
 }
 
+/// The worktree coda made for a session. Its presence on the session row is the
+/// record that coda owns the folder and the branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWorktree {
+    /// The worktree folder, which is also the session's working directory.
+    pub path: String,
+    /// The branch coda made for it.
+    pub branch: String,
+    /// The repository the worktree belongs to.
+    pub repo: String,
+}
+
 const SESSION_COLUMNS: &str = "id, backend, model, cwd, mode, created_at";
 
 /// Session ids are the decimal form of the row id.
@@ -198,4 +210,77 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Records the worktree a session works in and makes its folder the
+    /// session's working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SessionNotFound`] when no such session exists and
+    /// [`StoreError::WorktreeRefused`] when it already has a worktree or has a turn.
+    pub fn set_session_worktree(
+        &mut self,
+        id: &SessionId,
+        worktree: &SessionWorktree,
+    ) -> Result<(), StoreError> {
+        let not_found = || StoreError::SessionNotFound {
+            session: id.clone(),
+        };
+        let row_id = session_row_id(id).ok_or_else(not_found)?;
+        let changed = self.conn.execute(
+            "UPDATE sessions SET cwd = ?1, worktree_path = ?1, branch = ?2, worktree_repo = ?3 \
+             WHERE id = ?4 AND worktree_path IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM turns WHERE session_id = ?4)",
+            params![worktree.path, worktree.branch, worktree.repo, row_id],
+        )?;
+        if changed == 1 {
+            return Ok(());
+        }
+        self.load_session(id)?;
+        Err(StoreError::WorktreeRefused {
+            session: id.clone(),
+        })
+    }
+
+    /// The worktree coda made for `id`, or `None` when it has none or does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the query fails.
+    pub fn session_worktree(&self, id: &SessionId) -> Result<Option<SessionWorktree>, StoreError> {
+        let Some(row_id) = session_row_id(id) else {
+            return Ok(None);
+        };
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT worktree_path, branch, worktree_repo FROM sessions \
+                 WHERE id = ?1 AND worktree_path IS NOT NULL",
+                [row_id],
+                read_worktree,
+            )
+            .optional()?)
+    }
+
+    /// Every worktree coda made, with its session, oldest session first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the query fails.
+    pub fn session_worktrees(&self) -> Result<Vec<(SessionId, SessionWorktree)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT worktree_path, branch, worktree_repo, id FROM sessions \
+             WHERE worktree_path IS NOT NULL ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((session_id(row.get(3)?), read_worktree(row)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
+fn read_worktree(row: &Row<'_>) -> Result<SessionWorktree, rusqlite::Error> {
+    Ok(SessionWorktree {
+        path: row.get(0)?,
+        branch: row.get(1)?,
+        repo: row.get(2)?,
+    })
 }

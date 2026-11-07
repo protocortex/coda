@@ -304,6 +304,17 @@ A hook that times out or whose turn is cancelled is killed together with everyth
 
 A key the schema does not know in a hook entry is an error, so a misspelled `blocking` never turns a guard into a log line.
 
+## `[worktree]`
+
+`coda run --worktree` works in a git worktree that the daemon makes for the session, so your own checkout and branches are not touched. The worktree is a folder named after the session under the managed folder, on a new branch `coda/<session>` made from the `HEAD` of the repository that holds the session's folder. The session starts at the root of the worktree. Coda records the folder and the branch with the session, and only removes or puts back what it recorded. A branch or worktree you made yourself is never used, moved or removed: if a branch called `coda/<session>` already exists, making the worktree fails and the branch is left alone. Both keys come from this file only.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `dir` | string | unset | The managed folder. When unset, `worktrees` inside `$CODA_HOME/data`. It must be an absolute path. Coda makes it with owner-only permissions. |
+| `setup` | array of strings | `[]` | A program and its arguments, run in a new worktree before the session starts, for example `["npm", "install"]`. No shell. It is killed after 10 minutes. When it fails, the worktree and the branch it made are removed and the request fails with the command's error. It runs again when a removed worktree is put back. |
+
+If a worktree folder is removed and the session is resumed or sent to again, the daemon puts the folder back from the session's branch, or from `HEAD` when the branch is gone, and runs `setup` again. It only does this at the path it computes from the session id under the managed folder, so a recorded path elsewhere is refused. It also refuses when the branch is checked out in another folder, so it never takes over a branch someone else is using. When `setup` fails on a put-back, the folder is removed again (the branch and its commits stay) so the next request tries again.
+
 ## `[checks.<extension>]`
 
 A check is a command coda runs after the model changes a file, so the model sees what it broke in the same tool result and can fix it at once. It runs in model-API sessions (`anthropic`, `openai_compat`, `faux`) after a successful `edit`, `write` or `multi_edit`, for files with the extension named in the table, for example `[checks.rs]`. The extension has no dot and is matched without regard to case. Nothing runs for an extension with no table, and there are no checks unless you add them. Checks come from this file only. A project file or a definition file cannot add one.
@@ -335,6 +346,10 @@ stop_after = 5
 
 [tui]
 notify = "osc777"
+
+[worktree]
+dir = "/home/me/coda-worktrees"
+setup = ["npm", "install"]
 
 [permissions]
 mode = "accept-edits"

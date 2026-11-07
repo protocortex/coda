@@ -33,6 +33,8 @@ pub const SESSION_RESUME: &str = "session.resume";
 pub const SESSION_CLOSE: &str = "session.close";
 /// Restores the files and rolls back the conversation to the end of an earlier turn.
 pub const SESSION_REWIND: &str = "session.rewind";
+/// Moves a session that has not started into a git worktree made for it.
+pub const SESSION_WORKTREE: &str = "session.worktree";
 /// Lists stored sessions, without their content.
 pub const SESSION_LIST: &str = "session.list";
 /// Answers a pending permission request.
@@ -64,6 +66,7 @@ pub const METHODS: &[&str] = &[
     SESSION_LIST,
     SESSION_CLOSE,
     SESSION_REWIND,
+    SESSION_WORKTREE,
     PERMISSION_RESPOND,
     GRANT_ADD,
     USAGE_SUMMARY,
@@ -264,6 +267,31 @@ pub struct SessionRewindResult {
     /// `git restore --source <ref>`. Absent when the files were not restored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_as: Option<String>,
+}
+
+/// Error code of a [`SESSION_WORKTREE`] the daemon refused, with the reason as
+/// the message: the session already has a worktree or a turn, its folder is not
+/// a git repository, or the worktree could not be made.
+pub const WORKTREE_REFUSED_CODE: i64 = -32008;
+
+/// How long a client should wait for [`SESSION_WORKTREE`]: the daemon runs the
+/// user's setup command, which it stops after ten minutes, before it answers.
+pub const WORKTREE_REQUEST_TIMEOUT_SECS: u64 = 660;
+
+/// Parameters of [`SESSION_WORKTREE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionWorktreeParams {
+    /// Session to move. It must have no turn yet and no worktree.
+    pub session_id: SessionId,
+}
+
+/// Result of [`SESSION_WORKTREE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionWorktreeResult {
+    /// The session, whose working directory is now the worktree.
+    pub session: SessionInfo,
+    /// The branch coda made for the worktree.
+    pub branch: String,
 }
 
 /// Parameters of [`SESSION_SUBSCRIBE`].
@@ -550,6 +578,7 @@ mod tests {
             (SESSION_LIST, "session.list"),
             (SESSION_CLOSE, "session.close"),
             (SESSION_REWIND, "session.rewind"),
+            (SESSION_WORKTREE, "session.worktree"),
             (PERMISSION_RESPOND, "permission.respond"),
             (GRANT_ADD, "grant.add"),
             (USAGE_SUMMARY, "usage.summary"),

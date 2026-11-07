@@ -20,6 +20,7 @@ use crate::review::{
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
 use crate::tui::TuiConfig;
+use crate::worktree::{DIR_KEY, SETUP_KEY, WORKTREE_KEY, WorktreeConfig};
 
 /// Output limit of a model request when `max_output_tokens` is unset.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
@@ -295,6 +296,8 @@ pub struct Config {
     pub loop_guard: LoopGuardConfig,
     /// Settings of the terminal UI.
     pub tui: TuiConfig,
+    /// Where session worktrees go and what runs in a new one.
+    pub worktree: WorktreeConfig,
 }
 
 impl Default for Config {
@@ -315,6 +318,7 @@ impl Default for Config {
             review: ReviewConfig::default(),
             loop_guard: LoopGuardConfig::default(),
             tui: TuiConfig::default(),
+            worktree: WorktreeConfig::default(),
         }
     }
 }
@@ -356,6 +360,7 @@ impl Config {
         config.check_review()?;
         config.check_loop_guard()?;
         config.check_parallel_tools()?;
+        config.check_worktree()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -570,6 +575,27 @@ impl Config {
             return Err(ConfigError::InvalidValue {
                 path: format!("{LOOP_GUARD_KEY}.{STOP_AFTER_KEY}"),
                 allowed: format!("a whole number of repeats above {WARN_AFTER_KEY}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn check_worktree(&self) -> Result<(), ConfigError> {
+        let worktree = &self.worktree;
+        if worktree
+            .dir
+            .as_deref()
+            .is_some_and(|dir| !dir.is_absolute())
+        {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{WORKTREE_KEY}.{DIR_KEY}"),
+                allowed: "an absolute path".to_owned(),
+            });
+        }
+        if worktree.setup.first().is_some_and(String::is_empty) {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{WORKTREE_KEY}.{SETUP_KEY}"),
+                allowed: "a program name first, then its arguments".to_owned(),
             });
         }
         Ok(())
@@ -1281,6 +1307,50 @@ bots = true
                 NotifyMode::Osc777
             ]
         );
+    }
+
+    #[test]
+    fn the_worktree_table_defaults_to_no_folder_and_no_setup() {
+        // Act
+        let worktree = Config::from_toml_str("").unwrap().config.worktree;
+
+        // Assert
+        assert_eq!(worktree.dir, None);
+        assert_eq!(worktree.setup, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_worktree_folder_and_setup_command_are_read_from_the_file() {
+        // Arrange
+        let text = "[worktree]\ndir = \"/work/trees\"\nsetup = [\"npm\", \"install\"]\n";
+
+        // Act
+        let parsed = Config::from_toml_str(text).unwrap();
+
+        // Assert
+        assert_eq!(
+            parsed.config.worktree.dir,
+            Some(PathBuf::from("/work/trees"))
+        );
+        assert_eq!(parsed.config.worktree.setup, ["npm", "install"]);
+        assert_eq!(parsed.unknown_keys, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_relative_worktree_folder_or_an_empty_setup_program_is_rejected() {
+        // Arrange
+        let cases = [
+            ("[worktree]\ndir = \"trees\"\n", "worktree.dir"),
+            ("[worktree]\nsetup = [\"\"]\n", "worktree.setup"),
+        ];
+
+        for (text, key) in cases {
+            // Act
+            let err = Config::from_toml_str(text).unwrap_err();
+
+            // Assert
+            assert!(err.to_string().contains(key), "{err}");
+        }
     }
 
     #[test]
