@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use coda_config::config::Dirs;
 use coda_config::timing::Timing;
+use coda_providers::transcripts::TranscriptRoots;
 
 use crate::error::CliError;
 use crate::tui_cmd::{TuiLauncher, real_tui};
@@ -48,6 +49,8 @@ pub struct Context {
     pub stdin_is_tty: bool,
     /// Runs the terminal UI.
     pub launch_tui: TuiLauncher,
+    /// Where Claude Code and Codex keep their transcripts, for `coda usage --history`.
+    pub transcripts: TranscriptRoots,
 }
 
 impl Context {
@@ -63,6 +66,7 @@ impl Context {
             is_tty: false,
             stdin_is_tty: false,
             launch_tui: real_tui,
+            transcripts: TranscriptRoots::from_env(),
         }
     }
 
