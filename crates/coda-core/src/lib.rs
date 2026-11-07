@@ -11,6 +11,7 @@ pub mod history;
 pub mod hooks;
 pub mod loop_guard;
 pub mod prompt;
+pub mod repair;
 pub mod task;
 pub mod tools;
 pub mod turn;

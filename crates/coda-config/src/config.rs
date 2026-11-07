@@ -155,6 +155,10 @@ impl MaxTokensField {
 /// One `[providers.<backend>]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is its own key in config.toml"
+)]
 pub struct ProviderConfig {
     /// Whether the backend may be used.
     pub enabled: bool,
@@ -184,6 +188,9 @@ pub struct ProviderConfig {
     pub max_tokens_field: MaxTokensField,
     /// Whether the request asks for token usage in the stream; `openai_compat` only.
     pub stream_usage: bool,
+    /// Whether a reply that is one JSON object fitting exactly one tool counts as
+    /// a call to it; for a model that writes its calls as text. Model-API providers only.
+    pub text_tool_calls: bool,
 }
 
 // Written by hand because `stream_usage` is on unless the file turns it off.
@@ -204,6 +211,7 @@ impl Default for ProviderConfig {
             max_output_tokens: None,
             max_tokens_field: MaxTokensField::default(),
             stream_usage: true,
+            text_tool_calls: false,
         }
     }
 }
@@ -648,6 +656,21 @@ mod tests {
 
     fn parse(s: &str) -> Parsed {
         Config::from_toml_str(s).expect("valid config")
+    }
+
+    #[test]
+    fn text_tool_calls_are_off_unless_a_provider_turns_them_on() {
+        // Arrange
+        let on = "[providers.openai_compat]\nenabled = true\ntext_tool_calls = true\n";
+        let off = "[providers.openai_compat]\nenabled = true\n";
+
+        // Act
+        let on = parse(on).config;
+        let off = parse(off).config;
+
+        // Assert
+        assert!(on.providers["openai_compat"].text_tool_calls);
+        assert!(!off.providers["openai_compat"].text_tool_calls);
     }
 
     #[test]

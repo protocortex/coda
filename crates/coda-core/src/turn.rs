@@ -12,6 +12,7 @@ use std::time::Duration;
 use coda_config::config::DEFAULT_MAX_GUARD_CONTINUES;
 use coda_config::hooks::HookEvent;
 use coda_config::loop_guard::LoopGuardConfig;
+use coda_protocol::events::{CALL_FROM_TEXT, CALL_REPAIRED};
 use coda_protocol::types::{OriginalId, PermissionDecision, SessionId};
 use coda_providers::gate::PermissionGate;
 use coda_providers::model::{
@@ -36,6 +37,7 @@ use crate::economy::{cap_ends, compact};
 use crate::hooks::HookRunner;
 use crate::loop_guard::{self, LoopGuard, Verdict};
 use crate::prompt::{Conversation, Message, ToolCall};
+use crate::repair;
 use crate::task::{TaskRequest, TaskRunner};
 
 /// What the model is told about a call that never ran because the turn stopped.
@@ -56,6 +58,8 @@ const RESULT_WITHHELD: &str =
     "ran, but the result is withheld: the turn was cancelled before a hook checked it";
 /// Starts the note that tells the model it is repeating a call.
 const WARNING_PREFIX: &str = "warning:";
+/// Starts the id of a call that was read from a reply's text.
+const TEXT_CALL_ID_PREFIX: &str = "text_call_";
 /// Name of the span around one model call.
 pub const PROVIDER_CALL_SPAN: &str = "coda.provider.call";
 /// Name of the span around one tool call.
@@ -180,6 +184,17 @@ pub enum TurnEvent {
         /// How many continues were forced.
         attempts: u32,
     },
+    /// A tool call was not what the model sent: its arguments were repaired, or
+    /// the call was read from the text of the reply. The call then goes on as
+    /// any other.
+    CallRecovered {
+        /// The call, by the id it has in the conversation.
+        call_id: String,
+        /// The tool it calls.
+        tool: String,
+        /// What was done.
+        how: Recovery,
+    },
     /// An event of a sub-agent's run, passed up the session's own channel so it
     /// is stored in order with the session's events: after the call that started
     /// the sub-agent and before that call's result.
@@ -189,6 +204,26 @@ pub enum TurnEvent {
         /// What happened in its run.
         event: Box<TurnEvent>,
     },
+}
+
+/// How a tool call that the model did not make cleanly was recovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// Its arguments were almost valid JSON and were repaired.
+    Repaired,
+    /// It was read from the text of a reply that made no structured call.
+    FromText,
+}
+
+impl Recovery {
+    /// The stable name stored and shown.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Repaired => CALL_REPAIRED,
+            Self::FromText => CALL_FROM_TEXT,
+        }
+    }
 }
 
 /// Why a send failed outright.
@@ -293,6 +328,10 @@ pub struct TurnConfig {
 }
 
 /// One session's loop state.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent switches of one loop's state"
+)]
 pub struct TurnLoop<P, G> {
     provider: P,
     gate: G,
@@ -319,6 +358,8 @@ pub struct TurnLoop<P, G> {
     guard: LoopGuard,
     /// Most continues an `end_turn` hook may force in one send.
     max_guard_continues: u32,
+    /// Whether a reply that is one JSON object fitting one tool is a call.
+    text_tool_calls: bool,
 }
 
 /// How a compaction attempt ended.
@@ -362,7 +403,17 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             resumed: false,
             guard: LoopGuard::new(LoopGuardConfig::default()),
             max_guard_continues: DEFAULT_MAX_GUARD_CONTINUES,
+            text_tool_calls: false,
         }
+    }
+
+    /// Lets a reply with no structured call, whose whole text is one JSON object
+    /// that fits exactly one tool, count as a call to it. Off by default: only
+    /// a provider known to answer this way should turn it on.
+    #[must_use]
+    pub fn with_text_tool_calls(mut self, on: bool) -> Self {
+        self.text_tool_calls = on;
+        self
     }
 
     /// Sets how many times an `end_turn` hook may send the model back to work
@@ -542,17 +593,26 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             };
             // Calls from a reply that did not stop for tools are dropped: nothing
             // would answer them, and an unanswered call poisons every later request.
-            let calls = if reply.stop == StopReason::ToolUse {
+            let mut stop = reply.stop;
+            let mut calls = if stop == StopReason::ToolUse {
                 reply.calls
             } else {
                 Vec::new()
             };
-            let answer = reply.text.clone();
-            let text = if reply.text.is_empty() && calls.is_empty() {
-                NO_REPLY.to_owned()
-            } else {
-                reply.text
-            };
+            let mut text = reply.text;
+            let answer = text.clone();
+            self.repair_calls(&mut calls);
+            if calls.is_empty()
+                && stop == StopReason::EndTurn
+                && let Some(call) = self.call_from_text(&text)
+            {
+                calls.push(call);
+                stop = StopReason::ToolUse;
+                text.clear();
+            }
+            if text.is_empty() && calls.is_empty() {
+                NO_REPLY.clone_into(&mut text);
+            }
             self.emit(TurnEvent::Assistant {
                 text: text.clone(),
                 tool_calls: calls.clone(),
@@ -561,7 +621,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                 text,
                 tool_calls: calls.clone(),
             });
-            match reply.stop {
+            match stop {
                 StopReason::ToolUse if calls.is_empty() => {
                     if let Some(stop) = self.guard_end(&answer, &mut continues, last_turn).await {
                         return Ok(stop);
@@ -583,6 +643,75 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
             }
         }
         Ok(StopCondition::MaxTurns)
+    }
+
+    /// Repairs the arguments of each call that is not valid JSON, where a
+    /// strict fix makes it so, and says so.
+    fn repair_calls(&self, calls: &mut [ToolCall]) {
+        for call in calls {
+            if call.arguments.is_empty() || serde_json::from_str::<Value>(&call.arguments).is_ok() {
+                continue;
+            }
+            if let Some(fixed) = repair::repair_arguments(&call.arguments) {
+                info!(tool = %call.name, "repaired the arguments of a tool call");
+                call.arguments = fixed;
+                self.emit(TurnEvent::CallRecovered {
+                    call_id: call.id.clone(),
+                    tool: call.name.clone(),
+                    how: Recovery::Repaired,
+                });
+            }
+        }
+    }
+
+    /// The call a reply's text makes, when the provider allows it and the text
+    /// is one JSON object that fits exactly one tool.
+    fn call_from_text(&self, text: &str) -> Option<ToolCall> {
+        if !self.text_tool_calls {
+            return None;
+        }
+        let found = repair::text_call(text, self.conversation.prefix().tools())?;
+        info!(tool = %found.name, "read a tool call from the text of a reply");
+        let mut number = self.conversation.messages().len();
+        let id = loop {
+            let id = format!("{TEXT_CALL_ID_PREFIX}{number}");
+            if !self.call_id_in_use(&id) {
+                break id;
+            }
+            number += 1;
+        };
+        let call = ToolCall {
+            id,
+            name: found.name,
+            arguments: found.arguments,
+        };
+        self.emit(TurnEvent::CallRecovered {
+            call_id: call.id.clone(),
+            tool: call.name.clone(),
+            how: Recovery::FromText,
+        });
+        Some(call)
+    }
+
+    fn call_id_in_use(&self, id: &str) -> bool {
+        self.conversation.messages().iter().any(|message| {
+            matches!(message, Message::Assistant { tool_calls, .. }
+                if tool_calls.iter().any(|call| call.id == id))
+        })
+    }
+
+    /// `refusal` with the input schema of the tool `call` names, so the model
+    /// can correct the call.
+    fn with_schema(&self, call: &ToolCall, mut refusal: ToolOutcome) -> ToolOutcome {
+        let schema =
+            (self.conversation.prefix().tools().iter()).find(|tool| tool.name == call.name);
+        if let Some(schema) = schema {
+            refusal.text = format!(
+                "{}. The input schema of {} is {}",
+                refusal.text, call.name, schema.input_schema
+            );
+        }
+        refusal
     }
 
     /// Asks the `end_turn` hooks whether the turn may end after a reply with
@@ -994,7 +1123,7 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
         };
         let input = match parse_arguments(call) {
             Ok(input) => input,
-            Err(refusal) => return refusal,
+            Err(refusal) => return self.with_schema(call, refusal),
         };
         let request = tool_request(&call.name, &input, &self.config.cwd);
         let decision = tokio::select! {

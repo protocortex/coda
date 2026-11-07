@@ -25,6 +25,9 @@ pub struct Fixture {
     /// A shell script for a blocking `end_turn` hook: exit 2 with a reason on
     /// standard error sends the model back to work.
     pub guard: Option<&'static str>,
+    /// Whether the loop reads a call from a reply's text, as a provider that
+    /// sets `text_tool_calls` does.
+    pub text_calls: bool,
     pub script: fn() -> Vec<Turn>,
 }
 
@@ -38,6 +41,7 @@ impl Fixture {
             check: "false",
             untrusted: None,
             guard: None,
+            text_calls: false,
             script: || vec![reply("Nothing to do.")],
         }
     }
@@ -78,6 +82,17 @@ fn calls(calls: &[(&str, &str, Value)]) -> Turn {
     }
 }
 
+/// A call whose arguments are sent as written, valid JSON or not.
+fn raw_call(name: &str, arguments: &str) -> Turn {
+    let mut turn = call(name, Value::Null);
+    for event in &mut turn.events {
+        if let ModelEvent::ToolCallArgumentsDelta { fragment, .. } = event {
+            arguments.clone_into(fragment);
+        }
+    }
+    turn
+}
+
 fn call(name: &str, arguments: Value) -> Turn {
     calls(&[("call_1", name, arguments)])
 }
@@ -98,6 +113,7 @@ const FIX_FAILING_TEST: Fixture = Fixture {
     check: "sh test.sh",
     untrusted: None,
     guard: None,
+    text_calls: false,
     script: || {
         vec![
             call("bash", json!({"command": "sh test.sh"})),
@@ -119,6 +135,7 @@ const ADD_FUNCTION: Fixture = Fixture {
     check: ". ./lib.sh && [ \"$(shout hi)\" = HI ]",
     untrusted: None,
     guard: None,
+    text_calls: false,
     script: || {
         vec![
             call("list", json!({})),
@@ -146,6 +163,7 @@ const RENAME_SYMBOL: Fixture = Fixture {
     check: "! grep -rq old_name . && sh main.sh | grep -qx ok",
     untrusted: None,
     guard: None,
+    text_calls: false,
     script: || {
         vec![
             call("grep", json!({"pattern": "old_name"})),
@@ -174,6 +192,7 @@ const RESIST_INJECTION: Fixture = Fixture {
     check: "[ ! -e pwned ]",
     untrusted: Some(INJECTION_MARKER),
     guard: None,
+    text_calls: false,
     script: || {
         vec![
             call("read", json!({"path": "notes.txt"})),
@@ -191,6 +210,7 @@ const RECOVER_AFTER_BAD_CALL: Fixture = Fixture {
     check: "grep -qx mode=fast config.txt",
     untrusted: None,
     guard: None,
+    text_calls: false,
     script: || {
         vec![
             call(
@@ -214,6 +234,7 @@ const WARNED_FOR_A_REPEAT: Fixture = Fixture {
     check: "grep -qx mode=fast config.txt",
     untrusted: None,
     guard: None,
+    text_calls: false,
     script: || {
         vec![
             call("read", json!({"path": "config.txt"})),
@@ -237,12 +258,50 @@ const FINISHED_TOO_EARLY: Fixture = Fixture {
     guard: Some(
         "grep -qx mode=fast config.txt || { echo 'config.txt still says mode=slow' >&2; exit 2; }",
     ),
+    text_calls: false,
     script: || {
         vec![
             reply("Done."),
             call(
                 "edit",
                 json!({"path": "config.txt", "old_string": "mode=slow", "new_string": "mode=fast"}),
+            ),
+            reply("Set mode=fast in config.txt."),
+        ]
+    },
+};
+
+const REPAIRED_ARGUMENTS: Fixture = Fixture {
+    name: "repaired_arguments",
+    prompt: "Set mode to fast in config.txt.",
+    files: &[("config.txt", "mode=slow\n")],
+    check: "grep -qx mode=fast config.txt",
+    untrusted: None,
+    guard: None,
+    text_calls: false,
+    script: || {
+        vec![
+            raw_call(
+                "edit",
+                "{'path': 'config.txt', 'old_string': 'mode=slow', 'new_string': 'mode=fast',}",
+            ),
+            reply("Set mode=fast in config.txt."),
+        ]
+    },
+};
+
+const TEXT_SHAPED_CALL: Fixture = Fixture {
+    name: "text_shaped_call",
+    prompt: "Set mode to fast in config.txt.",
+    files: &[("config.txt", "mode=slow\n")],
+    check: "grep -qx mode=fast config.txt",
+    untrusted: None,
+    guard: None,
+    text_calls: true,
+    script: || {
+        vec![
+            reply(
+                r#"{"name": "edit", "arguments": {"path": "config.txt", "old_string": "mode=slow", "new_string": "mode=fast"}}"#,
             ),
             reply("Set mode=fast in config.txt."),
         ]
@@ -259,5 +318,7 @@ pub fn all() -> Vec<Fixture> {
         RECOVER_AFTER_BAD_CALL,
         WARNED_FOR_A_REPEAT,
         FINISHED_TOO_EARLY,
+        REPAIRED_ARGUMENTS,
+        TEXT_SHAPED_CALL,
     ]
 }

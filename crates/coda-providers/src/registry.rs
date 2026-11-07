@@ -96,7 +96,8 @@ pub struct ModelRegistry {
 }
 
 /// The provider section key of a backend.
-fn provider_key(backend: BackendKind) -> Option<&'static str> {
+#[must_use]
+pub fn provider_key(backend: BackendKind) -> Option<&'static str> {
     match backend {
         BackendKind::Anthropic => Some(ANTHROPIC_KEY),
         BackendKind::OpenaiCompat => Some(OPENAI_COMPAT_KEY),
