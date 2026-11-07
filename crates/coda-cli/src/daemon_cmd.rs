@@ -12,6 +12,7 @@ use coda_config::config::{Config, ConfigError, Dirs};
 use coda_daemon::backends::locate_claude_code;
 use coda_daemon::lock::LockError;
 use coda_daemon::recover::recover_and_continue;
+use coda_daemon::scheduler;
 use coda_daemon::server::{BoundServer, Server, ServerConfig, ServerError};
 use coda_daemon::state::DaemonState;
 use coda_daemon::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
@@ -74,6 +75,7 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
     info!(?report, "startup cleanup finished");
     let turns = build_turns(&config, &ctx.dirs, &hub);
     turns.start_continuations(&report.continued);
+    let scheduler = scheduler::spawn(Arc::clone(&hub), Arc::clone(&turns));
     let bound = bound
         .with_hub(Arc::clone(&hub))
         .with_state(state.clone())
@@ -92,6 +94,7 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
             }
         })
         .await;
+    scheduler.abort();
     turns.shutdown().await;
     info!("daemon stopped");
     Ok(())

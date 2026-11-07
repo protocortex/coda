@@ -71,6 +71,11 @@ pub enum Command {
     /// Report and clean up the worktrees coda made for sessions.
     #[command(subcommand)]
     Worktree(WorktreeCommand),
+    /// Send a prompt later, on an interval or at a time of day.
+    ///
+    /// Schedules run inside the daemon, so one only runs while the daemon does.
+    #[command(subcommand)]
+    Schedule(ScheduleCommand),
     /// Manage standing permission grants.
     #[command(subcommand)]
     Grant(GrantCommand),
@@ -561,6 +566,67 @@ impl From<ModeArg> for Mode {
             ModeArg::AcceptEdits => Self::AcceptEdits,
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScheduleCommand {
+    /// Add a scheduled prompt. At most 50 exist, an interval is at least 60 seconds, and a
+    /// tick sends at most 5 prompts.
+    Add(ScheduleAddArgs),
+    /// List the scheduled prompts with their state and next run.
+    List(ScheduleListArgs),
+    /// Remove a scheduled prompt.
+    Remove(ScheduleRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ScheduleAddArgs {
+    /// The prompt to send at each run.
+    #[arg(long)]
+    pub prompt: String,
+    /// Run once, this long from now: 90s, 10m, 2h or 1d.
+    #[arg(long = "in", value_name = "TIME", conflicts_with_all = ["every", "daily"])]
+    pub once_in: Option<String>,
+    /// Run again and again, this far apart: 90s, 10m, 2h or 1d. At least 60 seconds.
+    #[arg(long, value_name = "TIME", conflicts_with = "daily")]
+    pub every: Option<String>,
+    /// Run each day at this time of day, HH:MM, in UTC.
+    #[arg(long, value_name = "HH:MM")]
+    pub daily: Option<String>,
+    /// With --daily, only on these days: mon,tue,wed,thu,fri,sat,sun. Without it, every day.
+    #[arg(long, value_name = "DAYS", requires = "daily")]
+    pub weekdays: Option<String>,
+    /// Send into this session.
+    #[arg(long, conflicts_with_all = ["cwd", "backend", "model", "mode"])]
+    pub session: Option<String>,
+    /// Make a new session in this directory for each run.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// The backend of the new sessions.
+    #[arg(long, value_enum, requires = "cwd")]
+    pub backend: Option<BackendArg>,
+    /// The model of the new sessions.
+    #[arg(long, requires = "cwd")]
+    pub model: Option<String>,
+    /// The autonomy mode of the new sessions.
+    #[arg(long, value_enum, default_value_t, requires = "cwd")]
+    pub mode: ModeArg,
+    /// Print the schedule as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ScheduleListArgs {
+    /// Print the schedules as a JSON array.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ScheduleRemoveArgs {
+    /// The id `coda schedule list` shows.
+    pub id: u64,
 }
 
 #[derive(Debug, Subcommand)]

@@ -62,7 +62,7 @@ fn failed(e: HubError) -> ErrorObject {
 }
 
 /// The canonical form of `cwd`, which must be an absolute path to a directory.
-async fn canonical_cwd(cwd: &str) -> Result<String, ErrorObject> {
+pub(crate) async fn canonical_cwd(cwd: &str) -> Result<String, ErrorObject> {
     let invalid = || {
         error(
             INVALID_PARAMS,

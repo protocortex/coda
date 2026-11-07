@@ -39,7 +39,7 @@ const NOTICE_SENTENCES: [&str; 10] = [
     "The claude_code and codex backends stay disabled until you enable them.",
 ];
 const CANARY_KEY: &str = "sk-canary-must-not-reach-a-block";
-const HELP_COMMANDS: [&[&str]; 24] = [
+const HELP_COMMANDS: [&[&str]; 27] = [
     &[],
     &["tui"],
     &["init"],
@@ -62,6 +62,9 @@ const HELP_COMMANDS: [&[&str]; 24] = [
     &["session", "fork"],
     &["session", "ship"],
     &["session", "watch"],
+    &["schedule", "add"],
+    &["schedule", "list"],
+    &["schedule", "remove"],
     &["worktree", "clean"],
     &["checkpoints", "prune"],
 ];

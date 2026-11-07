@@ -419,3 +419,112 @@ async fn forking_a_model_api_session_fails_with_the_reason() {
         forked.err
     );
 }
+
+#[tokio::test]
+async fn an_added_schedule_is_listed_and_removed() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one")]);
+    let id = rig.start_session().await;
+
+    // Act
+    let added = rig
+        .coda(&[
+            "schedule",
+            "add",
+            "--session",
+            &id,
+            "--every",
+            "5m",
+            "--prompt",
+            "check the build",
+            "--json",
+        ])
+        .await;
+    let listed = rig.coda(&["schedule", "list"]).await;
+    let schedule: Value = serde_json::from_str(&added.out).unwrap();
+    let number = schedule["id"].as_u64().unwrap().to_string();
+    let removed = rig.coda(&["schedule", "remove", &number]).await;
+    let after = rig.coda(&["schedule", "list"]).await;
+
+    // Assert
+    assert_eq!(added.code, ExitCode::SUCCESS, "{}", added.err);
+    assert_eq!(schedule["spec"]["every_secs"], 300);
+    assert!(listed.out.contains("every 300s"), "{}", listed.out);
+    assert!(listed.out.contains("check the build"), "{}", listed.out);
+    assert_eq!(removed.code, ExitCode::SUCCESS, "{}", removed.err);
+    assert_eq!(after.out.trim(), "");
+}
+
+#[tokio::test]
+async fn an_interval_under_a_minute_is_refused() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one")]);
+    let id = rig.start_session().await;
+
+    // Act
+    let added = rig
+        .coda(&[
+            "schedule",
+            "add",
+            "--session",
+            &id,
+            "--every",
+            "30s",
+            "--prompt",
+            "hi",
+        ])
+        .await;
+
+    // Assert
+    assert_eq!(added.code, ExitCode::from(EXIT_FAILURE), "{}", added.out);
+    assert!(added.err.contains("at least 60 seconds"), "{}", added.err);
+}
+
+#[tokio::test]
+async fn removing_a_schedule_that_does_not_exist_fails() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one")]);
+    rig.start_session().await;
+
+    // Act
+    let removed = rig.coda(&["schedule", "remove", "99"]).await;
+
+    // Assert
+    assert_eq!(
+        removed.code,
+        ExitCode::from(EXIT_FAILURE),
+        "{}",
+        removed.out
+    );
+}
+
+#[tokio::test]
+async fn a_daily_schedule_with_weekdays_shows_its_time_in_utc() {
+    // Arrange
+    let rig = faux_rig(&[text_turn("one")]);
+    let id = rig.start_session().await;
+
+    // Act
+    let added = rig
+        .coda(&[
+            "schedule",
+            "add",
+            "--session",
+            &id,
+            "--daily",
+            "09:30",
+            "--weekdays",
+            "mon,fri",
+            "--prompt",
+            "summarize",
+        ])
+        .await;
+
+    // Assert
+    assert_eq!(added.code, ExitCode::SUCCESS, "{}", added.err);
+    assert!(
+        added.out.contains("daily 09:30 UTC mon,fri"),
+        "{}",
+        added.out
+    );
+}
