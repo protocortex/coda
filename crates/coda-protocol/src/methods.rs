@@ -12,6 +12,9 @@ use crate::types::{
     BackendKind, Mode, PermissionDecision, RequestId, SessionId, SessionInfo, TokenUsage, TurnId,
 };
 
+/// Longest `client_request_id` the daemon accepts.
+pub const MAX_REQUEST_ID_BYTES: usize = 128;
+
 /// Protocol version announced and checked during `initialize`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -154,6 +157,10 @@ pub struct Capabilities {
     /// The daemon serves `mode: steer` on `session.send`.
     #[serde(default)]
     pub steer: bool,
+    /// The daemon honors `client_request_id` on `session.create`, `session.send`
+    /// and `session.cancel`.
+    #[serde(default)]
+    pub idempotent_commands: bool,
 }
 
 /// Result of [`INITIALIZE`].
@@ -181,6 +188,10 @@ pub struct SessionCreateParams {
     /// Initial autonomy mode.
     #[serde(default)]
     pub mode: Mode,
+    /// Names this request, so a retry returns the first answer instead of making
+    /// another session. At most [`MAX_REQUEST_ID_BYTES`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_request_id: Option<String>,
 }
 
 /// Result of [`SESSION_CREATE`].
@@ -206,6 +217,10 @@ pub struct SessionSendParams {
     /// What to do when the session already has a turn running.
     #[serde(default, skip_serializing_if = "SendMode::is_start")]
     pub mode: SendMode,
+    /// Names this request, so a retry returns the first answer instead of
+    /// sending the message again. At most [`MAX_REQUEST_ID_BYTES`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_request_id: Option<String>,
 }
 
 /// What [`SESSION_SEND`] does with a message.
@@ -315,6 +330,11 @@ pub type AgentRunResult = SessionSendResult;
 pub struct SessionCancelParams {
     /// Target session.
     pub session_id: SessionId,
+    /// Names this request, so a retry returns the first answer instead of
+    /// cancelling again, which could stop a later turn. At most
+    /// [`MAX_REQUEST_ID_BYTES`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_request_id: Option<String>,
     /// Also kill the backend's process group at once, for a stop that did not
     /// take. Only a daemon that reports `force_cancel` honors it; an older one
     /// ignores it and cancels as usual.

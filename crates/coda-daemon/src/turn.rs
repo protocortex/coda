@@ -23,10 +23,10 @@ use coda_protocol::events::Event;
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, INVALID_PARAMS};
 use coda_protocol::methods::{
     AgentRunParams, AgentRunResult, DIFF_REFUSED_CODE, PermissionRespondParams,
-    PermissionRespondResult, REWIND_REFUSED_CODE, SendMode, SessionCancelParams,
-    SessionCancelResult, SessionCloseParams, SessionCloseResult, SessionDiffParams,
-    SessionRewindParams, SessionSendParams, SessionSendResult, SessionSetModeParams,
-    SessionSetModeResult,
+    PermissionRespondResult, REWIND_REFUSED_CODE, SESSION_CANCEL, SESSION_SEND, SendMode,
+    SessionCancelParams, SessionCancelResult, SessionCloseParams, SessionCloseResult,
+    SessionDiffParams, SessionRewindParams, SessionSendParams, SessionSendResult,
+    SessionSetModeParams, SessionSetModeResult,
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::TurnOutcome;
@@ -67,6 +67,7 @@ use crate::gate::{BrokerGate, Brokers};
 use crate::idle_pool::{IdlePool, MAX_IDLE_SERVERS};
 use crate::model_session::{Limits, ModelError, ModelSessions};
 use crate::pidfile;
+use crate::receipts;
 use crate::subscribe::{Hub, HubError};
 use crate::supervisor::{RestartPolicy, Supervisor, TokioSleeper, Verdict};
 use crate::trace::backend_span;
@@ -336,6 +337,8 @@ pub struct Turns {
     queues: Mutex<HashMap<SessionId, mpsc::WeakSender<Queued>>>,
     /// Held while a queued message is read, started and removed.
     queue_gate: tokio::sync::Mutex<()>,
+    /// One send with a request id at a time, so a duplicate sees the first answer.
+    request_gate: tokio::sync::Mutex<()>,
     /// Codex app-servers between turns, one per session. A turn takes its
     /// session's server out, so turns of one session never share it at once.
     idle: IdlePool<AgentSession>,
@@ -384,6 +387,7 @@ impl Turns {
             queues: Mutex::default(),
             steers: Mutex::default(),
             queue_gate: tokio::sync::Mutex::new(()),
+            request_gate: tokio::sync::Mutex::new(()),
             idle: IdlePool::new(MAX_IDLE_SERVERS),
             supervisor,
             stopping: AtomicBool::new(false),
@@ -419,6 +423,7 @@ impl Turns {
             text,
             max_turns,
             token_cap,
+            client_request_id,
             mode: _,
         } = params;
         let id = session_id.clone();
@@ -430,14 +435,17 @@ impl Turns {
         self.await_wind_down(&session_id).await?;
         match record.backend {
             BackendKind::ClaudeCode | BackendKind::CodexAppServer | BackendKind::CodexExec => {
-                self.send_agent(record, text.clone(), text, false).await
+                self.send_agent(record, text.clone(), text, false, client_request_id)
+                    .await
             }
             BackendKind::Anthropic | BackendKind::OpenaiCompat | BackendKind::Faux => {
                 let limits = Limits {
                     max_turns,
                     token_cap,
                 };
-                self.models.send(record, text, limits).await
+                self.models
+                    .send(record, text, limits, client_request_id)
+                    .await
             }
             _ => Err(TurnError::Unsupported(session_id)),
         }
@@ -476,7 +484,7 @@ impl Turns {
             .dispatchable(&agent)
             .map_err(|e| TurnError::Agent(e.to_string()))?;
         let prompt = format!("{}\n\n{AGENT_REQUEST_HEADING}\n\n{text}", entry.def.body);
-        self.send_agent(record, text, prompt, true).await
+        self.send_agent(record, text, prompt, true, None).await
     }
 
     /// Starts a turn on a delegated backend. `shown` is stored as the user's
@@ -488,6 +496,7 @@ impl Turns {
         shown: String,
         prompt: String,
         require_plan: bool,
+        request: Option<String>,
     ) -> Result<TurnId, TurnError> {
         let session_id = record.id.clone();
         let is_claude = record.backend == BackendKind::ClaudeCode;
@@ -519,7 +528,7 @@ impl Turns {
         };
         let mut child = self.start_child(&record, false).await?;
         let seed = self.rewind_seed(&record).await;
-        let turn = match Self::begin(&self.hub, &session_id, &shown).await {
+        let turn = match Self::begin_for(&self.hub, &session_id, &shown, request.as_deref()).await {
             Ok(turn) => turn,
             Err(e) => {
                 stop(&mut child, &session_id).await;
@@ -872,32 +881,59 @@ impl Turns {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Starts a turn and stores the user's message as its first event.
-    pub(crate) async fn begin(
+    /// Starts a turn and stores the user's message as its first event. With a
+    /// client request id, the turn and the receipt of that id are stored
+    /// together, so a repeat of the request finds the answer or no turn at all.
+    pub(crate) async fn begin_for(
         hub: &Arc<Hub>,
         session: &SessionId,
         text: &str,
+        request: Option<&str>,
     ) -> Result<TurnId, HubError> {
         let id = session.clone();
+        let owned = request.map(str::to_owned);
         let turn = hub
-            .with_store_mut(move |store| {
-                let turn = store.begin_turn(&id)?;
-                store.record_log_event(&log_event(LogEventKind::TurnStarted, &id, &turn))?;
-                Ok(turn)
+            .with_store_mut(move |store| match &owned {
+                Some(request) => store.begin_turn_for_request(&id, request, SESSION_SEND),
+                None => store.begin_turn(&id),
             })
             .await?;
+        let id = session.clone();
+        let logged = turn.clone();
+        let started = hub
+            .with_store_mut(move |store| {
+                store.record_log_event(&log_event(LogEventKind::TurnStarted, &id, &logged))
+            })
+            .await;
+        if let Err(e) = started {
+            Self::abandon(hub, session, &turn, request).await;
+            return Err(e);
+        }
         let body = json!({ "text": text }).to_string();
         let record = EventRecord {
             kind: USER_MESSAGE_KIND.to_owned(),
             body,
         };
         if let Err(e) = hub.publish(session, &turn, record).await {
-            // No task will run this turn, so nothing else would end it.
-            Self::finish(hub, session, &turn, true).await;
+            Self::abandon(hub, session, &turn, request).await;
             return Err(e);
         }
         checkpoint::before_turn(hub, session, &turn).await;
         Ok(turn)
+    }
+
+    /// Ends a turn that no task will run, and drops its receipt so a retry of
+    /// the request starts again instead of replaying a turn that never ran.
+    async fn abandon(hub: &Arc<Hub>, session: &SessionId, turn: &TurnId, request: Option<&str>) {
+        Self::finish(hub, session, turn, true).await;
+        let Some(request) = request else { return };
+        let request = request.to_owned();
+        let forgotten = hub
+            .with_store_mut(move |store| store.forget_receipt(&request))
+            .await;
+        if let Err(e) = forgotten {
+            warn!(error = %e, "could not drop the receipt of a turn that never started");
+        }
     }
 
     /// The named steps of a running turn: drive the backend (restarting it
@@ -1453,15 +1489,47 @@ fn not_found_or(e: HubError, session: &SessionId) -> TurnError {
 /// Answers `session.send`.
 pub(crate) async fn send(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
     let turns = turns.ok_or_else(unavailable)?;
-    let sent = turns
-        .send(parse_params(params)?)
-        .await
-        .map_err(TurnError::into_rpc)?;
-    to_value(&SessionSendResult {
+    let params: SessionSendParams = parse_params(params)?;
+    let request = params.client_request_id.clone();
+    let session = params.session_id.clone();
+    let _one_at_a_time = match &request {
+        Some(request) => {
+            receipts::check_id(request)?;
+            Some(turns.request_gate.lock().await)
+        }
+        None => None,
+    };
+    if let Some(request) = &request
+        && let Some(stored) =
+            receipts::replay(&turns.hub, request, SESSION_SEND, Some(&session)).await?
+    {
+        return Ok(stored);
+    }
+    let sent = match turns.send(params).await {
+        Ok(sent) => sent,
+        Err(e) => {
+            // A duplicate that raced the first may find its answer now.
+            if let Some(request) = &request
+                && let Some(stored) =
+                    receipts::replay(&turns.hub, request, SESSION_SEND, Some(&session)).await?
+            {
+                return Ok(stored);
+            }
+            return Err(e.into_rpc());
+        }
+    };
+    let answer = to_value(&SessionSendResult {
         turn_id: sent.turn,
         queued: sent.queued,
         steered: sent.steered,
-    })
+    })?;
+    // A started turn wrote its receipt with the turn. These did not start one.
+    if let Some(request) = &request
+        && (sent.queued || sent.steered)
+    {
+        receipts::remember(&turns.hub, request, SESSION_SEND, &session, &answer).await;
+    }
+    Ok(answer)
 }
 
 /// Answers `agent.run`.
@@ -1482,12 +1550,36 @@ pub(crate) async fn run_agent(turns: Option<&Arc<Turns>>, params: Option<Value>)
 pub(crate) async fn cancel(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
     let turns = turns.ok_or_else(unavailable)?;
     let params: SessionCancelParams = parse_params(params)?;
+    if let Some(request) = &params.client_request_id {
+        receipts::check_id(request)?;
+        let replayed = receipts::replay(
+            &turns.hub,
+            request,
+            SESSION_CANCEL,
+            Some(&params.session_id),
+        )
+        .await?;
+        if let Some(stored) = replayed {
+            return Ok(stored);
+        }
+    }
     let cancelled = if params.force {
         turns.force_cancel(&params.session_id).await
     } else {
         turns.cancel(&params.session_id)
     };
-    to_value(&SessionCancelResult { cancelled })
+    let answer = to_value(&SessionCancelResult { cancelled })?;
+    if let Some(request) = &params.client_request_id {
+        receipts::remember(
+            &turns.hub,
+            request,
+            SESSION_CANCEL,
+            &params.session_id,
+            &answer,
+        )
+        .await;
+    }
+    Ok(answer)
 }
 
 /// Answers `session.close`.

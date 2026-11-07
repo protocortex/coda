@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use coda_protocol::jsonrpc::{ErrorObject, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 use coda_protocol::methods::{
-    SessionAttention, SessionCreateParams, SessionCreateResult, SessionListParams,
+    SESSION_CREATE, SessionAttention, SessionCreateParams, SessionCreateResult, SessionListParams,
     SessionListResult, SessionResumeParams, SessionResumeResult, SessionStatus, SessionSummary,
     SessionWorktreeParams, SessionWorktreeResult, WORKTREE_REFUSED_CODE, WorktreeCleanParams,
 };
@@ -23,6 +23,7 @@ use serde_json::Value;
 use tracing::{Instrument, error, warn};
 
 use crate::dispatch::{HandlerResult, error, parse_params, to_value};
+use crate::receipts;
 use crate::subscribe::{Hub, HubError};
 use crate::trace::session_span;
 use crate::turn::SESSION_NOT_FOUND;
@@ -78,11 +79,19 @@ async fn canonical_cwd(cwd: &str) -> Result<String, ErrorObject> {
     }
 }
 
-/// Answers `session.create`. Each call makes a new session, so a retry whose
-/// first answer was lost leaves an unused extra one.
+/// Answers `session.create`. Each call makes a new session, unless it carries a
+/// `client_request_id` that already made one: then the answer of the first call
+/// comes back, so a retry whose first answer was lost leaves no extra session.
 pub(crate) async fn create(hub: Option<&Arc<Hub>>, params: Option<Value>) -> HandlerResult {
     let hub = hub.ok_or_else(unavailable)?;
     let params: SessionCreateParams = parse_params(params)?;
+    let request = params.client_request_id.clone();
+    if let Some(request) = &request {
+        receipts::check_id(request)?;
+        if let Some(stored) = receipts::replay(hub, request, SESSION_CREATE, None).await? {
+            return Ok(stored);
+        }
+    }
     let cwd = canonical_cwd(&params.cwd).await?;
     let new = NewSession {
         backend: params.backend,
@@ -90,15 +99,39 @@ pub(crate) async fn create(hub: Option<&Arc<Hub>>, params: Option<Value>) -> Han
         cwd,
         mode: params.mode,
     };
-    let record = hub
+    let made = hub
         .with_store_mut(move |store| {
-            let id = store.create_session(&new)?;
-            store.load_session(&id)
+            if let Some(request) = &request {
+                store.create_session_for_request(&new, request, SESSION_CREATE, |r| {
+                    answer_of(r.clone())
+                })
+            } else {
+                let id = store.create_session(&new)?;
+                store.load_session(&id)
+            }
         })
-        .await
-        .map_err(failed)?;
-    let session = info(record);
-    to_value(&SessionCreateResult { session })
+        .await;
+    match made {
+        Ok(record) => to_value(&SessionCreateResult {
+            session: info(record),
+        }),
+        // A duplicate that raced the first finds its answer now.
+        Err(HubError::Store(StoreError::DuplicateRequest { request_id })) => {
+            match receipts::replay(hub, &request_id, SESSION_CREATE, None).await? {
+                Some(stored) => Ok(stored),
+                None => Err(error(INTERNAL_ERROR, "Internal error")),
+            }
+        }
+        Err(e) => Err(failed(e)),
+    }
+}
+
+/// The JSON a `session.create` answers with for `record`.
+fn answer_of(record: SessionRecord) -> String {
+    serde_json::json!(SessionCreateResult {
+        session: info(record)
+    })
+    .to_string()
 }
 
 /// Answers `session.resume`. A read-only lookup, so a retry is safe.

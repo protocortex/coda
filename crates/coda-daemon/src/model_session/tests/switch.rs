@@ -417,7 +417,7 @@ async fn a_send_that_began_before_a_switch_builds_on_the_switched_model() {
     let sent = rig
         .turns
         .models
-        .send(stale.unwrap(), "go".to_owned(), Limits::default())
+        .send(stale.unwrap(), "go".to_owned(), Limits::default(), None)
         .await;
     rig.wait_for_results(1).await;
 
@@ -513,7 +513,7 @@ async fn a_send_without_a_key_variable_or_a_model_reports_why() {
         let record = rig.hub.with_store(move |s| s.load_session(&id)).await;
         let failed = rig
             .sessions
-            .send(record.unwrap(), "hi".to_owned(), Limits::default())
+            .send(record.unwrap(), "hi".to_owned(), Limits::default(), None)
             .await
             .unwrap_err();
         let rpc = failed.into_rpc();

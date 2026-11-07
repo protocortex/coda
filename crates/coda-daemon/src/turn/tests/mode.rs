@@ -195,7 +195,7 @@ async fn a_send_that_loaded_the_session_before_a_change_runs_under_the_stored_mo
 
     // Act
     rig.turns
-        .send_agent(stale, "hello".to_owned(), "hello".to_owned(), false)
+        .send_agent(stale, "hello".to_owned(), "hello".to_owned(), false, None)
         .await
         .unwrap();
     rig.wait_for("result").await;
@@ -218,7 +218,7 @@ async fn an_agent_run_that_checked_plan_mode_before_a_change_out_of_it_is_refuse
     // Act
     let refused = rig
         .turns
-        .send_agent(stale, "hello".to_owned(), "hello".to_owned(), true)
+        .send_agent(stale, "hello".to_owned(), "hello".to_owned(), true, None)
         .await;
 
     // Assert

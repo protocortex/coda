@@ -486,6 +486,7 @@ impl Link {
             cwd: self.config.cwd.clone(),
             model: None,
             mode: Mode::default(),
+            client_request_id: None,
         };
         let created: SessionCreateResult = self.client.request(SESSION_CREATE, &params).await?;
         self.follow(created.session, None, true).await
@@ -706,6 +707,7 @@ impl Link {
             max_turns: None,
             token_cap: None,
             mode: coda_protocol::methods::SendMode::Start,
+            client_request_id: None,
         };
         self.client
             .request::<_, SessionSendResult>(SESSION_SEND, &params)
@@ -721,7 +723,11 @@ impl Link {
         self.client
             .request::<_, SessionCancelResult>(
                 SESSION_CANCEL,
-                &SessionCancelParams { session_id, force },
+                &SessionCancelParams {
+                    session_id,
+                    force,
+                    client_request_id: None,
+                },
             )
             .await
             .map(|_| ())

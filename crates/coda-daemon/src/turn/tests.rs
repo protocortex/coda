@@ -70,6 +70,7 @@ fn relaxed() -> Timing {
 
 mod checkpoints;
 mod diff;
+mod idempotent;
 mod mode;
 mod queue;
 mod restarts;
@@ -1086,7 +1087,7 @@ async fn a_turn_whose_first_event_cannot_be_stored_is_not_left_open() {
         .unwrap();
 
     // Act
-    let begun = Turns::begin(&rig.hub, &rig.session, "hello").await;
+    let begun = Turns::begin_for(&rig.hub, &rig.session, "hello", None).await;
 
     // Assert
     let open = rig.hub.with_store(Store::unfinished_turns).await.unwrap();

@@ -93,6 +93,9 @@ golden_tests! {
     session_create_result: "session.create.result" => SessionCreateResult,
     session_send_params: "session.send.params" => SessionSendParams,
     session_send_params_limits: "session.send.params.limits" => SessionSendParams,
+    session_send_params_request: "session.send.params.request" => SessionSendParams,
+    session_cancel_params_request: "session.cancel.params.request" => SessionCancelParams,
+    session_create_params_request: "session.create.params.request" => SessionCreateParams,
     session_send_params_queue: "session.send.params.queue" => SessionSendParams,
     session_send_result: "session.send.result" => SessionSendResult,
     session_send_result_queued: "session.send.result.queued" => SessionSendResult,
@@ -183,6 +186,7 @@ fn absent_optional_fields_stay_absent_when_serialized() {
         cwd: "/work".to_owned(),
         model: None,
         mode: Mode::Default,
+        client_request_id: None,
     };
     let crashed = Event::BackendCrashed {
         session_id: SessionId::new("s-1"),

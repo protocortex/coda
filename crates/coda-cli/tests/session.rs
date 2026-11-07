@@ -43,6 +43,7 @@ impl Rig {
             cwd: self.work.path().display().to_string(),
             model: None,
             mode: Mode::Default,
+            client_request_id: None,
         };
         let created: SessionCreateResult = client.request(SESSION_CREATE, &params).await.unwrap();
         created.session.id.to_string()
@@ -186,6 +187,7 @@ async fn list_filters_by_a_directory_that_no_longer_exists() {
         cwd: gone.path().display().to_string(),
         model: None,
         mode: Mode::Default,
+        client_request_id: None,
     };
     let created: SessionCreateResult = client.request(SESSION_CREATE, &params).await.unwrap();
     let id = created.session.id.to_string();

@@ -410,6 +410,7 @@ impl ModelSessions {
         record: SessionRecord,
         text: String,
         limits: Limits,
+        request: Option<String>,
     ) -> Result<TurnId, TurnError> {
         let session = record.id.clone();
         let slot = self.reserve(&session)?;
@@ -420,7 +421,7 @@ impl ModelSessions {
         info!(session = %session, step = "build_loop", "preparing the model session");
         let model_loop = self.loop_for_send(&record, limits).await?;
         info!(session = %session, step = "begin_turn", "recording the user message");
-        let turn = match Turns::begin(&self.hub, &session, &text).await {
+        let turn = match Turns::begin_for(&self.hub, &session, &text, request.as_deref()).await {
             Ok(turn) => turn,
             Err(e) => {
                 self.keep_loop(session, model_loop);

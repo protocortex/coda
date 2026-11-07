@@ -262,6 +262,7 @@ async fn a_session_whose_close_was_refused_is_closed_when_the_link_ends() {
             &SessionCancelParams {
                 session_id: first.id,
                 force: false,
+                client_request_id: None,
             },
         )
         .await
