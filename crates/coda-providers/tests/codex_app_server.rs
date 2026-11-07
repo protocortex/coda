@@ -936,3 +936,155 @@ async fn a_command_that_ends_failed_finishes_as_failed() {
         ]
     );
 }
+
+fn limit_events(events: &[Event]) -> Vec<&Event> {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::RateLimit { .. } | Event::UsageLimit { .. }))
+        .collect()
+}
+
+fn five_hour_snapshot() -> Value {
+    json!({"rateLimits": {"primary": {"usedPercent": 62, "windowDurationMins": 300, "resetsAt": 1_794_000_000}}})
+}
+
+#[tokio::test]
+async fn the_first_turn_reads_the_account_limits_and_reports_them() {
+    // Arrange
+    let fixture = Fixture::new(&json!({"rate_limits": five_hour_snapshot()}));
+    let mut session = fixture.session().await;
+
+    // Act
+    let (_, first) = turn(&mut session, "say hi").await;
+    let (_, second) = turn(&mut session, "say hi again").await;
+
+    // Assert
+    let expected = Event::RateLimit {
+        session_id: SessionId::new("s-1"),
+        limit: coda_protocol::events::RateLimit {
+            status: "allowed".to_owned(),
+            window_type: None,
+            resets_at: None,
+            windows: vec![coda_protocol::events::RateLimitWindow {
+                name: "five_hour".to_owned(),
+                utilization_bps: 6200,
+                resets_at: Some(1_794_000_000),
+            }],
+            is_using_overage: false,
+            overage_status: None,
+            overage_resets_at: None,
+            overage_disabled_reason: None,
+        },
+    };
+    assert_eq!(limit_events(&first), vec![&expected]);
+    assert_eq!(limit_events(&second), Vec::<&Event>::new());
+    assert_eq!(fixture.report()["rate_limit_reads"], 1);
+}
+
+#[tokio::test]
+async fn a_server_that_refuses_the_limits_read_still_runs_the_turn() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+
+    // Act
+    let (outcome, events) = turn(&mut session, "say hi").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Completed { is_error: false });
+    assert_eq!(limit_events(&events), Vec::<&Event>::new());
+    assert_eq!(fixture.report()["rate_limit_reads"], 1);
+}
+
+#[tokio::test]
+async fn a_rate_limit_update_during_a_turn_is_reported() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+
+    // Act
+    let (outcome, events) = turn(&mut session, "limit-update").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Completed { is_error: false });
+    let [Event::RateLimit { limit, .. }] = limit_events(&events)[..] else {
+        panic!("expected one rate limit event, got {events:?}");
+    };
+    assert_eq!(limit.windows[0].utilization_bps, 7000);
+}
+
+#[tokio::test]
+async fn a_turn_that_hits_the_plan_limit_reports_the_window_before_its_result() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+
+    // Act
+    let (outcome, events) = turn(&mut session, "limit-hit").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Completed { is_error: true });
+    let tail: Vec<&Event> = events.iter().rev().take(3).rev().collect();
+    assert!(matches!(tail[0], Event::RateLimit { limit, .. } if limit.status == "rejected"));
+    assert_eq!(
+        tail[1],
+        &Event::UsageLimit {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new("t-1"),
+            window: coda_protocol::events::UsageWindowKind::SevenDay,
+            reset_at: Some(1_794_500_000),
+        }
+    );
+    assert!(matches!(tail[2], Event::Result { is_error: true, .. }));
+}
+
+#[tokio::test]
+async fn a_plan_limit_error_without_a_snapshot_is_an_unknown_window() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+
+    // Act
+    let (_, events) = turn(&mut session, "limit-bare").await;
+
+    // Assert
+    assert!(events.contains(&Event::UsageLimit {
+        session_id: SessionId::new("s-1"),
+        turn_id: TurnId::new("t-1"),
+        window: coda_protocol::events::UsageWindowKind::Unknown,
+        reset_at: None,
+    }));
+}
+
+#[tokio::test]
+async fn a_completed_turn_reports_no_usage_limit() {
+    // Arrange
+    let fixture = Fixture::new(&json!({"rate_limits": five_hour_snapshot()}));
+    let mut session = fixture.session().await;
+
+    // Act
+    let (_, events) = turn(&mut session, "say hi").await;
+
+    // Assert
+    assert!(!events.iter().any(|e| matches!(e, Event::UsageLimit { .. })));
+}
+
+#[tokio::test]
+async fn a_turn_that_fails_for_another_reason_reports_no_usage_limit() {
+    // Arrange
+    let fixture = Fixture::new(&json!({}));
+    let mut session = fixture.session().await;
+
+    // Act
+    let (outcome, events) = turn(&mut session, "limit-other").await;
+    let (_, recovered) = turn(&mut session, "limit-other-recovered").await;
+
+    // Assert
+    assert_eq!(outcome, TurnOutcome::Completed { is_error: true });
+    assert!(!events.iter().any(|e| matches!(e, Event::UsageLimit { .. })));
+    assert!(
+        !recovered
+            .iter()
+            .any(|e| matches!(e, Event::UsageLimit { .. }))
+    );
+}

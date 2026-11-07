@@ -7,6 +7,8 @@
 //! token usage and turn messages were checked against codex-cli 0.163.0; see
 //! `docs/live-recording.md`. File change approvals and the `decline` answer were
 //! not seen live, and the `fake-codex` the other tests use is still synthetic.
+//! The plan limit calls (`account/rateLimits/read` and its update) were taken
+//! from the installed server's schema and were not seen live either.
 //!
 //! A denied approval answers `decline`, else `cancel`, from the request's
 //! `availableDecisions`; when neither is offered, or the field is not a list,
@@ -28,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use coda_protocol::events::{Event, InterruptCause};
+use coda_protocol::events::{Event, InterruptCause, UsageWindowKind};
 use coda_protocol::types::{
     ContextFill, PermissionDecision, RequestId, SessionId, TokenUsage, TurnId,
 };
@@ -45,6 +47,7 @@ use crate::claude_session::{
     kill_group,
 };
 use crate::codex_exec::{SandboxMode, SpawnHook};
+use crate::codex_limits::{self, READ_METHOD, UPDATED_METHOD};
 use crate::emit::Emit;
 use crate::gate::PermissionGate;
 use crate::tool_call::{ToolCalls, codex_call, codex_failed};
@@ -276,6 +279,17 @@ fn reply_for(allowed: bool, params: &Value) -> Reply {
     }
 }
 
+/// What the session knows about the plan limits.
+#[derive(Debug, Default)]
+struct PlanLimits {
+    /// Whether the limits were asked for; they are read once, on the first turn.
+    asked: bool,
+    /// The window of the turn's last rejected limit report, and when it resets.
+    hit: Option<(UsageWindowKind, Option<u64>)>,
+    /// Whether the server said this turn ended at the plan limit.
+    stopped: bool,
+}
+
 /// A Codex thread served by one `codex app-server` process.
 #[derive(Debug)]
 pub struct CodexAppServerSession {
@@ -298,6 +312,7 @@ pub struct CodexAppServerSession {
     context: Option<ContextFill>,
     /// Whether the server accepted the last `turn/start`.
     turn_accepted: bool,
+    plan: PlanLimits,
     /// Messages that arrived while an approval was pending.
     queued: VecDeque<Message>,
     closed: bool,
@@ -359,6 +374,7 @@ impl CodexAppServerSession {
             server_turn: None,
             context: None,
             turn_accepted: false,
+            plan: PlanLimits::default(),
             queued: VecDeque::new(),
             closed: false,
         })
@@ -515,6 +531,14 @@ impl CodexAppServerSession {
         gate: &G,
         emit: &mut impl Emit,
     ) -> Result<Option<TurnOutcome>, AppServerError> {
+        self.plan.hit = None;
+        self.plan.stopped = false;
+        let limits_request = if self.plan.asked {
+            None
+        } else {
+            self.plan.asked = true;
+            Some(self.send_request(READ_METHOD, Value::Null).await?)
+        };
         let params = json!({"threadId": self.thread_id, "input": [{"type": "text", "text": text}]});
         let turn_request = self.send_request("turn/start", params).await?;
         self.server_turn = None;
@@ -574,9 +598,37 @@ impl CodexAppServerSession {
                     emit.emit(self.result(turn_id, true)).await;
                     return Ok(Some(TurnOutcome::Completed { is_error: true }));
                 }
+                Message::Response {
+                    id,
+                    failed: false,
+                    result,
+                } if Some(&id) == limits_request.as_ref() => {
+                    self.report_limits(&result["rateLimits"], emit).await;
+                }
                 Message::Response { .. } => {}
             }
         }
+    }
+
+    /// Reports a limits snapshot, and remembers it when it says a window ran out.
+    async fn report_limits(&mut self, snapshot: &Value, emit: &mut impl Emit) {
+        let Some(limit) = codex_limits::rate_limit(snapshot) else {
+            return;
+        };
+        if limit.status == codex_limits::REJECTED {
+            let window = limit
+                .window_type
+                .as_deref()
+                .map_or(UsageWindowKind::Unknown, UsageWindowKind::from_window_name);
+            self.plan.hit = Some((window, limit.resets_at));
+        } else {
+            self.plan.hit = None;
+        }
+        emit.emit(Event::RateLimit {
+            session_id: self.session_id.clone(),
+            limit,
+        })
+        .await;
     }
 
     /// Handles one notification; returns the turn's error flag once the turn ended.
@@ -632,14 +684,39 @@ impl CodexAppServerSession {
                 add_usage(usage, &params["tokenUsage"]["last"]);
                 self.context = context_of(&params["tokenUsage"]);
             }
+            UPDATED_METHOD => self.report_limits(&params["rateLimits"], emit).await,
+            "error" => {
+                if params["willRetry"] != true
+                    && codex_limits::is_usage_limit_error(&params["error"])
+                {
+                    self.plan.stopped = true;
+                }
+            }
             "turn/completed" => {
                 let is_error = params["turn"]["status"] != "completed";
+                if codex_limits::is_usage_limit_error(&params["turn"]["error"]) {
+                    self.plan.stopped = true;
+                }
                 if let Some(usage) = usage.take() {
                     emit.emit(Event::Usage {
                         session_id: self.session_id.clone(),
                         turn_id: turn_id.clone(),
                         usage,
                         context: self.context.take(),
+                    })
+                    .await;
+                }
+                if is_error && self.plan.stopped {
+                    let (window, reset_at) = self
+                        .plan
+                        .hit
+                        .take()
+                        .unwrap_or((UsageWindowKind::Unknown, None));
+                    emit.emit(Event::UsageLimit {
+                        session_id: self.session_id.clone(),
+                        turn_id: turn_id.clone(),
+                        window,
+                        reset_at,
                     })
                     .await;
                 }
