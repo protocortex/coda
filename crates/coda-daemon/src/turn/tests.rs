@@ -72,6 +72,7 @@ mod checkpoints;
 mod codex_resume;
 mod diff;
 mod idempotent;
+mod interrupt;
 mod mode;
 mod queue;
 mod restarts;
@@ -424,7 +425,7 @@ async fn cancelling_stops_the_turn_and_settles_the_waiting_prompt() {
         .call("session.cancel", json!({"session_id": rig.session}))
         .await;
     rig.wait_for("turn_interrupted").await;
-    rig.wait_until_idle().await;
+    rig.wait_until_turn_over().await;
 
     // Assert
     assert_eq!(cancelled["result"]["cancelled"], true);
@@ -1038,7 +1039,7 @@ async fn a_cancelled_turn_is_logged_as_ended_and_not_as_an_error() {
     rig.call("session.cancel", json!({"session_id": rig.session}))
         .await;
     rig.wait_for("turn_interrupted").await;
-    rig.wait_until_idle().await;
+    rig.wait_until_turn_over().await;
 
     // Assert
     let log = dump(&rig.db(), "event_log");
@@ -1062,7 +1063,7 @@ async fn a_turn_is_ended_even_when_the_event_log_refuses_its_end_record() {
     // Act
     rig.call("session.cancel", json!({"session_id": rig.session}))
         .await;
-    rig.wait_until_idle().await;
+    rig.wait_until_turn_over().await;
 
     // Assert
     let open: i64 = rig
@@ -1706,7 +1707,7 @@ async fn a_cancelled_turn_is_interrupted_with_the_cancelled_cause() {
     rig.call("session.cancel", json!({"session_id": rig.session}))
         .await;
     rig.wait_for("turn_interrupted").await;
-    rig.wait_until_idle().await;
+    rig.wait_until_turn_over().await;
 
     // Assert
     assert_eq!(interrupt_cause(&rig.events().await), "cancelled");

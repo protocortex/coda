@@ -357,7 +357,7 @@ impl AgentSession {
     /// Whether the session is a running server that can take another turn.
     pub fn is_reusable(&mut self) -> bool {
         match self {
-            Self::Claude(_) => false,
+            Self::Claude(session) => session.is_reusable(),
             Self::Codex(session) => session.is_reusable(),
         }
     }

@@ -165,7 +165,7 @@ async fn a_repeated_cancel_returns_the_first_answer_and_cancels_nothing_new() {
     let params = json!({"session_id": rig.session, "client_request_id": REQUEST});
     let first = rig.call("session.cancel", params.clone()).await;
     rig.wait_for("turn_interrupted").await;
-    rig.wait_until_idle().await;
+    rig.wait_until_turn_over().await;
     rig.send("again").await;
     rig.wait_for_pending().await;
 

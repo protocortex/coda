@@ -213,7 +213,7 @@ async fn a_user_cancel_is_not_restarted() {
     rig.call("session.cancel", json!({"session_id": rig.session}))
         .await;
     rig.wait_for("turn_interrupted").await;
-    rig.wait_until_idle().await;
+    rig.wait_until_turn_over().await;
 
     // Assert
     assert_eq!(rig.sleeper.waits(), Vec::<Duration>::new());

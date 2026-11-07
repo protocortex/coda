@@ -207,8 +207,9 @@ impl StreamParser {
                     report: InitReport::from_init(value),
                 })
             }
-            // Real streams also carry the model's own tool results.
-            "system" | "user" => None,
+            // Real streams also carry the model's own tool results, and the answers
+            // to requests coda sent, such as `interrupt`.
+            "system" | "user" | "control_response" => None,
             "rate_limit_event" => {
                 let mut unusable = Vec::new();
                 let limit = rate_limit(&value["rate_limit_info"], &mut unusable);

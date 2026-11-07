@@ -90,6 +90,9 @@ const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 pub(crate) const READ_CHUNK_BYTES: usize = 16 * 1024;
 /// How long a child whose output ended gets to exit on its own, so its exit code survives.
 pub(crate) const EXIT_GRACE: Duration = Duration::from_millis(500);
+/// How long a child gets to end an interrupted turn before its group is killed.
+pub(crate) const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(2);
+const INTERRUPT_REQUEST_PREFIX: &str = "coda-interrupt-";
 /// How long to wait for a killed child to be reaped before giving up on its status.
 pub(crate) const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -211,6 +214,12 @@ pub struct ClaudeSession {
     backend_id_tx: watch::Sender<Option<String>>,
     /// Whether the session's billing was reported; it is told once.
     billing_reported: bool,
+    /// Set when the last turn was interrupted and the process lives on.
+    reusable: bool,
+    /// Steers written to the child in the running turn.
+    steers_written: u32,
+    /// Interrupt requests sent, so each carries its own id.
+    interrupts: u64,
     closed: bool,
 }
 
@@ -299,6 +308,9 @@ impl ClaudeSession {
             backend_session_id: None,
             limit_hit: None,
             billing_reported: false,
+            reusable: false,
+            steers_written: 0,
+            interrupts: 0,
             context: None,
             backend_id_tx: watch::channel(None).0,
             closed: false,
@@ -322,6 +334,12 @@ impl ClaudeSession {
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    /// Whether the last turn was interrupted without stopping the process, which
+    /// can take another turn. A turn that completed leaves nothing to reuse.
+    pub fn is_reusable(&mut self) -> bool {
+        self.reusable && !self.closed && matches!(self.child.try_wait(), Ok(None))
     }
 
     /// Claude Code's own session id, once it has reported one.
@@ -366,10 +384,11 @@ impl ClaudeSession {
         if self.closed {
             return Err(AdapterError::Closed);
         }
+        self.reusable = false;
+        self.steers_written = 0;
         if *self.cancel.borrow() {
-            return self
-                .interrupted(turn_id, InterruptCause::Cancelled, emit)
-                .await;
+            // Nothing was sent, so there is nothing to interrupt.
+            return Ok(self.ended_by_cancel(turn_id, emit).await);
         }
         self.tool_calls.clear();
         steer::clear(&mut self.steer_inbox);
@@ -402,7 +421,7 @@ impl ClaudeSession {
                 let handled = tokio::select! {
                     handled = self.handle(message, turn_id, gate, emit) => handled?,
                     () = cancelled(cancel), if preemptible => {
-                        return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await;
+                        return self.cancel_turn(turn_id, emit).await;
                     }
                 };
                 if let Some(outcome) = handled {
@@ -412,9 +431,10 @@ impl ClaudeSession {
             let read = tokio::select! {
                 read = self.stdout.read(&mut buffer) => read?,
                 () = cancelled(self.cancel.subscribe()) => {
-                    return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await;
+                    return self.cancel_turn(turn_id, emit).await;
                 }
                 Some(text) = self.steer_inbox.recv() => {
+                    self.steers_written += 1;
                     if !self.write_line(&user_line(&text)).await? {
                         return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await;
                     }
@@ -608,7 +628,7 @@ impl ClaudeSession {
             tokio::select! {
                 decision = &mut waiting => break decision,
                 () = cancelled(self.cancel.subscribe()) => {
-                    return self.interrupted(turn_id, InterruptCause::Cancelled, emit).await.map(Some);
+                    return self.cancel_turn(turn_id, emit).await.map(Some);
                 }
                 read = self.stdout.read(&mut buffer) => {
                     let read = read?;
@@ -651,6 +671,80 @@ impl ClaudeSession {
                 .map(Some);
         }
         Ok(None)
+    }
+
+    /// Ends the running turn on the user's cancel. Claude Code is asked to interrupt
+    /// and the process is kept; one that does not answer in time is killed.
+    async fn cancel_turn(
+        &mut self,
+        turn_id: &TurnId,
+        emit: &mut impl Emit,
+    ) -> Result<TurnOutcome, AdapterError> {
+        // Claude Code may start a queued steer once the turn is interrupted, and its
+        // result would then answer the next turn.
+        let kept = self.steers_written == 0
+            && matches!(
+                timeout(INTERRUPT_TIMEOUT, self.interrupt()).await,
+                Ok(Ok(true))
+            );
+        if !kept {
+            return self
+                .interrupted(turn_id, InterruptCause::Cancelled, emit)
+                .await;
+        }
+        self.pending.clear();
+        self.limit_hit = None;
+        self.context = None;
+        self.reusable = true;
+        Ok(self.ended_by_cancel(turn_id, emit).await)
+    }
+
+    /// Reports a cancelled turn and spends the cancel, so the next turn is not cancelled with it.
+    async fn ended_by_cancel(&mut self, turn_id: &TurnId, emit: &mut impl Emit) -> TurnOutcome {
+        self.cancel.send_replace(false);
+        for event in self.tool_calls.fail_open(turn_id) {
+            emit.emit(event).await;
+        }
+        emit.emit(Event::TurnInterrupted {
+            session_id: self.session_id.clone(),
+            turn_id: turn_id.clone(),
+            cause: Some(InterruptCause::Cancelled),
+        })
+        .await;
+        TurnOutcome::Cancelled
+    }
+
+    /// Sends the `interrupt` request and reads until the turn's `result`. `false`
+    /// means the process ended or the stream broke, so it cannot be kept.
+    async fn interrupt(&mut self) -> Result<bool, AdapterError> {
+        if !self.backlog_ends_turn() {
+            self.interrupts += 1;
+            let line = interrupt_line(self.interrupts);
+            self.write_unless_cancelled(&line, false).await?;
+        }
+        let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+        // The write may have read the result while it waited, so look before reading.
+        while !self.backlog_ends_turn() {
+            let read = self.stdout.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok(false);
+            }
+            self.backlog.extend(self.parser.feed(&buffer[..read]));
+        }
+        self.backlog.clear();
+        Ok(true)
+    }
+
+    /// Whether the backlog holds the turn's `result`; anything else in it is dropped.
+    fn backlog_ends_turn(&mut self) -> bool {
+        let ended = self
+            .backlog
+            .iter()
+            .any(|message| matches!(message, Message::Result { .. }));
+        if !ended {
+            self.backlog.clear();
+        }
+        ended
     }
 
     async fn interrupted(
@@ -726,6 +820,15 @@ impl ClaudeSession {
     /// Writes one line while draining stdout, so a child blocked on its own output
     /// cannot stall the write. Returns `false` when cancellation stopped the write.
     async fn write_line(&mut self, line: &str) -> Result<bool, AdapterError> {
+        self.write_unless_cancelled(line, true).await
+    }
+
+    /// `write_line`, where `abort_on_cancel` says whether a cancel stops the write.
+    async fn write_unless_cancelled(
+        &mut self,
+        line: &str,
+        abort_on_cancel: bool,
+    ) -> Result<bool, AdapterError> {
         let stdin = self.stdin.as_mut().ok_or(AdapterError::Closed)?;
         let mut data = Vec::with_capacity(line.len() + 1);
         data.extend_from_slice(line.as_bytes());
@@ -743,7 +846,7 @@ impl ClaudeSession {
                     result?;
                     return Ok(true);
                 }
-                () = cancelled(self.cancel.subscribe()) => return Ok(false),
+                () = cancelled(self.cancel.subscribe()), if abort_on_cancel => return Ok(false),
                 read = self.stdout.read(&mut buffer), if output_open => {
                     let read = read?;
                     if read == 0 {
@@ -841,6 +944,15 @@ pub(crate) fn kill_group(pid: u32) {
     if let Some(group) = group {
         let _ = kill_process_group(group, Signal::KILL);
     }
+}
+
+fn interrupt_line(count: u64) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": format!("{INTERRUPT_REQUEST_PREFIX}{count}"),
+        "request": {"subtype": "interrupt"},
+    })
+    .to_string()
 }
 
 fn user_line(text: &str) -> String {
