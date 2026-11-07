@@ -9,6 +9,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use coda_config::config::ClaudeProfile;
 use coda_protocol::events::{Event, InterruptCause, UsageWindowKind};
 use coda_protocol::types::{ContextFill, PermissionDecision, RequestId, SessionId, TurnId};
 use rustix::process::{Pid, Signal, kill_process_group};
@@ -18,6 +19,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::claude_code::{
@@ -40,6 +42,26 @@ const CLAUDE_FLAGS: &[&str] = &[
     "--permission-prompt-tool",
     "stdio",
 ];
+const SETTING_SOURCES_FLAG: &str = "--setting-sources";
+const STRICT_MCP_FLAG: &str = "--strict-mcp-config";
+const DISABLE_SLASH_FLAG: &str = "--disable-slash-commands";
+const SYSTEM_PROMPT_FLAG: &str = "--system-prompt";
+const TOOLS_FLAG: &str = "--tools";
+const PROJECT_SETTINGS_SOURCE: &str = "project";
+/// An empty list: no user, project or local settings are read.
+const NO_SETTINGS_SOURCES: &str = "";
+/// The only prompt the lean profile sends; Claude Code's own is about 35k tokens.
+const LEAN_SYSTEM_PROMPT: &str = "You are a coding agent working in the user's repository \
+through Coda. Read files before you change them, keep changes small, and say plainly what \
+you did.";
+/// The tools of the lean profile, named as `--tools` expects, comma separated.
+const LEAN_TOOLS: &str = "Read,Grep,Glob,Edit,Write,Bash";
+/// Most stderr bytes kept to find the flag a start-up error names.
+const STDERR_KEEP_BYTES: u64 = 8 * 1024;
+/// Words that mark a stderr line as a complaint, in lower case.
+const ERROR_MARKERS: &[&str] = &["error", "unknown option", "invalid"];
+/// How long to wait for the stderr reader once the child has ended.
+const STDERR_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
 const RESUME_FLAG: &str = "--resume";
 /// The flag that bans tools, which wins over any allow rule in the user's settings.
 const DISALLOWED_TOOLS_FLAG: &str = "--disallowedTools";
@@ -120,6 +142,8 @@ pub struct SessionSpec {
     /// Ban the tools that change files or run commands, so the user's own allow
     /// rules cannot let the session change anything.
     pub read_only: bool,
+    /// How much of Claude Code's own setup the session keeps.
+    pub profile: ClaudeProfile,
 }
 
 /// Cancels a session's running or next turn; safe to call any number of times.
@@ -147,6 +171,9 @@ impl CancelHandle {
 #[derive(Debug)]
 pub struct ClaudeSession {
     child: Child,
+    profile: ClaudeProfile,
+    /// Reads the child's stderr, which is kept only to name a flag it rejects.
+    stderr: Option<JoinHandle<Vec<u8>>>,
     stdin: Option<ChildStdin>,
     stdout: ChildStdout,
     parser: StreamParser,
@@ -178,6 +205,7 @@ impl ClaudeSession {
     pub fn spawn(spec: SessionSpec) -> Result<Self, AdapterError> {
         let mut command = Command::new(&spec.binary);
         command.args(CLAUDE_FLAGS);
+        command.args(profile_args(spec.profile));
         if let Some(resume) = &spec.resume {
             command.args([RESUME_FLAG, resume]);
         }
@@ -192,7 +220,11 @@ impl ClaudeSession {
             .current_dir(&spec.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(if spec.profile == ClaudeProfile::Full {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
             .kill_on_drop(true)
             .process_group(0);
         let mut child = command.spawn().map_err(|source| AdapterError::Spawn {
@@ -207,7 +239,22 @@ impl ClaudeSession {
             .stdout
             .take()
             .ok_or(AdapterError::MissingPipe("stdout"))?;
+        let stderr = child.stderr.take().map(|pipe| {
+            tokio::spawn(async move {
+                let mut pipe = pipe;
+                let mut kept = Vec::new();
+                let _ = (&mut pipe)
+                    .take(STDERR_KEEP_BYTES)
+                    .read_to_end(&mut kept)
+                    .await;
+                // The child must never block on a full pipe.
+                let _ = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await;
+                kept
+            })
+        });
         Ok(Self {
+            profile: spec.profile,
+            stderr,
             child,
             stdin: Some(stdin),
             stdout,
@@ -280,7 +327,15 @@ impl ClaudeSession {
         }
         self.tool_calls.clear();
         let user = json!({"type": "user", "message": {"role": "user", "content": text}});
-        if !self.write_line(&user.to_string()).await? {
+        // A child that already exited, for example on a rejected flag, is a crash with
+        // its stderr to read, not an I/O failure.
+        let written = match self.write_line(&user.to_string()).await {
+            Err(AdapterError::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                return self.crashed(turn_id, emit).await;
+            }
+            other => other?,
+        };
+        if !written {
             return self
                 .interrupted(turn_id, InterruptCause::BackendLost, emit)
                 .await;
@@ -560,6 +615,7 @@ impl ClaudeSession {
             Err(_) => self.kill_and_reap().await?,
         };
         let exit_code = status.and_then(|status| status.code());
+        let detail = self.rejected_flag_detail().await;
         for event in self.tool_calls.fail_open(turn_id) {
             emit.emit(event).await;
         }
@@ -567,10 +623,26 @@ impl ClaudeSession {
             session_id: self.session_id.clone(),
             exit_code,
             will_restart: false,
-            detail: None,
+            detail,
         })
         .await;
         Ok(TurnOutcome::Crashed { exit_code })
+    }
+
+    /// Names the profile flag the child's start-up error complains about, if any.
+    /// Only the flag name is used; no other stderr text leaves this method.
+    async fn rejected_flag_detail(&mut self) -> Option<String> {
+        let reader = self.stderr.take()?;
+        let kept = timeout(STDERR_JOIN_TIMEOUT, reader).await.ok()?.ok()?;
+        let text = String::from_utf8_lossy(&kept);
+        let flag = profile_flag_names(self.profile)
+            .into_iter()
+            .find(|flag| text.lines().any(|line| is_error_about(line, flag)))?;
+        Some(format!(
+            "claude rejected `{flag}`, which the {} profile passes; set `profile = \"full\"` \
+             under [providers.claude_code] to start without it",
+            self.profile.as_str()
+        ))
     }
 
     /// Writes one line while draining stdout, so a child blocked on its own output
@@ -614,6 +686,47 @@ impl Drop for ClaudeSession {
             kill_group(pid);
         }
     }
+}
+
+/// The flags a profile adds to [`CLAUDE_FLAGS`], values included.
+///
+/// `--tools` is never given an empty list: with no tools and MCP servers still on,
+/// the prompt grows by about 22k tokens, so the lean profile also sets
+/// `--strict-mcp-config`.
+fn profile_args(profile: ClaudeProfile) -> Vec<&'static str> {
+    match profile {
+        ClaudeProfile::Full => Vec::new(),
+        ClaudeProfile::Project => vec![
+            SETTING_SOURCES_FLAG,
+            PROJECT_SETTINGS_SOURCE,
+            STRICT_MCP_FLAG,
+            DISABLE_SLASH_FLAG,
+        ],
+        ClaudeProfile::Lean => vec![
+            SETTING_SOURCES_FLAG,
+            NO_SETTINGS_SOURCES,
+            STRICT_MCP_FLAG,
+            DISABLE_SLASH_FLAG,
+            SYSTEM_PROMPT_FLAG,
+            LEAN_SYSTEM_PROMPT,
+            TOOLS_FLAG,
+            LEAN_TOOLS,
+        ],
+    }
+}
+
+/// Whether a stderr line is an error that names `flag`, such as `error: unknown option
+/// '--tools'` or `Error processing --setting-sources: ...`.
+fn is_error_about(line: &str, flag: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    line.contains(flag) && ERROR_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+fn profile_flag_names(profile: ClaudeProfile) -> Vec<&'static str> {
+    profile_args(profile)
+        .into_iter()
+        .filter(|arg| arg.starts_with("--"))
+        .collect()
 }
 
 /// The parent variables a child may inherit.

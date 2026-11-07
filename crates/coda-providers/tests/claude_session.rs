@@ -13,6 +13,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use coda_config::config::ClaudeProfile;
 use coda_protocol::events::{Event, InterruptCause, ToolCallStatus, UsageWindowKind};
 use coda_protocol::types::{
     ContextFill, PermissionDecision, RequestId, SessionId, TokenUsage, TurnId,
@@ -29,6 +30,7 @@ use serde_json::Value;
 const TURN_TIMEOUT: Duration = Duration::from_secs(30);
 const GONE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const CHILD_EXIT_WAIT: Duration = Duration::from_millis(400);
 const CONTROL_FILE: &str = "fake-claude-control.json";
 const REPORT_FILE: &str = "report.json";
 const PID_FILE: &str = "grandchild.pid";
@@ -107,6 +109,7 @@ impl Fixture {
             resume: None,
             parent_env,
             read_only: false,
+            profile: ClaudeProfile::Full,
         }
     }
 
@@ -872,4 +875,182 @@ async fn a_large_message_does_not_deadlock_against_a_child_flooding_its_output()
     // Assert
     assert_eq!(outcome, TurnOutcome::Completed { is_error: false });
     assert_ne!(session.diagnostics().len(), 0);
+}
+
+fn args_of(fixture: &Fixture) -> Vec<String> {
+    fixture.report()["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let at = args.iter().position(|a| a == flag)?;
+    args.get(at + 1).map(String::as_str)
+}
+
+async fn args_for(profile: ClaudeProfile) -> Vec<String> {
+    let fixture = Fixture::new();
+    let mut spec = fixture.spec(env(&[]));
+    spec.profile = profile;
+    let mut session = ClaudeSession::spawn(spec).unwrap();
+    turn(
+        &mut session,
+        &FixedGate::new(PermissionDecision::Deny),
+        "run ls",
+    )
+    .await;
+    args_of(&fixture)
+}
+
+#[tokio::test]
+async fn the_project_profile_keeps_project_settings_only() {
+    // Act
+    let args = args_for(ClaudeProfile::Project).await;
+
+    // Assert
+    assert_eq!(flag_value(&args, "--setting-sources"), Some("project"));
+    assert!(args.contains(&"--strict-mcp-config".to_owned()));
+    assert!(args.contains(&"--disable-slash-commands".to_owned()));
+    assert!(!args.contains(&"--system-prompt".to_owned()));
+    assert!(!args.contains(&"--tools".to_owned()));
+}
+
+#[tokio::test]
+async fn the_lean_profile_sets_its_own_prompt_tools_and_no_settings() {
+    // Act
+    let args = args_for(ClaudeProfile::Lean).await;
+
+    // Assert
+    assert_eq!(flag_value(&args, "--setting-sources"), Some(""));
+    assert!(args.contains(&"--strict-mcp-config".to_owned()));
+    assert!(args.contains(&"--disable-slash-commands".to_owned()));
+    assert!(
+        flag_value(&args, "--system-prompt").is_some_and(|prompt| !prompt.is_empty()),
+        "{args:?}"
+    );
+    let tools = flag_value(&args, "--tools").expect("a tool list");
+    assert_ne!(tools, "");
+    assert!(tools.split(',').all(|tool| !tool.is_empty()));
+}
+
+#[tokio::test]
+async fn the_full_profile_adds_no_profile_flags() {
+    // Act
+    let args = args_for(ClaudeProfile::Full).await;
+
+    // Assert
+    for flag in [
+        "--setting-sources",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--system-prompt",
+        "--tools",
+    ] {
+        assert!(!args.contains(&flag.to_owned()), "{flag} in {args:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_read_only_lean_session_still_bans_the_write_tools() {
+    // Arrange
+    let fixture = Fixture::new();
+    let mut spec = fixture.spec(env(&[]));
+    spec.profile = ClaudeProfile::Lean;
+    spec.read_only = true;
+    let mut session = ClaudeSession::spawn(spec).unwrap();
+
+    // Act
+    turn(
+        &mut session,
+        &FixedGate::new(PermissionDecision::Deny),
+        "run ls",
+    )
+    .await;
+
+    // Assert
+    assert!(args_of(&fixture).contains(&"--disallowedTools".to_owned()));
+}
+
+fn rejecting_binary(dir: &Path, stderr: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("rejecting-claude.sh");
+    // Like a real argument error, it exits before it reads anything from stdin.
+    let script = format!("#!/bin/sh\necho \"{stderr}\" >&2\nexit 2\n");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+async fn crash_detail(profile: ClaudeProfile, stderr: &str) -> Option<String> {
+    let fixture = Fixture::new();
+    let mut spec = fixture.spec(env(&[]));
+    spec.binary = rejecting_binary(fixture.cwd.path(), stderr);
+    spec.profile = profile;
+    let mut session = ClaudeSession::spawn(spec).unwrap();
+    // The child is gone before the first message is written, as with a real argument error.
+    tokio::time::sleep(CHILD_EXIT_WAIT).await;
+    let (outcome, events) = turn(
+        &mut session,
+        &FixedGate::new(PermissionDecision::Deny),
+        "hello",
+    )
+    .await;
+    assert_eq!(outcome, TurnOutcome::Crashed { exit_code: Some(2) });
+    events.into_iter().find_map(|event| match event {
+        Event::BackendCrashed { detail, .. } => detail,
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn a_rejected_profile_flag_is_named_with_the_full_profile_as_the_way_out() {
+    // Act
+    let detail = crash_detail(
+        ClaudeProfile::Project,
+        "error: unknown option '--disable-slash-commands'",
+    )
+    .await
+    .expect("the crash names the flag");
+
+    // Assert
+    assert!(detail.contains("--disable-slash-commands"), "{detail}");
+    assert!(detail.contains("profile = \"full\""), "{detail}");
+}
+
+#[tokio::test]
+async fn a_flag_named_in_a_line_that_is_no_error_is_not_blamed() {
+    // Act
+    let detail = crash_detail(
+        ClaudeProfile::Project,
+        "note: --strict-mcp-config is unchanged",
+    )
+    .await;
+
+    // Assert
+    assert_eq!(detail, None);
+}
+
+#[tokio::test]
+async fn a_crash_that_names_no_profile_flag_gets_no_detail() {
+    // Act
+    let detail = crash_detail(ClaudeProfile::Project, "error: network down").await;
+
+    // Assert
+    assert_eq!(detail, None);
+}
+
+#[tokio::test]
+async fn the_full_profile_never_blames_a_flag() {
+    // Act
+    let detail = crash_detail(
+        ClaudeProfile::Full,
+        "error: unknown option '--permission-prompt-tool'",
+    )
+    .await;
+
+    // Assert
+    assert_eq!(detail, None);
 }
