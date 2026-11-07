@@ -19,6 +19,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::activity::{self, Stage};
 use crate::chat::Chat;
 use crate::commands::{self, Command, CommandError, Resolved, UserCommands};
+use crate::completion;
 use crate::input::{Input, Stashed};
 use crate::notify;
 use crate::paste;
@@ -52,6 +53,9 @@ pub const SETUP_GUIDANCE: &str = "No provider is enabled. Run `coda init`, enabl
 pub const LOST_DAEMON_HINT: &str = "Ctrl+D quits. Run `coda` to start the daemon again.";
 const NO_SESSIONS: &str = "the daemon has no sessions";
 const NO_PASTE_FOLDER: &str = "no session folder yet";
+const NO_COMPLETION_FOLDER: &str = "no session folder yet to complete paths in";
+const NO_FILE_MATCHES: &str = "no file matches";
+const MORE_CHOICES: &str = ", ...";
 const CLEARED: &str = "prompt cleared; Ctrl+S brings it back";
 const NOTHING_STASHED: &str = "nothing is stashed";
 const STASHED: &str = "prompt stashed; press Ctrl+S on an empty prompt to bring it back";
@@ -522,6 +526,7 @@ impl App {
         match key.code {
             KeyCode::PageUp => self.chat.scroll_up(PAGE_ROWS),
             KeyCode::PageDown => self.chat.scroll_down(PAGE_ROWS),
+            KeyCode::Tab => self.complete_path(),
             _ => {
                 if let Some(line) = self.input.handle_key(key) {
                     self.submit(&line);
@@ -697,6 +702,37 @@ impl App {
                 ));
                 self.input.insert(&paste::clean(pasted).text);
             }
+        }
+    }
+
+    /// Completes the `@path` word before the cursor against the session's folder.
+    fn complete_path(&mut self) {
+        let Some((start, word)) = self.input.token_at_cursor(completion::MARKER) else {
+            return;
+        };
+        let word = word.to_owned();
+        let Some(folder) = self.cwd.clone() else {
+            self.chat.push_notice(NO_COMPLETION_FOLDER.to_owned());
+            return;
+        };
+        let Some(found) = completion::complete(Path::new(&folder), &word) else {
+            self.chat
+                .push_notice(sanitize_line(&format!("{NO_FILE_MATCHES} {word}")));
+            return;
+        };
+        self.input.replace_to_cursor(start, &found.replacement);
+        if !found.choices.is_empty() {
+            let more = if found.total > found.choices.len() {
+                MORE_CHOICES
+            } else {
+                ""
+            };
+            let list = format!(
+                "{} matches: {}{more}",
+                found.total,
+                found.choices.join(", ")
+            );
+            self.chat.push_notice(sanitize_line(&list));
         }
     }
 
@@ -1951,6 +1987,116 @@ mod tests {
         assert_eq!(stashed.0, "");
         assert!(stashed.1.contains("prompt stashed"), "{}", stashed.1);
         assert_eq!(app.input.text(), "half a thought");
+    }
+
+    #[test]
+    fn tab_completes_an_at_path_against_the_session_folder() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "x").unwrap();
+        let (mut app, _commands) = working_in(dir.path());
+        app.handle_paste("see @no");
+
+        // Act
+        app.handle_key(press(KeyCode::Tab));
+
+        // Assert
+        assert_eq!(app.input.text(), "see @notes.md ");
+    }
+
+    #[test]
+    fn tab_lists_the_choices_when_several_files_match() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alpha.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("alpine.rs"), "x").unwrap();
+        let (mut app, _commands) = working_in(dir.path());
+        app.handle_paste("@a");
+
+        // Act
+        app.handle_key(press(KeyCode::Tab));
+        let shown = wide_screen(&app);
+
+        // Assert
+        assert_eq!(app.input.text(), "@alp");
+        assert!(shown.contains("2 matches: alpha.rs, alpine.rs"), "{shown}");
+    }
+
+    #[test]
+    fn tab_says_when_nothing_matches() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _commands) = working_in(dir.path());
+        app.handle_paste("@zzz");
+
+        // Act
+        app.handle_key(press(KeyCode::Tab));
+        let shown = wide_screen(&app);
+
+        // Assert
+        assert!(shown.contains("no file matches @zzz"), "{shown}");
+        assert_eq!(app.input.text(), "@zzz");
+    }
+
+    #[test]
+    fn tab_leaves_a_word_that_is_not_a_path_alone() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _commands) = working_in(dir.path());
+        app.handle_paste("plain");
+
+        // Act
+        app.handle_key(press(KeyCode::Tab));
+
+        // Assert
+        assert_eq!(app.input.text(), "plain");
+    }
+
+    #[test]
+    fn tab_inside_a_word_changes_nothing() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "x").unwrap();
+        let (mut app, _commands) = working_in(dir.path());
+        app.handle_paste("@notes.md");
+        app.handle_key(press(KeyCode::Left));
+
+        // Act
+        app.handle_key(press(KeyCode::Tab));
+
+        // Assert
+        assert_eq!(app.input.text(), "@notes.md");
+    }
+
+    #[test]
+    fn tab_before_a_session_has_started_says_there_is_no_folder() {
+        // Arrange
+        let (mut app, _commands) = linked();
+        app.handle_paste("@no");
+
+        // Act
+        app.handle_key(press(KeyCode::Tab));
+        let shown = wide_screen(&app);
+
+        // Assert
+        assert!(shown.contains("no session folder yet"), "{shown}");
+        assert_eq!(app.input.text(), "@no");
+    }
+
+    #[test]
+    fn tab_goes_to_a_prompt_that_is_open_and_does_not_complete() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "x").unwrap();
+        let (mut app, _commands) = working_in(dir.path());
+        app.handle_paste("@no");
+        app.handle_event(prompt("r-1"));
+
+        // Act
+        app.handle_key(press(KeyCode::Tab));
+
+        // Assert
+        assert_eq!(app.input.text(), "@no");
     }
 
     #[test]

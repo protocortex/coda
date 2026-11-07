@@ -199,6 +199,34 @@ impl Input {
         }
     }
 
+    /// The word the cursor ends, when it starts with `marker`, with where it starts.
+    /// A cursor inside a word ends no word.
+    #[must_use]
+    pub fn token_at_cursor(&self, marker: char) -> Option<(usize, &str)> {
+        if !self.text[self.cursor..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
+        {
+            return None;
+        }
+        let before = &self.text[..self.cursor];
+        let start = before
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map_or(0, |(at, ch)| at + ch.len_utf8());
+        let token = &before[start..];
+        token.starts_with(marker).then_some((start, token))
+    }
+
+    /// Replaces the text from `start` to the cursor with `with`.
+    pub fn replace_to_cursor(&mut self, start: usize, with: &str) {
+        self.text.replace_range(start..self.cursor, with);
+        self.cursor = start + with.len();
+        self.recall = None;
+    }
+
     fn backspace(&mut self) {
         let before = self.previous_boundary();
         if before < self.cursor {
@@ -802,6 +830,57 @@ mod tests {
 
         // Assert
         assert_eq!(input.text(), "ax\ny!b");
+    }
+
+    #[test]
+    fn a_cursor_inside_a_word_has_no_token_to_complete() {
+        // Arrange
+        let mut input = Input::new();
+        type_text(&mut input, "@src/main.rs");
+        for _ in 0..4 {
+            input.handle_key(press(KeyCode::Left));
+        }
+
+        // Act / Assert
+        assert_eq!(input.token_at_cursor('@'), None);
+        input.handle_key(press(KeyCode::End));
+        assert!(input.token_at_cursor('@').is_some());
+        type_text(&mut input, " next");
+        for _ in 0..5 {
+            input.handle_key(press(KeyCode::Left));
+        }
+        assert_eq!(input.token_at_cursor('@'), Some((0, "@src/main.rs")));
+    }
+
+    #[test]
+    fn the_token_at_the_cursor_starts_at_the_marker_after_a_space_or_newline() {
+        // Arrange
+        let mut input = Input::new();
+        type_text(&mut input, "read\n@src/ma");
+
+        // Act
+        let token = input
+            .token_at_cursor('@')
+            .map(|(at, token)| (at, token.to_owned()));
+        input.replace_to_cursor(5, "@src/main.rs ");
+
+        // Assert
+        assert_eq!(token, Some((5, "@src/ma".to_owned())));
+        assert_eq!(input.text(), "read\n@src/main.rs ");
+        assert_eq!(input.token_at_cursor('@'), None);
+    }
+
+    #[test]
+    fn a_word_without_the_marker_is_not_a_token_and_a_wide_space_ends_one() {
+        // Arrange
+        let mut input = Input::new();
+        type_text(&mut input, "mail me@home");
+        let mut wide = Input::new();
+        type_text(&mut wide, "x\u{3000}@ab");
+
+        // Act / Assert
+        assert_eq!(input.token_at_cursor('@'), None);
+        assert_eq!(wide.token_at_cursor('@'), Some((4, "@ab")));
     }
 
     #[test]
