@@ -76,6 +76,43 @@ fn a_recorded_ref_is_read_back_after_the_store_is_reopened() {
 }
 
 #[test]
+fn a_forgotten_ref_is_no_longer_resumed_and_a_later_one_is_kept() {
+    // Arrange
+    let (_dir, mut store, session) = open();
+    store
+        .record_backend_thread(&session, BACKEND, NATIVE_REF)
+        .unwrap();
+
+    // Act
+    store.forget_backend_thread(&session, BACKEND).unwrap();
+
+    // Assert
+    assert_eq!(store.active_backend_ref(&session, BACKEND).unwrap(), None);
+    store
+        .record_backend_thread(&session, BACKEND, "native-2")
+        .unwrap();
+    assert_eq!(
+        store
+            .active_backend_ref(&session, BACKEND)
+            .unwrap()
+            .as_deref(),
+        Some("native-2")
+    );
+}
+
+#[test]
+fn forgetting_a_ref_that_was_never_recorded_is_not_an_error() {
+    // Arrange
+    let (_dir, mut store, session) = open();
+
+    // Act
+    let result = store.forget_backend_thread(&session, BACKEND);
+
+    // Assert
+    assert!(result.is_ok());
+}
+
+#[test]
 fn a_new_ref_replaces_the_old_one() {
     // Arrange
     let (_dir, mut store, session) = open();

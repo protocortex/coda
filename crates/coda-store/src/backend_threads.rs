@@ -39,6 +39,27 @@ impl Store {
         Ok(())
     }
 
+    /// Forgets the ref of `session` on `backend`, so its next turn starts a new
+    /// conversation. A ref that was never recorded is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the write fails.
+    pub fn forget_backend_thread(
+        &mut self,
+        session: &SessionId,
+        backend: BackendKind,
+    ) -> Result<(), StoreError> {
+        let Some(row) = session_row_id(session) else {
+            return Ok(());
+        };
+        self.connection().execute(
+            "DELETE FROM backend_threads WHERE session_id = ?1 AND backend = ?2",
+            params![row, encode_enum(&backend)?],
+        )?;
+        Ok(())
+    }
+
     /// The ref to resume for `session` on `backend`, or `None` when none was
     /// recorded.
     ///
