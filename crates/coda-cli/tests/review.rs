@@ -269,11 +269,17 @@ struct ClaudeRig {
 }
 
 fn claude_rig(reply: &str) -> ClaudeRig {
+    claude_rig_with(json!({"echo_text": reply}), "")
+}
+
+/// Like [`claude_rig`], with the fake's control settings given whole and `review_config`
+/// added to the home's config.
+fn claude_rig_with(control: Value, review_config: &str) -> ClaudeRig {
     let home = short_dir();
     let work = short_dir();
     let fake = coda_testkit::paths::fake_claude_path().unwrap();
     let config = format!(
-        "[providers.claude_code]\nenabled = true\nbinary = {:?}\n",
+        "[providers.claude_code]\nenabled = true\nbinary = {:?}\n{review_config}",
         fake.display().to_string()
     );
     std::fs::write(home.path().join("config.toml"), config).unwrap();
@@ -285,7 +291,8 @@ fn claude_rig(reply: &str) -> ClaudeRig {
     git(dir, &["checkout", "-q", "-b", "topic"]);
     std::fs::write(dir.join("a.txt"), TOPIC_FILE).unwrap();
     git(dir, &["commit", "-q", "-am", "topic"]);
-    let control = json!({"echo_text": reply, "prompt_path": dir.join(PROMPTS)});
+    let mut control = control;
+    control["prompt_path"] = json!(dir.join(PROMPTS));
     std::fs::write(dir.join("fake-claude-control.json"), control.to_string()).unwrap();
     ClaudeRig {
         ctx: context(home.path()),
@@ -306,6 +313,14 @@ impl ClaudeRig {
             "--instructions",
             "echo-text",
         ];
+        args.extend_from_slice(flags);
+        cli(&self.ctx, &args, "").await
+    }
+
+    /// A review that does not ask the fake to echo the reply of `--instructions`.
+    async fn review_plain(&self, flags: &[&str]) -> Outcome {
+        let cwd = self.work.path().display().to_string();
+        let mut args = vec!["coda", "review", "--cwd", &cwd];
         args.extend_from_slice(flags);
         cli(&self.ctx, &args, "").await
     }
@@ -488,4 +503,123 @@ async fn the_number_of_parts_is_capped_by_config_and_the_rest_is_left_out() {
     assert!(!parsed.run.partial);
     assert_eq!(parsed.coverage.reviewed, ["a.txt"]);
     assert_eq!(parsed.coverage.left_out, ["b.txt"]);
+}
+
+const REVIEWER_TEXT: &str = "You are a code reviewer";
+const VERIFIER_TEXT: &str = "You are a verifier";
+
+/// A reply with two findings: one on line 4 and one on line 5 of `a.txt`.
+fn two_findings_json() -> String {
+    let finding = |line: u32, title: &str| {
+        json!({
+            "file": "a.txt", "start_line": line, "end_line": line, "severity": "high",
+            "category": "bug", "title": title, "explanation": "Check it.",
+            "suggested_patch": null, "confidence": "high"
+        })
+    };
+    json!({
+        "summary": "Two findings.",
+        "effort": 1,
+        "risk": "medium",
+        "findings": [finding(4, "Real problem"), finding(5, "Imagined problem")]
+    })
+    .to_string()
+}
+
+fn verifier_control(verdicts: &str) -> Value {
+    json!({"replies": [
+        {"when": REVIEWER_TEXT, "text": two_findings_json()},
+        {"when": VERIFIER_TEXT, "text": verdicts},
+    ]})
+}
+
+#[tokio::test]
+async fn the_verifier_drops_a_false_finding_and_the_review_names_the_backend_that_checked() {
+    // Arrange
+    let verdicts = r#"{"verdicts": [
+        {"id": "F1", "score": 8, "reason": "The line is wrong."},
+        {"id": "F2", "score": 0, "reason": "The line is fine."}
+    ]}"#;
+    let rig = claude_rig_with(verifier_control(verdicts), "");
+
+    // Act
+    let outcome = rig.review_plain(&["--json"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let parsed: Review = serde_json::from_str(&outcome.out).unwrap();
+    assert_eq!(parsed.findings.len(), 1);
+    assert_eq!(parsed.findings[0].title, "Real problem");
+    assert_eq!(parsed.findings[0].score, Some(8));
+    assert_eq!(parsed.run.verifier.as_deref(), Some("claude_code"));
+    assert_eq!(parsed.run.verifier_dropped, 1);
+    let prompts = rig.prompts();
+    assert_eq!(prompts.matches(VERIFIER_TEXT).count(), 1, "{prompts}");
+    assert!(prompts.contains("Imagined problem"), "{prompts}");
+}
+
+#[tokio::test]
+async fn a_verifier_that_answers_junk_leaves_every_finding_marked_unverified() {
+    // Arrange
+    let rig = claude_rig_with(verifier_control("I could not decide."), "");
+
+    // Act
+    let outcome = rig.review_plain(&["--json"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let parsed: Review = serde_json::from_str(&outcome.out).unwrap();
+    assert_eq!(parsed.findings.len(), 2);
+    assert!(
+        parsed
+            .findings
+            .iter()
+            .all(|f| f.unverified && f.score.is_none())
+    );
+    assert_eq!(parsed.run.verifier_dropped, 0);
+    let text = rig.review_plain(&[]).await.out;
+    assert!(text.contains("unverified"), "{text}");
+}
+
+#[tokio::test]
+async fn a_threshold_in_the_config_drops_findings_the_verifier_scored_below_it() {
+    // Arrange
+    let verdicts = r#"{"verdicts": [
+        {"id": "F1", "score": 9, "reason": "Sure."},
+        {"id": "F2", "score": 6, "reason": "Maybe."}
+    ]}"#;
+    let rig = claude_rig_with(
+        verifier_control(verdicts),
+        "\n[review]\nverify_threshold = 7\n",
+    );
+
+    // Act
+    let outcome = rig.review_plain(&["--json"]).await;
+
+    // Assert
+    let parsed: Review = serde_json::from_str(&outcome.out).unwrap();
+    assert_eq!(parsed.findings.len(), 1);
+    assert_eq!(parsed.findings[0].title, "Real problem");
+    assert_eq!(parsed.run.verifier_dropped, 1);
+}
+
+#[tokio::test]
+async fn with_verify_off_no_verifier_runs_and_the_findings_carry_no_verdict() {
+    // Arrange
+    let rig = claude_rig_with(verifier_control("{}"), "\n[review]\nverify = false\n");
+
+    // Act
+    let outcome = rig.review_plain(&["--json"]).await;
+
+    // Assert
+    let parsed: Review = serde_json::from_str(&outcome.out).unwrap();
+    assert_eq!(parsed.findings.len(), 2);
+    assert_eq!(parsed.run.verifier, None);
+    assert!(
+        parsed
+            .findings
+            .iter()
+            .all(|f| !f.unverified && f.score.is_none())
+    );
+    assert_eq!(rig.prompts().matches(VERIFIER_TEXT).count(), 0);
 }

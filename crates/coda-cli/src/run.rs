@@ -46,8 +46,8 @@ use crate::exit;
 pub const MAX_COMMAND_INPUT_BYTES: usize = 256 * 1024;
 
 const FAUX_KEY: &str = "faux";
-const CLAUDE_CODE_KEY: &str = "claude_code";
-const CODEX_KEY: &str = "codex";
+pub(crate) const CLAUDE_CODE_KEY: &str = "claude_code";
+pub(crate) const CODEX_KEY: &str = "codex";
 pub(crate) const STREAM_DELTA_KIND: &str = "stream_delta";
 const RESULT_KIND: &str = "result";
 const TURN_INTERRUPTED_KIND: &str = "turn_interrupted";
@@ -62,7 +62,7 @@ const BUDGET_EXHAUSTED: &str = StopCondition::BudgetExhausted.as_str();
 const CONTEXT_OVERFLOW: &str = StopCondition::ContextOverflow.as_str();
 const COMPACTION_FAILED: &str = StopCondition::CompactionFailed.as_str();
 const HOOK_BLOCKED: &str = StopCondition::HookBlocked.as_str();
-const CANCELLED: &str = StopCondition::Cancelled.as_str();
+pub(crate) const CANCELLED: &str = StopCondition::Cancelled.as_str();
 
 /// The fields of a `session.event` notification this command reads.
 #[derive(Deserialize)]
