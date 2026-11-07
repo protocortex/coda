@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use coda_config::config::ClaudeProfile;
 use coda_protocol::events::{Event, InterruptCause, UsageWindowKind};
+
+use crate::account::billing_of_api_key_source;
 use coda_protocol::types::{ContextFill, PermissionDecision, RequestId, SessionId, TurnId};
 use rustix::process::{Pid, Signal, kill_process_group};
 use std::pin::pin;
@@ -192,6 +194,8 @@ pub struct ClaudeSession {
     tool_calls: ToolCalls,
     /// Carries the backend id to watchers the moment it is reported.
     backend_id_tx: watch::Sender<Option<String>>,
+    /// Whether the session's billing was reported; it is told once.
+    billing_reported: bool,
     closed: bool,
 }
 
@@ -267,6 +271,7 @@ impl ClaudeSession {
             cwd: spec.cwd,
             backend_session_id: None,
             limit_hit: None,
+            billing_reported: false,
             context: None,
             backend_id_tx: watch::channel(None).0,
             closed: false,
@@ -428,9 +433,21 @@ impl ClaudeSession {
         emit: &mut impl Emit,
     ) -> Result<Option<TurnOutcome>, AdapterError> {
         match message {
-            Message::Init { session_id } => {
+            Message::Init {
+                session_id,
+                api_key_source,
+            } => {
                 self.backend_id_tx.send_replace(Some(session_id.clone()));
                 self.backend_session_id = Some(session_id);
+                if let Some(source) = api_key_source.filter(|_| !self.billing_reported) {
+                    self.billing_reported = true;
+                    emit.emit(Event::Account {
+                        session_id: self.session_id.clone(),
+                        billing: billing_of_api_key_source(&source),
+                        plan: None,
+                    })
+                    .await;
+                }
             }
             Message::TextDelta(text) => {
                 emit.emit(Event::StreamDelta {

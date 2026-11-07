@@ -590,3 +590,94 @@ async fn a_plaintext_secret_in_the_config_is_reported_without_its_value() {
 fn wait_bounded(child: Child) -> std::process::Output {
     output_within(child, WAIT).expect("the child outlived WAIT")
 }
+
+/// A `claude` stand-in that answers `--version` and `auth status --json` with `status_json`.
+fn fake_claude(dir: &Path, status_json: &str, exit: u8) -> PathBuf {
+    let path = dir.join("claude");
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n--version) echo '2.1.296 (Claude Code)';;\nauth) echo '{status_json}'; exit {exit};;\nesac\n"
+    );
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn claude_config(binary: &Path) -> String {
+    format!(
+        "[providers.claude_code]\nenabled = true\nbinary = {:?}\nverified_versions = [\"2.1.296\"]\n",
+        binary.display().to_string()
+    )
+}
+
+#[tokio::test]
+async fn an_account_on_a_subscription_is_ok_and_names_the_plan() {
+    // Arrange
+    let dir = seeded_home();
+    let bin = short_dir();
+    let claude = fake_claude(
+        bin.path(),
+        r#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","email":"me@example.com"}"#,
+        0,
+    );
+    write_config(dir.path(), &claude_config(&claude));
+
+    // Act
+    let (_, report) = doctor(dir.path(), &[]).await;
+
+    // Assert
+    assert_eq!(status(&report, "accounts"), "ok", "{report}");
+    let text = detail(&report, "accounts");
+    assert!(
+        text.contains("claude_code") && text.contains("max") && text.contains("me@example.com"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn an_api_key_login_warns_that_the_session_bills_api_rates() {
+    // Arrange
+    let dir = seeded_home();
+    let bin = short_dir();
+    let claude = fake_claude(
+        bin.path(),
+        r#"{"loggedIn":true,"authMethod":"api_key","apiKeySource":"ANTHROPIC_API_KEY"}"#,
+        0,
+    );
+    write_config(dir.path(), &claude_config(&claude));
+
+    // Act
+    let (code, report) = doctor(dir.path(), &[]).await;
+
+    // Assert
+    assert_eq!(code, ExitCode::from(EXIT_WARNINGS));
+    assert_eq!(status(&report, "accounts"), "warn");
+    assert!(detail(&report, "accounts").contains("API rates"));
+}
+
+#[tokio::test]
+async fn a_logged_out_backend_warns_with_the_command_that_logs_in() {
+    // Arrange
+    let dir = seeded_home();
+    let bin = short_dir();
+    let claude = fake_claude(bin.path(), r#"{"loggedIn":false,"authMethod":"none"}"#, 1);
+    write_config(dir.path(), &claude_config(&claude));
+
+    // Act
+    let (_, report) = doctor(dir.path(), &[]).await;
+
+    // Assert
+    assert_eq!(status(&report, "accounts"), "warn");
+    assert!(detail(&report, "accounts").contains("claude auth login"));
+}
+
+#[tokio::test]
+async fn no_enabled_backend_means_nothing_to_ask() {
+    // Arrange
+    let dir = seeded_home();
+
+    // Act
+    let (_, report) = doctor(dir.path(), &[]).await;
+
+    // Assert
+    assert_eq!(status(&report, "accounts"), "ok");
+}

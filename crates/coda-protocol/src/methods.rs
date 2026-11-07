@@ -119,13 +119,17 @@ pub struct Capabilities {
     /// The daemon can report the full usage of a turn, including cache tokens.
     #[serde(default)]
     pub usage_details: bool,
-    /// The daemon can send `rate_limit` events. Only Claude Code sessions do.
+    /// The daemon can send `rate_limit` events. Claude Code and Codex app-server sessions do.
     #[serde(default)]
     pub rate_limit_events: bool,
     /// The daemon can send a `usage_limit` event when a turn ends at the plan limit.
-    /// Only Claude Code sessions do.
+    /// Claude Code and Codex app-server sessions do.
     #[serde(default)]
     pub usage_limit_events: bool,
+    /// The daemon can send an `account` event that says how a session is billed.
+    /// Claude Code and Codex app-server sessions do.
+    #[serde(default)]
+    pub account_events: bool,
     /// The daemon can send `tool_call` events. Claude Code, Codex and coda's own
     /// loop do; a backend without tool calls never does.
     #[serde(default)]

@@ -2,10 +2,11 @@
 
 //! Finds a backend binary and checks its version.
 
+use std::ffi::OsStr;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -91,19 +92,33 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & EXECUTABLE_BITS != 0)
 }
 
-/// Runs `<path> --version` with an empty environment and a bounded wait.
+/// What a bounded run printed and how it ended.
+#[derive(Debug)]
+pub(crate) struct Captured {
+    pub status: ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Runs `<path> <args>` with an environment of only `env` and a bounded wait.
 ///
 /// Both streams are drained on their own threads so a chatty binary cannot
-/// stall on a full pipe. Some CLIs print the version on stderr, so it is the
-/// fallback when stdout holds no version.
+/// stall on a full pipe. `what` names the call in error text.
 #[expect(
     clippy::disallowed_methods,
-    reason = "polls a real subprocess for the version probe"
+    reason = "polls a real subprocess for a bounded probe"
 )]
-fn probe_version(path: &Path, timeout: Duration) -> Result<String, String> {
+pub(crate) fn run_bounded(
+    path: &Path,
+    args: &[&str],
+    env: &[(&OsStr, &OsStr)],
+    timeout: Duration,
+    what: &str,
+) -> Result<Captured, String> {
     let mut child = Command::new(path)
-        .arg(VERSION_FLAG)
+        .args(args)
         .env_clear()
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -119,19 +134,28 @@ fn probe_version(path: &Path, timeout: Duration) -> Result<String, String> {
                 // Best effort: the child may have exited between the check and the kill.
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("{VERSION_FLAG} did not finish in {timeout:?}"));
+                return Err(format!("{what} did not finish in {timeout:?}"));
             }
             Ok(None) => std::thread::sleep(PROBE_POLL_INTERVAL),
-            Err(err) => return Err(format!("could not wait for {VERSION_FLAG}: {err}")),
+            Err(err) => return Err(format!("could not wait for {what}: {err}")),
         }
     };
-    if !status.success() {
-        return Err(format!("{VERSION_FLAG} exited with {status}"));
+    Ok(Captured {
+        status,
+        stdout: collect(stdout, deadline),
+        stderr: collect(stderr, deadline),
+    })
+}
+
+/// Runs `<path> --version`. Some CLIs print the version on stderr, so it is the
+/// fallback when stdout holds no version.
+fn probe_version(path: &Path, timeout: Duration) -> Result<String, String> {
+    let ran = run_bounded(path, &[VERSION_FLAG], &[], timeout, VERSION_FLAG)?;
+    if !ran.status.success() {
+        return Err(format!("{VERSION_FLAG} exited with {}", ran.status));
     }
-    let stdout = collect(stdout, deadline);
-    let stderr = collect(stderr, deadline);
-    parse_version(&stdout)
-        .or_else(|| parse_version(&stderr))
+    parse_version(&ran.stdout)
+        .or_else(|| parse_version(&ran.stderr))
         .ok_or_else(|| format!("{VERSION_FLAG} printed no version number"))
 }
 
