@@ -194,6 +194,10 @@ pub struct RunArgs {
 }
 
 #[derive(Debug, Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is its own option on the command line"
+)]
 pub struct ReviewArgs {
     /// A pull request number or URL, a branch, or a range such as `main...topic`.
     /// Without one, the current branch is reviewed against the default branch.
@@ -213,6 +217,14 @@ pub struct ReviewArgs {
     /// Working directory of the review.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
+    /// Post the findings to the pull request as a pending review plus a summary
+    /// comment, after a preview you confirm. Needs a pull request target; it never
+    /// approves or requests changes.
+    #[arg(long, conflicts_with = "staged")]
+    pub post: bool,
+    /// Post without asking. Needed when standard input is not a terminal.
+    #[arg(long, requires = "post")]
+    pub yes: bool,
 }
 
 /// The backends as typed on the command line.

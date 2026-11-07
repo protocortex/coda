@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `coda review`: packs a change, has the `reviewer` agent read it and prints the checked
-//! findings. The command only reads: it posts nothing and edits no file of the repository.
+//! findings. The command only reads, unless `--post` asks it to put the findings on a pull
+//! request as a pending review; it edits no file of the repository.
 //!
 //! On Claude Code and Codex the daemon runs the reviewer on a session in plan mode, with the
 //! packed diff in the prompt. On a model API the reviewer is a sub-agent of a session that
@@ -44,6 +45,7 @@ use crate::cli::ReviewArgs;
 use crate::context::{Context, Io};
 use crate::daemon_cmd::load_config;
 use crate::error::CliError;
+use crate::review_post::{Confirm, RealGh, head_of, post};
 use crate::run::{
     CANCELLED, CLAUDE_CODE_KEY, CODEX_KEY, Finish, Job, STREAM_DELTA_KIND, Tap, drive,
     pick_backend, session_cwd, stop_reason,
@@ -91,6 +93,7 @@ pub async fn run(
     } else {
         Some(Target::parse(args.target.as_deref()))
     };
+    let post_to = post_request(ctx, repo, &args, target.as_ref())?;
     if let Some(Target::PullRequest(pr)) = &target {
         match gh_pr_decision(repo, pr, &rules, force)? {
             Decision::Skip(reason) => {
@@ -172,12 +175,75 @@ pub async fn run(
     };
     let model = model.unwrap_or_else(|| backend_name(backend));
     let review = assemble(merged, &model, input_chars, verified);
-    if args.json {
-        write!(io.out, "{}", to_json(&review)?)?;
-    } else {
-        write!(io.out, "{}", to_markdown(&review))?;
+    print_review(io, args.json, &review)?;
+    if let Some(to) = post_to {
+        post_review(io, repo, to, &parts, &review)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_review(io: &mut Io<'_>, json: bool, review: &Review) -> Result<(), CliError> {
+    if json {
+        write!(io.out, "{}", to_json(review)?)?;
+    } else {
+        write!(io.out, "{}", to_markdown(review))?;
+    }
+    Ok(())
+}
+
+fn post_review(
+    io: &mut Io<'_>,
+    repo: &Path,
+    to: PostTo,
+    parts: &[Packed],
+    review: &Review,
+) -> Result<(), CliError> {
+    let scopes: Vec<&DiffScope> = parts.iter().map(|part| &part.scope).collect();
+    let PostTo { pr, confirm, head } = to;
+    post(
+        &mut RealGh { repo },
+        io,
+        confirm,
+        &pr,
+        &head,
+        review,
+        &scopes,
+    )
+}
+
+/// Where `--post` posts, how it is confirmed, and the commit the review is of.
+struct PostTo {
+    pr: String,
+    confirm: Confirm,
+    head: String,
+}
+
+/// What `--post` posts to and how it is confirmed, checked before any model run is paid for.
+/// `None` without `--post`.
+fn post_request(
+    ctx: &Context,
+    repo: &Path,
+    args: &ReviewArgs,
+    target: Option<&Target>,
+) -> Result<Option<PostTo>, CliError> {
+    if !args.post {
+        return Ok(None);
+    }
+    let confirm = Confirm {
+        assume_yes: args.yes,
+        interactive: ctx.stdin_is_tty,
+    };
+    confirm.check()?;
+    match target {
+        Some(Target::PullRequest(pr)) => Ok(Some(PostTo {
+            head: head_of(&mut RealGh { repo }, pr)?,
+            pr: pr.clone(),
+            confirm,
+        })),
+        _ => Err(CliError::ReviewPost(
+            "only a pull request can be posted to; name one by number or URL".to_owned(),
+        )),
+    }
 }
 
 /// Tells the user why there is no review. With `--json` the notice is a review with no
