@@ -174,6 +174,8 @@ A different argument or a changed result starts the count again, so a poll whose
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `notify` | string | `"bell"` | What the terminal UI writes to the terminal when a turn ends or a new approval or question waits while the terminal does not have focus. `"off"` writes nothing, `"bell"` rings the bell, `"osc9"` sends an OSC 9 desktop notification (iTerm2 and others) and `"osc777"` an OSC 777 one (VTE terminals and others). A terminal that does not report focus changes never gets one, and the UI counts the terminal as focused until it hears otherwise. It also rings when the backend crashes for good or the link to the daemon drops during a turn. Under tmux, focus reports and OSC 9 or 777 need `set -g focus-events on` and `set -g allow-passthrough on`. |
+| `cache_ttl_secs` | integer | `300` | How many seconds without a message or a turn end before the UI assumes the prompt cache is gone. How long the cache lasts depends on the provider and the plan (the usage report of one Claude Code plan splits its cache writes into five-minute and one-hour parts), so set this to match yours. `0` turns the cache hint off. |
+| `cache_hint_tokens` | integer | `50000` | The smallest context, in tokens, that gets the hint `cache likely expired: the next message resends about N tokens`. The size is what the last model call held, the same number the context meter uses. |
 
 ### Context meter
 

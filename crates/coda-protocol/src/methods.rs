@@ -29,6 +29,8 @@ pub const SESSION_SEND: &str = "session.send";
 pub const SESSION_QUEUE: &str = "session.queue";
 /// Turns on or off continuing a session when the plan window that stopped it resets.
 pub const SESSION_RESUME_AT_RESET: &str = "session.resume_at_reset";
+/// Compacts the conversation of an idle Claude Code session.
+pub const SESSION_COMPACT: &str = "session.compact";
 /// Run a named agent on a prompt in a session of a delegated backend.
 pub const AGENT_RUN: &str = "agent.run";
 /// Cancels the running turn.
@@ -89,6 +91,7 @@ pub const METHODS: &[&str] = &[
     SESSION_SEND,
     SESSION_QUEUE,
     SESSION_RESUME_AT_RESET,
+    SESSION_COMPACT,
     AGENT_RUN,
     SESSION_CANCEL,
     SESSION_SUBSCRIBE,
@@ -189,6 +192,9 @@ pub struct Capabilities {
     /// The daemon serves `session.fork` for sessions on Claude Code and Codex.
     #[serde(default)]
     pub fork: bool,
+    /// The daemon serves `session.compact`, for Claude Code sessions.
+    #[serde(default)]
+    pub compact: bool,
 }
 
 /// Result of [`INITIALIZE`].
@@ -290,6 +296,18 @@ pub struct SessionSendResult {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub steered: bool,
 }
+
+/// Parameters of [`SESSION_COMPACT`]. The daemon refuses while a turn runs, for a
+/// session that is not on Claude Code, and for one with no conversation yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionCompactParams {
+    /// Target session.
+    pub session_id: SessionId,
+}
+
+/// Result of [`SESSION_COMPACT`]; the answer comes when the compaction is done.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionCompactResult {}
 
 /// Parameters of [`SESSION_RESUME_AT_RESET`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -907,6 +925,10 @@ pub struct SessionResumeParams {
 pub struct SessionResumeResult {
     /// The reopened session.
     pub session: SessionInfo,
+    /// Time of the session's last event, or its creation time when it has none, in
+    /// milliseconds since the Unix epoch. Absent from daemons that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
 }
 
 /// Parameters of [`SESSION_LIST`].

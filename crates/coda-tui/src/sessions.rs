@@ -18,11 +18,12 @@ use coda_protocol::jsonrpc::Notification;
 use coda_protocol::methods::{
     DAEMON_BACKENDS, DAEMON_PING, DAEMON_STATUS, DaemonBackendsParams, DaemonBackendsResult,
     DaemonStatusParams, DaemonStatusResult, PERMISSION_RESPOND, PermissionRespondParams,
-    PermissionRespondResult, PingParams, PingResult, SESSION_CANCEL, SESSION_CREATE, SESSION_DIFF,
-    SESSION_LIST, SESSION_RESUME, SESSION_RESUME_AT_RESET, SESSION_SEND, SESSION_SET_MODE,
-    SESSION_SET_MODEL, SessionCancelParams, SessionCancelResult, SessionCreateParams,
-    SessionCreateResult, SessionDiffParams, SessionDiffResult, SessionListParams,
-    SessionListResult, SessionResumeAtResetParams, SessionResumeAtResetResult, SessionResumeParams,
+    PermissionRespondResult, PingParams, PingResult, SESSION_CANCEL, SESSION_COMPACT,
+    SESSION_CREATE, SESSION_DIFF, SESSION_LIST, SESSION_RESUME, SESSION_RESUME_AT_RESET,
+    SESSION_SEND, SESSION_SET_MODE, SESSION_SET_MODEL, SessionCancelParams, SessionCancelResult,
+    SessionCompactParams, SessionCompactResult, SessionCreateParams, SessionCreateResult,
+    SessionDiffParams, SessionDiffResult, SessionListParams, SessionListResult,
+    SessionResumeAtResetParams, SessionResumeAtResetResult, SessionResumeParams,
     SessionResumeResult, SessionSendParams, SessionSendResult, SessionSetModeParams,
     SessionSetModeResult, SessionSetModelParams, SessionSetModelResult, SessionSummary,
 };
@@ -52,6 +53,9 @@ const MAX_RESUME_AGE: Duration = Duration::from_hours(24);
 const RESUME_LOOKUP_LIMIT: u32 = 10;
 /// Replaying from the first event rebuilds the transcript of a reopened session.
 const REPLAY_FROM_START: u64 = 0;
+/// A compaction asks the model to summarize the whole conversation, so it can take minutes.
+const COMPACT_WAIT: Duration = Duration::from_secs(330);
+const COMPACTING: &str = "compacting the conversation, this can take a minute";
 
 /// Said after a backend switch: the new backend starts with an empty history.
 pub const TRANSCRIPT_NOT_CARRIED: &str = "the transcript is not carried over to the new session";
@@ -80,6 +84,8 @@ pub enum LinkCommand {
     ListSessions,
     /// Switch the current session to a model alias.
     SetModel(String),
+    /// Compact the conversation of the current session.
+    Compact,
     /// Change the mode of the current session, then send `then` when given.
     SetMode { mode: Mode, then: Option<String> },
     /// Turn on or off continuing the current session when its plan window resets.
@@ -499,8 +505,13 @@ impl Link {
             session_id: id.clone(),
         };
         let resumed: SessionResumeResult = self.client.request(SESSION_RESUME, &params).await?;
+        let updated_at = resumed.updated_at;
         self.follow(resumed.session, Some(REPLAY_FROM_START), false)
-            .await
+            .await?;
+        if let Some(at) = updated_at {
+            self.tell(LinkEvent::LastActive(at));
+        }
+        Ok(())
     }
 
     /// Follows `info`, then closes the session this link created before it.
@@ -547,6 +558,7 @@ impl Link {
                 .map(|sessions| self.tell(LinkEvent::Sessions(sessions)))
                 .map_err(|e| ("list the sessions", e)),
             LinkCommand::SetModel(alias) => self.set_model(alias).await,
+            LinkCommand::Compact => self.compact().await,
             LinkCommand::SetMode { mode, then } => self.set_mode(mode, then).await,
             LinkCommand::ResumeAtReset(enabled) => self.resume_at_reset(enabled).await,
             LinkCommand::Diff => self.diff().await,
@@ -624,6 +636,28 @@ impl Link {
             .await
             .map_err(|e| ("switch the model", e))?;
         self.tell(LinkEvent::ModelSwitched(switched.session));
+        Ok(())
+    }
+
+    async fn compact(&self) -> Result<(), (&'static str, ClientError)> {
+        let Some(session_id) = self.current() else {
+            self.notice("there is no session to compact".to_owned());
+            return Ok(());
+        };
+        self.notice(COMPACTING.to_owned());
+        let done: Result<SessionCompactResult, _> = self
+            .client
+            .request_within(
+                COMPACT_WAIT,
+                SESSION_COMPACT,
+                &SessionCompactParams { session_id },
+            )
+            .await;
+        if let Err(error) = done {
+            self.tell(LinkEvent::CompactFailed);
+            return Err(("compact the conversation", error));
+        }
+        self.tell(LinkEvent::Compacted);
         Ok(())
     }
 

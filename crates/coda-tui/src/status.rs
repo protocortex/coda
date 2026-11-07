@@ -96,6 +96,23 @@ impl Status {
         }
     }
 
+    /// The tokens the last model call held in its context, when a report said.
+    #[must_use]
+    pub fn context_tokens(&self) -> Option<u64> {
+        self.context.map(|fill| fill.used_tokens)
+    }
+
+    /// Forgets the context size, as after a compaction, until the next report.
+    pub fn forget_context(&mut self) {
+        self.context = None;
+    }
+
+    /// The backend of the session, once one has started.
+    #[must_use]
+    pub fn backend(&self) -> Option<BackendKind> {
+        self.backend
+    }
+
     #[must_use]
     pub fn usage(&self) -> TokenUsage {
         self.usage

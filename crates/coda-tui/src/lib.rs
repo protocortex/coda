@@ -4,6 +4,7 @@
 
 pub mod activity;
 pub mod app;
+pub mod cache_hint;
 pub mod chat;
 pub mod commands;
 pub mod completion;
@@ -176,6 +177,9 @@ pub struct Startup {
     /// How to tell the user, while the terminal is out of focus, that a turn
     /// ended or an approval waits.
     pub notify: NotifyMode,
+    /// When to warn that a large session's prompt cache has likely expired. The
+    /// default is off.
+    pub cache_hint: cache_hint::CacheHint,
 }
 
 /// Shows the connection state and runs until the user quits or `shutdown`
@@ -204,6 +208,7 @@ where
     let mut app = App::with_link(commands.clone());
     app.set_user_commands(user_commands);
     app.set_notify(startup.notify);
+    app.set_cache_hint(startup.cache_hint);
     if startup.needs_setup {
         app.show_setup_guidance();
     }

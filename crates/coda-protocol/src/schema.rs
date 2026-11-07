@@ -72,6 +72,11 @@ fn add_account_and_daemon_methods(
         methods,
         m::SESSION_RESUME_AT_RESET,
     );
+    add_method::<m::SessionCompactParams, m::SessionCompactResult>(
+        generator,
+        methods,
+        m::SESSION_COMPACT,
+    );
     add_method::<m::SessionSetModelParams, m::SessionSetModelResult>(
         generator,
         methods,

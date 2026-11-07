@@ -21,6 +21,7 @@ use common::{StopDaemon, calls, cli, context, fake_claude, home_with, short_dir}
 
 const LAUNCH_MARKER: &str = "tui-launched";
 const COMMANDS_MARKER: &str = "tui-commands";
+const CACHE_MARKER: &str = "tui-cache-hint";
 const NO_TERMINAL_MESSAGE: &str = "needs an interactive terminal";
 const FAUX_ENABLED: &str = "[providers.faux]\nenabled = true\nscript = \"/x/script.json\"\n";
 
@@ -40,6 +41,15 @@ fn record_launch(
         fs::write(
             run_dir.join(COMMANDS_MARKER),
             commands.help_lines().join("\n"),
+        )
+        .unwrap();
+        fs::write(
+            run_dir.join(CACHE_MARKER),
+            format!(
+                "ttl={} min={}",
+                startup.cache_hint.ttl.as_secs(),
+                startup.cache_hint.min_tokens
+            ),
         )
         .unwrap();
         fs::write(
@@ -128,6 +138,39 @@ async fn coda_tui_without_a_terminal_fails_and_says_why() {
     assert_eq!(outcome.code, ExitCode::from(exit::FAILURE));
     assert!(outcome.err.contains(NO_TERMINAL_MESSAGE), "{}", outcome.err);
     assert_eq!(launch_note(dir.path()), None);
+}
+
+fn cache_note(base: &Path) -> Option<String> {
+    let note = Dirs::from_base(base).run_dir().join(CACHE_MARKER);
+    fs::read_to_string(note).ok()
+}
+
+#[tokio::test]
+async fn the_tui_is_told_when_to_warn_about_a_cold_cache() {
+    // Arrange
+    let configured = short_dir();
+    fs::write(
+        Dirs::from_base(configured.path()).config_file(),
+        format!("[tui]\ncache_ttl_secs = 600\ncache_hint_tokens = 2000\n{FAUX_ENABLED}"),
+    )
+    .unwrap();
+    let plain = short_dir();
+    let mut notes = Vec::new();
+
+    // Act
+    for dir in [&configured, &plain] {
+        let _stop = StopDaemon::new(dir.path());
+        let mut ctx = context(dir.path());
+        ctx.is_tty = true;
+        ctx.launch_tui = record_launch;
+        let outcome = cli(&ctx, &["coda"], "").await;
+        assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+        notes.push(cache_note(dir.path()));
+    }
+
+    // Assert
+    assert_eq!(notes[0].as_deref(), Some("ttl=600 min=2000"));
+    assert_eq!(notes[1].as_deref(), Some("ttl=300 min=50000"));
 }
 
 #[tokio::test]

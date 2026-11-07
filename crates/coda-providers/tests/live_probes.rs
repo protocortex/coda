@@ -694,3 +694,60 @@ async fn native_accept_edits_mode_writes_a_file_that_changes_what_runs_without_a
         "claude now asks for execution files in acceptEdits; revisit #158"
     );
 }
+
+/// One `claude -p` call from `dir` with the cleared session environment; its JSON result.
+fn claude_json(dir: &Path, args: &[&str]) -> Value {
+    let out = std::process::Command::new(find_claude())
+        .args(["-p", "--output-format", "json", "--model", CHEAP_MODEL])
+        .args(["--setting-sources", "project", "--strict-mcp-config"])
+        .args(args)
+        .current_dir(dir)
+        .env_clear()
+        .envs(session_env())
+        .stdin(Stdio::null())
+        .output()
+        .expect("could not run claude");
+    serde_json::from_slice(&out.stdout).expect("claude printed no JSON result")
+}
+
+/// `/compact` does nothing under `--disable-slash-commands`, which is why coda
+/// compacts with a call of its own. This checks both halves: the flag makes
+/// `/compact` a no-op that costs nothing, and `claude_compact::compact` compacts the
+/// same session. About three short calls.
+#[ignore = "spends Claude subscription quota; needs CODA_LIVE_TESTS=1"]
+#[tokio::test]
+async fn compact_is_a_no_op_under_the_slash_flag_and_works_through_claude_compact() {
+    if !live() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let first = claude_json(
+        dir.path(),
+        &["--max-turns", "1", "--disable-slash-commands", TEXT_PROMPT],
+    );
+    let id = first["session_id"]
+        .as_str()
+        .expect("no session id")
+        .to_owned();
+    let cost = first["total_cost_usd"].as_f64().expect("no cost");
+
+    let flagged = claude_json(
+        dir.path(),
+        &["--resume", &id, "--disable-slash-commands", "/compact"],
+    );
+
+    assert_eq!(flagged["num_turns"], 0, "{flagged}");
+    assert_eq!(flagged["total_cost_usd"].as_f64(), Some(cost));
+    let env = session_env();
+    let done =
+        coda_providers::claude_compact::compact(&coda_providers::claude_compact::CompactRequest {
+            binary: &find_claude(),
+            parent_env: &env,
+            env_passthrough: &[],
+            cwd: dir.path(),
+            backend_session: &id,
+            timeout: TURN_BOUND,
+        })
+        .await;
+    assert!(done.is_ok(), "{done:?}");
+}

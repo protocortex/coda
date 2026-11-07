@@ -194,6 +194,30 @@ impl Store {
         rows.map(|row| row?).collect()
     }
 
+    /// The time of a session's last event, or its creation time when it has none,
+    /// in milliseconds since the Unix epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SessionNotFound`] when no such session exists.
+    pub fn session_updated_at(&self, id: &SessionId) -> Result<i64, StoreError> {
+        let not_found = || StoreError::SessionNotFound {
+            session: id.clone(),
+        };
+        let row_id = session_row_id(id).ok_or_else(not_found)?;
+        self.conn
+            .query_row(
+                "SELECT COALESCE((SELECT MAX(e.at) FROM events e \
+                                  JOIN turns t ON t.id = e.turn_id \
+                                  WHERE t.session_id = s.id), s.created_at) \
+                 FROM sessions s WHERE s.id = ?1",
+                [row_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(not_found)
+    }
+
     /// Lists at most `limit` sessions matching `filter` with their last
     /// activity, newest first.
     ///

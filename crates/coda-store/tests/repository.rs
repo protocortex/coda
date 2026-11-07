@@ -1037,6 +1037,30 @@ fn summaries_report_the_last_activity_and_filter_by_cwd() {
     assert_eq!(all[0].record.id, other);
 }
 
+#[test]
+fn one_session_reports_its_last_activity_and_an_unknown_one_is_not_found() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let clock = Arc::new(FixedClock(AtomicI64::new(T0)));
+    let mut store = Store::open_with_clock(&dir.path().join("data"), clock.clone()).unwrap();
+    let quiet = store.create_session(&new_session("/a")).unwrap();
+    let busy = store.create_session(&new_session("/a")).unwrap();
+    let turn = store.begin_turn(&busy).unwrap();
+    clock.0.store(T0 + 7_000, Ordering::SeqCst);
+    store
+        .append_event(&busy, &turn, &event("user_message", "{}"))
+        .unwrap();
+
+    // Act
+    let quiet_at = store.session_updated_at(&quiet).unwrap();
+    let busy_at = store.session_updated_at(&busy).unwrap();
+    let unknown = store.session_updated_at(&SessionId::new("999"));
+
+    // Assert
+    assert_eq!((quiet_at, busy_at), (T0, T0 + 7_000));
+    assert!(matches!(unknown, Err(StoreError::SessionNotFound { .. })));
+}
+
 fn user_message(text: &str) -> String {
     serde_json::json!({ "text": text }).to_string()
 }

@@ -4,7 +4,7 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use coda_config::tui::NotifyMode;
 use coda_protocol::events::{Event, InterruptCause, TodoItem};
@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Paragraph};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::activity::{self, Stage};
+use crate::cache_hint::{self, CacheHint};
 use crate::chat::Chat;
 use crate::commands::{self, Command, CommandError, Resolved, UserCommands};
 use crate::completion;
@@ -64,6 +65,7 @@ const STASHED: &str = "prompt stashed; press Ctrl+S on an empty prompt to bring 
 const ALREADY_PLANNING: &str = "the session is already in plan mode";
 const NO_LIMITS: &str = "no plan limits reported yet";
 const NO_DIFF: &str = "this daemon cannot show a diff";
+const COMPACTED: &str = "compacted the conversation";
 const NO_RESUME_AT_RESET: &str = "this daemon cannot resume a session at the plan reset";
 const NO_CHANGES: &str = "the last turn changed no files";
 const NOT_PLANNING: &str =
@@ -120,6 +122,12 @@ pub enum LinkEvent {
     },
     /// Something the user should read, such as a failed request.
     Notice(String),
+    /// When the resumed session last had an event, in milliseconds since the Unix epoch.
+    LastActive(i64),
+    /// The daemon compacted the session's conversation.
+    Compacted,
+    /// A compaction did not happen; the reason comes as a notice.
+    CompactFailed,
     /// What the daemon said it can do when the link connected.
     Capabilities(Capabilities),
     /// The model's todo list changed; this is the whole list now.
@@ -177,6 +185,13 @@ pub struct App {
     idle_ctrl_c_at: Option<Instant>,
     /// A short-lived line that replaces the connection line.
     hint: Option<(Instant, &'static str)>,
+    /// When to warn that the prompt cache has likely expired.
+    cache_hint: CacheHint,
+    /// When the session last had a message or ended a turn, in milliseconds since
+    /// the Unix epoch; unknown until a resume or a message says.
+    last_active_ms: Option<i64>,
+    /// When a compaction started, while one runs, so Tab asks for no second one.
+    compacting_since: Option<Instant>,
 }
 
 impl App {
@@ -208,6 +223,9 @@ impl App {
             quit: false,
             idle_ctrl_c_at: None,
             hint: None,
+            cache_hint: CacheHint::default(),
+            last_active_ms: None,
+            compacting_since: None,
         }
     }
 
@@ -293,10 +311,20 @@ impl App {
                 self.plan = None;
                 self.cwd = Some(info.cwd);
                 self.session = Some(info.id);
+                self.last_active_ms = None;
+                self.compacting_since = None;
                 self.diff_view = None;
                 self.overlay = Overlay::default();
                 self.turn_running = false;
                 self.work.reset();
+            }
+            LinkEvent::LastActive(at) => self.last_active_ms = Some(at),
+            LinkEvent::CompactFailed => self.compacting_since = None,
+            LinkEvent::Compacted => {
+                self.compacting_since = None;
+                self.status.forget_context();
+                self.last_active_ms = Some(unix_ms());
+                self.chat.push_notice(COMPACTED.to_owned());
             }
             LinkEvent::ModelSwitched(info) => {
                 self.chat.push_notice(format!(
@@ -368,6 +396,7 @@ impl App {
             | Event::Timeout { request_id, .. } => self.overlay.resolve(request_id),
             Event::Result { is_error, .. } => {
                 if self.turn_running {
+                    self.last_active_ms = Some(unix_ms());
                     let body = if *is_error {
                         NOTIFY_FAILED
                     } else {
@@ -382,6 +411,7 @@ impl App {
             }
             Event::TurnInterrupted { cause, .. } => {
                 if self.turn_running {
+                    self.last_active_ms = Some(unix_ms());
                     self.notify_user(NOTIFY_TITLE, NOTIFY_STOPPED.to_owned());
                 }
                 self.turn_running = false;
@@ -531,6 +561,43 @@ impl App {
         }
     }
 
+    /// Sets when the UI warns that a large session's prompt cache has likely expired.
+    pub fn set_cache_hint(&mut self, hint: CacheHint) {
+        self.cache_hint = hint;
+    }
+
+    /// Whether the session can be compacted: the daemon serves it, and the session is
+    /// on Claude Code.
+    fn can_compact(&self) -> bool {
+        self.capabilities.is_some_and(|known| known.compact)
+            && self.status.backend() == Some(BackendKind::ClaudeCode)
+    }
+
+    /// The tokens the next message would resend at full price, when the prompt
+    /// cache has likely expired at `now_ms` and the context is large.
+    fn cold_cache_tokens(&self, now_ms: i64) -> Option<u64> {
+        if self.turn_running || self.compacting_since.is_some() || self.session.is_none() {
+            return None;
+        }
+        let idle_ms = now_ms.checked_sub(self.last_active_ms?)?;
+        let idle = Duration::from_millis(u64::try_from(idle_ms).ok()?);
+        let tokens = self.status.context_tokens()?;
+        self.cache_hint.applies(idle, tokens).then_some(tokens)
+    }
+
+    /// The cache hint line at `now_ms`, when it applies.
+    fn cache_hint_line(&self, now_ms: i64) -> Option<String> {
+        let tokens = self.cold_cache_tokens(now_ms)?;
+        Some(cache_hint::text(tokens, self.can_compact()))
+    }
+
+    /// Whether Tab compacts now: the prompt is empty and the hint offers it.
+    fn compact_offered(&self, now_ms: i64) -> bool {
+        self.input.text().is_empty()
+            && self.can_compact()
+            && self.cold_cache_tokens(now_ms).is_some()
+    }
+
     /// Sets how the user is told, while the terminal is out of focus, that a turn
     /// ended or an approval waits.
     pub fn set_notify(&mut self, mode: NotifyMode) {
@@ -581,6 +648,9 @@ impl App {
         match key.code {
             KeyCode::PageUp => self.chat.scroll_up(PAGE_ROWS),
             KeyCode::PageDown => self.chat.scroll_down(PAGE_ROWS),
+            KeyCode::Tab if self.compact_offered(unix_ms()) => {
+                self.compacting_since = self.send(LinkCommand::Compact).then(Instant::now);
+            }
             KeyCode::Tab => self.complete_path(),
             _ => {
                 if let Some(line) = self.input.handle_key(key) {
@@ -614,6 +684,7 @@ impl App {
             self.stop = None;
         }
         self.turn_running = true;
+        self.last_active_ms = Some(unix_ms());
         if !self.send(LinkCommand::Send(text.to_owned())) {
             self.input.restore(typed);
         }
@@ -905,6 +976,12 @@ impl App {
         {
             return hint.to_owned();
         }
+        if !lost
+            && matches!(self.connection, ConnectionState::Connected)
+            && let Some(line) = self.cache_hint_line(unix_ms())
+        {
+            return line;
+        }
         match &self.connection {
             ConnectionState::Connecting => "Connecting to the daemon".to_owned(),
             ConnectionState::Connected => "Connected to the daemon".to_owned(),
@@ -914,6 +991,14 @@ impl App {
             }
         }
     }
+}
+
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// The line that follows a turn that changed files: how many, and how much.
@@ -1914,6 +1999,187 @@ mod tests {
         assert!(refused.is_empty(), "{refused:?}");
         assert!(tall_screen(&app).contains(NO_RESUME_AT_RESET));
         assert_eq!(asked, vec![LinkCommand::ResumeAtReset(false)]);
+    }
+
+    const COLD_TOKENS: u64 = 80_000;
+
+    fn cache_app(backend: BackendKind, can_compact: bool) -> (App, UnboundedReceiver<LinkCommand>) {
+        let (mut app, commands) = linked();
+        app.handle_event(LinkEvent::Connected);
+        app.set_cache_hint(crate::cache_hint::CacheHint {
+            ttl: std::time::Duration::from_secs(300),
+            min_tokens: 50_000,
+        });
+        app.handle_event(LinkEvent::Capabilities(Capabilities {
+            compact: can_compact,
+            ..Capabilities::default()
+        }));
+        let mut info = session("s-1");
+        info.backend = backend;
+        app.handle_event(LinkEvent::SessionStarted(info));
+        app.handle_event(LinkEvent::Session(Event::Usage {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new("t-1"),
+            usage: TokenUsage::default(),
+            context: Some(coda_protocol::types::ContextFill {
+                used_tokens: COLD_TOKENS,
+                window_tokens: 200_000,
+            }),
+        }));
+        (app, commands)
+    }
+
+    #[test]
+    fn a_large_session_idle_past_the_cache_lifetime_gets_the_hint_with_the_tab_offer() {
+        // Arrange
+        let (mut app, _commands) = cache_app(BackendKind::ClaudeCode, true);
+        app.handle_event(LinkEvent::LastActive(0));
+
+        // Act
+        let shown = tall_screen(&app);
+
+        // Assert
+        assert!(
+            shown.contains(
+                "cache likely expired: the next message resends about 80k tokens, Tab to compact first"
+            ),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_hint_stays_away_for_a_recent_session_a_small_one_or_an_unknown_time() {
+        // Arrange
+        let (mut recent, _a) = cache_app(BackendKind::ClaudeCode, true);
+        recent.handle_event(LinkEvent::LastActive(i64::MAX / 2));
+        let (unknown, _b) = cache_app(BackendKind::ClaudeCode, true);
+        let (mut small, _c) = cache_app(BackendKind::ClaudeCode, true);
+        small.handle_event(LinkEvent::Session(Event::Usage {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new("t-2"),
+            usage: TokenUsage::default(),
+            context: Some(coda_protocol::types::ContextFill {
+                used_tokens: 1_000,
+                window_tokens: 200_000,
+            }),
+        }));
+        small.handle_event(LinkEvent::LastActive(0));
+
+        // Act
+        let shown = [&recent, &unknown, &small].map(tall_screen);
+
+        // Assert
+        for text in shown {
+            assert!(!text.contains("cache likely expired"), "{text}");
+        }
+    }
+
+    #[test]
+    fn tab_on_an_empty_prompt_compacts_and_with_text_it_still_completes() {
+        // Arrange
+        let (mut app, mut commands) = cache_app(BackendKind::ClaudeCode, true);
+        app.handle_event(LinkEvent::LastActive(0));
+        type_line_keys(&mut app, "x");
+
+        // Act
+        app.handle_key(press(KeyCode::Tab));
+        let with_text = sent(&mut commands);
+        app.handle_key(press(KeyCode::Backspace));
+        app.handle_key(press(KeyCode::Tab));
+        let empty = sent(&mut commands);
+
+        // Assert
+        assert!(with_text.is_empty(), "{with_text:?}");
+        assert_eq!(empty, vec![LinkCommand::Compact]);
+    }
+
+    #[test]
+    fn a_session_that_cannot_compact_gets_the_hint_without_the_tab_offer() {
+        // Arrange
+        let (mut codex, mut commands) = cache_app(BackendKind::CodexAppServer, true);
+        codex.handle_event(LinkEvent::LastActive(0));
+        let (mut old_daemon, mut old_commands) = cache_app(BackendKind::ClaudeCode, false);
+        old_daemon.handle_event(LinkEvent::LastActive(0));
+
+        // Act
+        codex.handle_key(press(KeyCode::Tab));
+        old_daemon.handle_key(press(KeyCode::Tab));
+
+        // Assert
+        for app in [&codex, &old_daemon] {
+            let shown = tall_screen(app);
+            assert!(shown.contains("resends about 80k tokens"), "{shown}");
+            assert!(!shown.contains("Tab to compact"), "{shown}");
+        }
+        assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+        assert_eq!(sent(&mut old_commands), Vec::<LinkCommand>::new());
+    }
+
+    #[test]
+    fn sending_a_message_or_compacting_clears_the_hint() {
+        // Arrange
+        let (mut sending, _a) = cache_app(BackendKind::ClaudeCode, true);
+        sending.handle_event(LinkEvent::LastActive(0));
+        let (mut compacted, _b) = cache_app(BackendKind::ClaudeCode, true);
+        compacted.handle_event(LinkEvent::LastActive(0));
+
+        // Act
+        type_line(&mut sending, "go on");
+        compacted.handle_event(LinkEvent::Compacted);
+
+        // Assert
+        assert!(!tall_screen(&sending).contains("cache likely expired"));
+        let after = tall_screen(&compacted);
+        assert!(!after.contains("cache likely expired"), "{after}");
+        assert!(after.contains("compacted the conversation"), "{after}");
+    }
+
+    #[test]
+    fn a_second_tab_during_a_compaction_asks_for_nothing_until_it_fails() {
+        // Arrange
+        let (mut app, mut commands) = cache_app(BackendKind::ClaudeCode, true);
+        app.handle_event(LinkEvent::LastActive(0));
+
+        // Act
+        app.handle_key(press(KeyCode::Tab));
+        app.handle_key(press(KeyCode::Tab));
+        let while_running = sent(&mut commands);
+        app.handle_event(LinkEvent::CompactFailed);
+        app.handle_key(press(KeyCode::Tab));
+        let after_failure = sent(&mut commands);
+
+        // Assert
+        assert_eq!(while_running, vec![LinkCommand::Compact]);
+        assert_eq!(after_failure, vec![LinkCommand::Compact]);
+    }
+
+    #[test]
+    fn a_new_session_does_not_inherit_the_idle_time_of_the_last_one() {
+        // Arrange
+        let (mut app, _commands) = cache_app(BackendKind::ClaudeCode, true);
+        app.handle_event(LinkEvent::LastActive(0));
+
+        // Act
+        app.handle_event(LinkEvent::SessionStarted(session("s-2")));
+
+        // Assert
+        assert_eq!(app.last_active_ms, None);
+    }
+
+    #[test]
+    fn a_turn_that_ends_while_the_ui_watches_restarts_the_idle_clock() {
+        // Arrange
+        let (mut app, mut commands) = cache_app(BackendKind::ClaudeCode, true);
+        app.handle_event(LinkEvent::LastActive(0));
+        type_line(&mut app, "work");
+        sent(&mut commands);
+        app.last_active_ms = Some(0);
+
+        // Act
+        app.handle_event(turn_ended());
+
+        // Assert
+        assert!(app.last_active_ms.is_some_and(|at| at > 0));
     }
 
     #[test]
