@@ -13,7 +13,10 @@ use crate::hooks::{HookConfig, MAX_TIMEOUT_MS};
 use crate::loop_guard::{
     LOOP_GUARD_KEY, LoopGuardConfig, MIN_WARN_AFTER, STOP_AFTER_KEY, WARN_AFTER_KEY,
 };
-use crate::review::{DIFF_BUDGET_CHARS_KEY, MAX_FINDINGS_KEY, REVIEW_KEY, ReviewConfig};
+use crate::review::{
+    CHUNK_CONCURRENCY_KEY, DIFF_BUDGET_CHARS_KEY, MAX_CHUNKS_KEY, MAX_FINDINGS_KEY, REVIEW_KEY,
+    ReviewConfig,
+};
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
 
@@ -427,6 +430,18 @@ impl Config {
             return Err(ConfigError::InvalidValue {
                 path: format!("{REVIEW_KEY}.{DIFF_BUDGET_CHARS_KEY}"),
                 allowed: "a whole number of characters above 0".to_owned(),
+            });
+        }
+        if self.review.max_chunks == 0 {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{REVIEW_KEY}.{MAX_CHUNKS_KEY}"),
+                allowed: "a whole number of chunks above 0".to_owned(),
+            });
+        }
+        if self.review.chunk_concurrency == 0 {
+            return Err(ConfigError::InvalidValue {
+                path: format!("{REVIEW_KEY}.{CHUNK_CONCURRENCY_KEY}"),
+                allowed: "a whole number of chunks above 0".to_owned(),
             });
         }
         Ok(())
@@ -932,6 +947,34 @@ idle_timeout_ms = 1500
         assert!(
             matches!(&err, ConfigError::InvalidValue { path, .. } if path == "review.diff_budget_chars"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn review_chunk_limits_have_defaults_and_zero_is_rejected() {
+        // Arrange
+        let set = "[review]\nmax_chunks = 2\nchunk_concurrency = 1\n";
+        let no_chunks = "[review]\nmax_chunks = 0\n";
+        let no_workers = "[review]\nchunk_concurrency = 0\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config;
+        let custom = Config::from_toml_str(set).unwrap().config;
+        let chunks_err = Config::from_toml_str(no_chunks).unwrap_err();
+        let workers_err = Config::from_toml_str(no_workers).unwrap_err();
+
+        // Assert
+        assert_eq!(default.review.max_chunks, 4);
+        assert_eq!(default.review.chunk_concurrency, 3);
+        assert_eq!(custom.review.max_chunks, 2);
+        assert_eq!(custom.review.chunk_concurrency, 1);
+        assert!(
+            matches!(&chunks_err, ConfigError::InvalidValue { path, .. } if path == "review.max_chunks"),
+            "{chunks_err}"
+        );
+        assert!(
+            matches!(&workers_err, ConfigError::InvalidValue { path, .. } if path == "review.chunk_concurrency"),
+            "{workers_err}"
         );
     }
 

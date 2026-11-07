@@ -16,6 +16,8 @@ const RULE_CHARS: [char; 4] = ['-', '=', '_', '*'];
 const QUOTE_CHAR: char = '>';
 const NUMBER_ENDS: [char; 2] = ['.', ')'];
 const BULLET_CHARS: [char; 3] = ['-', '*', '+'];
+const PARTIAL_BANNER: &str = "**Partial review:** at least one part of the change could not be \
+    reviewed, so the findings below may be incomplete. The files it covered are listed under Left out.";
 const ESCAPE: &str = "\\";
 /// A zero-width space after `<` keeps it from opening a tag.
 const ANGLE_BREAK: &str = "<\u{200b}";
@@ -140,10 +142,14 @@ fn write_files(out: &mut String, label: &str, files: &[String]) {
 /// Renders `review` as markdown.
 #[must_use]
 pub fn to_markdown(review: &Review) -> String {
-    let mut out = String::new();
+    let mut out = String::from("# Review\n\n");
+    if review.run.partial {
+        out.push_str(PARTIAL_BANNER);
+        out.push_str("\n\n");
+    }
     let _ = write!(
         out,
-        "# Review\n\nRisk: {}. Effort: {} of {MAX_EFFORT}.\n\n{}\n\n## Findings ({})\n\n",
+        "Risk: {}. Effort: {} of {MAX_EFFORT}.\n\n{}\n\n## Findings ({})\n\n",
         review.risk.as_str(),
         review.effort,
         prose(&review.summary),
@@ -159,11 +165,15 @@ pub fn to_markdown(review: &Review) -> String {
     write_files(&mut out, "Reviewed", &review.coverage.reviewed);
     write_files(&mut out, "Clipped", &review.coverage.clipped);
     write_files(&mut out, "Left out", &review.coverage.left_out);
-    let _ = writeln!(
+    let _ = write!(
         out,
         "## Run\n\nModel: {}. Input: {} characters. Findings dropped: {}.",
         review.run.model, review.run.input_chars, review.run.dropped_findings,
     );
+    if review.run.chunks > 1 {
+        let _ = write!(out, " Chunks: {}.", review.run.chunks);
+    }
+    out.push('\n');
     out
 }
 
@@ -210,6 +220,8 @@ mod tests {
                 model: "m1".to_owned(),
                 input_chars: 900,
                 dropped_findings: 1,
+                chunks: 1,
+                partial: false,
             },
         }
     }
@@ -259,6 +271,31 @@ Model: m1. Input: 900 characters. Findings dropped: 1.
 
         // Assert
         assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn a_partial_review_opens_with_a_banner_and_a_whole_one_does_not() {
+        // Arrange
+        let whole = review();
+        let mut partial = review();
+        partial.run.partial = true;
+        partial.run.chunks = 3;
+
+        // Act
+        let text = to_markdown(&partial);
+
+        // Assert
+        assert!(
+            text.starts_with(
+                "# Review\n\n**Partial review:** at least one part of the change could not be \
+                 reviewed, so the findings below may be incomplete. The files it covered are \
+                 listed under Left out.\n\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Chunks: 3."), "{text}");
+        assert!(!to_markdown(&whole).contains("Partial review"));
+        assert!(!to_markdown(&whole).contains("Chunks:"));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! output, the renderers and the ignore and skip rules. Nothing here touches the network
 //! or a model.
 
+pub mod chunk;
 pub mod diff;
 pub mod ignore;
 pub mod pack;

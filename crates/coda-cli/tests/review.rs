@@ -399,3 +399,93 @@ async fn json_output_stays_a_review_when_there_is_nothing_to_review() {
     assert!(parsed.summary.contains("nothing to review"));
     assert_eq!(parsed.findings.len(), 0);
 }
+
+/// Room for one of the two files of [`two_file_rig`] but not both.
+const ONE_FILE_BUDGET: usize = 100;
+
+/// A reply with a finding in each of `a.txt` and `b.txt`. Every session replays the whole
+/// script, so each part gets this reply and keeps only the finding inside its own files.
+fn review_of_both(risk: &str) -> String {
+    let finding = |file: &str, line: u32| {
+        json!({
+            "file": file, "start_line": line, "end_line": line, "severity": "high",
+            "category": "bug", "title": format!("Problem in {file}"), "explanation": "Check it.",
+            "suggested_patch": null, "confidence": "high"
+        })
+    };
+    json!({
+        "summary": "Two files.",
+        "effort": 2,
+        "risk": risk,
+        "findings": [finding("a.txt", 4), finding("b.txt", 5)]
+    })
+    .to_string()
+}
+
+/// A [`rig`] whose branch also adds `b.txt`, with a config that fits one file per run.
+fn two_file_rig(script: &[Value], extra_config: &str) -> FauxRig {
+    let rig = rig(script);
+    let dir = rig.work.path();
+    std::fs::write(dir.join("b.txt"), TOPIC_FILE).unwrap();
+    git(dir, &["add", "b.txt"]);
+    git(dir, &["commit", "-q", "-m", "more"]);
+    let path = rig.home.path().join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    let config = format!(
+        "{config}\n[review]\ndiff_budget_chars = {ONE_FILE_BUDGET}\nchunk_concurrency = 1\n{extra_config}"
+    );
+    std::fs::write(path, config).unwrap();
+    rig
+}
+
+#[tokio::test]
+async fn a_change_that_does_not_fit_is_reviewed_in_parts_and_the_findings_are_merged() {
+    // Arrange
+    let rig = two_file_rig(&answered(&review_of_both("high")), "");
+
+    // Act
+    let outcome = review(&rig, &["--json"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let parsed: Review = serde_json::from_str(&outcome.out).unwrap();
+    assert_eq!(parsed.run.chunks, 2);
+    assert!(!parsed.run.partial);
+    assert_eq!(parsed.risk, Risk::High);
+    let files: Vec<&str> = parsed.findings.iter().map(|f| f.file.as_str()).collect();
+    assert_eq!(files, ["a.txt", "b.txt"]);
+    assert_eq!(parsed.coverage.reviewed, ["a.txt", "b.txt"]);
+    assert!(!rig.work.path().join(".coda").exists());
+}
+
+#[tokio::test]
+async fn a_review_where_every_part_fails_is_an_error_with_no_output() {
+    // Arrange
+    let down = json!({"events": [], "error": {"class": "fatal", "message": "the model is down"}});
+    let rig = two_file_rig(&[task_turn(), down, text_turn("done")], "");
+
+    // Act
+    let outcome = review(&rig, &["--json"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::from(FAILURE), "{}", outcome.out);
+    assert_eq!(outcome.out, "");
+    assert!(outcome.err.contains("reviewer"), "{}", outcome.err);
+}
+
+#[tokio::test]
+async fn the_number_of_parts_is_capped_by_config_and_the_rest_is_left_out() {
+    // Arrange
+    let rig = two_file_rig(&answered(&review_of_both("low")), "max_chunks = 1\n");
+
+    // Act
+    let outcome = review(&rig, &["--json"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let parsed: Review = serde_json::from_str(&outcome.out).unwrap();
+    assert_eq!(parsed.run.chunks, 1);
+    assert!(!parsed.run.partial);
+    assert_eq!(parsed.coverage.reviewed, ["a.txt"]);
+    assert_eq!(parsed.coverage.left_out, ["b.txt"]);
+}
