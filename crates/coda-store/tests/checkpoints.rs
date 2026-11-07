@@ -31,6 +31,33 @@ fn open() -> (TempDir, Store, SessionId) {
 }
 
 #[test]
+fn clearing_refs_forgets_only_those_refs() {
+    // Arrange
+    let (_dir, mut store, session) = open();
+    let first = store.begin_turn(&session).unwrap();
+    store
+        .record_checkpoint_before(&session, &first, BEFORE_REF)
+        .unwrap();
+    store
+        .record_checkpoint_after(&session, &first, AFTER_REF)
+        .unwrap();
+
+    // Act
+    let cleared = store
+        .clear_checkpoint_refs(&[
+            AFTER_REF.to_owned(),
+            "refs/coda/checkpoints/1/other".to_owned(),
+        ])
+        .unwrap();
+
+    // Assert
+    assert_eq!(cleared, 1);
+    let found = store.turn_checkpoints(&session).unwrap();
+    assert_eq!(found[0].before.as_deref(), Some(BEFORE_REF));
+    assert_eq!(found[0].after, None);
+}
+
+#[test]
 fn a_turn_has_no_checkpoint_until_one_is_recorded() {
     // Arrange
     let (_dir, mut store, session) = open();

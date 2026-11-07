@@ -4,6 +4,7 @@
 
 mod agents;
 pub mod autostart;
+mod checkpoints_cmd;
 pub mod cli;
 mod context;
 mod daemon_cmd;
@@ -21,6 +22,7 @@ mod review_post;
 mod review_route;
 mod run;
 mod session;
+mod size;
 mod status;
 mod tui_cmd;
 mod usage;
@@ -77,6 +79,7 @@ async fn execute(cli: Cli, ctx: &Context, io: &mut Io<'_>) -> Result<ExitCode, C
         Some(Command::Doctor(args)) => return doctor::run(ctx, io, args).await,
         Some(Command::Review(args)) => return review::run(ctx, io, force, args).await,
         Some(Command::Agents(command)) => return agents::run(ctx, io, &command),
+        Some(Command::Checkpoints(command)) => return checkpoints_cmd::run(ctx, io, command).await,
         Some(Command::Worktree(command)) => return worktree_cmd::run(ctx, io, command).await,
         Some(Command::Hooks(command)) => return hooks_cmd::run(ctx, io, &command),
         Some(Command::Session(command)) => return session::run(ctx, io, force, command).await,

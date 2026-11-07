@@ -28,6 +28,7 @@ use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
 use crate::turn::Turns;
 use crate::worktree::Worktrees;
+use coda_config::checkpoints::PruneConfig;
 
 const SOCKET_DIR_MODE: u32 = 0o700;
 const SOCKET_FILE_MODE: u32 = 0o600;
@@ -166,6 +167,7 @@ impl Server {
             state: None,
             turns: None,
             worktrees: None,
+            pruning: None,
             _lock: lock,
         })
     }
@@ -240,6 +242,7 @@ pub struct BoundServer {
     state: Option<Arc<DaemonState>>,
     turns: Option<Arc<Turns>>,
     worktrees: Option<Arc<Worktrees>>,
+    pruning: Option<PruneConfig>,
     _lock: InstanceLock,
 }
 
@@ -282,6 +285,13 @@ impl BoundServer {
         self
     }
 
+    /// Serves `checkpoints.prune` under `policy`.
+    #[must_use]
+    pub fn with_checkpoint_pruning(mut self, policy: PruneConfig) -> Self {
+        self.pruning = Some(policy);
+        self
+    }
+
     fn dispatcher(&self) -> Arc<Dispatcher> {
         let mut dispatcher = Dispatcher::new();
         if let Some(hub) = &self.hub {
@@ -292,6 +302,9 @@ impl BoundServer {
         }
         if let Some(turns) = &self.turns {
             dispatcher = dispatcher.with_turns(Arc::clone(turns));
+        }
+        if let Some(policy) = &self.pruning {
+            dispatcher = dispatcher.with_checkpoint_pruning(policy.clone());
         }
         if let Some(worktrees) = &self.worktrees {
             dispatcher = dispatcher.with_worktrees(Arc::clone(worktrees));

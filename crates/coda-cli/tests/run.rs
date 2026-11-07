@@ -175,6 +175,22 @@ async fn worktree_clean_reports_without_changing_anything_and_refuses_to_apply_w
 }
 
 #[tokio::test]
+async fn checkpoints_prune_reports_and_refuses_to_apply_while_off() {
+    // Arrange
+    let rig = rig(&[text_turn("all done")], "");
+    run(&rig, &[]).await;
+
+    // Act
+    let report = cli(&rig.ctx, &["coda", "checkpoints", "prune"], "").await;
+    let applied = cli(&rig.ctx, &["coda", "checkpoints", "prune", "--apply"], "").await;
+
+    // Assert
+    assert_eq!(report.code, ExitCode::SUCCESS, "{}", report.err);
+    assert_eq!(applied.code, ExitCode::from(70), "{}", applied.out);
+    assert!(applied.err.contains("enabled"), "{}", applied.err);
+}
+
+#[tokio::test]
 async fn a_run_with_worktree_outside_a_repository_fails_before_any_turn() {
     // Arrange
     let rig = rig(&[text_turn("never")], "");

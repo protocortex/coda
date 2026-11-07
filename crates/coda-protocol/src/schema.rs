@@ -128,6 +128,11 @@ pub fn protocol_schema() -> Value {
         &mut methods,
         m::WORKTREE_CLEAN,
     );
+    add_method::<m::CheckpointsPruneParams, m::CheckpointsPruneResult>(
+        &mut generator,
+        &mut methods,
+        m::CHECKPOINTS_PRUNE,
+    );
     add_method::<m::PermissionRespondParams, m::PermissionRespondResult>(
         &mut generator,
         &mut methods,

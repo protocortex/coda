@@ -17,8 +17,8 @@ use coda_protocol::jsonrpc::{
     PARSE_ERROR, Request, Response,
 };
 use coda_protocol::methods::{
-    AGENT_RUN, Capabilities, DAEMON_BACKENDS, DAEMON_PING, DAEMON_SHUTDOWN, DAEMON_STATUS,
-    DaemonShutdownResult, GRANT_ADD, INITIALIZE, InitializeParams, InitializeResult,
+    AGENT_RUN, CHECKPOINTS_PRUNE, Capabilities, DAEMON_BACKENDS, DAEMON_PING, DAEMON_SHUTDOWN,
+    DAEMON_STATUS, DaemonShutdownResult, GRANT_ADD, INITIALIZE, InitializeParams, InitializeResult,
     PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult, SESSION_CANCEL, SESSION_CLOSE,
     SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_REWIND, SESSION_SEND, SESSION_SET_MODE,
     SESSION_SET_MODEL, SESSION_SUBSCRIBE, SESSION_WORKTREE, SessionSubscribeParams,
@@ -29,6 +29,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tracing::{Instrument, error};
 
+use crate::checkpoints_rpc;
 use crate::grants_rpc;
 use crate::registry;
 use crate::session_rpc;
@@ -38,6 +39,7 @@ use crate::trace::{request_span, session_span};
 use crate::turn::{self, Turns};
 use crate::usage_rpc;
 use crate::worktree::Worktrees;
+use coda_config::checkpoints::PruneConfig;
 
 /// `initialize` was called with a protocol version the daemon does not speak.
 pub const PROTOCOL_VERSION_MISMATCH: i64 = -32001;
@@ -53,6 +55,7 @@ pub struct Dispatcher {
     state: Option<Arc<DaemonState>>,
     turns: Option<Arc<Turns>>,
     worktrees: Option<Arc<Worktrees>>,
+    pruning: Option<PruneConfig>,
 }
 
 impl Default for Dispatcher {
@@ -75,6 +78,7 @@ impl Dispatcher {
             state: None,
             turns: None,
             worktrees: None,
+            pruning: None,
         }
     }
 
@@ -111,6 +115,13 @@ impl Dispatcher {
     #[must_use]
     pub fn with_worktrees(mut self, worktrees: Arc<Worktrees>) -> Self {
         self.worktrees = Some(worktrees);
+        self
+    }
+
+    /// Also answers `checkpoints.prune` under `policy`.
+    #[must_use]
+    pub fn with_checkpoint_pruning(mut self, policy: PruneConfig) -> Self {
+        self.pruning = Some(policy);
         self
     }
 
@@ -172,6 +183,18 @@ impl Dispatcher {
             SESSION_RESUME => session_rpc::resume(self.hub.as_ref(), params).await,
             SESSION_WORKTREE => {
                 session_rpc::worktree(self.hub.as_ref(), self.worktrees.as_ref(), params).await
+            }
+            CHECKPOINTS_PRUNE => {
+                let turns = self.turns.clone();
+                let running =
+                    move |id: &SessionId| turns.as_ref().is_some_and(|t| t.is_running(id));
+                checkpoints_rpc::prune_checkpoints(
+                    self.hub.as_ref(),
+                    self.pruning.as_ref(),
+                    running,
+                    params,
+                )
+                .await
             }
             WORKTREE_CLEAN => {
                 let turns = self.turns.clone();

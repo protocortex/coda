@@ -4,6 +4,8 @@
 
 pub mod backends;
 mod checkpoint;
+mod checkpoint_prune;
+mod checkpoints_rpc;
 pub mod dispatch;
 pub mod gate;
 pub mod grants_rpc;

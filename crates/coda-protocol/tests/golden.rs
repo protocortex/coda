@@ -8,17 +8,17 @@ use std::path::PathBuf;
 
 use coda_protocol::events::{Event, InterruptCause, ToolCallStatus};
 use coda_protocol::methods::{
-    AgentRunParams, AgentRunResult, Capabilities, DaemonBackendsParams, DaemonBackendsResult,
-    DaemonShutdownParams, DaemonShutdownResult, DaemonStatusParams, DaemonStatusResult,
-    GrantAddParams, GrantAddResult, InitializeParams, InitializeResult, PermissionRequestParams,
-    PermissionRespondParams, PermissionRespondResult, PingParams, PingResult, SessionCancelParams,
-    SessionCancelResult, SessionCloseParams, SessionCloseResult, SessionCreateParams,
-    SessionCreateResult, SessionListParams, SessionListResult, SessionResumeParams,
-    SessionResumeResult, SessionRewindParams, SessionRewindResult, SessionSendParams,
-    SessionSendResult, SessionSetModeParams, SessionSetModeResult, SessionSetModelParams,
-    SessionSetModelResult, SessionSubscribeParams, SessionSubscribeResult, SessionWorktreeParams,
-    SessionWorktreeResult, UsageSummaryParams, UsageSummaryResult, WorktreeCleanParams,
-    WorktreeCleanResult,
+    AgentRunParams, AgentRunResult, Capabilities, CheckpointsPruneParams, CheckpointsPruneResult,
+    DaemonBackendsParams, DaemonBackendsResult, DaemonShutdownParams, DaemonShutdownResult,
+    DaemonStatusParams, DaemonStatusResult, GrantAddParams, GrantAddResult, InitializeParams,
+    InitializeResult, PermissionRequestParams, PermissionRespondParams, PermissionRespondResult,
+    PingParams, PingResult, SessionCancelParams, SessionCancelResult, SessionCloseParams,
+    SessionCloseResult, SessionCreateParams, SessionCreateResult, SessionListParams,
+    SessionListResult, SessionResumeParams, SessionResumeResult, SessionRewindParams,
+    SessionRewindResult, SessionSendParams, SessionSendResult, SessionSetModeParams,
+    SessionSetModeResult, SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams,
+    SessionSubscribeResult, SessionWorktreeParams, SessionWorktreeResult, UsageSummaryParams,
+    UsageSummaryResult, WorktreeCleanParams, WorktreeCleanResult,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use serde::Serialize;
@@ -108,6 +108,8 @@ golden_tests! {
     session_worktree_result: "session.worktree.result" => SessionWorktreeResult,
     worktree_clean_params: "worktree.clean.params" => WorktreeCleanParams,
     worktree_clean_result: "worktree.clean.result" => WorktreeCleanResult,
+    checkpoints_prune_params: "checkpoints.prune.params" => CheckpointsPruneParams,
+    checkpoints_prune_result: "checkpoints.prune.result" => CheckpointsPruneResult,
     session_rewind_result_kept: "session.rewind.result.kept" => SessionRewindResult,
     session_subscribe_params: "session.subscribe.params" => SessionSubscribeParams,
     session_subscribe_result: "session.subscribe.result" => SessionSubscribeResult,

@@ -37,6 +37,8 @@ pub const SESSION_REWIND: &str = "session.rewind";
 pub const SESSION_WORKTREE: &str = "session.worktree";
 /// Reports, and with `apply` removes, the git worktrees coda made that are no longer needed.
 pub const WORKTREE_CLEAN: &str = "worktree.clean";
+/// Reports, and with `apply` removes, old checkpoint refs.
+pub const CHECKPOINTS_PRUNE: &str = "checkpoints.prune";
 /// Lists stored sessions, without their content.
 pub const SESSION_LIST: &str = "session.list";
 /// Answers a pending permission request.
@@ -72,6 +74,7 @@ pub const METHODS: &[&str] = &[
     SESSION_REWIND,
     SESSION_WORKTREE,
     WORKTREE_CLEAN,
+    CHECKPOINTS_PRUNE,
     PERMISSION_RESPOND,
     GRANT_ADD,
     USAGE_SUMMARY,
@@ -365,6 +368,57 @@ pub struct WorktreeCleanResult {
     pub worktrees: Vec<CleanWorktree>,
     /// Folders in the managed folder that coda did not make.
     pub unknown: Vec<UnknownFolder>,
+}
+
+/// Error code of a [`CHECKPOINTS_PRUNE`] with `apply` that the daemon refused
+/// because pruning is off in its config.
+pub const PRUNE_REFUSED_CODE: i64 = -32009;
+
+/// Parameters of [`CHECKPOINTS_PRUNE`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CheckpointsPruneParams {
+    /// Remove what the report lists. Without it nothing changes and the result
+    /// only says what would go. The daemon refuses it while
+    /// `[checkpoints.prune] enabled` is off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub apply: bool,
+}
+
+/// One checkpoint ref that pruning removes or removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PrunedRef {
+    /// The git ref.
+    pub reference: String,
+    /// Why it can go.
+    pub reason: String,
+    /// Whether this call removed it.
+    pub removed: bool,
+}
+
+/// What pruning found for one session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PrunedSession {
+    /// The session.
+    pub session_id: SessionId,
+    /// How many of its checkpoint refs stay.
+    pub kept: u64,
+    /// The refs that go.
+    pub refs: Vec<PrunedRef>,
+    /// An estimate of the bytes that `git gc` can free once these refs are
+    /// gone: what only these refs keep alive. Zero when it could not be worked out.
+    pub bytes: u64,
+    /// Why the session was left alone, when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Result of [`CHECKPOINTS_PRUNE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CheckpointsPruneResult {
+    /// Whether removals were allowed and tried in this call.
+    pub applied: bool,
+    /// Every session that has checkpoint refs.
+    pub sessions: Vec<PrunedSession>,
 }
 
 /// Parameters of [`SESSION_SUBSCRIBE`].
@@ -670,6 +724,7 @@ mod tests {
             (SESSION_REWIND, "session.rewind"),
             (SESSION_WORKTREE, "session.worktree"),
             (WORKTREE_CLEAN, "worktree.clean"),
+            (CHECKPOINTS_PRUNE, "checkpoints.prune"),
             (PERMISSION_RESPOND, "permission.respond"),
             (GRANT_ADD, "grant.add"),
             (USAGE_SUMMARY, "usage.summary"),
