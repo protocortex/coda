@@ -81,6 +81,8 @@ pub enum CliError {
     ReviewFailed(String),
     #[error("cannot post the review: {0}")]
     ReviewPost(String),
+    #[error("review memory: {0}")]
+    ReviewMemory(String),
     #[error("the reviewer did not give a usable answer: {0}")]
     ReviewOutput(#[from] coda_review::parse::BadShape),
     #[error("could not read the process environment: {0}")]

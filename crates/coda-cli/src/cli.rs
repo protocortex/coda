@@ -225,6 +225,14 @@ pub struct ReviewArgs {
     /// Post without asking. Needed when standard input is not a terminal.
     #[arg(long, requires = "post")]
     pub yes: bool,
+    /// Review only what came after the last review of this pull request, and do nothing
+    /// when too little is new. Needs a pull request target.
+    #[arg(long, conflicts_with = "staged")]
+    pub incremental: bool,
+    /// Dismiss the finding of this pull request that starts with this fingerprint, so later
+    /// reviews leave it out, and stop. May be given more than once.
+    #[arg(long, value_name = "FINGERPRINT", conflicts_with_all = ["staged", "post", "incremental"])]
+    pub dismiss: Vec<String>,
 }
 
 /// The backends as typed on the command line.

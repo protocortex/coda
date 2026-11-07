@@ -217,6 +217,20 @@ struct Target {
     head_sha: String,
 }
 
+/// The key the review memory files the pull request under (`owner/repo#number`) and the
+/// commit it is at.
+///
+/// # Errors
+/// Returns [`CliError::ReviewPost`] when `gh` fails or its answer lacks a field.
+pub fn identify(gh: &mut impl Gh, pr: &str) -> Result<(String, String), CliError> {
+    let target = read_target(gh, pr)?;
+    let repo = target
+        .repo_path
+        .strip_prefix("repos/")
+        .unwrap_or(&target.repo_path);
+    Ok((format!("{repo}#{}", target.number), target.head_sha))
+}
+
 /// The commit the pull request is at. Read before the diff, so a push during the review is
 /// noticed when posting.
 ///
