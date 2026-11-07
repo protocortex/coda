@@ -17,6 +17,7 @@ use coda_daemon::state::DaemonState;
 use coda_daemon::subscribe::{DEFAULT_QUEUE_CAPACITY, Hub};
 use coda_daemon::supervisor::{RestartPolicy, Supervisor, TokioSleeper};
 use coda_daemon::turn::{TurnConfig, Turns};
+use coda_daemon::worktree::{DEFAULT_DIR_NAME, Worktrees};
 use coda_store::Store;
 use coda_telemetry::init::{TelemetryConfig, init};
 use tokio::signal::unix::{SignalKind, signal};
@@ -48,6 +49,14 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
     let store = Store::open(&data_dir)?;
     let uid = own_uid(&data_dir)?;
     info!("step 3: binding the socket");
+    let worktrees = Arc::new(Worktrees::new(
+        config
+            .worktree
+            .dir
+            .clone()
+            .unwrap_or_else(|| data_dir.join(DEFAULT_DIR_NAME)),
+        config.worktree.setup.clone(),
+    ));
     let state = DaemonState::new(data_dir);
     let bound = bind(ServerConfig::new(ctx.dirs.socket_path(), uid)).await?;
     let hub = Hub::new(store, DEFAULT_QUEUE_CAPACITY);
@@ -59,7 +68,8 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
     let bound = bound
         .with_hub(Arc::clone(&hub))
         .with_state(state.clone())
-        .with_turns(Arc::clone(&turns));
+        .with_turns(Arc::clone(&turns))
+        .with_worktrees(worktrees);
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signal)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(CliError::Signal)?;
     info!("step 5: serving");

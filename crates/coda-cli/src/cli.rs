@@ -227,6 +227,10 @@ pub struct RunArgs {
     /// Working directory of the run.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
+    /// Work in a new git worktree on its own branch, `coda/<session>`, so the
+    /// run does not touch your checkout. Configure it under `[worktree]`.
+    #[arg(long)]
+    pub worktree: bool,
     /// How much autonomy the agent has.
     #[arg(long, value_enum, default_value_t)]
     pub mode: ModeArg,

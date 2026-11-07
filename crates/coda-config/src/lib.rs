@@ -10,3 +10,4 @@ pub mod review;
 pub mod routing;
 pub mod timing;
 pub mod tui;
+pub mod worktree;

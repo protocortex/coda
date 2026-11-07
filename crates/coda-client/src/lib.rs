@@ -143,8 +143,23 @@ impl Client {
         method: &str,
         params: &P,
     ) -> Result<R, ClientError> {
+        self.request_within(self.request_timeout, method, params)
+            .await
+    }
+
+    /// Like [`Client::request`], but waits up to `timeout` for the answer, for a
+    /// request the daemon may spend longer on than the usual request timeout.
+    ///
+    /// # Errors
+    /// The same as [`Client::request`].
+    pub async fn request_within<P: Serialize, R: DeserializeOwned>(
+        &self,
+        timeout: Duration,
+        method: &str,
+        params: &P,
+    ) -> Result<R, ClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let outcome = tokio::time::timeout(self.request_timeout, self.exchange(id, method, params))
+        let outcome = tokio::time::timeout(timeout, self.exchange(id, method, params))
             .await
             .map_err(|_| ClientError::Timeout {
                 method: method.to_owned(),

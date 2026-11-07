@@ -23,8 +23,9 @@ use coda_protocol::events::{
 use coda_protocol::methods::{
     AGENT_RUN, AgentRunParams, AgentRunResult, PERMISSION_RESPOND, PermissionRequestParams,
     PermissionRespondParams, PermissionRespondResult, SESSION_CANCEL, SESSION_CREATE, SESSION_SEND,
-    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
-    SessionSendParams, SessionSendResult,
+    SESSION_WORKTREE, SessionCancelParams, SessionCancelResult, SessionCreateParams,
+    SessionCreateResult, SessionSendParams, SessionSendResult, SessionWorktreeParams,
+    SessionWorktreeResult, WORKTREE_REQUEST_TIMEOUT_SECS,
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId};
 use coda_tui::sessions::HOOKS_NOT_RUN;
@@ -119,6 +120,7 @@ pub async fn run(
     let job = Job {
         prompt,
         cwd,
+        worktree: args.worktree,
         backend: None,
         agent: None,
         mode: args.mode.into(),
@@ -137,6 +139,8 @@ pub async fn run(
 pub(crate) struct Job {
     pub(crate) prompt: String,
     pub(crate) cwd: String,
+    /// Move the session into a git worktree of its own before the prompt is sent.
+    pub(crate) worktree: bool,
     /// The backend to use; the config picks one when absent.
     pub(crate) backend: Option<BackendKind>,
     /// A named agent to run the prompt, which the daemon allows on delegated
@@ -173,6 +177,7 @@ pub(crate) async fn drive(
     let Job {
         prompt,
         cwd,
+        worktree,
         backend: chosen,
         agent,
         mode,
@@ -199,6 +204,18 @@ pub(crate) async fn drive(
         .await?;
     let model = created.session.model;
     let session = created.session.id;
+    if worktree {
+        info!(step = "create_worktree", session = %session, "making the worktree");
+        client
+            .request_within::<_, SessionWorktreeResult>(
+                Duration::from_secs(WORKTREE_REQUEST_TIMEOUT_SECS),
+                SESSION_WORKTREE,
+                &SessionWorktreeParams {
+                    session_id: session.clone(),
+                },
+            )
+            .await?;
+    }
     let delivery = Delivery {
         prompt,
         agent,

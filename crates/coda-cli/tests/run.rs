@@ -91,6 +91,67 @@ async fn a_run_that_ends_its_turn_prints_the_answer_and_exits_zero() {
     assert_eq!(outcome.out, "all done\n");
 }
 
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn a_run_with_worktree_works_on_its_own_branch_and_leaves_the_checkout_alone() {
+    // Arrange
+    let rig = rig(&[text_turn("all done")], "");
+    let repo = rig.work.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-q", "-m", "first"]);
+
+    // Act
+    let outcome = run(&rig, &["--worktree"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let session = only_session(&rig).await;
+    let trees = Dirs::from_base(rig.home.path())
+        .data_dir()
+        .join("worktrees");
+    assert_eq!(
+        std::path::PathBuf::from(&session.cwd),
+        trees.join(session.id.as_str())
+    );
+    assert!(trees.join(session.id.as_str()).join("a.txt").exists());
+    let branches = git(repo, &["branch", "--format=%(refname:short)"]);
+    assert!(
+        branches
+            .lines()
+            .any(|b| b == format!("coda/{}", session.id))
+    );
+    assert_eq!(git(repo, &["branch", "--show-current"]).trim(), "main");
+}
+
+#[tokio::test]
+async fn a_run_with_worktree_outside_a_repository_fails_before_any_turn() {
+    // Arrange
+    let rig = rig(&[text_turn("never")], "");
+
+    // Act
+    let outcome = run(&rig, &["--worktree"]).await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::from(70), "{}", outcome.err);
+    assert!(outcome.err.contains("git repository"), "{}", outcome.err);
+    assert_eq!(outcome.out, "");
+}
+
 #[tokio::test]
 async fn each_stop_condition_exits_with_its_own_code() {
     let looping = tool_turn("missing", &json!({}));

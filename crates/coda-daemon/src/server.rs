@@ -27,6 +27,7 @@ use crate::lock::{InstanceLock, LockError};
 use crate::state::DaemonState;
 use crate::subscribe::{Connection, Hub, Outbox};
 use crate::turn::Turns;
+use crate::worktree::Worktrees;
 
 const SOCKET_DIR_MODE: u32 = 0o700;
 const SOCKET_FILE_MODE: u32 = 0o600;
@@ -164,6 +165,7 @@ impl Server {
             hub: None,
             state: None,
             turns: None,
+            worktrees: None,
             _lock: lock,
         })
     }
@@ -237,6 +239,7 @@ pub struct BoundServer {
     hub: Option<Arc<Hub>>,
     state: Option<Arc<DaemonState>>,
     turns: Option<Arc<Turns>>,
+    worktrees: Option<Arc<Worktrees>>,
     _lock: InstanceLock,
 }
 
@@ -272,6 +275,13 @@ impl BoundServer {
         self
     }
 
+    /// Serves `session.worktree` and puts back removed worktree checkouts.
+    #[must_use]
+    pub fn with_worktrees(mut self, worktrees: Arc<Worktrees>) -> Self {
+        self.worktrees = Some(worktrees);
+        self
+    }
+
     fn dispatcher(&self) -> Arc<Dispatcher> {
         let mut dispatcher = Dispatcher::new();
         if let Some(hub) = &self.hub {
@@ -282,6 +292,9 @@ impl BoundServer {
         }
         if let Some(turns) = &self.turns {
             dispatcher = dispatcher.with_turns(Arc::clone(turns));
+        }
+        if let Some(worktrees) = &self.worktrees {
+            dispatcher = dispatcher.with_worktrees(Arc::clone(worktrees));
         }
         Arc::new(dispatcher)
     }

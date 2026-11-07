@@ -913,6 +913,7 @@ async fn run_reviewer(
     let job = Job {
         prompt,
         cwd: cwd.to_owned(),
+        worktree: false,
         backend: Some(backend),
         agent: direct.then(|| agent.to_owned()),
         mode: if direct { Mode::Plan } else { Mode::Default },
