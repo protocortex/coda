@@ -287,6 +287,10 @@ pub struct UsageArgs {
     /// Only this session; defaults to every session.
     #[arg(long)]
     pub session: Option<String>,
+    /// Show tokens per day, model and project from the transcripts Claude Code and Codex keep
+    /// on disk, read only, whether or not coda ran the session. It needs no daemon.
+    #[arg(long, conflicts_with = "session")]
+    pub history: bool,
 }
 
 #[derive(Debug, Args)]

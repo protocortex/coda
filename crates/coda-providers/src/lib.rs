@@ -29,4 +29,5 @@ pub mod testing;
 pub mod think;
 mod tool_call;
 pub mod tool_request;
+pub mod transcripts;
 mod websocket;
