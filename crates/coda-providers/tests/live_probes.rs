@@ -635,3 +635,62 @@ async fn the_login_commands_exist_and_the_probes_read_the_installed_logins() {
         "codex is not logged in for this probe"
     );
 }
+
+const ACCEPT_EDITS_PROMPT: &str = "Use the Write tool to create notes.txt containing the word hi, then use the Write tool to create Cargo.toml containing the line [package]. Do nothing else.";
+const ACCEPT_EDITS_ARGS: &[&str] = &["--permission-mode", "acceptEdits"];
+const PLAIN_FILE: &str = "notes.txt";
+const EXECUTION_FILE: &str = "Cargo.toml";
+const PERMISSION_ASK: &str = "can_use_tool";
+const WRITE_TOOL: &str = "Write";
+
+/// The answer to a permission request: the `Write` tool is allowed, anything else denied.
+fn answer_ask(line: &Value) -> Value {
+    let verdict = if line["request"]["tool_name"] == WRITE_TOOL {
+        json!({"behavior": "allow", "updatedInput": line["request"]["input"]})
+    } else {
+        json!({"behavior": "deny", "message": "not part of this probe"})
+    };
+    json!({"type": "control_response", "response": {
+        "subtype": CONTROL_SUCCESS, "request_id": line["request_id"], "response": verdict}})
+}
+
+#[ignore = "spends Claude subscription quota; needs CODA_LIVE_TESTS=1"]
+#[tokio::test]
+async fn native_accept_edits_mode_writes_a_file_that_changes_what_runs_without_asking() {
+    if !live() {
+        return;
+    }
+    let cwd = tempfile::tempdir().unwrap();
+    let mut claude = RawClaude::start(cwd.path(), ACCEPT_EDITS_ARGS);
+    claude.user(ACCEPT_EDITS_PROMPT).await;
+    let mut asked: Vec<String> = Vec::new();
+    let mut ended = None;
+    while let Some(line) = claude.next(LINE_BOUND).await {
+        if is_result(&line) {
+            ended = Some(line["is_error"].clone());
+            break;
+        }
+        if line["type"] == "control_request" && line["request"]["subtype"] == PERMISSION_ASK {
+            let file = line["request"]["input"]["file_path"].as_str();
+            asked.push(file.unwrap_or_default().to_owned());
+            claude.send(&answer_ask(&line)).await;
+        }
+    }
+    eprintln!("native acceptEdits: asked for {asked:?}");
+
+    assert_eq!(ended, Some(json!(false)), "the turn did not end cleanly");
+    assert!(
+        cwd.path().join(PLAIN_FILE).exists(),
+        "the plain write did not happen"
+    );
+    assert!(
+        cwd.path().join(EXECUTION_FILE).exists(),
+        "the model did not write {EXECUTION_FILE}"
+    );
+    // Coda's own accept-edits mode asks for this file. While claude's does not, passing
+    // its mode would drop that prompt, so coda does not (#158).
+    assert!(
+        !asked.iter().any(|file| file.ends_with(EXECUTION_FILE)),
+        "claude now asks for execution files in acceptEdits; revisit #158"
+    );
+}
