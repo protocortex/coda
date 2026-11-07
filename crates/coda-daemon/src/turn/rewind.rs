@@ -108,7 +108,10 @@ impl Turns {
     }
 
     /// Keeps a send from starting while the rewind runs.
-    fn hold(self: &Arc<Self>, record: &SessionRecord) -> Result<Box<dyn Any + Send>, TurnError> {
+    pub(super) fn hold(
+        self: &Arc<Self>,
+        record: &SessionRecord,
+    ) -> Result<Box<dyn Any + Send>, TurnError> {
         if record.backend.is_model_backend() {
             self.models.hold(&record.id)
         } else {

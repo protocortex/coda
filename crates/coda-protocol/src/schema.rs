@@ -26,6 +26,44 @@ fn add_method<P: JsonSchema, R: JsonSchema>(
     methods.insert(name.to_owned(), json!({"params": params, "result": result}));
 }
 
+/// The methods about usage, the model, the mode and the daemon itself.
+fn add_account_and_daemon_methods(
+    generator: &mut SchemaGenerator,
+    methods: &mut Map<String, Value>,
+) {
+    add_method::<m::UsageSummaryParams, m::UsageSummaryResult>(
+        generator,
+        methods,
+        m::USAGE_SUMMARY,
+    );
+    add_method::<m::SessionSetModeParams, m::SessionSetModeResult>(
+        generator,
+        methods,
+        m::SESSION_SET_MODE,
+    );
+    add_method::<m::SessionSetModelParams, m::SessionSetModelResult>(
+        generator,
+        methods,
+        m::SESSION_SET_MODEL,
+    );
+    add_method::<m::DaemonBackendsParams, m::DaemonBackendsResult>(
+        generator,
+        methods,
+        m::DAEMON_BACKENDS,
+    );
+    add_method::<m::DaemonStatusParams, m::DaemonStatusResult>(
+        generator,
+        methods,
+        m::DAEMON_STATUS,
+    );
+    add_method::<m::DaemonShutdownParams, m::DaemonShutdownResult>(
+        generator,
+        methods,
+        m::DAEMON_SHUTDOWN,
+    );
+    add_method::<m::PingParams, m::PingResult>(generator, methods, m::DAEMON_PING);
+}
+
 /// Builds the schema document: `$defs` for every public wire type, a
 /// `methods` map keyed by method name with its params and result, and the
 /// `event` schema.
@@ -90,32 +128,7 @@ pub fn protocol_schema() -> Value {
         m::PERMISSION_RESPOND,
     );
     add_method::<m::GrantAddParams, m::GrantAddResult>(&mut generator, &mut methods, m::GRANT_ADD);
-    add_method::<m::UsageSummaryParams, m::UsageSummaryResult>(
-        &mut generator,
-        &mut methods,
-        m::USAGE_SUMMARY,
-    );
-    add_method::<m::SessionSetModelParams, m::SessionSetModelResult>(
-        &mut generator,
-        &mut methods,
-        m::SESSION_SET_MODEL,
-    );
-    add_method::<m::DaemonBackendsParams, m::DaemonBackendsResult>(
-        &mut generator,
-        &mut methods,
-        m::DAEMON_BACKENDS,
-    );
-    add_method::<m::DaemonStatusParams, m::DaemonStatusResult>(
-        &mut generator,
-        &mut methods,
-        m::DAEMON_STATUS,
-    );
-    add_method::<m::DaemonShutdownParams, m::DaemonShutdownResult>(
-        &mut generator,
-        &mut methods,
-        m::DAEMON_SHUTDOWN,
-    );
-    add_method::<m::PingParams, m::PingResult>(&mut generator, &mut methods, m::DAEMON_PING);
+    add_account_and_daemon_methods(&mut generator, &mut methods);
 
     let event = generator.subschema_for::<Event>().to_value();
     // Types no method or event reaches still belong to the contract.

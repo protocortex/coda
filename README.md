@@ -55,7 +55,7 @@ coda daemon restart
 coda
 ```
 
-`coda init` writes `config.toml` with every provider section commented out. It stops with an error if the file already exists, so it does not overwrite your settings. Plain `coda` and `coda tui` start the daemon if none is running and open the terminal UI. With no provider enabled, the UI tells you to run `coda init` and edit the config.
+`coda init` writes `config.toml` with every provider section commented out. It stops with an error if the file already exists, so it does not overwrite your settings. Plain `coda` and `coda tui` start the daemon if none is running and open the terminal UI. With no provider enabled, the UI tells you to run `coda init` and edit the config. In the UI, `/plan` makes the session read-only so the agent can only plan, and the status line shows `plan mode`. When a plan turn ends well the status line shows `plan ready`, `/plan save <path>` writes the plan to a new file (it will not overwrite one), and `/implement` leaves plan mode and sends the plan back as the next turn. `/implement` works only in plan mode. Both mode commands are refused while a turn runs. Over the protocol, `session.set_mode` changes the mode for any client (reported as the `set_mode` capability) and the new mode applies from the next turn. Only the client that asks is told of the change.
 
 ## Quickstart with the faux provider
 

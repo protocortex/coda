@@ -20,9 +20,9 @@ use coda_protocol::methods::{
     AGENT_RUN, Capabilities, DAEMON_BACKENDS, DAEMON_PING, DAEMON_SHUTDOWN, DAEMON_STATUS,
     DaemonShutdownResult, GRANT_ADD, INITIALIZE, InitializeParams, InitializeResult,
     PERMISSION_RESPOND, PROTOCOL_VERSION, PingResult, SESSION_CANCEL, SESSION_CLOSE,
-    SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_REWIND, SESSION_SEND, SESSION_SET_MODEL,
-    SESSION_SUBSCRIBE, SESSION_WORKTREE, SessionSubscribeParams, SessionSubscribeResult,
-    USAGE_SUMMARY,
+    SESSION_CREATE, SESSION_LIST, SESSION_RESUME, SESSION_REWIND, SESSION_SEND, SESSION_SET_MODE,
+    SESSION_SET_MODEL, SESSION_SUBSCRIBE, SESSION_WORKTREE, SessionSubscribeParams,
+    SessionSubscribeResult, USAGE_SUMMARY,
 };
 use coda_protocol::types::SessionId;
 use serde::de::DeserializeOwned;
@@ -183,6 +183,7 @@ impl Dispatcher {
             SESSION_CANCEL => turn::cancel(self.turns.as_ref(), params).await,
             SESSION_CLOSE => turn::close(self.turns.as_ref(), params).await,
             SESSION_REWIND => turn::rewind(self.turns.as_ref(), params).await,
+            SESSION_SET_MODE => turn::set_mode(self.turns.as_ref(), params).await,
             SESSION_SET_MODEL => registry::set_model(self.turns.as_ref(), params).await,
             PERMISSION_RESPOND => turn::respond(self.turns.as_ref(), params).await,
             DAEMON_BACKENDS => registry::backends(self.turns.as_ref()),
@@ -303,6 +304,7 @@ fn initialize(params: Option<Value>) -> HandlerFuture {
                 tool_call_events: true,
                 force_cancel: true,
                 rewind: true,
+                set_mode: true,
             },
         })
     })
@@ -370,6 +372,7 @@ mod tests {
         assert_eq!(result["capabilities"]["tool_call_events"], json!(true));
         assert_eq!(result["capabilities"]["force_cancel"], json!(true));
         assert_eq!(result["capabilities"]["rewind"], json!(true));
+        assert_eq!(result["capabilities"]["set_mode"], json!(true));
     }
 
     #[tokio::test]

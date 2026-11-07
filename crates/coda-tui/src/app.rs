@@ -2,12 +2,13 @@
 
 //! UI state, key handling and rendering.
 
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use coda_config::tui::NotifyMode;
 use coda_protocol::events::{Event, InterruptCause, TodoItem};
 use coda_protocol::methods::{Capabilities, SessionStatus, SessionSummary};
-use coda_protocol::types::{BackendKind, SessionInfo};
+use coda_protocol::types::{BackendKind, Mode, SessionInfo, TurnId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -19,9 +20,9 @@ use crate::chat::Chat;
 use crate::commands::{self, Command, CommandError, Resolved, UserCommands};
 use crate::input::Input;
 use crate::notify;
-use crate::permission::{Overlay, PermissionPrompt};
+use crate::permission::{Overlay, PermissionPrompt, sanitize_line};
 use crate::sessions::LinkCommand;
-use crate::status::Status;
+use crate::status::{Status, mode_name};
 use crate::todos;
 use crate::work::WorkLog;
 
@@ -48,6 +49,13 @@ pub const SETUP_GUIDANCE: &str = "No provider is enabled. Run `coda init`, enabl
 /// Closes the connection line after the daemon went away.
 pub const LOST_DAEMON_HINT: &str = "Ctrl+D quits. Run `coda` to start the daemon again.";
 const NO_SESSIONS: &str = "the daemon has no sessions";
+const ALREADY_PLANNING: &str = "the session is already in plan mode";
+const NOT_PLANNING: &str =
+    "the session is not in plan mode, so there is no plan to carry out; use /plan first";
+const NO_PLAN: &str = "there is no plan to save yet; ask the agent for one in plan mode first";
+const MODE_CHANGE_BUSY: &str = "wait for the running turn to finish before changing the mode";
+const MODE_CHANGE_UNSUPPORTED: &str =
+    "this daemon cannot change the mode of a session; restart it with `coda daemon restart`";
 const BACKEND_SWITCH_BUSY: &str = "wait for the running turn to finish before switching backend";
 
 /// Where the link to the daemon stands.
@@ -74,6 +82,12 @@ pub enum LinkEvent {
     SessionStarted(SessionInfo),
     /// The daemon switched the model of the session the UI follows.
     ModelSwitched(SessionInfo),
+    /// The daemon changed the mode of the session the UI follows. `started_turn`
+    /// is true when a message followed the change, as `/implement` sends one.
+    ModeChanged {
+        info: SessionInfo,
+        started_turn: bool,
+    },
     /// The user's own message, live or replayed from the stored history.
     UserMessage(String),
     /// The daemon's sessions, answering `/sessions`.
@@ -106,6 +120,10 @@ pub struct App {
     overlay: Overlay,
     link: Option<UnboundedSender<LinkCommand>>,
     turn_running: bool,
+    /// The text of the plan-mode turn being streamed, by its turn.
+    plan_draft: Option<(TurnId, String)>,
+    /// What the agent last said in a plan-mode turn that ended well.
+    plan: Option<String>,
     work: WorkLog,
     /// The model's todo list, drawn above the prompt.
     todos: Vec<TodoItem>,
@@ -138,6 +156,8 @@ impl App {
             overlay: Overlay::default(),
             link: None,
             turn_running: false,
+            plan_draft: None,
+            plan: None,
             work: WorkLog::new(),
             todos: Vec::new(),
             stop: None,
@@ -230,6 +250,9 @@ impl App {
                 self.chat.clear();
                 self.todos.clear();
                 self.status.set_session(info.backend, info.model);
+                self.status.set_mode(info.mode);
+                self.plan_draft = None;
+                self.plan = None;
                 self.overlay = Overlay::default();
                 self.turn_running = false;
                 self.work.reset();
@@ -241,6 +264,16 @@ impl App {
                 ));
                 self.status.switch_model(info.model);
             }
+            LinkEvent::ModeChanged { info, started_turn } => {
+                self.chat
+                    .push_notice(format!("mode is now {}", mode_name(info.mode)));
+                self.status.set_mode(info.mode);
+                if started_turn {
+                    self.work.begin(Instant::now());
+                    self.stop = None;
+                    self.turn_running = true;
+                }
+            }
             LinkEvent::UserMessage(text) => self.chat.push_user(text),
             LinkEvent::Sessions(sessions) => self.show_sessions(&sessions),
             LinkEvent::Notice(text) => self.chat.push_notice(text),
@@ -251,7 +284,36 @@ impl App {
         }
     }
 
+    /// Keeps what the agent says in plan mode, so `/implement` and `/plan save`
+    /// can use the last finished plan.
+    fn track_plan(&mut self, event: &Event) {
+        if self.status.mode() != Mode::Plan {
+            return;
+        }
+        match event {
+            Event::StreamDelta { turn_id, text, .. } => match &mut self.plan_draft {
+                Some((turn, draft)) if turn == turn_id => draft.push_str(text),
+                _ => self.plan_draft = Some((turn_id.clone(), text.clone())),
+            },
+            Event::Result {
+                turn_id,
+                is_error: false,
+                ..
+            } => {
+                if let Some((turn, draft)) = self.plan_draft.take()
+                    && &turn == turn_id
+                    && !draft.trim().is_empty()
+                {
+                    self.plan = Some(draft);
+                    self.status.set_plan_ready(true);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn apply_session_event(&mut self, event: &Event, now: Instant) {
+        self.track_plan(event);
         match event {
             Event::Approve { request_id, .. }
             | Event::Deny { request_id, .. }
@@ -512,6 +574,27 @@ impl App {
                 return;
             }
             Command::Backend(Some(name)) => LinkCommand::SwitchBackend(name),
+            Command::Plan if self.status.mode() == Mode::Plan => {
+                self.chat.push_notice(ALREADY_PLANNING.to_owned());
+                return;
+            }
+            Command::Plan => return self.change_mode(Mode::Plan, None),
+            Command::PlanSave(path) => {
+                self.save_plan(&path);
+                return;
+            }
+            Command::Implement if self.turn_running => {
+                self.chat.push_notice(MODE_CHANGE_BUSY.to_owned());
+                return;
+            }
+            Command::Implement if self.status.mode() != Mode::Plan => {
+                self.chat.push_notice(NOT_PLANNING.to_owned());
+                return;
+            }
+            Command::Implement => {
+                let prompt = commands::implement_prompt(self.plan.as_deref());
+                return self.change_mode(Mode::Default, Some(prompt));
+            }
             Command::Review(target) => {
                 let typed = format!("/review {target}");
                 self.send_message(&commands::review_prompt(&target), typed.trim_end());
@@ -527,6 +610,33 @@ impl App {
             }
         };
         self.send(link_command);
+    }
+
+    fn save_plan(&mut self, path: &str) {
+        let Some(plan) = &self.plan else {
+            self.chat.push_notice(NO_PLAN.to_owned());
+            return;
+        };
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{plan}"));
+        let notice = match written {
+            Ok(()) => format!("plan written to {path}"),
+            Err(error) => format!("could not save the plan to {path}: {error}"),
+        };
+        self.chat.push_notice(sanitize_line(&notice));
+    }
+
+    fn change_mode(&mut self, mode: Mode, then: Option<String>) {
+        if self.turn_running {
+            self.chat.push_notice(MODE_CHANGE_BUSY.to_owned());
+        } else if self.capabilities.is_some_and(|known| !known.set_mode) {
+            self.chat.push_notice(MODE_CHANGE_UNSUPPORTED.to_owned());
+        } else {
+            self.send(LinkCommand::SetMode { mode, then });
+        }
     }
 
     fn show_sessions(&mut self, sessions: &[SessionSummary]) {
@@ -620,7 +730,9 @@ mod tests {
 
     use coda_protocol::events::ToolCallStatus;
     use coda_protocol::methods::{Capabilities, SessionStatus, SessionSummary};
-    use coda_protocol::types::{PermissionDecision, RequestId, SessionId, TokenUsage, TurnId};
+    use coda_protocol::types::{
+        Mode, PermissionDecision, RequestId, SessionId, TokenUsage, TurnId,
+    };
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use crate::permission::PermissionAnswer;
@@ -1569,6 +1681,265 @@ mod tests {
             ]
         );
         assert!(!app.turn_running);
+    }
+
+    fn session_in(mode: Mode) -> SessionInfo {
+        let mut info = session("s-1");
+        info.mode = mode;
+        info
+    }
+
+    fn plan_delta(turn: &str, text: &str) -> LinkEvent {
+        LinkEvent::Session(Event::StreamDelta {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new(turn),
+            text: text.to_owned(),
+        })
+    }
+
+    fn result_of(turn: &str, is_error: bool) -> LinkEvent {
+        LinkEvent::Session(Event::Result {
+            session_id: SessionId::new("s-1"),
+            turn_id: TurnId::new(turn),
+            is_error,
+        })
+    }
+
+    /// An app in plan mode that holds the plan "step one".
+    fn planned() -> (App, UnboundedReceiver<LinkCommand>) {
+        let (mut app, commands) = linked();
+        app.handle_event(LinkEvent::SessionStarted(session_in(Mode::Plan)));
+        app.handle_event(plan_delta("t-1", "step "));
+        app.handle_event(plan_delta("t-1", "one"));
+        app.handle_event(result_of("t-1", false));
+        (app, commands)
+    }
+
+    #[test]
+    fn plan_asks_the_link_to_change_the_mode() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+
+        // Act
+        type_line(&mut app, "/plan");
+
+        // Assert
+        assert_eq!(
+            sent(&mut commands),
+            vec![LinkCommand::SetMode {
+                mode: Mode::Plan,
+                then: None
+            }]
+        );
+        assert!(!app.turn_running);
+    }
+
+    #[test]
+    fn plan_in_plan_mode_changes_nothing_and_says_so() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        app.handle_event(LinkEvent::SessionStarted(session_in(Mode::Plan)));
+
+        // Act
+        type_line(&mut app, "/plan");
+
+        // Assert
+        assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+        let shown = wide_screen(&app);
+        assert!(shown.contains("already in plan mode"), "{shown}");
+    }
+
+    #[test]
+    fn implement_sends_the_plan_back_as_a_default_mode_turn() {
+        // Arrange
+        let (mut app, mut commands) = planned();
+
+        // Act
+        type_line(&mut app, "/implement");
+
+        // Assert
+        assert_eq!(
+            sent(&mut commands),
+            vec![LinkCommand::SetMode {
+                mode: Mode::Default,
+                then: Some(commands::implement_prompt(Some("step one")))
+            }]
+        );
+        assert!(!app.turn_running);
+    }
+
+    #[test]
+    fn implement_outside_plan_mode_changes_nothing_and_says_so() {
+        for mode in [Mode::Default, Mode::AcceptEdits] {
+            // Arrange
+            let (mut app, mut commands) = linked();
+            app.handle_event(LinkEvent::SessionStarted(session_in(mode)));
+
+            // Act
+            type_line(&mut app, "/implement");
+
+            // Assert
+            assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+            let shown = wide_screen(&app);
+            assert!(shown.contains("not in plan mode"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn a_finished_plan_turn_makes_the_plan_ready() {
+        // Arrange
+        let (app, _commands) = planned();
+
+        // Act
+        let shown = wide_screen(&app);
+
+        // Assert
+        assert!(shown.contains("plan ready"), "{shown}");
+    }
+
+    #[test]
+    fn a_turn_that_failed_or_ran_outside_plan_mode_leaves_no_plan() {
+        // Arrange
+        let mut failed = App::new();
+        failed.handle_event(LinkEvent::SessionStarted(session_in(Mode::Plan)));
+        failed.handle_event(plan_delta("t-1", "half a plan"));
+        failed.handle_event(result_of("t-1", true));
+        let mut outside = App::new();
+        outside.handle_event(LinkEvent::SessionStarted(session("s-1")));
+        outside.handle_event(plan_delta("t-1", "an answer"));
+        outside.handle_event(result_of("t-1", false));
+
+        // Act
+        let (failed_shown, outside_shown) = (wide_screen(&failed), wide_screen(&outside));
+
+        // Assert
+        assert!(!failed_shown.contains("plan ready"), "{failed_shown}");
+        assert!(!outside_shown.contains("plan ready"), "{outside_shown}");
+    }
+
+    #[test]
+    fn a_newer_plan_turn_replaces_the_plan_and_a_new_session_clears_it() {
+        // Arrange
+        let (mut app, mut commands) = planned();
+        app.handle_event(plan_delta("t-2", "step two"));
+        app.handle_event(result_of("t-2", false));
+
+        // Act
+        type_line(&mut app, "/implement");
+        let replaced = sent(&mut commands);
+        app.handle_event(LinkEvent::SessionStarted(session_in(Mode::Plan)));
+        type_line(&mut app, "/plan save out.md");
+
+        // Assert
+        assert_eq!(
+            replaced,
+            vec![LinkCommand::SetMode {
+                mode: Mode::Default,
+                then: Some(commands::implement_prompt(Some("step two")))
+            }]
+        );
+        let shown = wide_screen(&app);
+        assert!(shown.contains("no plan to save"), "{shown}");
+    }
+
+    #[test]
+    fn plan_save_writes_the_plan_and_refuses_to_overwrite() {
+        // Arrange
+        let (mut app, _commands) = planned();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan.md");
+        let line = format!("/plan save {}", path.display());
+
+        // Act
+        type_line(&mut app, &line);
+        let written = std::fs::read_to_string(&path).unwrap();
+        type_line(&mut app, &line);
+
+        // Assert
+        assert_eq!(written, "step one\n");
+        let shown = crate::test_support::screen(300, 8, |frame| app.render(frame));
+        assert!(shown.contains("plan written to"), "{shown}");
+        assert!(shown.contains("could not save the plan"), "{shown}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "step one\n");
+    }
+
+    #[test]
+    fn a_mode_change_is_refused_while_a_turn_is_running() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        type_line(&mut app, "q hi");
+        sent(&mut commands);
+
+        // Act
+        type_line(&mut app, "/plan");
+        type_line(&mut app, "/implement");
+
+        // Assert
+        assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+        let shown = wide_screen(&app);
+        assert!(shown.contains("wait for the running turn"), "{shown}");
+    }
+
+    #[test]
+    fn a_daemon_that_cannot_change_the_mode_is_not_asked() {
+        // Arrange
+        let (mut app, mut commands) = linked();
+        app.handle_event(LinkEvent::Capabilities(Capabilities::default()));
+
+        // Act
+        type_line(&mut app, "/plan");
+
+        // Assert
+        assert_eq!(sent(&mut commands), Vec::<LinkCommand>::new());
+        let shown = wide_screen(&app);
+        assert!(shown.contains("cannot change the mode"), "{shown}");
+    }
+
+    #[test]
+    fn a_changed_mode_shows_in_the_status_line_and_the_transcript() {
+        // Arrange
+        let mut app = App::new();
+        app.handle_event(LinkEvent::SessionStarted(session("s-1")));
+
+        // Act
+        app.handle_event(LinkEvent::ModeChanged {
+            info: session_in(Mode::Plan),
+            started_turn: false,
+        });
+
+        // Assert
+        let shown = wide_screen(&app);
+        assert!(shown.contains("plan mode"), "{shown}");
+        assert!(shown.contains("mode is now plan"), "{shown}");
+        assert!(!app.turn_running);
+    }
+
+    #[test]
+    fn a_resumed_session_in_plan_mode_shows_plan_mode() {
+        // Arrange
+        let mut app = App::new();
+
+        // Act
+        app.handle_event(LinkEvent::SessionStarted(session_in(Mode::Plan)));
+
+        // Assert
+        let shown = wide_screen(&app);
+        assert!(shown.contains("plan mode"), "{shown}");
+    }
+
+    #[test]
+    fn a_mode_change_that_started_a_turn_marks_the_turn_running() {
+        // Arrange
+        let mut app = App::new();
+
+        // Act
+        app.handle_event(LinkEvent::ModeChanged {
+            info: session_in(Mode::Default),
+            started_turn: true,
+        });
+
+        // Assert
+        assert!(app.turn_running);
     }
 
     #[test]

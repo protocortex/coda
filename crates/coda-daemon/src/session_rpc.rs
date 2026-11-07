@@ -28,7 +28,7 @@ use crate::trace::session_span;
 use crate::turn::SESSION_NOT_FOUND;
 use crate::worktree::{Worktrees, remove_made};
 
-fn info(record: SessionRecord) -> SessionInfo {
+pub(crate) fn info(record: SessionRecord) -> SessionInfo {
     SessionInfo {
         id: record.id,
         backend: record.backend,

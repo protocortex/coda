@@ -19,10 +19,11 @@ use coda_protocol::methods::{
     DAEMON_BACKENDS, DAEMON_PING, DAEMON_STATUS, DaemonBackendsParams, DaemonBackendsResult,
     DaemonStatusParams, DaemonStatusResult, PERMISSION_RESPOND, PermissionRespondParams,
     PermissionRespondResult, PingParams, PingResult, SESSION_CANCEL, SESSION_CREATE, SESSION_LIST,
-    SESSION_RESUME, SESSION_SEND, SESSION_SET_MODEL, SessionCancelParams, SessionCancelResult,
-    SessionCreateParams, SessionCreateResult, SessionListParams, SessionListResult,
-    SessionResumeParams, SessionResumeResult, SessionSendParams, SessionSendResult,
-    SessionSetModelParams, SessionSetModelResult, SessionSummary,
+    SESSION_RESUME, SESSION_SEND, SESSION_SET_MODE, SESSION_SET_MODEL, SessionCancelParams,
+    SessionCancelResult, SessionCreateParams, SessionCreateResult, SessionListParams,
+    SessionListResult, SessionResumeParams, SessionResumeResult, SessionSendParams,
+    SessionSendResult, SessionSetModeParams, SessionSetModeResult, SessionSetModelParams,
+    SessionSetModelResult, SessionSummary,
 };
 use coda_protocol::types::{BackendKind, Mode, SessionId, SessionInfo};
 use serde_json::Value;
@@ -78,6 +79,8 @@ pub enum LinkCommand {
     ListSessions,
     /// Switch the current session to a model alias.
     SetModel(String),
+    /// Change the mode of the current session, then send `then` when given.
+    SetMode { mode: Mode, then: Option<String> },
     /// Show the backends the daemon offers.
     ListBackends,
     /// Start a new session on the named backend.
@@ -531,6 +534,7 @@ impl Link {
                 .map(|sessions| self.tell(LinkEvent::Sessions(sessions)))
                 .map_err(|e| ("list the sessions", e)),
             LinkCommand::SetModel(alias) => self.set_model(alias).await,
+            LinkCommand::SetMode { mode, then } => self.set_mode(mode, then).await,
             LinkCommand::ListBackends => self.list_backends().await,
             LinkCommand::SwitchBackend(name) => self.switch_backend(&name).await,
             // `run_link` ends the link on this before it gets here.
@@ -602,6 +606,33 @@ impl Link {
             .map_err(|e| ("switch the model", e))?;
         self.tell(LinkEvent::ModelSwitched(switched.session));
         Ok(())
+    }
+
+    async fn set_mode(
+        &self,
+        mode: Mode,
+        then: Option<String>,
+    ) -> Result<(), (&'static str, ClientError)> {
+        let Some(session_id) = self.current() else {
+            self.notice("there is no session to change".to_owned());
+            return Ok(());
+        };
+        let params = SessionSetModeParams { session_id, mode };
+        let changed: SessionSetModeResult = self
+            .client
+            .request(SESSION_SET_MODE, &params)
+            .await
+            .map_err(|e| ("change the mode", e))?;
+        let wanted_turn = then.is_some();
+        let sent = match then {
+            Some(text) => self.send(text).await,
+            None => Ok(()),
+        };
+        self.tell(LinkEvent::ModeChanged {
+            info: changed.session,
+            started_turn: wanted_turn && sent.is_ok(),
+        });
+        sent
     }
 
     fn current(&self) -> Option<SessionId> {

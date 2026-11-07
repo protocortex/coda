@@ -10,12 +10,22 @@ use coda_protocol::types::SessionId;
 use crate::permission::sanitize;
 
 const SLASH: char = '/';
+const PLAN_SAVE: &str = "save";
 /// The commands the UI itself runs. They win over a command file of the same name.
-const COMMANDS: [&str; 8] = [
-    "sessions", "new", "resume", "model", "backend", "review", "help", "quit",
+const COMMANDS: [&str; 10] = [
+    "sessions",
+    "new",
+    "resume",
+    "model",
+    "backend",
+    "plan",
+    "implement",
+    "review",
+    "help",
+    "quit",
 ];
 /// The built-in commands as `/help` lists them.
-const BUILT_IN_HELP: &str = "Built-in commands: /sessions, /new, /resume <id>, /model <alias>, /backend [name], /review [target], /help, /quit";
+const BUILT_IN_HELP: &str = "Built-in commands: /sessions, /new, /resume <id>, /model <alias>, /backend [name], /plan [save <path>], /implement, /review [target], /help, /quit";
 
 /// A command the user can type instead of a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,11 +40,31 @@ pub enum Command {
     Model(String),
     /// List the backends, or start a new session on the named one.
     Backend(Option<String>),
+    /// Make the session read-only, so the agent can only plan.
+    Plan,
+    /// Write the plan the agent made to a file.
+    PlanSave(String),
+    /// Leave plan mode and tell the agent to carry the plan out.
+    Implement,
     /// Ask the reviewer agent to review a change; the text is what to review, or empty.
     Review(String),
     /// List the built-in commands and the ones from command files.
     Help,
     Quit,
+}
+
+/// The message `/implement` sends once the session is out of plan mode, when no plan was kept.
+pub const IMPLEMENT_PROMPT: &str = "The plan is approved. Implement it now.";
+/// Opens the message `/implement` sends when it has the plan to hand back.
+const IMPLEMENT_WITH_PLAN: &str = "The plan below is approved. Implement it now.";
+
+/// The message `/implement` sends: the plan the agent made, when there is one.
+#[must_use]
+pub fn implement_prompt(plan: Option<&str>) -> String {
+    match plan {
+        Some(plan) => format!("{IMPLEMENT_WITH_PLAN}\n\n{plan}"),
+        None => IMPLEMENT_PROMPT.to_owned(),
+    }
 }
 
 /// The message `/review` sends: it hands `target` to the `reviewer` agent through the
@@ -64,6 +94,10 @@ pub enum CommandError {
     MissingSessionId,
     #[error("/model needs a model alias; define aliases under [models.<alias>] in the config")]
     MissingModel,
+    #[error("/plan save needs a file path")]
+    MissingPlanPath,
+    #[error("/plan takes no argument, or `save <path>`")]
+    PlanUsage,
     #[error("{0} takes a single argument; remove the extra words")]
     ExtraArguments(String),
 }
@@ -108,6 +142,11 @@ pub fn parse(line: &str) -> Result<Option<Command>, CommandError> {
         )),
         "model" => Command::Model(words.next().ok_or(CommandError::MissingModel)?.to_owned()),
         "backend" => Command::Backend(words.next().map(str::to_owned)),
+        "plan" => {
+            let rest = line.trim().strip_prefix(word).unwrap_or_default().trim();
+            parse_plan(rest)?
+        }
+        "implement" => Command::Implement,
         "review" => Command::Review(
             line.trim()
                 .strip_prefix(word)
@@ -118,10 +157,25 @@ pub fn parse(line: &str) -> Result<Option<Command>, CommandError> {
         _ => return Err(CommandError::Unknown(word.to_owned())),
     };
     match (&command, words.next()) {
-        (Command::Model(_) | Command::Backend(_), Some(_)) => {
+        (Command::Model(_) | Command::Backend(_) | Command::Implement, Some(_)) => {
             Err(CommandError::ExtraArguments(word.to_owned()))
         }
         _ => Ok(Some(command)),
+    }
+}
+
+/// Reads what follows `/plan`: nothing, or `save` and a path.
+fn parse_plan(rest: &str) -> Result<Command, CommandError> {
+    if rest.is_empty() {
+        return Ok(Command::Plan);
+    }
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    if parts.next() != Some(PLAN_SAVE) {
+        return Err(CommandError::PlanUsage);
+    }
+    match parts.next().map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => Ok(Command::PlanSave(path.to_owned())),
+        None => Err(CommandError::MissingPlanPath),
     }
 }
 
@@ -420,6 +474,62 @@ mod tests {
     }
 
     #[test]
+    fn plan_and_implement_take_no_arguments() {
+        for (line, expected) in [
+            ("/plan", Ok(Some(Command::Plan))),
+            ("/implement", Ok(Some(Command::Implement))),
+            ("/plan add a cache", Err(CommandError::PlanUsage)),
+            (
+                "/implement now",
+                Err(CommandError::ExtraArguments("/implement".to_owned())),
+            ),
+        ] {
+            // Arrange / Act
+            let parsed = parse(line);
+
+            // Assert
+            assert_eq!(parsed, expected, "{line}");
+        }
+    }
+
+    #[test]
+    fn plan_save_takes_the_rest_of_the_line_as_the_path() {
+        for (line, expected) in [
+            (
+                "/plan save plan.md",
+                Ok(Some(Command::PlanSave("plan.md".to_owned()))),
+            ),
+            (
+                "  /plan   save   notes/my plan.md  ",
+                Ok(Some(Command::PlanSave("notes/my plan.md".to_owned()))),
+            ),
+            ("/plan save", Err(CommandError::MissingPlanPath)),
+            ("/plan saved x", Err(CommandError::PlanUsage)),
+        ] {
+            // Arrange / Act
+            let parsed = parse(line);
+
+            // Assert
+            assert_eq!(parsed, expected, "{line}");
+        }
+    }
+
+    #[test]
+    fn the_implement_prompt_carries_the_plan_when_there_is_one() {
+        // Arrange
+        let plan = "1. add the field\n2. test it";
+
+        // Act
+        let with_plan = implement_prompt(Some(plan));
+        let without = implement_prompt(None);
+
+        // Assert
+        assert!(with_plan.ends_with(plan), "{with_plan}");
+        assert!(with_plan.contains("Implement it now"), "{with_plan}");
+        assert_eq!(without, IMPLEMENT_PROMPT);
+    }
+
+    #[test]
     fn a_prompt_that_starts_with_a_path_or_slashes_is_a_message() {
         for line in [
             "/usr/bin",
@@ -465,7 +575,10 @@ mod tests {
             );
             assert!(
                 matches!(parsed, Ok(Some(_)))
-                    || matches!(parsed, Err(CommandError::ExtraArguments(_))),
+                    || matches!(
+                        parsed,
+                        Err(CommandError::ExtraArguments(_) | CommandError::PlanUsage)
+                    ),
                 "{name} is in COMMANDS but parse does not know it: {parsed:?}"
             );
         }

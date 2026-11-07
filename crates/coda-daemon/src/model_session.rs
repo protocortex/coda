@@ -564,6 +564,13 @@ impl ModelSessions {
         self.take_loop(session).is_some()
     }
 
+    /// Drops the idle loop of `session` but hands its spent budget to the next one.
+    pub(crate) fn drop_idle_loop(&self, session: &SessionId) {
+        if let Some(dropped) = self.take_loop(session) {
+            lock(&self.carried).insert(session.clone(), dropped.carried());
+        }
+    }
+
     /// The state of the send of `session`, or `None` when it has none.
     pub(crate) fn turn_state(&self, session: &SessionId) -> Option<TurnState> {
         self.running().get(session).map(Reservation::state)

@@ -275,6 +275,27 @@ impl Store {
         let rows = stmt.query_map([], |row| Ok((session_id(row.get(3)?), read_worktree(row)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    /// Changes the autonomy mode of a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SessionNotFound`] when no such session exists.
+    pub fn set_session_mode(&mut self, id: &SessionId, mode: Mode) -> Result<(), StoreError> {
+        let changed = match session_row_id(id) {
+            Some(row_id) => self.conn.execute(
+                "UPDATE sessions SET mode = ?1 WHERE id = ?2",
+                params![encode_enum(&mode)?, row_id],
+            )?,
+            None => 0,
+        };
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound {
+                session: id.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 fn read_worktree(row: &Row<'_>) -> Result<SessionWorktree, rusqlite::Error> {

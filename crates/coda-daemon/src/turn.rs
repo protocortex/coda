@@ -25,6 +25,7 @@ use coda_protocol::methods::{
     AgentRunParams, AgentRunResult, PermissionRespondParams, PermissionRespondResult,
     REWIND_REFUSED_CODE, SessionCancelParams, SessionCancelResult, SessionCloseParams,
     SessionCloseResult, SessionRewindParams, SessionSendParams, SessionSendResult,
+    SessionSetModeParams, SessionSetModeResult,
 };
 use coda_protocol::types::{BackendKind, Mode, PermissionDecision, SessionId, TurnId};
 use coda_providers::claude_session::TurnOutcome;
@@ -49,6 +50,7 @@ use crate::backends::{
     start_claude_session, start_codex_session,
 };
 mod drive;
+mod mode;
 mod rewind;
 
 use self::drive::Drive;
@@ -390,7 +392,7 @@ impl Turns {
         self.await_wind_down(&session_id).await?;
         match record.backend {
             BackendKind::ClaudeCode | BackendKind::CodexAppServer | BackendKind::CodexExec => {
-                self.send_agent(record, text.clone(), text).await
+                self.send_agent(record, text.clone(), text, false).await
             }
             BackendKind::Anthropic | BackendKind::OpenaiCompat | BackendKind::Faux => {
                 let limits = Limits {
@@ -436,16 +438,18 @@ impl Turns {
             .dispatchable(&agent)
             .map_err(|e| TurnError::Agent(e.to_string()))?;
         let prompt = format!("{}\n\n{AGENT_REQUEST_HEADING}\n\n{text}", entry.def.body);
-        self.send_agent(record, text, prompt).await
+        self.send_agent(record, text, prompt, true).await
     }
 
     /// Starts a turn on a delegated backend. `shown` is stored as the user's
-    /// message and `prompt` is what the backend is given.
+    /// message and `prompt` is what the backend is given. `require_plan` refuses
+    /// a session that is not in plan mode once the turn is reserved.
     async fn send_agent(
         self: &Arc<Self>,
         record: SessionRecord,
         shown: String,
         prompt: String,
+        require_plan: bool,
     ) -> Result<TurnId, TurnError> {
         let session_id = record.id.clone();
         let is_claude = record.backend == BackendKind::ClaudeCode;
@@ -453,6 +457,17 @@ impl Turns {
             return Err(TurnError::Unsupported(session_id));
         }
         let slot = self.reserve(&session_id)?;
+        // The caller's record may predate a mode change that finished while this
+        // send was starting; under the reservation the stored one is final.
+        let id = session_id.clone();
+        let record = self
+            .hub
+            .with_store(move |store| store.load_session(&id))
+            .await
+            .map_err(|e| not_found_or(e, &session_id))?;
+        if require_plan && record.mode != Mode::Plan {
+            return Err(TurnError::Agent(AGENT_NEEDS_PLAN_MODE.to_owned()));
+        }
         let broker = self
             .brokers
             .broker(&record, self.config.timing.permission)
@@ -1418,6 +1433,19 @@ pub(crate) async fn close(turns: Option<&Arc<Turns>>, params: Option<Value>) -> 
         .await
         .map_err(TurnError::into_rpc)?;
     to_value(&SessionCloseResult { closed })
+}
+
+/// Answers `session.set_mode`.
+pub(crate) async fn set_mode(turns: Option<&Arc<Turns>>, params: Option<Value>) -> HandlerResult {
+    let turns = turns.ok_or_else(unavailable)?;
+    let params: SessionSetModeParams = parse_params(params)?;
+    let record = turns
+        .set_mode(&params.session_id, params.mode)
+        .await
+        .map_err(TurnError::into_rpc)?;
+    to_value(&SessionSetModeResult {
+        session: crate::session_rpc::info(record),
+    })
 }
 
 /// Answers `session.rewind`.
