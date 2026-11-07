@@ -185,6 +185,19 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// The bodies of the newest stored events of `kind`, newest first, across all sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the read fails.
+    pub fn recent_event_bodies(&self, kind: &str, limit: u32) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT body FROM events WHERE kind = ?1 ORDER BY id DESC LIMIT ?2")?;
+        let rows = stmt.query_map(params![kind, limit], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Checks that `turn` exists and belongs to `session`.
     ///
     /// # Errors

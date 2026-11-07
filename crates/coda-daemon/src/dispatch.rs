@@ -578,14 +578,35 @@ mod tests {
             })
             .unwrap();
         let turn = store.begin_turn(&session).unwrap();
-        for (input, output) in [(100, 20), (7, 3)] {
+        for (input, output, cache_read, cache_write) in [(100, 20, 1_000, 40), (7, 3, 5, 0)] {
             store
                 .record_usage(&UsageRecord {
                     session: session.clone(),
                     turn: turn.clone(),
                     input_tokens: input,
                     output_tokens: output,
+                    cache_read_tokens: cache_read,
+                    cache_write_tokens: cache_write,
                 })
+                .unwrap();
+        }
+        for windows in [
+            r#"[{"name":"five_hour","utilization_bps":1000,"resets_at":500},{"name":"seven_day","utilization_bps":500}]"#,
+            r#"[{"name":"five_hour","utilization_bps":2000,"resets_at":900}]"#,
+        ] {
+            let body = format!(
+                r#"{{"type":"rate_limit","session_id":"{}","limit":{{"status":"allowed","windows":{windows}}}}}"#,
+                session.as_str()
+            );
+            store
+                .append_event(
+                    &session,
+                    &turn,
+                    &coda_store::EventRecord {
+                        kind: "rate_limit".to_owned(),
+                        body,
+                    },
+                )
                 .unwrap();
         }
         for (original_bytes, compressed_bytes) in [(1000, 300), (500, 100)] {
@@ -622,6 +643,15 @@ mod tests {
         assert_eq!(result["usage"]["input_tokens"], json!(107));
         assert_eq!(result["usage"]["output_tokens"], json!(23));
         assert_eq!(result["saved_bytes"], json!(1100));
+        assert_eq!(result["usage"]["cache_read_tokens"], json!(1005));
+        assert_eq!(result["usage"]["cache_write_tokens"], json!(40));
+        assert_eq!(
+            result["limits"],
+            json!([
+                {"name": "five_hour", "utilization_bps": 2000, "resets_at": 900},
+                {"name": "seven_day", "utilization_bps": 500}
+            ])
+        );
     }
 
     #[tokio::test]

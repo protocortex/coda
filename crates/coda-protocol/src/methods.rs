@@ -8,6 +8,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::events::RateLimitWindow;
 use crate::types::{
     BackendKind, Mode, PermissionDecision, RequestId, SessionId, SessionInfo, TokenUsage, TurnId,
 };
@@ -789,6 +790,11 @@ pub struct UsageSummaryResult {
     /// Bytes of tool output the token economy kept out of the context.
     #[serde(default)]
     pub saved_bytes: u64,
+    /// The plan limit windows the provider last reported, whichever session saw them. A
+    /// window the daemon has no report for is missing; one past its reset time may still be
+    /// listed, so a client checks `resets_at`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<RateLimitWindow>,
 }
 
 /// Parameters of [`SESSION_SET_MODE`]. The daemon refuses the change while a

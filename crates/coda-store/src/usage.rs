@@ -16,6 +16,8 @@ pub struct UsageRecord {
     pub turn: TurnId,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 /// Summed token counts.
@@ -23,6 +25,8 @@ pub struct UsageRecord {
 pub struct UsageSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 impl Store {
@@ -42,11 +46,14 @@ impl Store {
             &record.turn,
         )?;
         self.connection().execute(
-            "INSERT INTO usage (turn_id, input_tokens, output_tokens, at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO usage (turn_id, input_tokens, output_tokens, cache_read_tokens, \
+             cache_write_tokens, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 turn_row,
                 to_db_int(record.input_tokens)?,
                 to_db_int(record.output_tokens)?,
+                to_db_int(record.cache_read_tokens)?,
+                to_db_int(record.cache_write_tokens)?,
                 self.clock.now_ms()
             ],
         )?;
@@ -62,7 +69,8 @@ impl Store {
     pub fn usage_summary(&self, session: Option<&SessionId>) -> Result<UsageSummary, StoreError> {
         let session_row = session.map(|s| self.existing_session_row(s)).transpose()?;
         Ok(self.connection().query_row(
-            "SELECT COALESCE(SUM(u.input_tokens), 0), COALESCE(SUM(u.output_tokens), 0) \
+            "SELECT COALESCE(SUM(u.input_tokens), 0), COALESCE(SUM(u.output_tokens), 0), \
+             COALESCE(SUM(u.cache_read_tokens), 0), COALESCE(SUM(u.cache_write_tokens), 0) \
              FROM usage u JOIN turns t ON t.id = u.turn_id \
              WHERE (?1 IS NULL OR t.session_id = ?1)",
             [session_row],
@@ -70,6 +78,8 @@ impl Store {
                 Ok(UsageSummary {
                     input_tokens: get_u64(row, 0)?,
                     output_tokens: get_u64(row, 1)?,
+                    cache_read_tokens: get_u64(row, 2)?,
+                    cache_write_tokens: get_u64(row, 3)?,
                 })
             },
         )?)

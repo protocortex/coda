@@ -9,13 +9,15 @@ use std::process::ExitCode;
 
 use coda_config::config::Dirs;
 use coda_protocol::types::{BackendKind, Mode, SessionId};
-use coda_store::{NewSession, SavingRecord, Store, UsageRecord};
+use coda_store::{EventRecord, NewSession, SavingRecord, Store, UsageRecord};
 use common::{TestDaemon, cli, context, short_dir};
 
+/// Year 2100, so a reported window has not reset when the test runs.
+const FAR_FUTURE: u64 = 4_102_444_800;
 const SUMMED_OUTPUT: &str = "input tokens: 107\n\
 output tokens: 23\n\
-cache read tokens: 0\n\
-cache write tokens: 0\n\
+cache read tokens: 1005\n\
+cache write tokens: 40\n\
 saved bytes: 1100\n";
 
 /// Stores one session with two usage records (100 + 7 in, 20 + 3 out) and two savings, then
@@ -31,13 +33,17 @@ fn seed_usage(base: &Path) -> SessionId {
         })
         .unwrap();
     let turn = store.begin_turn(&session).unwrap();
-    for (input_tokens, output_tokens) in [(100, 20), (7, 3)] {
+    for (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) in
+        [(100, 20, 1_000, 40), (7, 3, 5, 0)]
+    {
         store
             .record_usage(&UsageRecord {
                 session: session.clone(),
                 turn: turn.clone(),
                 input_tokens,
                 output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
             })
             .unwrap();
     }
@@ -51,6 +57,47 @@ fn seed_usage(base: &Path) -> SessionId {
             .unwrap();
     }
     session
+}
+
+/// Stores a limit report for a window that resets far in the future, so the line stays.
+fn seed_limit(base: &Path, session: &SessionId) {
+    let mut store = Store::open(&Dirs::from_base(base).data_dir()).unwrap();
+    let turn = store.begin_turn(session).unwrap();
+    let body = format!(
+        r#"{{"type":"rate_limit","session_id":"{}","limit":{{"status":"allowed","windows":[{{"name":"five_hour","utilization_bps":2000,"resets_at":{FAR_FUTURE}}}]}}}}"#,
+        session.as_str()
+    );
+    store
+        .append_event(
+            session,
+            &turn,
+            &EventRecord {
+                kind: "rate_limit".to_owned(),
+                body,
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn usage_lists_the_plan_limits_the_provider_reported() {
+    // Arrange
+    let dir = short_dir();
+    let session = seed_usage(dir.path());
+    seed_limit(dir.path(), &session);
+    let ctx = context(dir.path());
+
+    // Act
+    let outcome = cli(&ctx, &["coda", "usage"], "").await;
+
+    // Assert
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.err);
+    let last = outcome.out.lines().last().unwrap();
+    assert!(
+        last.starts_with("limit: 5h 80% left, resets in "),
+        "{}",
+        outcome.out
+    );
 }
 
 #[tokio::test]

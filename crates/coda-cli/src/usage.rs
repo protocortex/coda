@@ -3,6 +3,7 @@
 //! `coda usage`: token usage and savings, from the daemon or else the store.
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use coda_client::ClientError;
 use coda_protocol::jsonrpc::METHOD_NOT_FOUND;
@@ -10,6 +11,7 @@ use coda_protocol::methods::{USAGE_SUMMARY, UsageSummaryParams, UsageSummaryResu
 use coda_protocol::types::{SessionId, TokenUsage};
 use coda_providers::transcripts::{History, read_history};
 use coda_store::{DB_FILE_NAME, Store};
+use coda_tui::limits::Limits;
 use tracing::debug;
 
 use crate::autostart::connect_unchecked;
@@ -189,6 +191,7 @@ fn from_store(ctx: &Context, session: Option<&SessionId>) -> Result<UsageSummary
         return Ok(UsageSummaryResult {
             usage: TokenUsage::default(),
             saved_bytes: 0,
+            limits: Vec::new(),
         });
     }
     let store = Store::open(&ctx.dirs.data_dir())?;
@@ -202,5 +205,11 @@ fn print(io: &mut Io<'_>, summary: &UsageSummaryResult) -> Result<(), CliError> 
     writeln!(io.out, "cache read tokens: {}", usage.cache_read_tokens)?;
     writeln!(io.out, "cache write tokens: {}", usage.cache_write_tokens)?;
     writeln!(io.out, "saved bytes: {}", summary.saved_bytes)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    for line in Limits::from_windows(&summary.limits).report(now) {
+        writeln!(io.out, "limit: {line}")?;
+    }
     Ok(())
 }
