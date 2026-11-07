@@ -131,6 +131,8 @@ pub struct SessionStart {
     pub session_id: SessionId,
     pub resume: Option<String>,
     pub parent_env: Vec<(OsString, OsString)>,
+    /// Names from `providers.claude_code.env_passthrough`.
+    pub env_passthrough: Vec<String>,
     /// Directory that holds the child's pidfile.
     pub pidfile_dir: PathBuf,
     /// Ban the tools that change files or run commands.
@@ -148,6 +150,16 @@ pub fn claude_profile(config: &Config) -> ClaudeProfile {
         .map_or_else(ClaudeProfile::default, |section| section.profile)
 }
 
+/// The variable names `providers.claude_code` lets through to the child.
+#[must_use]
+pub fn claude_env_passthrough(config: &Config) -> Vec<String> {
+    config
+        .providers
+        .get(CONFIG_KEY)
+        .map(|section| section.env_passthrough.clone())
+        .unwrap_or_default()
+}
+
 /// Starts the child and records its pidfile; the child is stopped again if
 /// the pidfile cannot be written.
 ///
@@ -163,6 +175,7 @@ pub async fn start_claude_session(start: SessionStart) -> Result<ClaudeSession, 
         session_id: start.session_id,
         resume: start.resume,
         parent_env: start.parent_env,
+        env_passthrough: start.env_passthrough,
         read_only: start.read_only,
         profile: start.profile,
     })?;
@@ -414,9 +427,9 @@ mod tests {
     use coda_config::config::{ClaudeProfile, Config};
 
     use super::{
-        ClaudeCodeBackend, CodexStart, SessionStart, StartError, claude_profile,
-        enabled_agent_backends, pidfile_path, resolve_codex, resolve_codex_off_worker,
-        start_claude_session, start_codex_session,
+        ClaudeCodeBackend, CodexStart, SessionStart, StartError, claude_env_passthrough,
+        claude_profile, enabled_agent_backends, pidfile_path, resolve_codex,
+        resolve_codex_off_worker, start_claude_session, start_codex_session,
     };
     use crate::pidfile::{is_same_process, read};
     use crate::reaper::reap;
@@ -437,10 +450,34 @@ mod tests {
             session_id: SessionId::new("s-1"),
             resume: None,
             parent_env: Vec::new(),
+            env_passthrough: Vec::new(),
             pidfile_dir: dir.path().to_path_buf(),
             read_only: false,
             profile: ClaudeProfile::Full,
         }
+    }
+
+    #[test]
+    fn the_claude_passthrough_names_come_from_its_section() {
+        // Arrange
+        let listed = Config::from_toml_str(
+            "[providers.claude_code]\nenv_passthrough = [\"ANTHROPIC_API_KEY\"]\n\
+             [providers.codex]\nenv_passthrough = [\"OTHER\"]\n",
+        )
+        .unwrap()
+        .config;
+
+        // Act
+        let (names, absent) = (
+            claude_env_passthrough(&listed),
+            claude_env_passthrough(&Config::default()),
+        );
+
+        // Assert
+        assert_eq!(
+            (names, absent),
+            (vec!["ANTHROPIC_API_KEY".to_owned()], vec![])
+        );
     }
 
     #[test]

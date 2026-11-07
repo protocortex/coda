@@ -124,6 +124,7 @@ impl Fixture {
             session_id: SessionId::new("s-1"),
             resume: None,
             parent_env,
+            env_passthrough: Vec::new(),
             read_only: false,
             profile: ClaudeProfile::Full,
         }
@@ -573,6 +574,39 @@ async fn the_child_gets_only_allowlisted_environment() {
     assert_eq!(report["anthropic_api_key_present"], false);
     assert_eq!(report["claudecode_present"], false);
     assert_eq!(report["home"], "/tmp/coda-home");
+}
+
+async fn env_report(passthrough: &[&str]) -> Value {
+    let fixture = Fixture::new();
+    let parent = env(&[("ANTHROPIC_API_KEY", "sk-test"), ("CLAUDECODE", "1")]);
+    let mut spec = fixture.spec(parent);
+    spec.env_passthrough = passthrough.iter().map(|name| (*name).to_owned()).collect();
+    let mut session = ClaudeSession::spawn(spec).unwrap();
+    turn(
+        &mut session,
+        &FixedGate::new(PermissionDecision::Deny),
+        "run ls",
+    )
+    .await;
+    fixture.report()
+}
+
+#[tokio::test]
+async fn a_variable_listed_in_env_passthrough_reaches_the_child() {
+    // Act
+    let report = env_report(&["ANTHROPIC_API_KEY"]).await;
+
+    // Assert
+    assert_eq!(report["anthropic_api_key_present"], true);
+}
+
+#[tokio::test]
+async fn the_nested_session_marker_never_passes_even_when_listed() {
+    // Act
+    let report = env_report(&["CLAUDECODE"]).await;
+
+    // Assert
+    assert_eq!(report["claudecode_present"], false);
 }
 
 #[tokio::test]

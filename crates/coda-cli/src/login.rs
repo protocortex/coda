@@ -16,7 +16,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
 use coda_config::config::Config;
-use coda_daemon::backends::{ClaudeCodeBackend, CodexBackend};
+use coda_daemon::backends::{ClaudeCodeBackend, CodexBackend, claude_env_passthrough};
 use coda_protocol::events::AccountBilling;
 use coda_protocol::types::SessionId;
 use coda_providers::account::{Account, AccountStatus, probe_claude};
@@ -85,13 +85,17 @@ pub(crate) fn locate_binary(backend: LoginBackend, config: &Config) -> Result<Pa
 pub(crate) async fn probe_account(
     backend: LoginBackend,
     binary: PathBuf,
+    config: &Config,
 ) -> Result<AccountStatus, String> {
     let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     match backend {
         LoginBackend::ClaudeCode => {
-            tokio::task::spawn_blocking(move || probe_claude(&binary, &env, PROBE_TIMEOUT))
-                .await
-                .unwrap_or_else(|error| Err(format!("the probe did not finish: {error}")))
+            let passthrough = claude_env_passthrough(config);
+            tokio::task::spawn_blocking(move || {
+                probe_claude(&binary, &env, &passthrough, PROBE_TIMEOUT)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("the probe did not finish: {error}")))
         }
         LoginBackend::Codex => {
             let spec = AppServerSpec {
@@ -115,12 +119,15 @@ pub(crate) async fn probe_account(
 pub async fn run(ctx: &Context, io: &mut Io<'_>, args: LoginArgs) -> Result<ExitCode, CliError> {
     let backend = args.backend;
     let config = load_config(&ctx.dirs)?;
-    let located = tokio::task::spawn_blocking(move || locate_binary(backend, &config))
+    let for_locate = config.clone();
+    let located = tokio::task::spawn_blocking(move || locate_binary(backend, &for_locate))
         .await
         .map_err(|error| CliError::Login(error.to_string()))?;
     let binary = located.map_err(CliError::Login)?;
     let key = backend.key();
-    if let Ok(AccountStatus::LoggedIn(account)) = probe_account(backend, binary.clone()).await {
+    if let Ok(AccountStatus::LoggedIn(account)) =
+        probe_account(backend, binary.clone(), &config).await
+    {
         writeln!(io.out, "{key} is already logged in{}", who(&account))?;
         if account.billing == AccountBilling::ApiKey {
             writeln!(io.out, "{API_KEY_NOTE}")?;
@@ -142,7 +149,7 @@ pub async fn run(ctx: &Context, io: &mut Io<'_>, args: LoginArgs) -> Result<Exit
     if !status.success() {
         return Err(CliError::Login(format!("`{command}` exited with {status}")));
     }
-    match probe_account(backend, binary).await {
+    match probe_account(backend, binary, &config).await {
         Ok(AccountStatus::LoggedIn(account)) => {
             writeln!(io.out, "{key} is logged in{}", who(&account))?;
             Ok(ExitCode::SUCCESS)

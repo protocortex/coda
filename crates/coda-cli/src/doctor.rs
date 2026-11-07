@@ -541,11 +541,12 @@ async fn check_accounts(config: Option<Config>) -> Check {
         return Check::warn(NAME, "skipped, the config is not valid");
     };
     // Locating runs `--version` and waits on it, so it stays off the runtime.
+    let for_locate = config.clone();
     let located = tokio::task::spawn_blocking(move || {
         LoginBackend::value_variants()
             .iter()
             .filter_map(|backend| {
-                locate_binary(*backend, &config)
+                locate_binary(*backend, &for_locate)
                     .ok()
                     .map(|binary| (*backend, binary))
             })
@@ -555,7 +556,7 @@ async fn check_accounts(config: Option<Config>) -> Check {
     .unwrap_or_default();
     let mut parts = Vec::new();
     for (backend, binary) in located {
-        let probed = probe_account(backend, binary).await;
+        let probed = probe_account(backend, binary, &config).await;
         parts.push(describe_account(backend, probed));
     }
     if parts.is_empty() {

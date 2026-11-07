@@ -302,6 +302,7 @@ async fn record_claude(
         session_id: SessionId::new("live"),
         resume: None,
         parent_env: parent_env(),
+        env_passthrough: Vec::new(),
         read_only: false,
         profile: ClaudeProfile::Full,
     })
@@ -405,6 +406,7 @@ async fn claude_write_attempt(out: &Path, name: &str, read_only: bool) -> bool {
         session_id: SessionId::new("live"),
         resume: None,
         parent_env: parent_env(),
+        env_passthrough: Vec::new(),
         read_only,
         profile: ClaudeProfile::Full,
     })

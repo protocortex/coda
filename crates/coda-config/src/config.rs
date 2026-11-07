@@ -394,6 +394,7 @@ impl Config {
         let config: Self =
             serde_ignored::deserialize(value, |path| unknown_keys.push(path.to_string()))?;
         config.check_sandboxes()?;
+        config.check_env_passthrough()?;
         config.check_output_limits()?;
         config.check_context_windows()?;
         config.check_timing()?;
@@ -531,6 +532,19 @@ impl Config {
                 return Err(ConfigError::InvalidValue {
                     path: format!("{PROVIDERS_KEY}.{name}.sandbox"),
                     allowed: SANDBOX_MODES.join(", "),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_env_passthrough(&self) -> Result<(), ConfigError> {
+        for (name, section) in &self.providers {
+            if !section.env_passthrough.iter().all(|var| is_env_name(var)) {
+                return Err(ConfigError::InvalidValue {
+                    path: format!("{PROVIDERS_KEY}.{name}.env_passthrough"),
+                    allowed: "variable names made of letters, digits and underscores, with no `=` and no value"
+                        .to_owned(),
                 });
             }
         }
@@ -787,6 +801,12 @@ fn is_secret_key(key: &str) -> bool {
     }
     let key = key.strip_suffix('s').unwrap_or(&key);
     SECRET_KEY_SUFFIXES.iter().any(|s| key.ends_with(s))
+}
+
+fn is_env_name(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with(|c: char| c.is_ascii_digit())
+        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn holds_string(value: &toml::Value) -> bool {
