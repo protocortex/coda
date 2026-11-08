@@ -23,6 +23,8 @@ fn schedule(target: ScheduleTarget) -> ScheduleInfo {
         last_run_at: None,
         runs: 1,
         created_at: 0,
+        last_error: None,
+        last_error_at: None,
     }
 }
 
@@ -197,4 +199,47 @@ async fn a_pull_request_watch_wake_restores_a_cleaned_worktree_and_sends() {
     let request = rig.wait_for_pending().await;
     rig.respond(&request, "allow_once").await;
     rig.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn a_failed_send_for_a_new_session_schedule_leaves_no_session_behind() {
+    // Arrange
+    let rig = Rig::new(relaxed(), Vec::new());
+    let runner = TurnsRunner::new(rig.hub.clone(), rig.turns.clone());
+    let target = ScheduleTarget::NewSession {
+        backend: BackendKind::Anthropic,
+        model: None,
+        cwd: rig.cwd.path().to_string_lossy().into_owned(),
+        mode: Mode::Default,
+    };
+    let count = || async {
+        rig.hub
+            .with_store(|store| store.list_sessions(&coda_store::SessionFilter::default()))
+            .await
+            .unwrap()
+            .len()
+    };
+    let before = count().await;
+
+    // Act
+    let sent = runner.run(&schedule(target)).await;
+
+    // Assert
+    assert!(sent.is_err(), "{sent:?}");
+    assert_eq!(count().await, before);
+}
+
+#[tokio::test]
+async fn forgetting_a_session_drops_the_backend_id_the_daemon_kept_for_it() {
+    // Arrange
+    let rig = Rig::new(relaxed(), Vec::new());
+    rig.turns
+        .backend_ids()
+        .insert(rig.session.clone(), "backend-id".to_owned());
+
+    // Act
+    rig.turns.forget_session(&rig.session).await;
+
+    // Assert
+    assert_eq!(rig.turns.backend_ids().get(&rig.session), None);
 }

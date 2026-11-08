@@ -756,6 +756,12 @@ pub struct ScheduleInfo {
     /// How many runs have started.
     pub runs: u64,
     pub created_at: i64,
+    /// Why the latest finished run failed. Empty when it did not, and cleared when the next run starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// When that run failed, in milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_at: Option<i64>,
 }
 
 /// Result of [`SCHEDULE_ADD`].

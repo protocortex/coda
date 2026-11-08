@@ -42,7 +42,10 @@ pub use receipts::{RECEIPT_RETENTION_MS, Receipt};
 pub use review_memory::{FindingStatus, MemoryFinding, ReviewRunRecord, StoredFinding};
 pub use savings::SavingRecord;
 pub use schedule_time::{first_run, next_after};
-pub use schedules::{MAX_SCHEDULE_INTERVAL_SECS, MAX_SCHEDULE_TEXT_BYTES};
+pub use schedules::{
+    MAX_LISTED_SCHEDULES, MAX_SCHEDULE_ERROR_CHARS, MAX_SCHEDULE_INTERVAL_SECS,
+    MAX_SCHEDULE_TEXT_BYTES,
+};
 pub use sessions::{
     MAX_TITLE_CHARS, NewSession, SessionFilter, SessionRecord, SessionSummary, SessionWorktree,
     WorktreeSession,
@@ -62,7 +65,7 @@ use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 24;
 
 /// Release of this binary, recorded in the database each time it opens it.
 pub const BINARY_RELEASE: &str = env!("CARGO_PKG_VERSION");

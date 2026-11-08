@@ -25,6 +25,10 @@ use crate::turn::Turns;
 pub const TICK: Duration = Duration::from_secs(15);
 /// Most prompts one tick sends.
 pub const MAX_RUNS_PER_TICK: usize = 5;
+/// Most runs of a schedule that makes a new session for each one. The next run ends the schedule.
+pub const MAX_SESSIONS_PER_SCHEDULE: u64 = 50;
+/// How long a finished schedule stays in the list before a tick deletes it.
+const DONE_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Sends the prompt of one run.
 pub(crate) trait RunTarget {
@@ -43,9 +47,10 @@ impl TurnsRunner {
         Self { hub, turns }
     }
 
-    async fn session_for(&self, target: &ScheduleTarget) -> Result<SessionId, String> {
+    /// The session a run sends to, and whether the run made it.
+    async fn session_for(&self, target: &ScheduleTarget) -> Result<(SessionId, bool), String> {
         match target {
-            ScheduleTarget::Session { session_id } => Ok(session_id.clone()),
+            ScheduleTarget::Session { session_id } => Ok((session_id.clone(), false)),
             ScheduleTarget::NewSession {
                 backend,
                 model,
@@ -64,19 +69,17 @@ impl TurnsRunner {
                 self.hub
                     .with_store_mut(move |store| store.create_session(&new))
                     .await
+                    .map(|id| (id, true))
                     .map_err(|e: HubError| e.to_string())
             }
         }
     }
-}
 
-impl RunTarget for TurnsRunner {
-    async fn run(&self, schedule: &ScheduleInfo) -> Result<(), String> {
-        let session_id = self.session_for(&schedule.target).await?;
+    async fn send(&self, session_id: SessionId, text: &str) -> Result<(), String> {
         self.turns.ensure_checkout(&session_id).await?;
         let send = SessionSendParams {
             session_id,
-            text: schedule.text.clone(),
+            text: text.to_owned(),
             max_turns: None,
             token_cap: None,
             mode: SendMode::Queue,
@@ -87,6 +90,25 @@ impl RunTarget for TurnsRunner {
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+}
+
+impl RunTarget for TurnsRunner {
+    async fn run(&self, schedule: &ScheduleInfo) -> Result<(), String> {
+        let (session_id, created) = self.session_for(&schedule.target).await?;
+        let sent = self.send(session_id.clone(), &schedule.text).await;
+        if sent.is_err() && created {
+            self.turns.forget_session(&session_id).await;
+            let id = session_id.clone();
+            if let Err(e) = self
+                .hub
+                .with_store_mut(move |store| store.delete_session(&id))
+                .await
+            {
+                warn!(session = %session_id, error = %e, "could not remove the session of a failed scheduled send");
+            }
+        }
+        sent
     }
 }
 
@@ -107,6 +129,12 @@ pub async fn recover(hub: &Arc<Hub>) {
 
 /// Claims what is due and sends it. Returns how many prompts it sent or tried to send.
 pub(crate) async fn tick<R: RunTarget>(hub: &Arc<Hub>, runner: &R) -> usize {
+    if let Err(e) = hub
+        .with_store_mut(|store| store.prune_done_schedules(DONE_RETENTION_MS))
+        .await
+    {
+        warn!(error = %e, "could not delete the finished scheduled prompts that are old");
+    }
     let claimed = match hub
         .with_store_mut(|store| store.claim_due_schedules(MAX_RUNS_PER_TICK))
         .await
@@ -118,19 +146,42 @@ pub(crate) async fn tick<R: RunTarget>(hub: &Arc<Hub>, runner: &R) -> usize {
         }
     };
     for schedule in &claimed {
-        match runner.run(schedule).await {
-            Ok(()) => info!(
-                schedule = schedule.id,
-                run = schedule.runs,
-                "sent a scheduled prompt"
-            ),
-            Err(reason) => {
-                warn!(schedule = schedule.id, %reason, "could not send a scheduled prompt");
+        let at_limit = matches!(schedule.target, ScheduleTarget::NewSession { .. })
+            && schedule.runs > MAX_SESSIONS_PER_SCHEDULE;
+        let failure = if at_limit {
+            Some(format!(
+                "this schedule reached its limit of {MAX_SESSIONS_PER_SCHEDULE} runs into new sessions and was ended; \
+                 schedule into one session to go on"
+            ))
+        } else {
+            match runner.run(schedule).await {
+                Ok(()) => {
+                    info!(
+                        schedule = schedule.id,
+                        run = schedule.runs,
+                        "sent a scheduled prompt"
+                    );
+                    None
+                }
+                Err(reason) => Some(reason),
             }
+        };
+        if let Some(reason) = &failure {
+            warn!(schedule = schedule.id, %reason, "could not send a scheduled prompt");
         }
         let id = schedule.id;
         if let Err(e) = hub
-            .with_store_mut(move |store| store.finish_schedule_run(id))
+            .with_store_mut(move |store| {
+                let recorded = failure
+                    .as_deref()
+                    .map_or(Ok(()), |reason| store.record_schedule_failure(id, reason));
+                let stopped = if at_limit {
+                    store.stop_schedule(id)
+                } else {
+                    Ok(())
+                };
+                store.finish_schedule_run(id).and(recorded).and(stopped)
+            })
             .await
         {
             warn!(schedule = id, error = %e, "could not end the run of a scheduled prompt");
@@ -275,6 +326,159 @@ mod tests {
         assert_eq!((first, second), (1, 0));
         assert_eq!(runner.sent.lock().unwrap().len(), 1);
         assert_eq!(states(&rig).await, [ScheduleState::Idle]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_leaves_its_reason_in_the_list_and_waits_for_the_next_due_time() {
+        // Arrange
+        let rig = rig();
+        add(&rig, ScheduleSpec::Interval { every_secs: 60 }, "hi").await;
+        let runner = recording(true);
+        rig.clock.0.fetch_add(MINUTE_MS, Ordering::SeqCst);
+
+        // Act
+        tick(&rig.hub, &runner).await;
+        let again = tick(&rig.hub, &runner).await;
+
+        // Assert
+        let listed = rig
+            .hub
+            .with_store(coda_store::Store::list_schedules)
+            .await
+            .unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(listed[0].last_error.as_deref(), Some("down"));
+        assert_eq!(listed[0].last_error_at, Some(START + MINUTE_MS));
+        assert_eq!(runner.sent.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_one_time_prompt_that_fails_is_done_with_its_error_and_is_not_sent_again() {
+        // Arrange
+        let rig = rig();
+        add(
+            &rig,
+            ScheduleSpec::Once {
+                at: START + MINUTE_MS,
+            },
+            "once",
+        )
+        .await;
+        let runner = recording(true);
+        rig.clock.0.fetch_add(MINUTE_MS, Ordering::SeqCst);
+
+        // Act
+        tick(&rig.hub, &runner).await;
+        rig.clock.0.fetch_add(10 * MINUTE_MS, Ordering::SeqCst);
+        tick(&rig.hub, &runner).await;
+
+        // Assert
+        let listed = rig
+            .hub
+            .with_store(coda_store::Store::list_schedules)
+            .await
+            .unwrap();
+        assert_eq!(listed[0].state, ScheduleState::Done);
+        assert_eq!(listed[0].last_error.as_deref(), Some("down"));
+        assert_eq!(runner.sent.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_that_makes_a_session_per_run_ends_at_the_session_limit() {
+        // Arrange
+        let rig = rig();
+        let target = ScheduleTarget::NewSession {
+            backend: BackendKind::Faux,
+            model: None,
+            cwd: "/repo".to_owned(),
+            mode: Mode::Default,
+        };
+        let spec = ScheduleSpec::Interval { every_secs: 60 };
+        rig.hub
+            .with_store_mut(move |store| store.add_schedule(&spec, &target, "hi"))
+            .await
+            .unwrap();
+        let runner = recording(false);
+
+        // Act
+        for _ in 0..=MAX_SESSIONS_PER_SCHEDULE {
+            rig.clock.0.fetch_add(MINUTE_MS, Ordering::SeqCst);
+            tick(&rig.hub, &runner).await;
+        }
+        rig.clock.0.fetch_add(MINUTE_MS, Ordering::SeqCst);
+        let after = tick(&rig.hub, &runner).await;
+
+        // Assert
+        assert_eq!(
+            runner.sent.lock().unwrap().len() as u64,
+            MAX_SESSIONS_PER_SCHEDULE
+        );
+        assert_eq!(after, 0);
+        let listed = rig
+            .hub
+            .with_store(coda_store::Store::list_schedules)
+            .await
+            .unwrap();
+        assert_eq!(listed[0].state, ScheduleState::Done);
+        assert!(
+            listed[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("limit")),
+            "{:?}",
+            listed[0].last_error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_target_has_no_session_limit() {
+        // Arrange
+        let rig = rig();
+        add(&rig, ScheduleSpec::Interval { every_secs: 60 }, "hi").await;
+        let runner = recording(false);
+
+        // Act
+        for _ in 0..=MAX_SESSIONS_PER_SCHEDULE {
+            rig.clock.0.fetch_add(MINUTE_MS, Ordering::SeqCst);
+            tick(&rig.hub, &runner).await;
+        }
+
+        // Assert
+        assert_eq!(
+            runner.sent.lock().unwrap().len() as u64,
+            MAX_SESSIONS_PER_SCHEDULE + 1
+        );
+        assert_eq!(states(&rig).await, [ScheduleState::Idle]);
+    }
+
+    #[tokio::test]
+    async fn a_tick_prunes_done_prompts_older_than_the_retention() {
+        // Arrange
+        let rig = rig();
+        add(
+            &rig,
+            ScheduleSpec::Once {
+                at: START + MINUTE_MS,
+            },
+            "once",
+        )
+        .await;
+        let runner = recording(false);
+        rig.clock.0.fetch_add(MINUTE_MS, Ordering::SeqCst);
+        tick(&rig.hub, &runner).await;
+
+        // Act
+        rig.clock
+            .0
+            .fetch_add(DONE_RETENTION_MS - 1, Ordering::SeqCst);
+        tick(&rig.hub, &runner).await;
+        let early = states(&rig).await;
+        rig.clock.0.fetch_add(2, Ordering::SeqCst);
+        tick(&rig.hub, &runner).await;
+
+        // Assert
+        assert_eq!(early, [ScheduleState::Done]);
+        assert_eq!(states(&rig).await, []);
     }
 
     #[tokio::test]

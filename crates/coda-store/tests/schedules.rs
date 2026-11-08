@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use coda_protocol::methods::{MAX_SCHEDULES, ScheduleSpec, ScheduleState, ScheduleTarget, Weekday};
 use coda_protocol::types::{BackendKind, Mode, SessionId};
 use coda_store::{
-    Clock, MAX_SCHEDULE_INTERVAL_SECS, MAX_SCHEDULE_TEXT_BYTES, NewSession, Store, StoreError,
+    Clock, MAX_LISTED_SCHEDULES, MAX_SCHEDULE_ERROR_CHARS, MAX_SCHEDULE_INTERVAL_SECS,
+    MAX_SCHEDULE_TEXT_BYTES, NewSession, Store, StoreError,
 };
 use tempfile::TempDir;
 
@@ -425,4 +426,269 @@ fn a_prompt_over_the_size_limit_is_refused() {
 
     // Assert
     assert!(matches!(refused, Err(StoreError::ScheduleRefused { .. })));
+}
+
+#[test]
+fn a_failed_run_leaves_its_reason_and_time_on_the_row_and_the_next_claim_clears_them() {
+    // Arrange
+    let mut rig = rig();
+    let added = rig
+        .store
+        .add_schedule(&every(60), &into(&rig.session), "hi")
+        .unwrap();
+    advance(&rig, MINUTE_MS);
+    rig.store.claim_due_schedules(10).unwrap();
+
+    // Act
+    rig.store
+        .record_schedule_failure(added.id, "the folder is gone")
+        .unwrap();
+    rig.store.finish_schedule_run(added.id).unwrap();
+    let failed = rig.store.list_schedules().unwrap().remove(0);
+    advance(&rig, MINUTE_MS);
+    rig.store.claim_due_schedules(10).unwrap();
+    let retried = rig.store.list_schedules().unwrap().remove(0);
+
+    // Assert
+    assert_eq!(failed.last_error.as_deref(), Some("the folder is gone"));
+    assert_eq!(failed.last_error_at, Some(START + MINUTE_MS));
+    assert_eq!(failed.state, ScheduleState::Idle);
+    assert_eq!(retried.last_error, None);
+    assert_eq!(retried.last_error_at, None);
+}
+
+#[test]
+fn a_failed_one_time_run_is_done_and_keeps_its_error_and_does_not_run_again() {
+    // Arrange
+    let mut rig = rig();
+    let added = rig
+        .store
+        .add_schedule(
+            &ScheduleSpec::Once {
+                at: START + MINUTE_MS,
+            },
+            &into(&rig.session),
+            "hi",
+        )
+        .unwrap();
+    advance(&rig, MINUTE_MS);
+    rig.store.claim_due_schedules(10).unwrap();
+
+    // Act
+    rig.store.record_schedule_failure(added.id, "down").unwrap();
+    rig.store.finish_schedule_run(added.id).unwrap();
+    advance(&rig, 60 * MINUTE_MS);
+    let again = rig.store.claim_due_schedules(10).unwrap();
+
+    // Assert
+    assert_eq!(again.len(), 0);
+    let kept = rig.store.list_schedules().unwrap().remove(0);
+    assert_eq!(kept.state, ScheduleState::Done);
+    assert_eq!(kept.last_error.as_deref(), Some("down"));
+}
+
+#[test]
+fn a_long_error_is_cut_and_a_cut_never_splits_a_character() {
+    // Arrange
+    let mut rig = rig();
+    let added = rig
+        .store
+        .add_schedule(&every(60), &into(&rig.session), "hi")
+        .unwrap();
+    let long = "\u{e9}".repeat(MAX_SCHEDULE_ERROR_CHARS * 2);
+
+    // Act
+    rig.store.record_schedule_failure(added.id, &long).unwrap();
+
+    // Assert
+    let kept = rig.store.list_schedules().unwrap().remove(0);
+    assert_eq!(
+        kept.last_error.unwrap().chars().count(),
+        MAX_SCHEDULE_ERROR_CHARS
+    );
+}
+
+#[test]
+fn a_stopped_schedule_has_no_next_run_and_is_done_once_its_run_ends() {
+    // Arrange
+    let mut rig = rig();
+    let added = rig
+        .store
+        .add_schedule(&every(60), &into(&rig.session), "hi")
+        .unwrap();
+    advance(&rig, MINUTE_MS);
+    rig.store.claim_due_schedules(10).unwrap();
+
+    // Act
+    rig.store.stop_schedule(added.id).unwrap();
+    rig.store.finish_schedule_run(added.id).unwrap();
+    advance(&rig, 60 * MINUTE_MS);
+    let again = rig.store.claim_due_schedules(10).unwrap();
+
+    // Assert
+    assert_eq!(again.len(), 0);
+    let kept = rig.store.list_schedules().unwrap().remove(0);
+    assert_eq!(kept.state, ScheduleState::Done);
+    assert_eq!(kept.next_run_at, None);
+}
+
+#[test]
+fn done_schedules_older_than_the_retention_are_pruned_and_live_ones_stay() {
+    // Arrange
+    let mut rig = rig();
+    let old = rig
+        .store
+        .add_schedule(
+            &ScheduleSpec::Once {
+                at: START + MINUTE_MS,
+            },
+            &into(&rig.session),
+            "old",
+        )
+        .unwrap();
+    let live = rig
+        .store
+        .add_schedule(
+            &every(MAX_SCHEDULE_INTERVAL_SECS),
+            &into(&rig.session),
+            "live",
+        )
+        .unwrap();
+    advance(&rig, MINUTE_MS);
+    rig.store.claim_due_schedules(10).unwrap();
+    rig.store.finish_schedule_run(old.id).unwrap();
+    let retention = 7 * 24 * 60 * MINUTE_MS;
+
+    // Act
+    advance(&rig, retention - 1);
+    let early = rig.store.prune_done_schedules(retention).unwrap();
+    advance(&rig, 2);
+    let late = rig.store.prune_done_schedules(retention).unwrap();
+
+    // Assert
+    assert_eq!((early, late), (0, 1));
+    let left: Vec<u64> = rig
+        .store
+        .list_schedules()
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(left, [live.id]);
+}
+
+#[test]
+fn the_list_holds_at_most_the_limit_and_keeps_the_newest() {
+    // Arrange
+    let mut rig = rig();
+    let rounds = MAX_LISTED_SCHEDULES / MAX_SCHEDULES + 1;
+    let mut last = 0;
+    for _ in 0..rounds {
+        for _ in 0..MAX_SCHEDULES {
+            last = rig
+                .store
+                .add_schedule(
+                    &ScheduleSpec::Once { at: START + 1 },
+                    &into(&rig.session),
+                    "x",
+                )
+                .unwrap()
+                .id;
+        }
+        advance(&rig, MINUTE_MS);
+        loop {
+            let claimed = rig.store.claim_due_schedules(MAX_SCHEDULES).unwrap();
+            if claimed.is_empty() {
+                break;
+            }
+            for schedule in claimed {
+                rig.store.finish_schedule_run(schedule.id).unwrap();
+            }
+        }
+    }
+
+    // Act
+    let listed = rig.store.list_schedules().unwrap();
+
+    // Assert
+    assert_eq!(listed.len(), MAX_LISTED_SCHEDULES);
+    assert_eq!(listed.last().unwrap().id, last);
+    assert!(listed.windows(2).all(|pair| pair[0].id < pair[1].id));
+}
+
+#[test]
+fn a_deleted_session_is_gone_and_a_second_delete_says_so() {
+    // Arrange
+    let mut rig = rig();
+
+    // Act
+    let first = rig.store.delete_session(&rig.session).unwrap();
+    let second = rig.store.delete_session(&rig.session).unwrap();
+
+    // Assert
+    assert!(first);
+    assert!(!second);
+    assert!(rig.store.load_session(&rig.session).is_err());
+}
+
+#[test]
+fn a_live_schedule_stays_in_the_list_when_many_newer_done_ones_exist() {
+    // Arrange
+    let mut rig = rig();
+    let live = rig
+        .store
+        .add_schedule(
+            &every(MAX_SCHEDULE_INTERVAL_SECS),
+            &into(&rig.session),
+            "live",
+        )
+        .unwrap();
+    for _ in 0..=(MAX_LISTED_SCHEDULES / MAX_SCHEDULES) {
+        for _ in 0..MAX_SCHEDULES - 1 {
+            rig.store
+                .add_schedule(
+                    &ScheduleSpec::Once { at: START + 1 },
+                    &into(&rig.session),
+                    "x",
+                )
+                .unwrap();
+        }
+        advance(&rig, MINUTE_MS);
+        loop {
+            let claimed = rig.store.claim_due_schedules(MAX_SCHEDULES).unwrap();
+            if claimed.is_empty() {
+                break;
+            }
+            for schedule in claimed {
+                rig.store.finish_schedule_run(schedule.id).unwrap();
+            }
+        }
+    }
+
+    // Act
+    let listed = rig.store.list_schedules().unwrap();
+
+    // Assert
+    assert_eq!(listed.len(), MAX_LISTED_SCHEDULES);
+    assert_eq!(listed[0].id, live.id);
+    assert!(listed.windows(2).all(|pair| pair[0].id < pair[1].id));
+}
+
+#[test]
+fn control_characters_in_an_error_are_replaced_by_spaces() {
+    // Arrange
+    let mut rig = rig();
+    let added = rig
+        .store
+        .add_schedule(&every(60), &into(&rig.session), "hi")
+        .unwrap();
+
+    // Act
+    rig.store
+        .record_schedule_failure(added.id, "a\u{1b}[31mb\nc\td")
+        .unwrap();
+
+    // Assert
+    let kept = rig.store.list_schedules().unwrap().remove(0);
+    assert_eq!(kept.last_error.as_deref(), Some("a [31mb c d"));
 }
