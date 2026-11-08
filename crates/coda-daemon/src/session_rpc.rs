@@ -234,6 +234,16 @@ pub(crate) async fn ensure_checkout(
     else {
         return Ok(());
     };
+    restore_checkout(hub, trees, &id).await
+}
+
+/// Puts back the checkout of `id` when it has a recorded worktree whose folder is gone.
+pub(crate) async fn restore_checkout(
+    hub: &Arc<Hub>,
+    trees: &Arc<Worktrees>,
+    id: &SessionId,
+) -> Result<(), ErrorObject> {
+    let id = id.clone();
     let recorded: Option<SessionWorktree> = hub
         .with_store({
             let id = id.clone();

@@ -410,7 +410,7 @@ If a worktree folder is removed and the session is resumed or sent to again, the
 
 ## `[worktree.cleanup]`
 
-`coda worktree clean` lists every worktree coda made, with its size and what cleanup would do with it, and changes nothing. `coda worktree clean --apply` removes the ones marked for removal, and it only works while `enabled` is `true`. Cleanup is off by default, and nothing runs on its own: you run the command. Keys come from this file only.
+`coda worktree clean` lists every worktree coda made, with its size and what cleanup would do with it, and changes nothing. `coda worktree clean --apply` removes the ones marked for removal, and it only works while `enabled` is `true`. Cleanup is off by default, and nothing runs on its own: you run the command. A session whose folder was removed gets it back the next time you send to it, or a scheduled prompt or a pull request watch wake runs for it. A queued message that starts after a turn ends, and a continuation after a daemon restart, do not restore it yet. Keys come from this file only.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |

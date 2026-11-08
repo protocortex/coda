@@ -74,6 +74,7 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
     .await;
     info!(?report, "startup cleanup finished");
     let turns = build_turns(&config, &ctx.dirs, &hub);
+    turns.set_worktrees(Arc::clone(&worktrees));
     turns.start_continuations(&report.continued);
     let scheduler = scheduler::spawn(Arc::clone(&hub), Arc::clone(&turns));
     let bound = bound

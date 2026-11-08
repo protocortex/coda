@@ -79,6 +79,7 @@ use crate::subscribe::{Hub, HubError};
 use crate::supervisor::{RestartPolicy, Supervisor, TokioSleeper, Verdict};
 use crate::trace::backend_span;
 use crate::watchdog::{Phase, Timing, Watchdog};
+use crate::worktree::Worktrees;
 
 /// The session named in a request does not exist.
 pub const SESSION_NOT_FOUND: i64 = -32002;
@@ -359,6 +360,8 @@ pub struct Turns {
     supervisor: Supervisor,
     /// The pull request watches that wake sessions.
     pr_watches: Arc<PrWatches>,
+    /// Where worktrees live, so a run the daemon starts itself can put one back.
+    worktrees: OnceLock<Arc<Worktrees>>,
     /// Set once the daemon shuts down, so no crashed backend is restarted.
     stopping: AtomicBool,
 }
@@ -408,6 +411,7 @@ impl Turns {
             idle: IdlePool::new(MAX_IDLE_SERVERS),
             supervisor,
             pr_watches: PrWatches::new(),
+            worktrees: OnceLock::new(),
             stopping: AtomicBool::new(false),
         });
         turns.models.set_pr_watches(Arc::clone(&turns.pr_watches));
@@ -422,19 +426,7 @@ impl Turns {
         let waking = Arc::downgrade(&turns);
         turns.pr_watches.set_waker(Arc::new(move |session, text| {
             if let Some(turns) = waking.upgrade() {
-                tokio::spawn(async move {
-                    let wake = SessionSendParams {
-                        session_id: session.clone(),
-                        text,
-                        max_turns: None,
-                        token_cap: None,
-                        mode: SendMode::Queue,
-                        client_request_id: None,
-                    };
-                    if let Err(error) = turns.send(wake).await {
-                        warn!(session = %session, %error, "could not wake a session for its pull request watch");
-                    }
-                });
+                tokio::spawn(async move { turns.wake_for_watch(session, text).await });
             }
         }));
         let weak = Arc::downgrade(&turns);
@@ -444,6 +436,42 @@ impl Turns {
             }
         }));
         turns
+    }
+
+    /// Sends a pull request watch's message into its session, after putting
+    /// back the session's folder if a cleanup removed it.
+    pub(crate) async fn wake_for_watch(self: &Arc<Self>, session: SessionId, text: String) {
+        if let Err(error) = self.ensure_checkout(&session).await {
+            warn!(session = %session, %error, "could not restore a session folder for its pull request watch");
+            return;
+        }
+        let wake = SessionSendParams {
+            session_id: session.clone(),
+            text,
+            max_turns: None,
+            token_cap: None,
+            mode: SendMode::Queue,
+            client_request_id: None,
+        };
+        if let Err(error) = self.send(wake).await {
+            warn!(session = %session, %error, "could not wake a session for its pull request watch");
+        }
+    }
+
+    /// Sets where worktrees live. The first call wins.
+    pub fn set_worktrees(&self, worktrees: Arc<Worktrees>) {
+        let _ = self.worktrees.set(worktrees);
+    }
+
+    /// Puts back the folder of a session whose worktree was cleaned, before a
+    /// send the daemon starts on its own (a schedule or a pull request watch).
+    pub(crate) async fn ensure_checkout(&self, session: &SessionId) -> Result<(), String> {
+        let Some(trees) = self.worktrees.get() else {
+            return Ok(());
+        };
+        crate::session_rpc::restore_checkout(&self.hub, trees, session)
+            .await
+            .map_err(|e| e.message)
     }
 
     /// Starts a turn with `text` and returns without waiting for it to end.
