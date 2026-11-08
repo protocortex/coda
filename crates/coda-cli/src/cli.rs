@@ -248,6 +248,9 @@ pub struct SessionShipArgs {
     /// Open the pull request ready for review instead of as a draft.
     #[arg(long, requires = "pr")]
     pub ready: bool,
+    /// Stage every change first. Without it only what is already staged is committed.
+    #[arg(long)]
+    pub all: bool,
     /// Print the result as JSON.
     #[arg(long)]
     pub json: bool,

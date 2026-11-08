@@ -970,6 +970,7 @@ mod tests {
         git(&f.repo, &["config", "user.email", "t@t"]);
         git(&f.repo, &["config", "commit.gpgsign", "false"]);
         std::fs::write(f.repo.join("a.txt"), "two\n").unwrap();
+        git(&f.repo, &["add", "a.txt"]);
         let script = root.join("gh");
         std::fs::write(&script, format!("#!/bin/sh\necho '{SHIPPED_PR}'\n")).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();

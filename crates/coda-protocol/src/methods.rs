@@ -601,6 +601,9 @@ pub struct SessionShipParams {
     /// Open the pull request ready for review instead of as a draft.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ready: bool,
+    /// Stage every change first. Off by default, so only what is already staged is committed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
 }
 
 /// Result of [`SESSION_SHIP`].
@@ -610,6 +613,9 @@ pub struct SessionShipResult {
     pub commit: String,
     /// The branch that was committed to.
     pub branch: String,
+    /// The files the commit holds, as paths relative to the repository root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
     /// Whether the branch was pushed.
     pub pushed: bool,
     /// The address of the pull request that was opened, when the action asked for one.
