@@ -95,7 +95,8 @@ skipped. The run is headless use of Claude Code, which the user confirmed
   400000 token cap. In `accept-edits` mode edits to any path inside the copy
   are allowed without a grant, except execution-affecting paths (`Cargo.toml`,
   `build.rs`, `rust-toolchain.toml`, `Makefile`, `justfile`, `package.json` and other
-  build and package files, `.cargo/config.toml`, `.git/hooks`,
+  build and package files, `.cargo/config.toml`, `.gitattributes`, anything
+  under a `.git` directory or a `.git` file (`config`, `info`, `hooks`; `info` selects drivers that `config` defines),
   `.github/workflows` and `scripts`, see `is_execution_affecting` in
   `crates/coda-providers/src/policy.rs`), which
   need a prompt that a headless run denies; a grant never overrides that. The
