@@ -56,7 +56,9 @@ use crate::checkpoint;
 use crate::gate::{BrokerGate, Brokers};
 use crate::idle_pool::IdlePool;
 use crate::pr_watches::{PrWatches, WatchPrTool};
-use crate::ship::{creates_pull_request, ended_cleanly, printed_pull_request};
+use crate::ship::{
+    ShipTools, creates_pull_request, ended_cleanly, origin_host, printed_pull_request_of,
+};
 use crate::subscribe::{Hub, HubError};
 use crate::trace::backend_span;
 use crate::turn::{
@@ -1305,6 +1307,27 @@ async fn event_row(hub: &Arc<Hub>, session: &SessionId, event: &TurnEvent) -> Ro
     }
 }
 
+/// The pull request address in the output of a `gh pr create`, taken only when it
+/// is on the session folder's `origin` host. Without a readable origin
+/// nothing is taken, so output from another host or repository is never linked.
+async fn pull_request_of_origin(
+    hub: &Arc<Hub>,
+    session: &SessionId,
+    output: String,
+) -> Option<String> {
+    let id = session.clone();
+    let record = hub
+        .with_store(move |store| store.load_session(&id))
+        .await
+        .ok()?;
+    let found = tokio::task::spawn_blocking(move || {
+        let repo = origin_host(&ShipTools::default(), std::path::Path::new(&record.cwd))?;
+        printed_pull_request_of(&output, &repo)
+    })
+    .await;
+    found.ok().flatten()
+}
+
 /// Answer text the loop streamed that is not stored yet. Consecutive chunks
 /// within [`DELTA_WINDOW`] become one row, as for a backend turn, so a long
 /// answer is not one row per token. Any other event flushes the text first, so
@@ -1343,7 +1366,9 @@ impl StreamedText {
         }
         let TurnEvent::Text(chunk) = event else {
             self.flush(hub, session, turn).await;
-            if let Some(url) = self.opened_pull_request(&event) {
+            if let Some(output) = self.opened_pull_request(&event)
+                && let Some(url) = pull_request_of_origin(hub, session, output).await
+            {
                 let session = session.clone();
                 let linked = hub
                     .with_store_mut(move |store| store.link_pull_request(&session, &url))
@@ -1365,7 +1390,7 @@ impl StreamedText {
         }
     }
 
-    /// The address of the pull request a `gh pr create` the model ran has just opened.
+    /// The output of a `gh pr create` the model ran that has just ended without a failure.
     fn opened_pull_request(&mut self, event: &TurnEvent) -> Option<String> {
         match event {
             TurnEvent::Assistant { tool_calls, .. } => {
@@ -1384,9 +1409,9 @@ impl StreamedText {
                 is_error,
                 text,
                 ..
-            } if self.pr_calls.remove(call_id) && !is_error => ended_cleanly(text)
-                .then(|| printed_pull_request(text))
-                .flatten(),
+            } if self.pr_calls.remove(call_id) && !is_error => {
+                ended_cleanly(text).then(|| text.clone())
+            }
             _ => None,
         }
     }
