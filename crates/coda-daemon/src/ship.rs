@@ -93,9 +93,27 @@ pub(crate) fn ship(
             "{branch} is the default branch; make a branch for the change before pushing"
         ));
     }
-    run(&tools.git, cwd, &["add", "--all"], GIT_LIMIT)?;
-    if run(&tools.git, cwd, &["diff", "--cached", "--quiet"], GIT_LIMIT).is_ok() {
-        return Err("there is nothing to commit".to_owned());
+    if params.all {
+        run(&tools.git, cwd, &["add", "--all"], GIT_LIMIT)?;
+    }
+    let staged = run(
+        &tools.git,
+        cwd,
+        &["diff", "--cached", "--name-only", "--no-renames", "-z"],
+        GIT_LIMIT,
+    )?;
+    let files: Vec<String> = staged
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if files.is_empty() {
+        return Err(if params.all {
+            "there is nothing to commit".to_owned()
+        } else {
+            "there is nothing to commit: stage files first, or ship with --all to stage every change"
+                .to_owned()
+        });
     }
     run(
         &tools.git,
@@ -109,6 +127,7 @@ pub(crate) fn ship(
     let mut result = SessionShipResult {
         commit,
         branch: branch.clone(),
+        files,
         pushed: false,
         pull_request: None,
     };
@@ -299,6 +318,7 @@ mod tests {
             message: "fix(parser): keep the last line\n\nmore".to_owned(),
             body: Some("because it was lost".to_owned()),
             ready: false,
+            all: true,
         }
     }
 
@@ -357,6 +377,64 @@ mod tests {
         assert_eq!(git(&rig.work, &["status", "--porcelain"]), "");
         assert!(git(&rig.work, &["log", "-1", "--format=%B"]).starts_with("fix(parser)"));
         assert_eq!(git(&rig.remote, &["branch", "--list"]).trim(), "");
+    }
+
+    #[test]
+    fn without_all_only_the_staged_files_are_committed_and_listed() {
+        // Arrange
+        let rig = rig();
+        fs::write(rig.work.join("a.txt"), "two\n").unwrap();
+        fs::write(rig.work.join("staged.txt"), "staged\n").unwrap();
+        fs::write(rig.work.join(".env"), "SECRET=1\n").unwrap();
+        git(&rig.work, &["add", "staged.txt"]);
+        let mut asked = params(ShipAction::Commit);
+        asked.all = false;
+
+        // Act
+        let done = ship(&rig.tools, &rig.work, &asked).unwrap();
+
+        // Assert
+        assert_eq!(done.files, ["staged.txt"]);
+        assert_eq!(
+            git(&rig.work, &["show", "--name-only", "--format=", "HEAD"]).trim(),
+            "staged.txt"
+        );
+        assert_eq!(
+            git(&rig.work, &["status", "--porcelain"]),
+            " M a.txt\n?? .env\n"
+        );
+    }
+
+    #[test]
+    fn without_all_and_nothing_staged_is_refused_and_leaves_the_tree_alone() {
+        // Arrange
+        let rig = rig();
+        fs::write(rig.work.join("a.txt"), "two\n").unwrap();
+        let mut asked = params(ShipAction::CommitPush);
+        asked.all = false;
+
+        // Act
+        let refused = ship(&rig.tools, &rig.work, &asked).unwrap_err();
+
+        // Assert
+        assert!(refused.contains("stage files first"), "{refused}");
+        assert_eq!(git(&rig.work, &["status", "--porcelain"]), " M a.txt\n");
+        assert_eq!(git(&rig.remote, &["branch", "--list"]).trim(), "");
+    }
+
+    #[test]
+    fn all_stages_every_change_and_lists_the_files() {
+        // Arrange
+        let rig = rig();
+        fs::write(rig.work.join("a.txt"), "two\n").unwrap();
+        fs::write(rig.work.join("new.txt"), "new\n").unwrap();
+        fs::write(rig.work.join("odd name\u{e9}.txt"), "x\n").unwrap();
+
+        // Act
+        let done = ship(&rig.tools, &rig.work, &params(ShipAction::Commit)).unwrap();
+
+        // Assert
+        assert_eq!(done.files, ["a.txt", "new.txt", "odd name\u{e9}.txt"]);
     }
 
     #[test]

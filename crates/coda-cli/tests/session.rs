@@ -331,13 +331,22 @@ async fn ship_commits_the_session_changes_with_the_given_message() {
 
     // Act
     let shipped = rig
-        .coda(&["session", "ship", &id, "--message", "feat: add b", "--json"])
+        .coda(&[
+            "session",
+            "ship",
+            &id,
+            "--message",
+            "feat: add b",
+            "--all",
+            "--json",
+        ])
         .await;
 
     // Assert
     assert_eq!(shipped.code, ExitCode::SUCCESS, "{}", shipped.err);
     let result: Value = serde_json::from_str(&shipped.out).unwrap();
     assert_eq!(result["pushed"], false);
+    assert_eq!(result["files"], serde_json::json!(["b.txt"]));
     let log = std::process::Command::new("git")
         .args(["log", "-1", "--format=%s"])
         .current_dir(rig.work.path())

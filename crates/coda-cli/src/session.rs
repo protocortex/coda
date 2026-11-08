@@ -156,6 +156,7 @@ async fn ship(
         message: args.message,
         body: args.body,
         ready: args.ready,
+        all: args.all,
     };
     let done: SessionShipResult = client
         .request_within(
@@ -169,6 +170,9 @@ async fn ship(
         return Ok(());
     }
     writeln!(io.out, "committed {} on {}", done.commit, done.branch)?;
+    for file in &done.files {
+        writeln!(io.out, "  {file}")?;
+    }
     if done.pushed {
         writeln!(io.out, "pushed {} to origin", done.branch)?;
     }
