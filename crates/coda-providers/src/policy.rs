@@ -13,7 +13,8 @@ use crate::tool_request::Tool;
 /// any depth, matched without regard to case because the usual macOS
 /// filesystem does not tell `Makefile` from `makefile`. `edit`, `write` and `multi_edit` all ask about these in
 /// accept-edits mode.
-const EXECUTION_FILE_NAMES: [&str; 27] = [
+const EXECUTION_FILE_NAMES: [&str; 28] = [
+    ".gitattributes",
     "Cargo.toml",
     "build.rs",
     "rust-toolchain.toml",
@@ -45,8 +46,12 @@ const EXECUTION_FILE_NAMES: [&str; 27] = [
 const CARGO_DIR: &str = ".cargo";
 const CARGO_CONFIG_FILE: &str = "config.toml";
 /// Directories whose contents run on commits, in CI or by hand, from the root.
-const ROOT_EXECUTION_DIRS: [&[&str]; 3] =
-    [&[".git", "hooks"], &[".github", "workflows"], &["scripts"]];
+const ROOT_EXECUTION_DIRS: [&[&str]; 2] = [&[".github", "workflows"], &["scripts"]];
+/// Git's own directory, or the `.git` file a worktree uses to point at it. Its
+/// `config` and `hooks` run code on the next git command and `info` picks the
+/// drivers `config` defines, so any path
+/// through a component with this name, at any depth, is execution affecting.
+const GIT_DIR: &str = ".git";
 
 /// What the policy says to do with a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +173,9 @@ pub fn is_execution_affecting(workspace_root: &Path, path: &Path) -> bool {
     let Some(file_name) = parts.last() else {
         return false;
     };
+    if parts.iter().any(|part| part.eq_ignore_ascii_case(GIT_DIR)) {
+        return true;
+    }
     if EXECUTION_FILE_NAMES
         .iter()
         .any(|name| name.eq_ignore_ascii_case(file_name))
@@ -1057,6 +1065,69 @@ mod tests {
                     assert_eq!(verdict, Verdict::Prompt, "{tool:?} on {path}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn accept_edits_prompts_for_git_metadata_at_the_root_and_nested() {
+        // Arrange
+        let paths = [
+            ".git/config",
+            ".git/info/exclude",
+            ".git/info/attributes",
+            ".git/modules/sub/config",
+            ".git",
+            ".GIT/config",
+            ".gitattributes",
+            ".GitAttributes",
+            "packages/app/.git/config",
+            "packages/app/.git/info/attributes",
+            "packages/app/.git",
+            "./.git/config",
+            "src/../.git/config",
+            ".git/config/",
+            "packages/app/.gitattributes",
+        ];
+
+        for path in paths {
+            for tool in [Tool::Edit, Tool::Write, Tool::MultiEdit] {
+                let targets = [ClassifiedTarget {
+                    path: PathBuf::from(path),
+                    target: Target::Inside,
+                }];
+                let input = PolicyInput {
+                    mode: PermissionMode::AcceptEdits,
+                    tool: &tool,
+                    workspace_root: Path::new(ROOT),
+                    targets: &targets,
+                    granted: false,
+                };
+
+                // Act
+                let verdict = decide(&input);
+
+                // Assert
+                assert_eq!(verdict, Verdict::Prompt, "{tool:?} on {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn files_that_merely_resemble_git_metadata_stay_plain() {
+        // Arrange
+        let plain = [
+            ".gitignore",
+            "docs/.github/readme.md",
+            "src/git/config",
+            "a.git/config",
+        ];
+
+        for path in plain {
+            // Act
+            let result = is_execution_affecting(Path::new(ROOT), Path::new(path));
+
+            // Assert
+            assert!(!result, "{path} should be plain");
         }
     }
 
