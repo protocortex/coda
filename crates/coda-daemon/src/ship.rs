@@ -3,7 +3,9 @@
 //! `session.ship`: commit what a session changed, push the branch and open a
 //! pull request, each through the user's own `git` and `gh`.
 //!
-//! Signing, sign-off and the `gh` login come from the user's git and `gh`
+//! The commit is signed when the user's git is set to sign (`commit.gpgsign`). It has a
+//! sign-off only when a hook of the user's, such as `prepare-commit-msg`, adds one,
+//! because the commit runs without `-s`. The `gh` login comes from the user's `gh`
 //! setup. Nothing here reads a token or a credential file, and nothing forces a
 //! push. The text of the commit and of the pull request comes from the request.
 
@@ -428,6 +430,15 @@ mod tests {
         git(&work, &["config", "user.name", "t"]);
         git(&work, &["config", "user.email", "t@t"]);
         git(&work, &["config", "commit.gpgsign", "false"]);
+        git(&work, &["config", "gpg.format", "openpgp"]);
+        git(
+            &work,
+            &[
+                "config",
+                "core.hooksPath",
+                work.join(".git/hooks").to_str().unwrap(),
+            ],
+        );
         git(
             &work,
             &["remote", "add", "origin", remote.to_str().unwrap()],
@@ -692,6 +703,77 @@ mod tests {
 
         // Assert
         assert_eq!(done.files, ["a.txt", "new.txt", "odd name\u{e9}.txt"]);
+    }
+
+    fn commit_text(rig: &Rig) -> String {
+        git(&rig.work, &["cat-file", "commit", "HEAD"])
+    }
+
+    #[test]
+    fn the_commit_has_no_sign_off_or_signature_unless_the_users_git_adds_one() {
+        // Arrange
+        let rig = rig();
+        fs::write(rig.work.join("a.txt"), "two\n").unwrap();
+
+        // Act
+        ship(&rig.tools, &rig.work, &params(ShipAction::Commit)).unwrap();
+
+        // Assert
+        let text = commit_text(&rig);
+        assert!(!text.contains("Signed-off-by"), "{text}");
+        assert!(!text.contains("gpgsig"), "{text}");
+    }
+
+    #[test]
+    fn a_sign_off_added_by_the_users_commit_hook_is_in_the_commit() {
+        // Arrange
+        let rig = rig();
+        let hook = rig.work.join(".git/hooks/prepare-commit-msg");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf '\\nSigned-off-by: Dev <dev@example.com>\\n' >> \"$1\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(rig.work.join("a.txt"), "two\n").unwrap();
+
+        // Act
+        ship(&rig.tools, &rig.work, &params(ShipAction::Commit)).unwrap();
+
+        // Assert
+        let text = commit_text(&rig);
+        assert!(
+            text.contains("Signed-off-by: Dev <dev@example.com>"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_commit_is_signed_when_the_users_git_is_set_to_sign() {
+        // Arrange
+        let rig = rig();
+        let signer = rig.work.join("fake-signer");
+        fs::write(
+            &signer,
+            "#!/bin/sh\ncat > /dev/null\necho '[GNUPG:] SIG_CREATED ' >&2\n\
+             printf -- '-----BEGIN PGP SIGNATURE-----\\n\\nfake\\n-----END PGP SIGNATURE-----\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&signer, fs::Permissions::from_mode(0o755)).unwrap();
+        git(&rig.work, &["config", "commit.gpgsign", "true"]);
+        git(&rig.work, &["config", "user.signingkey", "ABCDEF"]);
+        git(
+            &rig.work,
+            &["config", "gpg.program", signer.to_str().unwrap()],
+        );
+        fs::write(rig.work.join("a.txt"), "two\n").unwrap();
+
+        // Act
+        ship(&rig.tools, &rig.work, &params(ShipAction::Commit)).unwrap();
+
+        // Assert
+        let text = commit_text(&rig);
+        assert!(text.contains("gpgsig"), "{text}");
     }
 
     #[test]
