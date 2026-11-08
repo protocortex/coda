@@ -2085,4 +2085,51 @@ mod pull_request_link {
         // Assert
         assert_eq!(found, None);
     }
+
+    #[tokio::test]
+    async fn an_address_is_linked_only_when_it_is_on_the_origin_host() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["remote", "add", "origin", "https://github.com/acme/app.git"],
+        ] {
+            let done = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "{args:?}");
+        }
+        let mut store = coda_store::Store::open(&dir.path().join("store")).unwrap();
+        let session = store
+            .create_session(&coda_store::NewSession {
+                backend: coda_protocol::types::BackendKind::Faux,
+                model: None,
+                cwd: repo.to_string_lossy().into_owned(),
+                mode: coda_protocol::types::Mode::Default,
+            })
+            .unwrap();
+        let hub = crate::subscribe::Hub::new(store, 8);
+
+        // Act
+        let own = super::super::pull_request_of_origin(
+            &hub,
+            &session,
+            "https://github.com/acme/app/pull/3".to_owned(),
+        )
+        .await;
+        let foreign = super::super::pull_request_of_origin(
+            &hub,
+            &session,
+            "https://evil.example/acme/app/pull/3".to_owned(),
+        )
+        .await;
+
+        // Assert
+        assert_eq!(own.as_deref(), Some("https://github.com/acme/app/pull/3"));
+        assert_eq!(foreign, None);
+    }
 }

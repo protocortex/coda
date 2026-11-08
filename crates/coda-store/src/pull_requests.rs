@@ -8,8 +8,12 @@ use rusqlite::params;
 use crate::sessions::session_row_id;
 use crate::{Store, StoreError};
 
+/// Most pull requests linked to one session. Further ones are ignored.
+pub const MAX_PULL_REQUESTS_PER_SESSION: usize = 20;
+
 impl Store {
-    /// Links a pull request address to a session. Linking the same address again changes nothing.
+    /// Links a pull request address to a session. Linking the same address again changes
+    /// nothing, and neither does linking one past [`MAX_PULL_REQUESTS_PER_SESSION`].
     ///
     /// # Errors
     ///
@@ -22,8 +26,14 @@ impl Store {
         self.load_session(session)?;
         self.conn.execute(
             "INSERT OR IGNORE INTO session_pull_requests (session_id, url, created_at) \
-             VALUES (?1, ?2, ?3)",
-            params![row_id, url, self.clock.now_ms()],
+             SELECT ?1, ?2, ?3 WHERE \
+             (SELECT COUNT(*) FROM session_pull_requests WHERE session_id = ?1) < ?4",
+            params![
+                row_id,
+                url,
+                self.clock.now_ms(),
+                i64::try_from(MAX_PULL_REQUESTS_PER_SESSION).unwrap_or(i64::MAX)
+            ],
         )?;
         Ok(())
     }

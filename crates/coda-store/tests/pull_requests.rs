@@ -3,7 +3,7 @@
 //! The pull requests linked to a session.
 
 use coda_protocol::types::{BackendKind, Mode, SessionId};
-use coda_store::{NewSession, Store};
+use coda_store::{MAX_PULL_REQUESTS_PER_SESSION, NewSession, Store};
 use tempfile::TempDir;
 
 const FIRST: &str = "https://github.com/o/r/pull/1";
@@ -72,4 +72,25 @@ fn linking_to_a_session_that_does_not_exist_fails() {
 
     // Assert
     assert!(linked.is_err());
+}
+
+#[test]
+fn a_session_keeps_at_most_the_limit_of_pull_requests() {
+    // Arrange
+    let (_dir, mut store, session) = open();
+
+    // Act
+    for n in 0..MAX_PULL_REQUESTS_PER_SESSION + 5 {
+        store
+            .link_pull_request(&session, &format!("https://github.com/o/r/pull/{n}"))
+            .unwrap();
+    }
+
+    // Assert
+    let kept = store.session_pull_requests(&session).unwrap();
+    assert_eq!(kept.len(), MAX_PULL_REQUESTS_PER_SESSION);
+    assert!(kept.contains(&"https://github.com/o/r/pull/0".to_owned()));
+    assert!(!kept.contains(&format!(
+        "https://github.com/o/r/pull/{MAX_PULL_REQUESTS_PER_SESSION}"
+    )));
 }

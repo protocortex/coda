@@ -28,7 +28,15 @@ const NO_PROMPT_VARIABLES: [(&str, &str); 2] =
     [("GIT_TERMINAL_PROMPT", "0"), ("GH_PROMPT_DISABLED", "1")];
 const URL_PREFIX: &str = "https://";
 const PULL_PATH: &str = "/pull/";
-const PR_CREATE_COMMAND: &str = "gh pr create";
+const PULL_WORD: &str = "pull";
+const PR_CREATE_WORDS: [&str; 3] = ["gh", "pr", "create"];
+/// Characters that start shell syntax the word splitter does not read: escapes,
+/// command substitution, subshells, groups, heredocs and comments. They count even inside
+/// quotes, since a line that holds one is not worth the risk of misreading.
+const UNREAD_SHELL_SYNTAX: [char; 8] = ['\\', '`', '(', ')', '{', '}', '<', '#'];
+/// A pull request address is `https://host/owner/repo/pull/number`: this many path parts.
+const PULL_PATH_PARTS: usize = 4;
+const PULL_WORD_INDEX: usize = 2;
 /// What the shell tool appends to the output of a command that exited with a failure.
 const EXIT_STATUS_MARKER: &str = "[exit status";
 /// Longest pull request address kept.
@@ -183,9 +191,146 @@ fn open_pull_request(
         .ok_or_else(|| "gh did not print the address of the pull request".to_owned())
 }
 
-/// Whether `command` runs `gh pr create`, so its output holds a pull request address.
+/// Whether some command of the shell line `command` is `gh pr create`, so its output
+/// holds a pull request address. Text inside quotes or after another command's name
+/// does not count. A line with escapes, subshells, groups or redirections is not read at
+/// all, so it never counts: a lost link is better than a planted one.
 pub(crate) fn creates_pull_request(command: &str) -> bool {
-    command.contains(PR_CREATE_COMMAND)
+    if command.contains(UNREAD_SHELL_SYNTAX) {
+        return false;
+    }
+    command_words(command).iter().any(|words| {
+        words
+            .iter()
+            .map(String::as_str)
+            .skip_while(|w| is_assignment(w))
+            .take(PR_CREATE_WORDS.len())
+            .eq(PR_CREATE_WORDS)
+    })
+}
+
+/// A word like `NAME=value`, which sets a variable for the command after it.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// The words of each command of a shell line, split at unquoted `;`, `&`, `|` and
+/// newlines, with quotes removed. It reads only what is needed to find a command's name.
+fn command_words(line: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for c in line.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, ';' | '&' | '|' | '\n') => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+                if !words.is_empty() {
+                    commands.push(std::mem::take(&mut words));
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    if !words.is_empty() {
+        commands.push(words);
+    }
+    commands
+}
+
+/// The host `origin` points at. Compared without case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OriginHost(String);
+
+impl OriginHost {
+    /// Reads the host of a remote in the forms `https://host/owner/repo(.git)`,
+    /// `ssh://user@host(:port)/owner/repo(.git)` and `user@host:owner/repo(.git)`. A path on
+    /// disk, a `file:` address or an address without an owner and a repository gives `None`.
+    pub(crate) fn parse(remote: &str) -> Option<Self> {
+        let remote = remote.trim();
+        let (authority, path, port_is_part_of_host) = match remote.split_once("://") {
+            Some((scheme @ ("https" | "http" | "ssh" | "git"), rest)) => {
+                let (authority, path) = rest.split_once('/')?;
+                (authority, path, matches!(scheme, "https" | "http"))
+            }
+            Some(_) => return None,
+            None => {
+                let (authority, path) = remote.split_once(':')?;
+                (authority, path, false)
+            }
+        };
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let host = if port_is_part_of_host {
+            host
+        } else {
+            host.split(':').next().unwrap_or(host)
+        };
+        let mut parts = path
+            .trim_matches('/')
+            .trim_end_matches(".git")
+            .split('/')
+            .filter(|part| !part.is_empty());
+        let (owner, repo) = (parts.next()?, parts.next()?);
+        if host.is_empty() || owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        Some(Self(host.to_ascii_lowercase()))
+    }
+
+    fn owns(&self, url: &str) -> bool {
+        let Some((host, path)) = url
+            .strip_prefix(URL_PREFIX)
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            return false;
+        };
+        let parts: Vec<&str> = path.split('/').collect();
+        host.eq_ignore_ascii_case(&self.0)
+            && parts.len() == PULL_PATH_PARTS
+            && parts[PULL_WORD_INDEX] == PULL_WORD
+            && parts[..PULL_WORD_INDEX].iter().all(|part| !part.is_empty())
+            && !parts[PULL_PATH_PARTS - 1].is_empty()
+            && parts[PULL_PATH_PARTS - 1]
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+    }
+}
+
+/// The host of the remote `origin` in the folder `cwd`, or `None` when there is no such
+/// remote or it is not in a form [`OriginHost::parse`] reads.
+pub(crate) fn origin_host(tools: &ShipTools, cwd: &Path) -> Option<OriginHost> {
+    let remote = run(&tools.git, cwd, &["remote", "get-url", REMOTE], GIT_LIMIT).ok()?;
+    OriginHost::parse(&remote)
+}
+
+/// The pull request address in `output` that is on `origin`'s host: the last line that is a
+/// pull request address there, so output that names another host is not taken.
+pub(crate) fn printed_pull_request_of(output: &str, origin: &OriginHost) -> Option<String> {
+    printed_pull_request_matching(output, |line| origin.owns(line))
 }
 
 /// Whether the output of a shell tool call ended without a failure exit status.
@@ -195,13 +340,17 @@ pub(crate) fn ended_cleanly(output: &str) -> bool {
 
 /// The pull request address `gh pr create` printed in `output`, if it printed one.
 pub(crate) fn printed_pull_request(output: &str) -> Option<String> {
+    printed_pull_request_matching(output, |line| line.contains(PULL_PATH))
+}
+
+fn printed_pull_request_matching(output: &str, wanted: impl Fn(&str) -> bool) -> Option<String> {
     output
         .lines()
         .map(str::trim)
         .rev()
         .find(|line| {
             line.starts_with(URL_PREFIX)
-                && line.contains(PULL_PATH)
+                && wanted(line)
                 && line.len() <= MAX_URL_BYTES
                 && !line.chars().any(|c| c.is_control() || c.is_whitespace())
         })
@@ -344,6 +493,114 @@ mod tests {
 
         // Assert
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_gh_pr_create_named_only_in_a_string_or_another_command_does_not_count() {
+        // Arrange
+        let opens = [
+            "gh pr create --fill",
+            "git push && gh pr create --fill",
+            "cd sub; gh pr create --title 'a;b'",
+            "FOO=1 gh pr create",
+            "git push\ngh pr create",
+        ];
+        let unread = [
+            "echo \"x\\\"; gh pr create; echo \\\"\"",
+            "cat <<EOF\ngh pr create\nEOF",
+            "(cd x && gh pr create)",
+            "$(gh pr create)",
+            "`gh pr create`",
+            "{ gh pr create; }",
+            "echo https://github.com/acme/app/pull/3 # ; gh pr create",
+            "gh pr create --title 'fix (parser)'",
+        ];
+        let others = [
+            "echo \"gh pr create\"; cat file",
+            "echo 'a; gh pr create'",
+            "cat notes | grep \"gh pr create\"",
+            "gh pr created",
+            "gh pr create-x",
+            "echo gh pr create",
+            "git commit -m 'gh pr create'",
+        ];
+
+        // Act and Assert
+        for command in opens {
+            assert!(creates_pull_request(command), "{command}");
+        }
+        for command in others.iter().chain(unread.iter()) {
+            assert!(!creates_pull_request(command), "{command}");
+        }
+    }
+
+    fn origin() -> OriginHost {
+        OriginHost::parse("git@github.com:Acme/App.git").unwrap()
+    }
+
+    #[test]
+    fn an_origin_remote_reads_as_a_host_in_every_common_form() {
+        // Arrange
+        let forms = [
+            "https://github.com/Acme/App.git",
+            "https://github.com/Acme/App",
+            "https://user@github.com/Acme/App.git",
+            "ssh://git@github.com/Acme/App.git",
+            "git@github.com:Acme/App.git",
+            "https://GitHub.com/acme/app/",
+            "ssh://git@github.com:22/Acme/App.git",
+            "git://github.com/Acme/App.git",
+        ];
+
+        // Act and Assert
+        for form in forms {
+            assert_eq!(OriginHost::parse(form), Some(origin()), "{form}");
+        }
+        assert_eq!(
+            OriginHost::parse("https://ghe.example:8443/a/b.git"),
+            OriginHost::parse("https://ghe.example:8443/c/d")
+        );
+        for bad in [
+            "",
+            "/srv/repos/app.git",
+            "file:///x/y.git",
+            "https://github.com/onlyowner",
+        ] {
+            assert_eq!(OriginHost::parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_a_pull_request_on_the_origin_host_is_taken() {
+        // Arrange
+        let cases = [
+            (
+                "https://github.com/acme/app/pull/7",
+                Some("https://github.com/acme/app/pull/7"),
+            ),
+            (
+                "noise\nhttps://GitHub.com/Acme/App/pull/12\n",
+                Some("https://GitHub.com/Acme/App/pull/12"),
+            ),
+            ("https://evil.example/acme/app/pull/7", None),
+            (
+                "https://github.com/someone/fork/pull/7",
+                Some("https://github.com/someone/fork/pull/7"),
+            ),
+            ("https://github.com/acme/pull/7", None),
+            ("https://github.com/acme/app/pull/7/files", None),
+            ("https://github.com/acme/app/pull/x", None),
+            ("https://github.com.evil.example/acme/app/pull/7", None),
+        ];
+
+        // Act and Assert
+        for (output, want) in cases {
+            assert_eq!(
+                printed_pull_request_of(output, &origin()).as_deref(),
+                want,
+                "{output}"
+            );
+        }
     }
 
     #[test]

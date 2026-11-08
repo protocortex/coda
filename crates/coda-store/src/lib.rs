@@ -36,6 +36,7 @@ pub use grants::{Grant, GrantKey};
 pub use index::{IndexStatus, IndexedFileState, Symbol};
 pub use originals::{MAX_ORIGINAL_BYTES, MAX_SESSION_ORIGINAL_BYTES};
 pub use pending::{NewPending, PendingPermission};
+pub use pull_requests::MAX_PULL_REQUESTS_PER_SESSION;
 pub use queue::{MAX_QUEUED_MESSAGES, MAX_QUEUED_TEXT_BYTES, NewQueued, QueuedMessage};
 pub use readers::{RepoIndex, SessionOriginals};
 pub use receipts::{RECEIPT_RETENTION_MS, Receipt};
