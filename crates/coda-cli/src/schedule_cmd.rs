@@ -234,8 +234,13 @@ pub(crate) fn line(schedule: &ScheduleInfo) -> String {
         ScheduleTarget::Session { session_id } => format!("session {session_id}"),
         ScheduleTarget::NewSession { cwd, .. } => format!("new session in {cwd}"),
     };
+    let failure = match (&schedule.last_error, schedule.last_error_at) {
+        (Some(error), Some(at)) => format!("  last run failed {}: {error}", format_utc(at)),
+        (Some(error), None) => format!("  last run failed: {error}"),
+        _ => String::new(),
+    };
     format!(
-        "{}  {state}  next {next}  {}  runs {}  {target}  {}",
+        "{}  {state}  next {next}  {}  runs {}  {target}  {}{failure}",
         schedule.id,
         describe(&schedule.spec),
         schedule.runs,
@@ -356,5 +361,47 @@ mod tests {
         assert_eq!(format_utc(1_700_000_000_000), "2023-11-14 22:13 UTC");
         assert_eq!(format_utc(0), "1970-01-01 00:00 UTC");
         assert_eq!(format_utc(951_782_400_000), "2000-02-29 00:00 UTC");
+    }
+
+    fn info(last_error: Option<&str>) -> ScheduleInfo {
+        ScheduleInfo {
+            id: 3,
+            spec: ScheduleSpec::Interval { every_secs: 60 },
+            target: ScheduleTarget::Session {
+                session_id: coda_protocol::types::SessionId::new("s-1"),
+            },
+            text: "check the build".to_owned(),
+            state: ScheduleState::Idle,
+            next_run_at: Some(1_700_000_000_000),
+            last_run_at: Some(1_699_999_940_000),
+            runs: 2,
+            created_at: 0,
+            last_error: last_error.map(str::to_owned),
+            last_error_at: last_error.map(|_| 1_699_999_941_000),
+        }
+    }
+
+    #[test]
+    fn a_schedule_whose_last_run_failed_shows_when_and_why() {
+        // Arrange
+        let failed = info(Some("the queue is full"));
+
+        // Act
+        let text = line(&failed);
+
+        // Assert
+        assert!(
+            text.ends_with("last run failed 2023-11-14 22:12 UTC: the queue is full"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_schedule_that_never_failed_shows_no_failure() {
+        // Arrange and Act
+        let text = line(&info(None));
+
+        // Assert
+        assert!(!text.contains("failed"), "{text}");
     }
 }

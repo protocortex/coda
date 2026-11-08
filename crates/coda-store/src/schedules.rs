@@ -21,10 +21,14 @@ pub const MAX_SCHEDULE_TEXT_BYTES: usize = 16 * 1024;
 /// Longest gap between two runs of an interval schedule, one year.
 pub const MAX_SCHEDULE_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
 const MINUTES_PER_DAY: u32 = 24 * 60;
+/// Most schedules `list_schedules` returns: the live ones first, then the newest done ones.
+pub const MAX_LISTED_SCHEDULES: usize = 200;
+/// Longest error kept on a schedule row, in characters.
+pub const MAX_SCHEDULE_ERROR_CHARS: usize = 300;
 
 const COLUMNS: &str = "id, kind, at, every_secs, minute_of_day, weekdays, target_session, \
                        backend, model, cwd, mode, text, state, next_run_at, last_run_at, runs, \
-                       created_at";
+                       created_at, last_error, last_error_at";
 
 fn refused(reason: impl Into<String>) -> StoreError {
     StoreError::ScheduleRefused {
@@ -95,6 +99,8 @@ fn read(row: &Row<'_>) -> Result<Result<ScheduleInfo, StoreError>, rusqlite::Err
         last_run_at: row.get(14)?,
         runs: get_u64(row, 15)?,
         created_at: row.get(16)?,
+        last_error: row.get(17)?,
+        last_error_at: row.get(18)?,
     };
     Ok(decode(
         info,
@@ -245,10 +251,14 @@ impl Store {
     /// Returns [`StoreError::Sqlite`] when the query fails.
     pub fn list_schedules(&self) -> Result<Vec<ScheduleInfo>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {COLUMNS} FROM scheduled_prompts ORDER BY id"
+            "SELECT {COLUMNS} FROM scheduled_prompts \
+             ORDER BY state = 'done', id DESC LIMIT ?1"
         ))?;
-        let rows = stmt.query_map([], read)?;
-        rows.map(|row| row?).collect()
+        let limit = i64::try_from(MAX_LISTED_SCHEDULES).unwrap_or(i64::MAX);
+        let rows = stmt.query_map([limit], read)?;
+        let mut listed = rows.map(|row| row?).collect::<Result<Vec<_>, _>>()?;
+        listed.sort_by_key(|schedule| schedule.id);
+        Ok(listed)
     }
 
     /// Removes a scheduled prompt; returns whether one had that id.
@@ -291,13 +301,16 @@ impl Store {
             let next = next_after(&schedule.spec, now);
             tx.execute(
                 "UPDATE scheduled_prompts SET state = 'running', next_run_at = ?1, \
-                 last_run_at = ?2, runs = runs + 1 WHERE id = ?3",
+                 last_run_at = ?2, runs = runs + 1, last_error = NULL, last_error_at = NULL \
+                 WHERE id = ?3",
                 params![next, now, i64::try_from(schedule.id).unwrap_or(i64::MAX)],
             )?;
             schedule.state = ScheduleState::Running;
             schedule.next_run_at = next;
             schedule.last_run_at = Some(now);
             schedule.runs += 1;
+            schedule.last_error = None;
+            schedule.last_error_at = None;
             claimed.push(schedule);
         }
         tx.commit()?;
@@ -318,6 +331,56 @@ impl Store {
             [id],
         )?;
         Ok(())
+    }
+
+    /// Records why the run of schedule `id` failed, with the time, cut to
+    /// [`MAX_SCHEDULE_ERROR_CHARS`] characters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the statement fails.
+    pub fn record_schedule_failure(&mut self, id: u64, reason: &str) -> Result<(), StoreError> {
+        let id = i64::try_from(id).unwrap_or(i64::MAX);
+        let reason: String = reason
+            .chars()
+            .take(MAX_SCHEDULE_ERROR_CHARS)
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let now = self.clock.now_ms();
+        self.conn.execute(
+            "UPDATE scheduled_prompts SET last_error = ?1, last_error_at = ?2 WHERE id = ?3",
+            params![reason, now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Ends a schedule for good: it gets no next run, and is done once its current run ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the statement fails.
+    pub fn stop_schedule(&mut self, id: u64) -> Result<(), StoreError> {
+        let id = i64::try_from(id).unwrap_or(i64::MAX);
+        self.conn.execute(
+            "UPDATE scheduled_prompts SET next_run_at = NULL WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the done schedules whose last run, or creation when they never ran, is
+    /// more than `retention_ms` ago. Returns how many it deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the statement fails.
+    pub fn prune_done_schedules(&mut self, retention_ms: i64) -> Result<usize, StoreError> {
+        let cutoff = self.clock.now_ms().saturating_sub(retention_ms);
+        Ok(self.conn.execute(
+            "DELETE FROM scheduled_prompts \
+             WHERE state = 'done' AND COALESCE(last_run_at, created_at) < ?1",
+            [cutoff],
+        )?)
     }
 
     /// Puts back the prompts a crash left running: a repeating one waits for its next run,

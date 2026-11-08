@@ -180,6 +180,21 @@ impl Store {
             .ok_or_else(not_found)?
     }
 
+    /// Deletes a session and everything stored under it. Returns whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the statement fails.
+    pub fn delete_session(&mut self, id: &SessionId) -> Result<bool, StoreError> {
+        let Some(row_id) = session_row_id(id) else {
+            return Ok(false);
+        };
+        let removed = self
+            .conn
+            .execute("DELETE FROM sessions WHERE id = ?1", [row_id])?;
+        Ok(removed == 1)
+    }
+
     /// Lists sessions matching `filter`, oldest first. No match is an empty list.
     ///
     /// # Errors

@@ -1,1 +1,1 @@
-{"schedules":[{"id":1,"spec":{"kind":"once","at":1700000000000},"target":{"kind":"session","session_id":"s-1"},"text":"remind me","state":"done","runs":1,"created_at":1699000000000}]}
+{"schedules":[{"id":1,"spec":{"kind":"once","at":1700000000000},"target":{"kind":"session","session_id":"s-1"},"text":"remind me","state":"done","runs":1,"created_at":1699000000000,"last_error":"the queue is full","last_error_at":1700000000000}]}

@@ -59,6 +59,15 @@ impl Turns {
             .map_err(|e| not_found_or(e, session))
     }
 
+    /// Drops everything the daemon keeps in memory for a session that was deleted,
+    /// so a later session that reuses its id starts clean.
+    pub(crate) async fn forget_session(&self, session: &SessionId) {
+        self.brokers.forget(session);
+        self.backend_ids().remove(session);
+        self.drop_idle(session).await;
+        self.models.close(session);
+    }
+
     /// Stops the pooled backend server and drops the idle model loop, which keep
     /// the mode they were built with. A model loop hands its spent budget on.
     pub(super) async fn drop_idle(&self, session: &SessionId) {
