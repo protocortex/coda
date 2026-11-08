@@ -41,7 +41,9 @@ const GLOBAL_ARGS: [&str; 7] = [
 ];
 /// Variables set on top of the caller's, so git never waits for a person, never
 /// reads system wide configuration and never writes the index to refresh it.
-const FIXED_ENV: [(&str, &str); 4] = [
+const FIXED_ENV: [(&str, &str); 5] = [
+    // A missing object in a partial clone would run the remote's transport program.
+    ("GIT_NO_LAZY_FETCH", "1"),
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_OPTIONAL_LOCKS", "0"),
@@ -52,6 +54,11 @@ const FIXED_ENV: [(&str, &str); 4] = [
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Keys of the filter settings that name a program git runs on file content.
 const FILTER_KEY_PREFIX: &str = "filter.";
+const REQUIRED_OFF: &str = "false";
+const CONFIG_COUNT_VAR: &str = "GIT_CONFIG_COUNT";
+const CONFIG_PARAMETERS_VAR: &str = "GIT_CONFIG_PARAMETERS";
+const CONFIG_KEY_VAR_PREFIX: &str = "GIT_CONFIG_KEY_";
+const CONFIG_VALUE_VAR_PREFIX: &str = "GIT_CONFIG_VALUE_";
 const FILTER_PROGRAM_VARS: [&str; 3] = ["clean", "smudge", "process"];
 /// What `git config --get-regexp` exits with when nothing matches.
 const NO_MATCH_EXIT: i32 = 1;
@@ -93,16 +100,20 @@ impl GitRunner {
             .env_clear()
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .envs(FIXED_ENV)
+            .env_remove(CONFIG_COUNT_VAR)
+            .env_remove(CONFIG_PARAMETERS_VAR)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command
     }
 
-    /// `-c` switches that empty every filter program the repository configures. A
-    /// clean filter runs whenever git compares a file with the index, and
-    /// `.gitattributes` in the tree picks which files it applies to.
-    fn filter_overrides(&self) -> Result<Vec<String>, ToolError> {
+    /// Key and value pairs that empty every filter program the repository
+    /// configures. A clean filter runs whenever git compares a file with the
+    /// index, and `.gitattributes` in the tree picks which files it applies to.
+    /// They go in through `GIT_CONFIG_KEY_n`, because a `-c` switch splits at its
+    /// first `=` and so cannot name a filter that holds one.
+    fn filter_overrides(&self) -> Result<Vec<(String, String)>, ToolError> {
         let listed = self
             .command()
             .args(["config", "--null", "--get-regexp", "^filter\\."])
@@ -127,26 +138,28 @@ impl GitRunner {
             .collect();
         names.sort();
         names.dedup();
-        let mut switches = Vec::new();
+        let mut pairs = Vec::new();
         for name in names {
             for var in FILTER_PROGRAM_VARS {
-                switches.push("-c".to_owned());
-                switches.push(format!("{FILTER_KEY_PREFIX}{name}.{var}="));
+                pairs.push((format!("{FILTER_KEY_PREFIX}{name}.{var}"), String::new()));
             }
-            switches.push("-c".to_owned());
-            switches.push(format!("{FILTER_KEY_PREFIX}{name}.required=false"));
+            pairs.push((
+                format!("{FILTER_KEY_PREFIX}{name}.required"),
+                REQUIRED_OFF.to_owned(),
+            ));
         }
-        Ok(switches)
+        Ok(pairs)
     }
 
     fn run(&self, args: &[&str], cancel: &AtomicBool) -> Result<ToolOutput, ToolError> {
         let overrides = self.filter_overrides()?;
-        let mut child = self
-            .command()
-            .args(&overrides)
-            .args(args)
-            .spawn()
-            .map_err(ToolError::Spawn)?;
+        let mut command = self.command();
+        command.env(CONFIG_COUNT_VAR, overrides.len().to_string());
+        for (index, (key, value)) in overrides.iter().enumerate() {
+            command.env(format!("{CONFIG_KEY_VAR_PREFIX}{index}"), key);
+            command.env(format!("{CONFIG_VALUE_VAR_PREFIX}{index}"), value);
+        }
+        let mut child = command.args(args).spawn().map_err(ToolError::Spawn)?;
         let stdout = child
             .stdout
             .take()
@@ -406,6 +419,8 @@ mod tests {
     use std::fs;
 
     const CAP: usize = 64 * 1024;
+    /// Leading hex digits of an object id that name its folder under `.git/objects`.
+    const OBJECT_FOLDER_LEN: usize = 2;
     const TIMEOUT: Duration = Duration::from_secs(30);
 
     struct Repo {
@@ -614,6 +629,7 @@ mod tests {
         repo.write("a.txt", "two\n");
         repo.git(&["config", "diff.external", &touch]);
         repo.git(&["config", "diff.evil.textconv", &touch]);
+        repo.git(&["config", "diff.evil.command", &touch]);
         repo.git(&["config", "core.fsmonitor", &touch]);
 
         // Act
@@ -650,6 +666,170 @@ mod tests {
             !marker.exists(),
             "git ran a filter from the repository config"
         );
+    }
+
+    /// Filter names a `-c key=value` switch cannot carry whole, plus other odd ones.
+    const ODD_FILTER_NAMES: [&str; 10] = [
+        "a=b", "a==", "=", "A.B", "a..b", ".a", "a.", "a,b", "a\\b", "a:b",
+    ];
+
+    fn marker_after_calls_with_filter(name: &str, env: Vec<(OsString, OsString)>) -> bool {
+        let repo = Repo::new();
+        let marker = repo.dir.path().join("ran");
+        let touch = format!("touch {}", marker.display());
+        repo.write(".gitattributes", &format!("* filter={name}\n"));
+        repo.write("a.txt", "one\n");
+        repo.git(&["add", "."]);
+        repo.write("a.txt", "two\n");
+        for var in ["clean", "smudge", "process"] {
+            repo.git(&["config", &format!("filter.{name}.{var}"), &touch]);
+        }
+        let status = GitStatusTool::new(repo.dir.path().to_path_buf(), env.clone(), TIMEOUT, CAP);
+        let diff = GitDiffTool::new(repo.dir.path().to_path_buf(), env, TIMEOUT, CAP);
+        status.call(&json!({})).unwrap();
+        diff.call(&json!({})).unwrap();
+        diff.call(&json!({"staged": true})).unwrap();
+        marker.exists()
+    }
+
+    #[test]
+    fn a_filter_with_an_odd_name_is_never_run() {
+        for name in ODD_FILTER_NAMES {
+            // Arrange
+            let env = vec![(
+                OsString::from("PATH"),
+                std::env::var_os("PATH").unwrap_or_default(),
+            )];
+
+            // Act
+            let ran = marker_after_calls_with_filter(name, env);
+
+            // Assert
+            assert!(!ran, "git ran a filter named {name:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_object_is_never_fetched_through_a_program_from_the_config() {
+        // Arrange
+        let repo = Repo::new();
+        let marker = repo.dir.path().join("ran");
+        let touch = format!("touch {}; false", marker.display());
+        repo.write("a.txt", "one\n");
+        repo.git(&["add", "."]);
+        let blob = Command::new(GIT)
+            .args(["rev-parse", ":a.txt"])
+            .current_dir(repo.dir.path())
+            .output()
+            .unwrap()
+            .stdout;
+        let blob = String::from_utf8(blob).unwrap();
+        let blob = blob.trim();
+        let (folder, file) = blob.split_at(OBJECT_FOLDER_LEN);
+        fs::remove_file(repo.dir.path().join(".git/objects").join(folder).join(file)).unwrap();
+        repo.write("a.txt", "two\n");
+        repo.git(&["config", "extensions.partialClone", "origin"]);
+        repo.git(&["config", "remote.origin.promisor", "true"]);
+        repo.git(&["config", "remote.origin.url", "ssh://example.invalid/x.git"]);
+        repo.git(&["config", "core.sshCommand", &touch]);
+
+        // Act
+        repo.status().call(&json!({})).unwrap();
+        repo.diff().call(&json!({})).unwrap();
+
+        // Assert
+        assert!(!marker.exists(), "git fetched through a configured program");
+    }
+
+    #[test]
+    fn a_filter_set_in_the_callers_config_parameters_is_never_run() {
+        // Arrange
+        let repo = Repo::new();
+        let marker = repo.dir.path().join("ran");
+        let touch = format!("touch {}", marker.display());
+        repo.write(".gitattributes", "* filter=evil\n");
+        repo.write("a.txt", "one\n");
+        repo.git(&["add", "."]);
+        repo.write("a.txt", "two\n");
+        let mut env = repo.env();
+        env.push((
+            "GIT_CONFIG_PARAMETERS".into(),
+            format!("'filter.evil.clean={touch}'").into(),
+        ));
+        let diff = GitDiffTool::new(repo.dir.path().to_path_buf(), env, TIMEOUT, CAP);
+
+        // Act
+        diff.call(&json!({})).unwrap();
+
+        // Assert
+        assert!(!marker.exists(), "git ran a filter from the environment");
+    }
+
+    #[test]
+    fn program_variables_in_the_callers_environment_are_never_run() {
+        // Arrange
+        let repo = Repo::new();
+        let marker = repo.dir.path().join("ran");
+        let touch = format!("touch {}", marker.display());
+        repo.write(".gitattributes", "* diff=evil filter=evil\n");
+        repo.write("a.txt", "one\n");
+        repo.git(&["add", "."]);
+        repo.write("a.txt", "two\n");
+        let mut env = repo.env();
+        env.extend([
+            ("GIT_EXTERNAL_DIFF".into(), touch.clone().into()),
+            ("GIT_PAGER".into(), touch.clone().into()),
+            ("PAGER".into(), touch.clone().into()),
+            ("GIT_SSH_COMMAND".into(), touch.clone().into()),
+            ("GIT_CONFIG_COUNT".into(), "3".into()),
+            ("GIT_CONFIG_KEY_0".into(), "core.fsmonitor".into()),
+            ("GIT_CONFIG_VALUE_0".into(), touch.clone().into()),
+            ("GIT_CONFIG_KEY_1".into(), "diff.evil.textconv".into()),
+            ("GIT_CONFIG_VALUE_1".into(), touch.clone().into()),
+            ("GIT_CONFIG_KEY_2".into(), "filter.evil.clean".into()),
+            ("GIT_CONFIG_VALUE_2".into(), touch.clone().into()),
+            (
+                "GIT_CONFIG_PARAMETERS".into(),
+                format!("'core.fsmonitor={touch}'").into(),
+            ),
+        ]);
+        let status = GitStatusTool::new(repo.dir.path().to_path_buf(), env.clone(), TIMEOUT, CAP);
+        let diff = GitDiffTool::new(repo.dir.path().to_path_buf(), env, TIMEOUT, CAP);
+
+        // Act
+        status.call(&json!({})).unwrap();
+        diff.call(&json!({})).unwrap();
+
+        // Assert
+        assert!(!marker.exists(), "git ran a program from the environment");
+    }
+
+    #[test]
+    fn config_that_includes_another_file_runs_nothing() {
+        // Arrange
+        let repo = Repo::new();
+        let marker = repo.dir.path().join("ran");
+        let touch = format!("touch {}", marker.display());
+        repo.write("extra.cfg", &format!("[core]\n\tfsmonitor = {touch}\n[diff]\n\texternal = {touch}\n[pager]\n\tdiff = {touch}\n\tstatus = {touch}\n"));
+        repo.write("a.txt", "one\n");
+        repo.git(&["add", "."]);
+        repo.write("a.txt", "two\n");
+        repo.git(&["config", "include.path", "../extra.cfg"]);
+        repo.git(&["config", "includeIf.gitdir:**.path", "../extra.cfg"]);
+        let included = Command::new(GIT)
+            .args(["config", "--get", "core.fsmonitor"])
+            .current_dir(repo.dir.path())
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(String::from_utf8_lossy(&included).trim(), touch);
+
+        // Act
+        repo.status().call(&json!({})).unwrap();
+        repo.diff().call(&json!({})).unwrap();
+
+        // Assert
+        assert!(!marker.exists(), "git ran a program from an included file");
     }
 
     #[test]
