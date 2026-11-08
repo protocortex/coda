@@ -73,6 +73,7 @@ impl TurnsRunner {
 impl RunTarget for TurnsRunner {
     async fn run(&self, schedule: &ScheduleInfo) -> Result<(), String> {
         let session_id = self.session_for(&schedule.target).await?;
+        self.turns.ensure_checkout(&session_id).await?;
         let send = SessionSendParams {
             session_id,
             text: schedule.text.clone(),
