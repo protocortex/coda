@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Builds the fake `claude` and `codex` binaries once per test process and returns where they are.
+//! Builds the fake `claude`, `codex` and tool server binaries once per test process and returns where they are.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ const SMOKE_ATTEMPTS: u32 = 5;
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLAUDE_BIN: &str = "fake-claude";
 const CODEX_BIN: &str = "fake-codex";
+const TOOL_SERVER_BIN: &str = "fake-tool-server";
 const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 /// Parent of the private target dirs, one per binary, so a nested build never
 /// rewrites a binary that a concurrent test process is executing from the shared one.
@@ -54,6 +55,15 @@ pub fn fake_claude_path() -> Result<PathBuf, BuildError> {
 pub fn fake_codex_path() -> Result<PathBuf, BuildError> {
     static PATH: OnceLock<Result<PathBuf, BuildError>> = OnceLock::new();
     PATH.get_or_init(|| build(CODEX_BIN)).clone()
+}
+
+/// Builds `fake-tool-server` on first use and returns the path to the executable.
+///
+/// # Errors
+/// Returns [`BuildError`] when cargo cannot build the binary.
+pub fn fake_tool_server_path() -> Result<PathBuf, BuildError> {
+    static PATH: OnceLock<Result<PathBuf, BuildError>> = OnceLock::new();
+    PATH.get_or_init(|| build(TOOL_SERVER_BIN)).clone()
 }
 
 fn build(bin_name: &str) -> Result<PathBuf, BuildError> {

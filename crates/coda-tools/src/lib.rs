@@ -24,6 +24,7 @@ pub mod sandbox;
 pub mod skill;
 pub mod task;
 pub mod todo;
+pub mod tool_server;
 pub mod write;
 
 use std::sync::atomic::AtomicBool;
@@ -170,6 +171,14 @@ pub enum ToolError {
         /// The tool that refused.
         tool: &'static str,
         /// Why.
+        reason: String,
+    },
+    /// A tool server failed the call, was killed, or reported an error.
+    #[error("{tool} failed: {reason}")]
+    External {
+        /// The tool, under the name the model uses.
+        tool: &'static str,
+        /// What went wrong.
         reason: String,
     },
     /// The file is not valid UTF-8 text.

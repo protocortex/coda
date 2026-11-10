@@ -33,6 +33,10 @@ use crate::review::{
 };
 use crate::routing::{Routing, Tier};
 use crate::timing::Timing;
+use crate::tool_servers::{
+    COMMAND_KEY, ENV_KEY, MAX_ENV_NAMES, MAX_SERVER_TIMEOUT_MS, MAX_SERVERS, SERVER_TIMEOUT_MS_KEY,
+    TOOL_SERVERS_KEY, ToolServerConfig, env_name_problem, name_problem,
+};
 use crate::tui::TuiConfig;
 use crate::worktree::{
     CLEAN_COMMAND_KEY, CLEANUP_KEY, DIR_KEY, IDLE_DAYS_KEY, SETUP_KEY, WORKTREE_KEY, WorktreeConfig,
@@ -360,6 +364,8 @@ pub struct Config {
     pub recall: RecallConfig,
     /// The outline of the repository a model-API session starts with.
     pub repo_map: RepoMapConfig,
+    /// External tool servers by name; none until the user lists one.
+    pub tool_servers: BTreeMap<String, ToolServerConfig>,
 }
 
 impl Default for Config {
@@ -387,6 +393,7 @@ impl Default for Config {
             fetch: FetchConfig::default(),
             recall: RecallConfig::default(),
             repo_map: RepoMapConfig::default(),
+            tool_servers: BTreeMap::new(),
         }
     }
 }
@@ -435,6 +442,7 @@ impl Config {
         config.check_fetch()?;
         config.check_recall()?;
         config.check_repo_map()?;
+        config.check_tool_servers()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -791,6 +799,45 @@ impl Config {
             path: format!("{REPO_MAP_KEY}.{TOKEN_SHARE_KEY}"),
             allowed: format!("a whole number of percent from 1 to {MAX_TOKEN_SHARE_PERCENT}"),
         })
+    }
+
+    fn check_tool_servers(&self) -> Result<(), ConfigError> {
+        let invalid = |path: String, allowed: String| ConfigError::InvalidValue { path, allowed };
+        if self.tool_servers.len() > MAX_SERVERS {
+            return Err(invalid(
+                TOOL_SERVERS_KEY.to_owned(),
+                format!("at most {MAX_SERVERS} servers"),
+            ));
+        }
+        for (name, server) in &self.tool_servers {
+            let at = |key: &str| format!("{TOOL_SERVERS_KEY}.{name}.{key}");
+            if let Some(allowed) = name_problem(name) {
+                return Err(invalid(
+                    format!("{TOOL_SERVERS_KEY}.{name}"),
+                    allowed.to_owned(),
+                ));
+            }
+            if let Some(allowed) = server.problem() {
+                return Err(invalid(at(COMMAND_KEY), allowed));
+            }
+            let bad_env = server.env.iter().find_map(|var| env_name_problem(var));
+            if server.env.len() > MAX_ENV_NAMES || bad_env.is_some() {
+                return Err(invalid(
+                    at(ENV_KEY),
+                    format!(
+                        "at most {MAX_ENV_NAMES} names of {}",
+                        bad_env.unwrap_or("environment variables")
+                    ),
+                ));
+            }
+            if server.timeout_ms == 0 || server.timeout_ms > MAX_SERVER_TIMEOUT_MS {
+                return Err(invalid(
+                    at(SERVER_TIMEOUT_MS_KEY),
+                    format!("a whole number of milliseconds from 1 to {MAX_SERVER_TIMEOUT_MS}"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn check_checkpoints(&self) -> Result<(), ConfigError> {
@@ -1790,6 +1837,68 @@ bots = true
             ),
             ("[repo_map]\nenable = true\n", "enable"),
         ] {
+            // Act
+            let error = Config::from_toml_str(text).unwrap_err();
+
+            // Assert
+            assert!(error.to_string().contains(key), "{text}: {error}");
+        }
+    }
+
+    #[test]
+    fn no_tool_server_exists_until_the_file_lists_one() {
+        // Act
+        let servers = Config::from_toml_str("").unwrap().config.tool_servers;
+
+        // Assert
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn a_tool_server_table_is_read_from_the_file() {
+        // Arrange
+        let text = "[tool_servers.notes]\ncommand = [\"/usr/bin/notes\", \"--stdio\"]\nenv = [\"NOTES_TOKEN\"]\ntimeout_ms = 5000\n\n[tool_servers.plain]\ncommand = [\"/bin/plain\"]\n";
+
+        // Act
+        let servers = Config::from_toml_str(text).unwrap().config.tool_servers;
+
+        // Assert
+        let notes = &servers["notes"];
+        assert_eq!(notes.command, ["/usr/bin/notes", "--stdio"]);
+        assert_eq!(notes.env, ["NOTES_TOKEN"]);
+        assert_eq!(notes.timeout_ms, 5000);
+        assert_eq!(servers["plain"].env, Vec::<String>::new());
+        assert_eq!(servers["plain"].timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn a_bad_tool_server_table_names_the_key_that_is_wrong() {
+        // Arrange
+        let cases = [
+            (
+                "[tool_servers.Bad_Name]\ncommand = [\"/bin/x\"]\n",
+                "tool_servers.Bad_Name",
+            ),
+            ("[tool_servers.a]\ncommand = []\n", "tool_servers.a.command"),
+            (
+                "[tool_servers.a]\ncommand = [\"x\"]\n",
+                "tool_servers.a.command",
+            ),
+            (
+                "[tool_servers.a]\ncommand = [\"/bin/x\"]\nenv = [\"1BAD\"]\n",
+                "tool_servers.a.env",
+            ),
+            (
+                "[tool_servers.a]\ncommand = [\"/bin/x\"]\ntimeout_ms = 0\n",
+                "tool_servers.a.timeout_ms",
+            ),
+            (
+                "[tool_servers.a]\ncommand = [\"/bin/x\"]\nshell = true\n",
+                "shell",
+            ),
+        ];
+
+        for (text, key) in cases {
             // Act
             let error = Config::from_toml_str(text).unwrap_err();
 
