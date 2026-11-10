@@ -5,7 +5,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use coda_config::config::PermissionMode;
-use coda_protocol::paths::Target;
+use coda_protocol::paths::{Target, resolve_in_workspace};
 
 use crate::tool_request::Tool;
 
@@ -141,7 +141,7 @@ fn decide_edit(input: &PolicyInput<'_>) -> Verdict {
         let affecting = input
             .targets
             .iter()
-            .any(|t| is_execution_affecting(input.workspace_root, &t.path));
+            .any(|t| target_affects_execution(input.workspace_root, &t.path));
         return if affecting {
             Verdict::Prompt
         } else {
@@ -149,6 +149,18 @@ fn decide_edit(input: &PolicyInput<'_>) -> Verdict {
         };
     }
     grant_or_prompt(input.granted)
+}
+
+/// Whether editing `path` can change what a build or hook executes, by the name
+/// it is given or by the place it really is once symlinks are followed. A link
+/// into `.git` or a guarded directory has a harmless name, so the name alone
+/// would let it through.
+fn target_affects_execution(workspace_root: &Path, path: &Path) -> bool {
+    if is_execution_affecting(workspace_root, path) {
+        return true;
+    }
+    resolve_in_workspace(workspace_root, path)
+        .is_none_or(|real| is_execution_affecting(workspace_root, &real))
 }
 
 /// Whether editing `path` can change what a build or hook executes.
@@ -960,6 +972,7 @@ fn target(path: &str, target: Target) -> ClassifiedTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coda_protocol::paths::classify_target;
 
     const ROOT: &str = "/ws";
 
@@ -1066,6 +1079,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accept_edits_prompts_for_a_symlink_that_points_at_a_guarded_path() {
+        use std::os::unix::fs::symlink;
+
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for guarded in [".git", "scripts", ".github/workflows"] {
+            std::fs::create_dir_all(root.join(guarded)).unwrap();
+        }
+        std::fs::write(root.join(".git/config"), "").unwrap();
+        std::fs::write(root.join("scripts/build.sh"), "").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        symlink(".git", root.join("to_git")).unwrap();
+        symlink("scripts", root.join("to_scripts")).unwrap();
+        symlink(".github/workflows", root.join("to_workflows")).unwrap();
+        symlink("../.git/config", root.join("src/to_config")).unwrap();
+        symlink("scripts/build.sh", root.join("to_build_file")).unwrap();
+        let paths = [
+            "to_git",
+            "to_git/config",
+            "to_scripts/new.sh",
+            "to_scripts/build.sh",
+            "to_workflows/ci.yml",
+            "src/to_config",
+            "to_build_file",
+        ];
+
+        for path in paths {
+            for tool in [Tool::Edit, Tool::Write, Tool::MultiEdit] {
+                let targets = [ClassifiedTarget {
+                    path: PathBuf::from(path),
+                    target: classify_target(&root, Path::new(path)),
+                }];
+                let input = PolicyInput {
+                    mode: PermissionMode::AcceptEdits,
+                    tool: &tool,
+                    workspace_root: &root,
+                    targets: &targets,
+                    granted: true,
+                };
+
+                // Act
+                let verdict = decide(&input);
+
+                // Assert
+                assert_eq!(verdict, Verdict::Prompt, "{tool:?} on {path}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accept_edits_allows_a_symlink_that_points_at_a_plain_file() {
+        use std::os::unix::fs::symlink;
+
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("notes.txt"), "").unwrap();
+        symlink("notes.txt", root.join("alias.txt")).unwrap();
+        let targets = [ClassifiedTarget {
+            path: PathBuf::from("alias.txt"),
+            target: classify_target(&root, Path::new("alias.txt")),
+        }];
+        let input = PolicyInput {
+            mode: PermissionMode::AcceptEdits,
+            tool: &Tool::Write,
+            workspace_root: &root,
+            targets: &targets,
+            granted: false,
+        };
+
+        // Act
+        let verdict = decide(&input);
+
+        // Assert
+        assert_eq!(verdict, Verdict::Allow);
     }
 
     #[test]
