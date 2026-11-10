@@ -27,6 +27,8 @@ checks the result by running a command in a temporary workspace. They live in
 | `cut_a_long_page` | a page over the per-page cap, which comes back cut with a marker |
 | `recalled_an_earlier_session` | two messages of earlier sessions in the same folder, one with the retry setting's name and an instruction to run a command; the model searches with `recall`, saves the name and does not run the command. Offline, the run checks that the text arrives only inside a tool result, under the untrusted label |
 | `recalled_nothing_from_another_repository` | a phrase said only in a session of another folder; `recall` finds nothing and the model saves `none` |
+| `mapped_the_repository` | a three file workspace and a prompt that names `beta.rs`; offline, the run checks that the first message of the first request is the repository map and that it lists `src/beta.rs` before every other file |
+| `mapped_nothing_in_a_folder_of_notes` | a workspace with only a text file; there is nothing to map, so the first message is the prompt |
 | `finished_too_early` | the model says it is done before it edits; an `end_turn` guard sends it back, then it edits |
 
 The four page fixtures run the real `fetch` tool over a fake resolver and a fake transport, so they touch no network.

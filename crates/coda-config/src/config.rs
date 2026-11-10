@@ -25,6 +25,7 @@ use crate::loop_guard::{
     LOOP_GUARD_KEY, LoopGuardConfig, MIN_WARN_AFTER, STOP_AFTER_KEY, WARN_AFTER_KEY,
 };
 use crate::recall::{DELEGATED_REPOS_KEY, RECALL_KEY, RecallConfig, is_repo_path};
+use crate::repo_map::{MAX_TOKEN_SHARE_PERCENT, REPO_MAP_KEY, RepoMapConfig, TOKEN_SHARE_KEY};
 use crate::review::{
     CHECK_COMMANDS_KEY, CHUNK_CONCURRENCY_KEY, DIFF_BUDGET_CHARS_KEY, MAX_CHUNKS_KEY,
     MAX_FINDINGS_KEY, REVIEW_KEY, ROUTING_MODEL_KEY, ROUTING_RULES_PATH, ReviewConfig,
@@ -357,6 +358,8 @@ pub struct Config {
     pub fetch: FetchConfig,
     /// Whether earlier sessions are indexed for the `recall` tool; off by default.
     pub recall: RecallConfig,
+    /// The outline of the repository a model-API session starts with.
+    pub repo_map: RepoMapConfig,
 }
 
 impl Default for Config {
@@ -383,6 +386,7 @@ impl Default for Config {
             describe: DescribeConfig::default(),
             fetch: FetchConfig::default(),
             recall: RecallConfig::default(),
+            repo_map: RepoMapConfig::default(),
         }
     }
 }
@@ -430,6 +434,7 @@ impl Config {
         config.check_checkpoints()?;
         config.check_fetch()?;
         config.check_recall()?;
+        config.check_repo_map()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -774,6 +779,17 @@ impl Config {
         Err(ConfigError::InvalidValue {
             path: format!("{RECALL_KEY}.{DELEGATED_REPOS_KEY}"),
             allowed: "absolute folder paths".to_owned(),
+        })
+    }
+
+    fn check_repo_map(&self) -> Result<(), ConfigError> {
+        let share = self.repo_map.token_share_percent;
+        if (1..=MAX_TOKEN_SHARE_PERCENT).contains(&share) {
+            return Ok(());
+        }
+        Err(ConfigError::InvalidValue {
+            path: format!("{REPO_MAP_KEY}.{TOKEN_SHARE_KEY}"),
+            allowed: format!("a whole number of percent from 1 to {MAX_TOKEN_SHARE_PERCENT}"),
         })
     }
 
@@ -1737,6 +1753,43 @@ bots = true
         ];
 
         for (text, key) in cases {
+            // Act
+            let error = Config::from_toml_str(text).unwrap_err();
+
+            // Assert
+            assert!(error.to_string().contains(key), "{text}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_repo_map_is_on_with_a_small_share_and_is_read_from_the_file() {
+        // Arrange
+        let text = "[repo_map]\nenabled = false\ntoken_share_percent = 5\n";
+
+        // Act
+        let default = Config::from_toml_str("").unwrap().config.repo_map;
+        let read = Config::from_toml_str(text).unwrap().config.repo_map;
+
+        // Assert
+        assert!(default.enabled);
+        assert_eq!(default.token_share_percent, 2);
+        assert!(!read.enabled);
+        assert_eq!(read.token_share_percent, 5);
+    }
+
+    #[test]
+    fn a_repo_map_share_outside_one_to_twenty_or_a_misspelled_key_is_an_error() {
+        for (text, key) in [
+            (
+                "[repo_map]\ntoken_share_percent = 0\n",
+                "repo_map.token_share_percent",
+            ),
+            (
+                "[repo_map]\ntoken_share_percent = 21\n",
+                "repo_map.token_share_percent",
+            ),
+            ("[repo_map]\nenable = true\n", "enable"),
+        ] {
             // Act
             let error = Config::from_toml_str(text).unwrap_err();
 

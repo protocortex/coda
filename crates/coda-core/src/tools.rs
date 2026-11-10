@@ -279,7 +279,7 @@ impl StoreCodeIndex {
     }
 }
 
-fn lock(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
+pub(crate) fn lock(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
     // SQLite rolls an interrupted transaction back, so a poisoned guard is safe to reuse.
     store.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -347,7 +347,7 @@ impl CodeIndex for StoreCodeIndex {
 
 /// Milliseconds since the Unix epoch at which `path` last changed, or `None`
 /// when it cannot be statted.
-fn modified_ms(path: &Path) -> Option<i64> {
+pub(crate) fn modified_ms(path: &Path) -> Option<i64> {
     let modified = path.metadata().and_then(|m| m.modified()).ok()?;
     let since_epoch = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
     i64::try_from(since_epoch.as_millis()).ok()

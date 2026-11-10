@@ -2,6 +2,7 @@
 
 //! Symbol index writers. The FTS5 table follows through triggers in the schema.
 
+use coda_protocol::readers::SymbolLocation;
 use rusqlite::{Transaction, params};
 
 use crate::{Store, StoreError};
@@ -118,6 +119,29 @@ impl Store {
                 file_path: row.get(0)?,
                 content_hash: row.get(1)?,
                 indexed_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The symbols of `repo` that no other definition encloses, ordered by file
+    /// path and line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sqlite`] when the read fails.
+    pub fn top_level_symbols(&self, repo: &str) -> Result<Vec<SymbolLocation>, StoreError> {
+        let mut stmt = self.connection().prepare(
+            "SELECT name, kind, file_path, line, end_line FROM symbols \
+             WHERE repo_path = ?1 AND parent IS NULL ORDER BY file_path, line, id",
+        )?;
+        let rows = stmt.query_map([repo], |row| {
+            Ok(SymbolLocation {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                path: row.get(2)?,
+                line: row.get(3)?,
+                end_line: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

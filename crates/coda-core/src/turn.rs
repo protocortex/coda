@@ -1225,9 +1225,10 @@ impl<P: ModelProvider, G: PermissionGate> TurnLoop<P, G> {
                 .collect(),
             messages: self
                 .conversation
-                .messages()
-                .iter()
-                .map(request_message)
+                .context()
+                .map(|context| RequestMessage::User(context.to_owned()))
+                .into_iter()
+                .chain(self.conversation.messages().iter().map(request_message))
                 .collect(),
         }
     }

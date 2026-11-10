@@ -432,7 +432,7 @@ impl ModelSessions {
         let id = session.clone();
         let record = self.hub.with_store(move |s| s.load_session(&id)).await?;
         info!(session = %session, step = "build_loop", "preparing the model session");
-        let model_loop = self.loop_for_send(&record, limits).await?;
+        let model_loop = self.loop_for_send(&record, limits, &text).await?;
         info!(session = %session, step = "begin_turn", "recording the user message");
         let turn = match Turns::begin_for(&self.hub, &session, &text, request.as_deref()).await {
             Ok(turn) => turn,
@@ -780,6 +780,7 @@ impl ModelSessions {
         &self,
         record: &SessionRecord,
         limits: Limits,
+        text: &str,
     ) -> Result<ModelLoop, ModelError> {
         let catalog = match self.children.read_catalog(&record.cwd).await {
             Ok(catalog) => catalog,
@@ -814,7 +815,7 @@ impl ModelSessions {
             },
         };
         warn_skipped(&record.id, problems);
-        let built = self.build(record, carried, offer, problems).await?;
+        let built = self.build(record, carried, offer, problems, text).await?;
         lock(&self.carried).remove(&record.id);
         Ok(built)
     }
@@ -889,6 +890,30 @@ impl ModelSessions {
         ))
     }
 
+    /// The map of the repository for a loop built now, or `None` when there is
+    /// none. It is built once per loop, so it can differ between sessions and
+    /// stays the same inside one.
+    async fn repo_map(&self, record: &SessionRecord, text: &str) -> Option<String> {
+        let (store, root, text) = (
+            self.hub.store_handle(),
+            PathBuf::from(&record.cwd),
+            text.to_owned(),
+        );
+        let (window, config, env) = (
+            self.context_window(record),
+            self.config.repo_map.clone(),
+            self.env.clone(),
+        );
+        let built = tokio::task::spawn_blocking(move || {
+            coda_core::repo_map::build(&store, &root, &text, window, &config, env)
+        })
+        .await;
+        built.unwrap_or_else(|error| {
+            warn!(%error, "building the repository map crashed");
+            None
+        })
+    }
+
     /// The system prompt, with the rule about untrusted text added when the
     /// session can fetch pages.
     fn system_prompt(&self) -> String {
@@ -905,6 +930,7 @@ impl ModelSessions {
         Carried { limits, used }: Carried,
         offer: Offer,
         problems: usize,
+        text: &str,
     ) -> Result<ModelLoop, ModelError> {
         let provider = self.provider(record)?;
         let faux = if let Provider::Faux(faux) = &provider {
@@ -940,6 +966,7 @@ impl ModelSessions {
         let prefix = Prefix::new(&self.system_prompt(), schemas, "")?;
         let (conversation, session_started, todos) =
             self.stored_conversation(&record.id, prefix).await?;
+        let conversation = conversation.with_context(self.repo_map(record, text).await);
         let turn = Arc::new(Mutex::new(TurnId::new(NO_TURN)));
         let broker = self
             .brokers
