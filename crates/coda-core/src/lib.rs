@@ -15,5 +15,6 @@ pub mod repair;
 pub mod repo_map;
 pub mod steer;
 pub mod task;
+pub mod tool_servers;
 pub mod tools;
 pub mod turn;

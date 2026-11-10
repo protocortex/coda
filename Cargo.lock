@@ -345,6 +345,7 @@ dependencies = [
  "coda-providers",
  "coda-store",
  "coda-telemetry",
+ "coda-testkit",
  "coda-tools",
  "rusqlite",
  "rustix",

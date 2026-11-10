@@ -24,6 +24,7 @@ use coda_core::history::{
 pub use coda_core::history::{CONTEXT_OVERFLOW_KIND, MODEL_SWITCHED_KIND, TURN_STOPPED_KIND};
 use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
 use coda_core::steer::SteerQueue;
+use coda_core::tool_servers::{ToolServers, offers_tools, with_tool_servers};
 use coda_core::tools::{
     BaseTools, BaseToolsConfig, StoreOriginals, ToolsError, ask_schema, base_tools, refresh_index,
     task_schema, todo_schema, with_fetch, with_recall,
@@ -46,6 +47,7 @@ use coda_providers::registry::{
 use coda_store::{EventRecord, NewQueued, SessionRecord, StoreError};
 use coda_tools::bash::NAME as SHELL_TOOL;
 use coda_tools::bash::{DEFAULT_ENV_ALLOWLIST, allowlisted_env};
+use coda_tools::tool_server::Started;
 use coda_tools::{Tool, fetch, skill};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -311,6 +313,8 @@ pub struct ModelSessions {
     config: Config,
     registry: ModelRegistry,
     env: Vec<(OsString, OsString)>,
+    /// The tool servers the user listed, each with the variables it named.
+    tool_servers: ToolServers,
     key_reader: EnvReader,
     /// Present from the moment a send reserves the session, with its cancel
     /// token and turn once it runs; never held across an await.
@@ -359,6 +363,7 @@ impl ModelSessions {
             }
         };
         let registry = ModelRegistry::from_config(&config);
+        let tool_servers = ToolServers::new(&config.tool_servers, &env);
         let env = allowlisted_env(DEFAULT_ENV_ALLOWLIST, env);
         let children = Arc::new(task::ChildEnv {
             hub: Arc::clone(&hub),
@@ -374,6 +379,7 @@ impl ModelSessions {
             registry,
             config,
             env,
+            tool_servers,
             key_reader,
             running: Mutex::default(),
             forces: Mutex::default(),
@@ -914,14 +920,37 @@ impl ModelSessions {
         })
     }
 
-    /// The system prompt, with the rule about untrusted text added when the
-    /// session can fetch pages.
-    fn system_prompt(&self) -> String {
-        if self.config.fetch.allow_hosts.is_empty() {
-            SYSTEM_PROMPT.to_owned()
-        } else {
-            format!("{SYSTEM_PROMPT} {}", fetch::UNTRUSTED_RULE)
+    /// Starts the user's tool servers for a loop built now. The loop owns them
+    /// through its tools, so they stop when it is dropped.
+    async fn start_tool_servers(&self, record: &SessionRecord, tools: &BaseTools) -> Vec<Started> {
+        if self.tool_servers.is_empty() {
+            return Vec::new();
         }
+        let mut reserved: Vec<String> = tools.schemas.iter().map(|s| s.name.clone()).collect();
+        reserved.extend([task_schema(&[]).name, todo_schema().name, ask_schema().name]);
+        let (servers, cwd) = (self.tool_servers.clone(), PathBuf::from(&record.cwd));
+        let started = tokio::task::spawn_blocking(move || {
+            let names: Vec<&str> = reserved.iter().map(String::as_str).collect();
+            servers.start(&cwd, &names)
+        })
+        .await;
+        started.unwrap_or_else(|error| {
+            warn!(%error, "starting the tool servers crashed");
+            Vec::new()
+        })
+    }
+
+    /// The system prompt, with the rule about untrusted text added when the
+    /// session can fetch pages and again when it offers tool server tools.
+    fn system_prompt(&self, external: bool) -> String {
+        let mut prompt = SYSTEM_PROMPT.to_owned();
+        if !self.config.fetch.allow_hosts.is_empty() {
+            prompt = format!("{prompt} {}", fetch::UNTRUSTED_RULE);
+        }
+        if external {
+            prompt = format!("{prompt} {}", coda_tools::tool_server::UNTRUSTED_RULE);
+        }
+        prompt
     }
 
     async fn build(
@@ -959,11 +988,14 @@ impl ModelSessions {
             );
             tools.tools = tools.tools.with(Arc::new(tool) as Arc<dyn Tool>);
         }
+        let offered_servers = self.start_tool_servers(record, &tools).await;
+        let external = offers_tools(&offered_servers);
+        let tools = with_tool_servers(tools, &offered_servers);
         let mut schemas = tools.schemas;
         schemas.push(task_schema(&offer.agents));
         schemas.push(todo_schema());
         schemas.push(ask_schema());
-        let prefix = Prefix::new(&self.system_prompt(), schemas, "")?;
+        let prefix = Prefix::new(&self.system_prompt(external), schemas, "")?;
         let (conversation, session_started, todos) =
             self.stored_conversation(&record.id, prefix).await?;
         let conversation = conversation.with_context(self.repo_map(record, text).await);
