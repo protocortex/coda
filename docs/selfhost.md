@@ -98,7 +98,7 @@ skipped. The run is headless use of Claude Code, which the user confirmed
   build and package files, `.cargo/config.toml`, `.gitattributes`, anything
   under a `.git` directory or a `.git` file (`config`, `info`, `hooks`; `info` selects drivers that `config` defines),
   `.github/workflows` and `scripts`, see `is_execution_affecting` in
-  `crates/coda-providers/src/policy.rs`), which
+  `crates/coda-providers/src/policy.rs`; a symlink that points at one of them counts too, because the path is resolved first), which
   need a prompt that a headless run denies; a grant never overrides that. The
   grants that matter are the exact commands `cargo test` and `cargo build`
   (`[permissions] grants`), the only shell commands that are approved; the

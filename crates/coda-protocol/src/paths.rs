@@ -49,6 +49,18 @@ pub fn classify_target(workspace_root: &Path, path: &Path) -> Target {
     }
 }
 
+/// Where `path` really lands, relative to the resolved `workspace_root`, with
+/// every symlink followed.
+///
+/// `None` when either side cannot be resolved or the result is outside the
+/// root, so a caller that matches names in the result fails closed.
+#[must_use]
+pub fn resolve_in_workspace(workspace_root: &Path, path: &Path) -> Option<PathBuf> {
+    let root = resolve(workspace_root)?;
+    let resolved = resolve(&workspace_root.join(path))?;
+    resolved.strip_prefix(&root).ok().map(Path::to_path_buf)
+}
+
 /// Resolves `path` to an absolute form with no `.`, `..` or symlinks.
 ///
 /// Returns `None` when the path cannot be resolved (a symlink escape target
