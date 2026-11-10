@@ -161,6 +161,9 @@ pub enum TurnError {
     /// A `session.fork` that cannot be done as asked. The text is for the caller.
     #[error("{0}")]
     Fork(String),
+    /// The folder of a cleaned worktree could not be put back before a send.
+    #[error("could not restore the session folder: {0}")]
+    Restore(String),
     #[error(transparent)]
     Hub(#[from] HubError),
     #[error(transparent)]
@@ -438,13 +441,8 @@ impl Turns {
         turns
     }
 
-    /// Sends a pull request watch's message into its session, after putting
-    /// back the session's folder if a cleanup removed it.
+    /// Sends a pull request watch's message into its session.
     pub(crate) async fn wake_for_watch(self: &Arc<Self>, session: SessionId, text: String) {
-        if let Err(error) = self.ensure_checkout(&session).await {
-            warn!(session = %session, %error, "could not restore a session folder for its pull request watch");
-            return;
-        }
         let wake = SessionSendParams {
             session_id: session.clone(),
             text,
@@ -463,9 +461,11 @@ impl Turns {
         let _ = self.worktrees.set(worktrees);
     }
 
-    /// Puts back the folder of a session whose worktree was cleaned, before a
-    /// send the daemon starts on its own (a schedule or a pull request watch).
-    pub(crate) async fn ensure_checkout(&self, session: &SessionId) -> Result<(), String> {
+    /// Puts back the folder of a session whose worktree was cleaned. A message
+    /// start goes through [`Self::send_now`], which calls this first, so a send
+    /// the daemon makes on its own (a schedule, a watch wake, a queued message,
+    /// a restart continuation, a resume at a limit reset) finds its folder.
+    async fn ensure_checkout(&self, session: &SessionId) -> Result<(), String> {
         let Some(trees) = self.worktrees.get() else {
             return Ok(());
         };
@@ -511,6 +511,9 @@ impl Turns {
             .with_store(move |store| store.load_session(&id))
             .await
             .map_err(|e| not_found_or(e, &session_id))?;
+        self.ensure_checkout(&session_id)
+            .await
+            .map_err(TurnError::Restore)?;
         self.await_wind_down(&session_id).await?;
         match record.backend {
             BackendKind::ClaudeCode | BackendKind::CodexAppServer | BackendKind::CodexExec => {

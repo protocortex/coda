@@ -79,6 +79,7 @@ mod mode;
 mod queue;
 mod reset;
 mod restarts;
+mod restore;
 mod resume;
 mod rewind;
 mod schedule;
