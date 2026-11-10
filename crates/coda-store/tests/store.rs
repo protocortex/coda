@@ -81,7 +81,7 @@ fn open_records_the_schema_version() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn newer_schema_version_is_refused() {
         err,
         StoreError::SchemaTooNew {
             found: 99,
-            supported: 24
+            supported: 25
         }
     ));
 }
@@ -277,6 +277,8 @@ fn v3_snapshot_migrates_forward_keeping_unresolved_pending_requests() {
             "events_by_kind",
             "events_by_turn_and_time",
             "queued_messages_by_session",
+            "recall_entries_by_original",
+            "recall_entries_by_session",
             "review_runs_by_pr",
             "savings_by_session",
             "scheduled_prompts_due",
@@ -288,6 +290,12 @@ fn v3_snapshot_migrates_forward_keeping_unresolved_pending_requests() {
             "permission_decisions",
             "project_trust",
             "queued_messages",
+            "recall_entries",
+            "recall_fts",
+            "recall_fts_config",
+            "recall_fts_data",
+            "recall_fts_docsize",
+            "recall_fts_idx",
             "review_findings",
             "review_runs",
             "savings",
@@ -297,7 +305,9 @@ fn v3_snapshot_migrates_forward_keeping_unresolved_pending_requests() {
             "sessions",
             "symbols",
             "turns",
-            "usage"
+            "usage",
+            "recall_fts_delete",
+            "recall_fts_insert"
         ]
     );
 }

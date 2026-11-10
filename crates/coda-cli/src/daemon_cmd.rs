@@ -47,7 +47,8 @@ pub async fn serve(ctx: &Context) -> Result<(), CliError> {
     })?;
     info!("step 2: opening the database");
     let data_dir = ctx.dirs.data_dir();
-    let store = Store::open(&data_dir)?;
+    let mut store = Store::open(&data_dir)?;
+    store.configure_recall(config.recall.enabled)?;
     let uid = own_uid(&data_dir)?;
     info!("step 3: binding the socket");
     let worktrees = Arc::new(

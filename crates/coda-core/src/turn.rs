@@ -25,7 +25,8 @@ use coda_telemetry::attrs::{CODA_SESSION_ID, CODA_TOOL_NAME};
 use coda_tools::ask as ask_tool;
 use coda_tools::todo::{self as todo_tool, TodoList};
 use coda_tools::{
-    Tool, fetch as fetch_tool, git as git_tool, skill as skill_tool, task as task_tool,
+    Tool, fetch as fetch_tool, git as git_tool, recall as recall_tool, skill as skill_tool,
+    task as task_tool,
 };
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -1838,6 +1839,7 @@ fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
         git_tool::STATUS_NAME => RequestTool::GitStatus,
         git_tool::DIFF_NAME => RequestTool::GitDiff,
         fetch_tool::NAME => RequestTool::Fetch,
+        recall_tool::NAME => RequestTool::Recall,
         other => RequestTool::Unknown(other.to_owned()),
     };
     let target_paths = target_paths(&tool, input);
@@ -1936,6 +1938,7 @@ mod tests {
             ("git_status", RequestTool::GitStatus),
             ("git_diff", RequestTool::GitDiff),
             ("fetch", RequestTool::Fetch),
+            ("recall", RequestTool::Recall),
         ];
 
         for (name, expected) in names {

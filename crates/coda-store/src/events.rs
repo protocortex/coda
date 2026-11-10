@@ -17,6 +17,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use coda_protocol::types::{SessionId, TurnId};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, ffi, params};
 
+use crate::recall::{Indexed, index_event};
 use crate::sessions::{get_u64, session_row_id, to_db_int};
 use crate::{Store, StoreError};
 
@@ -244,6 +245,18 @@ impl Store {
             None => next_seq(&tx, session_row)?,
         };
         insert_event(&tx, session, turn_row, seq, record, at)?;
+        if self.recall {
+            let event = Indexed {
+                session_row,
+                turn_row,
+                event_row: tx.last_insert_rowid(),
+                kind: &record.kind,
+                body: &record.body,
+                at,
+            };
+            // A search aid must never stop an event from being recorded.
+            let _ = index_event(&tx, &event);
+        }
         tx.commit()?;
         Ok(seq)
     }

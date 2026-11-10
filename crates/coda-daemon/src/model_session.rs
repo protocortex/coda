@@ -26,7 +26,7 @@ use coda_core::prompt::{Conversation, Prefix, PromptError, ToolSchema};
 use coda_core::steer::SteerQueue;
 use coda_core::tools::{
     BaseTools, BaseToolsConfig, StoreOriginals, ToolsError, ask_schema, base_tools, refresh_index,
-    task_schema, todo_schema, with_fetch,
+    task_schema, todo_schema, with_fetch, with_recall,
 };
 use coda_core::turn::{CancelToken, Fallback, StopCondition, TurnConfig, TurnEvent, TurnLoop};
 use coda_protocol::events::{
@@ -868,7 +868,8 @@ impl ModelSessions {
         }
     }
 
-    /// The base tools of a session, and `fetch` when the user listed a host.
+    /// The base tools of a session, `fetch` when the user listed a host, and
+    /// `recall` when the user switched it on.
     fn session_tools(&self, record: &SessionRecord) -> Result<BaseTools, ToolsError> {
         let tools = base_tools(
             &BaseToolsConfig {
@@ -879,7 +880,13 @@ impl ModelSessions {
             self.hub.store_handle(),
             StoreOriginals::new(self.hub.store_handle(), record.id.clone()),
         )?;
-        Ok(with_fetch(tools, &self.config.fetch))
+        let tools = with_fetch(tools, &self.config.fetch);
+        Ok(with_recall(
+            tools,
+            &self.config.recall,
+            self.hub.store_handle(),
+            record.id.clone(),
+        ))
     }
 
     /// The system prompt, with the rule about untrusted text added when the

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use crate::types::OriginalId;
+use crate::types::{SessionId, TurnId};
 
 /// Why a read failed.
 #[derive(Debug, Error)]
@@ -49,6 +50,23 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+/// One match from a search of earlier sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecallHit {
+    /// Session the text was said in.
+    pub session: SessionId,
+    /// Turn the text belongs to.
+    pub turn: TurnId,
+    /// Position of the event in its session, starting at 1.
+    pub seq: u64,
+    /// What the text is: a user message, a model reply or a tool summary.
+    pub kind: String,
+    /// A short piece of the text around the match.
+    pub snippet: String,
+    /// When the text was stored, in milliseconds since the Unix epoch.
+    pub at: i64,
+}
+
 /// Fetches full tool outputs that were shortened before reaching the model.
 pub trait OriginalsReader {
     /// Returns the untruncated output stored under `id`.
@@ -78,6 +96,16 @@ pub trait IndexReader {
     /// # Errors
     /// [`ReaderError::Unavailable`] when the index cannot answer.
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, ReaderError>;
+}
+
+/// Searches the text of earlier sessions of one repository.
+pub trait RecallReader {
+    /// Finds stored messages and tool summaries that contain any of the words
+    /// of `query`, best match first, at most `limit` of them.
+    ///
+    /// # Errors
+    /// [`ReaderError::Unavailable`] when the search cannot answer.
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<RecallHit>, ReaderError>;
 }
 
 #[cfg(test)]

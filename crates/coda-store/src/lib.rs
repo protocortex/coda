@@ -17,6 +17,7 @@ mod pending;
 mod pull_requests;
 mod queue;
 mod readers;
+mod recall;
 mod receipts;
 mod review_memory;
 mod rollback;
@@ -39,6 +40,7 @@ pub use pending::{NewPending, PendingPermission};
 pub use pull_requests::MAX_PULL_REQUESTS_PER_SESSION;
 pub use queue::{MAX_QUEUED_MESSAGES, MAX_QUEUED_TEXT_BYTES, NewQueued, QueuedMessage};
 pub use readers::{RepoIndex, SessionOriginals};
+pub use recall::{MAX_RECALL_RESULTS, MAX_RECALL_SNIPPET_BYTES, RecallIndex};
 pub use receipts::{RECEIPT_RETENTION_MS, Receipt};
 pub use review_memory::{FindingStatus, MemoryFinding, ReviewRunRecord, StoredFinding};
 pub use savings::SavingRecord;
@@ -66,7 +68,7 @@ use coda_protocol::types::{OriginalId, RequestId, SessionId, TurnId};
 use rusqlite::{Connection, ErrorCode};
 
 /// Schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 25;
 
 /// Release of this binary, recorded in the database each time it opens it.
 pub const BINARY_RELEASE: &str = env!("CARGO_PKG_VERSION");
@@ -189,6 +191,8 @@ pub struct Store {
     db_path: PathBuf,
     /// Identifies this handle as the owner of its writer leases.
     id: u64,
+    /// Whether appended messages and tool summaries are copied into the recall index.
+    recall: bool,
 }
 
 impl Store {
@@ -244,6 +248,7 @@ impl Store {
             clock,
             db_path: fs::canonicalize(&db_path)?,
             id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
+            recall: false,
         })
     }
 

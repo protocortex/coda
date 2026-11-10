@@ -5,6 +5,7 @@
 use coda_protocol::types::{OriginalId, SessionId};
 use rusqlite::{OptionalExtension, params};
 
+use crate::recall::forget_original;
 use crate::{Store, StoreError};
 
 /// Largest original the store accepts, in bytes.
@@ -81,6 +82,7 @@ impl Store {
             "DELETE FROM originals WHERE id = ?1 AND session_id = ?2",
             [original_row, session_row],
         )?;
+        forget_original(self.connection(), original_row)?;
         Ok(())
     }
 
@@ -103,6 +105,7 @@ impl Store {
             }
             self.connection()
                 .execute("UPDATE originals SET content = x'' WHERE id = ?1", [id])?;
+            forget_original(self.connection(), id)?;
             total -= usize::try_from(len).unwrap_or(0);
         }
         Ok(())
