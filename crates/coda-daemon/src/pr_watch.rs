@@ -7,8 +7,10 @@
 //! for a failed check, required checks that pass, a comment or review from
 //! someone else, or a conflict. It stops when the pull request is merged or
 //! closed, after [`MAX_COMMENT_ONLY_WAKES`] wakes in a row that carried only
-//! comments, or after [`MAX_FAILED_READS`] reads in a row that failed. News that
-//! was already reported is not reported again.
+//! comments, after [`MAX_FAILED_READS`] reads in a row that failed, or after
+//! [`MAX_LIFETIME_HOURS`] hours. A watch with reviews on starts at most
+//! [`MAX_REVIEWS_PER_WATCH`] of them and says so when it stops. News that was
+//! already reported is not reported again.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -20,6 +22,14 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(120);
 pub const MAX_COMMENT_ONLY_WAKES: u32 = 10;
 /// Reads in a row that fail, after which the watch stops.
 pub const MAX_FAILED_READS: u32 = 8;
+/// Reviews one watch starts. A review runs for up to 15 minutes and wakes the
+/// session, so a branch that is pushed to without end must not run them without end.
+pub const MAX_REVIEWS_PER_WATCH: u32 = 10;
+/// Hours a watch lives, whatever happens on the pull request. It is counted in
+/// reads, so a review that pauses the reads stretches it a little.
+pub const MAX_LIFETIME_HOURS: u64 = 48;
+/// Reads a watch makes in its lifetime, at [`POLL_INTERVAL`].
+pub const MAX_LIFETIME_READS: u32 = 1_440;
 
 /// Longest pull request address a watch accepts.
 pub const MAX_REFERENCE_BYTES: usize = 256;
@@ -91,6 +101,7 @@ pub enum StopReason {
     Closed,
     OnlyComments,
     UnreadablePr,
+    Expired,
 }
 
 impl StopReason {
@@ -103,6 +114,9 @@ impl StopReason {
             }
             Self::UnreadablePr => {
                 format!("the pull request could not be read {MAX_FAILED_READS} times in a row")
+            }
+            Self::Expired => {
+                format!("the watch reached its lifetime of about {MAX_LIFETIME_HOURS} hours")
             }
         }
     }
@@ -119,6 +133,14 @@ pub struct Decision {
     pub review: Option<String>,
 }
 
+/// Whether a watch starts reviews, which decides if a push is counted toward the limit.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Reviews {
+    #[default]
+    On,
+    Off,
+}
+
 /// What a watch has already told the session, and the counts that end it.
 #[derive(Debug, Default)]
 pub struct Tracker {
@@ -132,9 +154,24 @@ pub struct Tracker {
     last_head: Option<String>,
     /// A head that came with a push and has not been reviewed or ruled out yet.
     unreviewed: Option<String>,
+    /// Reviews started, plus one once the limit has been announced.
+    reviews_started: u32,
+    reviews: Reviews,
+    /// Reads made so far, failed ones included.
+    reads: u32,
 }
 
 impl Tracker {
+    /// A tracker for a watch that never reviews, so it neither asks for a review
+    /// nor counts one toward the limit.
+    #[must_use]
+    pub fn without_reviews() -> Self {
+        Self {
+            reviews: Reviews::Off,
+            ..Self::default()
+        }
+    }
+
     /// The head to review after this read, if a push is waiting and can be reviewed now.
     fn review_for(&mut self, snapshot: &Snapshot) -> Option<String> {
         let changed = self
@@ -160,7 +197,42 @@ impl Tracker {
     }
 
     /// Decides what one read means. `subject` names the pull request in a message.
+    /// The read that is the last of the watch's lifetime also ends it.
     pub fn on_read(&mut self, read: Result<Snapshot, String>, subject: &str) -> Decision {
+        let mut decision = self.decide(read, subject);
+        self.reads += 1;
+        if decision.stop.is_none() && self.reads >= MAX_LIFETIME_READS {
+            let reason = StopReason::Expired;
+            decision.wake = Some(match decision.wake {
+                Some(text) => format!("{text} The watch stops: {}.", reason.text()),
+                None => stopped(subject, reason),
+            });
+            decision.stop = Some(reason);
+        }
+        decision
+    }
+
+    /// Keeps a push from starting a review once the watch has run its share, and
+    /// says so once.
+    fn cap_review(&mut self, review: Option<String>) -> (Option<String>, Option<String>) {
+        if review.is_none() || self.reviews == Reviews::Off {
+            return (None, None);
+        }
+        if self.reviews_started < MAX_REVIEWS_PER_WATCH {
+            self.reviews_started += 1;
+            return (review, None);
+        }
+        let first_excess = self.reviews_started == MAX_REVIEWS_PER_WATCH;
+        self.reviews_started = self.reviews_started.saturating_add(u32::from(first_excess));
+        let notice = first_excess.then(|| {
+            format!(
+                "the watch has run {MAX_REVIEWS_PER_WATCH} reviews, its limit, so later pushes are not reviewed"
+            )
+        });
+        (None, notice)
+    }
+
+    fn decide(&mut self, read: Result<Snapshot, String>, subject: &str) -> Decision {
         let Ok(snapshot) = read else {
             self.failed_reads += 1;
             let stop = (self.failed_reads >= MAX_FAILED_READS).then_some(StopReason::UnreadablePr);
@@ -177,6 +249,7 @@ impl Tracker {
             PrState::Open => {}
         }
         let review = self.review_for(&snapshot);
+        let (review, review_limit_notice) = self.cap_review(review);
         let mut news = Vec::new();
         let new_failures: Vec<&String> = snapshot
             .failed_checks
@@ -224,6 +297,8 @@ impl Tracker {
                 "{fresh_comments} new comment or review from someone else"
             ));
         }
+        let notice_only = news.is_empty() && review_limit_notice.is_some();
+        news.extend(review_limit_notice);
         if news.is_empty() {
             return Decision {
                 review,
@@ -232,7 +307,7 @@ impl Tracker {
         }
         if comments_only {
             self.comment_only_wakes += 1;
-        } else {
+        } else if !notice_only {
             self.comment_only_wakes = 0;
         }
         let stop =
@@ -290,7 +365,11 @@ pub async fn run<R: PrReader, V: Reviewer>(
     interval: Duration,
     mut wake: impl FnMut(String),
 ) -> StopReason {
-    let mut tracker = Tracker::default();
+    let mut tracker = if reviewer.is_some() {
+        Tracker::default()
+    } else {
+        Tracker::without_reviews()
+    };
     loop {
         let decision = tracker.on_read(reader.read().await, subject);
         if let Some(text) = decision.wake {
@@ -820,5 +899,134 @@ mod tests {
         assert_eq!(woken.len(), 2);
         assert!(woken[0].contains("failed checks"), "{woken:?}");
         assert!(woken[1].contains("merged"), "{woken:?}");
+    }
+
+    #[test]
+    fn the_lifetime_in_reads_matches_the_lifetime_in_hours() {
+        assert_eq!(
+            u64::from(MAX_LIFETIME_READS) * POLL_INTERVAL.as_secs(),
+            MAX_LIFETIME_HOURS * 3_600
+        );
+    }
+
+    #[test]
+    fn many_pushes_stop_being_reviewed_at_the_cap_and_the_session_is_told_once() {
+        // Arrange
+        let mut tracker = Tracker::default();
+        tracker.on_read(Ok(pushed("start")), PR);
+        let pushes = MAX_REVIEWS_PER_WATCH + 5;
+
+        // Act
+        let decisions: Vec<Decision> = (0..pushes)
+            .map(|n| tracker.on_read(Ok(pushed(&format!("head{n}"))), PR))
+            .collect();
+
+        // Assert
+        let reviewed = decisions.iter().filter(|d| d.review.is_some()).count();
+        assert_eq!(reviewed, MAX_REVIEWS_PER_WATCH as usize);
+        let told: Vec<usize> = decisions
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                d.wake
+                    .as_deref()
+                    .is_some_and(|w| w.contains("not reviewed"))
+            })
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(told, [MAX_REVIEWS_PER_WATCH as usize], "{decisions:?}");
+        assert!(decisions.iter().all(|d| d.stop.is_none()));
+    }
+
+    #[test]
+    fn a_watch_ends_after_its_lifetime_and_says_so() {
+        // Arrange
+        let mut tracker = Tracker::default();
+
+        // Act
+        let decisions: Vec<Decision> = (0..MAX_LIFETIME_READS)
+            .map(|_| tracker.on_read(Ok(open()), PR))
+            .collect();
+
+        // Assert
+        let (last, earlier) = decisions.split_last().unwrap();
+        assert!(earlier.iter().all(|d| d.stop.is_none()));
+        assert_eq!(last.stop, Some(StopReason::Expired));
+        assert!(woke(last).contains("about 48 hours"), "{last:?}");
+    }
+
+    #[test]
+    fn failed_reads_count_toward_the_lifetime() {
+        // Arrange
+        let mut tracker = Tracker::default();
+
+        // Act
+        let mut last = Decision::default();
+        for n in 0..MAX_LIFETIME_READS {
+            let read = if n % MAX_FAILED_READS == 0 {
+                Ok(open())
+            } else {
+                Err("down".to_owned())
+            };
+            last = tracker.on_read(read, PR);
+        }
+
+        // Assert
+        assert_eq!(last.stop, Some(StopReason::Expired));
+    }
+
+    #[test]
+    fn the_review_limit_notice_does_not_reset_the_comment_only_count() {
+        // Arrange
+        let mut tracker = Tracker::default();
+        tracker.on_read(Ok(pushed("start")), PR);
+        for n in 0..MAX_REVIEWS_PER_WATCH {
+            tracker.on_read(Ok(pushed(&format!("review{n}"))), PR);
+        }
+        let mut comments = Vec::new();
+        for n in 0..(MAX_COMMENT_ONLY_WAKES - 1) {
+            comments.push(format!("c{n}"));
+            tracker.on_read(
+                Ok(Snapshot {
+                    others_comments: comments.clone(),
+                    ..pushed("review9")
+                }),
+                PR,
+            );
+        }
+
+        // Act
+        let notice = tracker.on_read(Ok(pushed("one more push")), PR);
+        comments.push("last".to_owned());
+        let last = tracker.on_read(
+            Ok(Snapshot {
+                others_comments: comments,
+                ..pushed("one more push")
+            }),
+            PR,
+        );
+
+        // Assert
+        assert!(woke(&notice).contains("not reviewed"), "{notice:?}");
+        assert_eq!(last.stop, Some(StopReason::OnlyComments));
+    }
+
+    #[test]
+    fn with_reviews_off_many_pushes_start_no_review_and_tell_nobody_of_a_limit() {
+        // Arrange
+        let mut tracker = Tracker::without_reviews();
+        tracker.on_read(Ok(pushed("start")), PR);
+
+        // Act
+        let decisions: Vec<Decision> = (0..(MAX_REVIEWS_PER_WATCH + 5))
+            .map(|n| tracker.on_read(Ok(pushed(&format!("head{n}"))), PR))
+            .collect();
+
+        // Assert
+        assert!(
+            decisions
+                .iter()
+                .all(|d| d.review.is_none() && d.wake.is_none())
+        );
     }
 }
