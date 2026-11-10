@@ -25,7 +25,7 @@ pub const SUMMARY_UNAVAILABLE: &str =
     "[the summary of the earlier messages is no longer available]";
 
 /// Rough size of a token, for estimating a request without a tokenizer.
-const BYTES_PER_TOKEN: usize = 4;
+pub(crate) const BYTES_PER_TOKEN: usize = 4;
 /// Share of the window, in percent, at which a request is compacted ahead of time.
 const PROACTIVE_PERCENT: usize = 80;
 /// Share of the window, in percent, that one summarizer request may carry.
@@ -178,7 +178,8 @@ pub(crate) fn request_bytes(conversation: &Conversation) -> usize {
             }
         })
         .sum();
-    conversation.prefix().bytes().len() + messages
+    let context = conversation.context().map_or(0, str::len);
+    conversation.prefix().bytes().len() + context + messages
 }
 
 fn reasoning_bytes(block: &ReasoningBlock) -> usize {

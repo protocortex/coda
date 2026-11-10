@@ -296,3 +296,17 @@ fn an_earlier_summary_alone_is_not_worth_compacting_ahead() {
     assert!(worth_compacting(&new_material));
     assert!(!worth_compacting(&tail));
 }
+
+#[test]
+fn a_context_message_counts_toward_the_size_of_the_request() {
+    // Arrange
+    let prefix = crate::prompt::Prefix::new("system", Vec::new(), "").unwrap();
+    let bare = Conversation::new(prefix.clone());
+    let mapped = Conversation::new(prefix).with_context(Some("0123456789".to_owned()));
+
+    // Act
+    let extra = request_bytes(&mapped) - request_bytes(&bare);
+
+    // Assert
+    assert_eq!(extra, 10);
+}

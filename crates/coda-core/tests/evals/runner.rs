@@ -13,12 +13,14 @@ use std::time::Duration;
 
 use coda_config::hooks::{HookConfig, HookEvent};
 use coda_config::recall::RecallConfig;
+use coda_config::repo_map::RepoMapConfig;
 use coda_core::hooks::HookRunner;
 use coda_core::prompt::ToolSchema;
 use coda_core::prompt::{Conversation, Prefix};
+use coda_core::repo_map::{HEADER as MAP_HEADER, build as build_repo_map};
 use coda_core::tools::{
-    BaseTools, BaseToolsConfig, StoreOriginals, ask_schema, base_tools, fetch_schema, todo_schema,
-    with_recall,
+    BaseTools, BaseToolsConfig, StoreOriginals, ask_schema, base_tools, fetch_schema,
+    refresh_index, todo_schema, with_recall,
 };
 use coda_core::turn::{
     Fallback, StopCondition, ToolSet, TurnConfig, TurnError, TurnEvent, TurnLoop,
@@ -36,7 +38,7 @@ use coda_tools::fetch::{
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::fixtures::{Fixture, Site};
+use crate::fixtures::{Fixture, MapExpect, Site};
 
 const SYSTEM_PROMPT: &str = "You are Coda, a coding agent. Use the tools to finish the task, then reply with a short summary.";
 const MAX_TURNS: u32 = 12;
@@ -48,6 +50,8 @@ const FETCH_MAX_BYTES: usize = 256;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const BASH_TIMEOUT: Duration = Duration::from_secs(20);
 const GUARD_TIMEOUT_MS: u64 = 10_000;
+/// A context window large enough that the map's share holds the small fixture repositories.
+const MAP_WINDOW: u32 = 200_000;
 const OTHER_REPO: &str = "/somewhere/else";
 const USER_MESSAGE_KIND: &str = "user_message";
 const SHELL_PATH: &str = "/usr/bin:/bin";
@@ -214,7 +218,7 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
         AllowAll,
         tool_set,
         Arc::clone(&store),
-        Conversation::new(prefix),
+        Conversation::new(prefix).with_context(repo_map(fixture, &store, &workdir)),
         TurnConfig {
             session: session.clone(),
             cwd: workdir.clone(),
@@ -259,6 +263,22 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
         stop,
         failure,
     }
+}
+
+/// The repository map of the fixture's workspace, when the fixture asks for one.
+fn repo_map(fixture: &Fixture, store: &Arc<Mutex<Store>>, workdir: &Path) -> Option<String> {
+    if fixture.map == MapExpect::Off {
+        return None;
+    }
+    refresh_index(store, workdir);
+    build_repo_map(
+        store,
+        workdir,
+        fixture.prompt,
+        Some(MAP_WINDOW),
+        &RepoMapConfig::default(),
+        Vec::new(),
+    )
 }
 
 /// Stores what the fixture says was said in earlier sessions, one session per
@@ -365,7 +385,9 @@ fn make_workspace(fixture: &Fixture, root: &Path) -> PathBuf {
     let workdir = root.join("ws");
     std::fs::create_dir(&workdir).unwrap();
     for (path, content) in fixture.files {
-        std::fs::write(workdir.join(path), content).unwrap();
+        let file = workdir.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, content).unwrap();
     }
     if fixture.git {
         stage_files(&workdir, root);
@@ -435,6 +457,31 @@ fn count_events(receiver: &mut UnboundedReceiver<TurnEvent>) -> (u32, u64, u32, 
     (turns, tokens, errors, fallbacks)
 }
 
+/// Why the first request does not hold what the fixture expects of the map, if it does not.
+fn judge_map(fixture: &Fixture, requests: &[ModelRequest]) -> Option<String> {
+    let first = requests.first()?.messages.first();
+    let text = match first {
+        Some(RequestMessage::User(text)) => text.as_str(),
+        _ => return Some("the first message is not a user message".to_owned()),
+    };
+    match fixture.map {
+        MapExpect::Off => None,
+        MapExpect::NoMap if text == fixture.prompt => None,
+        MapExpect::NoMap => Some("a map was sent for a workspace with nothing to map".to_owned()),
+        MapExpect::FirstPath(path) => {
+            let listed = text
+                .starts_with(MAP_HEADER)
+                .then(|| {
+                    text.lines()
+                        .find(|line| !line.starts_with('[') && !line.starts_with(' '))
+                })
+                .flatten();
+            (listed != Some(path))
+                .then(|| format!("the map does not list {path} first: {listed:?}"))
+        }
+    }
+}
+
 /// Why the run does not count as a pass, if it does not.
 fn judge(
     fixture: &Fixture,
@@ -473,6 +520,9 @@ fn judge(
         if !seen {
             return Some(format!("no tool result held {text:?}"));
         }
+    }
+    if let Some(failure) = judge_map(fixture, requests) {
+        return Some(failure);
     }
     if let Some(text) = fixture.unseen {
         let leaked = requests.iter().any(|request| {

@@ -12,6 +12,7 @@ pub mod hooks;
 pub mod loop_guard;
 pub mod prompt;
 pub mod repair;
+pub mod repo_map;
 pub mod steer;
 pub mod task;
 pub mod tools;

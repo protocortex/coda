@@ -157,6 +157,7 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub struct Conversation {
     prefix: Prefix,
+    context: Option<String>,
     messages: Vec<Message>,
 }
 
@@ -166,8 +167,25 @@ impl Conversation {
     pub fn new(prefix: Prefix) -> Self {
         Self {
             prefix,
+            context: None,
             messages: Vec::new(),
         }
+    }
+
+    /// This conversation with a context message that is sent first, after the
+    /// prefix and before every message. It is not a message: replay, compaction
+    /// and message counts never see it, and it is not part of the prefix, so it
+    /// can change between conversations without changing the prefix bytes.
+    #[must_use]
+    pub fn with_context(mut self, context: Option<String>) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// The context message, when there is one.
+    #[must_use]
+    pub fn context(&self) -> Option<&str> {
+        self.context.as_deref()
     }
 
     /// Appends a message.
@@ -281,6 +299,21 @@ mod tests {
 
         // Assert
         assert_eq!(prefix.bytes(), GOLDEN.as_bytes());
+    }
+
+    #[test]
+    fn a_context_message_changes_neither_the_prefix_nor_the_messages() {
+        // Arrange
+        let mut conversation = Conversation::new(prefix(vec![read_tool(), grep_tool()]))
+            .with_context(Some("map of the repository".into()));
+
+        // Act
+        conversation.push(Message::User("hello".into()));
+
+        // Assert
+        assert_eq!(conversation.context(), Some("map of the repository"));
+        assert_eq!(conversation.prefix().bytes(), GOLDEN.as_bytes());
+        assert_eq!(conversation.messages(), [Message::User("hello".into())]);
     }
 
     #[test]

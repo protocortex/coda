@@ -1673,6 +1673,64 @@ async fn a_configured_window_compacts_the_conversation_before_the_request_is_sen
     );
 }
 
+fn mapped_rig(tune: impl FnOnce(&mut Config)) -> Rig {
+    let rig = Rig::custom(
+        Mode::Default,
+        &[text_turn("hi"), text_turn("again")],
+        true,
+        Some("script-1"),
+        |config| {
+            config.models.insert(
+                "scripted".to_owned(),
+                ModelAlias {
+                    provider: "faux".to_owned(),
+                    model: "script-1".to_owned(),
+                    context_window: Some(LARGE_WINDOW),
+                    fallback: Vec::new(),
+                },
+            );
+            tune(config);
+        },
+    );
+    std::fs::write(rig.cwd.join("lib.rs"), "pub fn mapped_name() {}\n").unwrap();
+    rig
+}
+
+#[tokio::test]
+async fn a_new_loop_starts_with_the_repository_map_and_keeps_it_for_later_sends() {
+    // Arrange
+    let mut rig = mapped_rig(|_| {});
+
+    // Act
+    rig.send("hello").await;
+    rig.wait_for_results(1).await;
+    rig.wait_until_idle().await;
+    std::fs::write(rig.cwd.join("later.rs"), "pub fn added_later() {}\n").unwrap();
+    rig.send("more").await;
+    rig.wait_for_results(2).await;
+
+    // Assert
+    let requests = rig.requests();
+    let first = requests[0][0]["text"].as_str().unwrap();
+    assert!(first.starts_with(coda_core::repo_map::HEADER), "{first}");
+    assert!(first.contains("mapped_name"), "{first}");
+    assert_eq!(requests[0][1]["text"], "hello");
+    assert_eq!(requests[1][0]["text"].as_str().unwrap(), first);
+}
+
+#[tokio::test]
+async fn a_session_with_the_map_off_starts_with_the_user_message() {
+    // Arrange
+    let mut rig = mapped_rig(|config| config.repo_map.enabled = false);
+
+    // Act
+    rig.send("hello").await;
+    rig.wait_for_results(1).await;
+
+    // Assert
+    assert_eq!(rig.requests()[0][0]["text"], "hello");
+}
+
 #[tokio::test]
 async fn a_usage_event_says_how_full_the_context_of_a_model_with_a_window_is() {
     // Arrange

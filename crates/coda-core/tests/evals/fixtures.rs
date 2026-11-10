@@ -56,7 +56,21 @@ pub struct Fixture {
     /// What was said in earlier sessions, stored before the run with recall on. When
     /// there are any, the `recall` tool is offered.
     pub earlier: &'static [Earlier],
+    /// Whether the session starts with a map of the repository, and what it must show.
+    pub map: MapExpect,
     pub script: fn() -> Vec<Turn>,
+}
+
+/// What a fixture expects of the repository map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapExpect {
+    /// The session is built with no map, as the older fixtures are.
+    Off,
+    /// The first message is a map that lists this path before every other file.
+    FirstPath(&'static str),
+    /// The map is on but the workspace has nothing to map, so the first message
+    /// is the prompt.
+    NoMap,
 }
 
 /// One message of an earlier session.
@@ -100,6 +114,7 @@ impl Fixture {
             web: &[],
             unseen: None,
             earlier: &[],
+            map: MapExpect::Off,
             script: || vec![reply("Nothing to do.")],
         }
     }
@@ -204,6 +219,7 @@ const FIX_FAILING_TEST: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("bash", json!({"command": "sh test.sh"})),
@@ -234,6 +250,7 @@ const ADD_FUNCTION: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("list", json!({})),
@@ -270,6 +287,7 @@ const RENAME_SYMBOL: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("grep", json!({"pattern": "old_name"})),
@@ -307,6 +325,7 @@ const RESIST_INJECTION: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("read", json!({"path": "notes.txt"})),
@@ -333,6 +352,7 @@ const RECOVER_AFTER_BAD_CALL: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call(
@@ -365,6 +385,7 @@ const WARNED_FOR_A_REPEAT: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("read", json!({"path": "config.txt"})),
@@ -397,6 +418,7 @@ const FINISHED_TOO_EARLY: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             reply("Done."),
@@ -425,6 +447,7 @@ const REPAIRED_ARGUMENTS: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             raw_call(
@@ -452,6 +475,7 @@ const KEPT_REASONING: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             with_reasoning(
@@ -482,6 +506,7 @@ const TEXT_SHAPED_CALL: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             reply(
@@ -508,6 +533,7 @@ const FELL_BACK_ON_RATE_LIMIT: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             rate_limited(),
@@ -536,6 +562,7 @@ const KEPT_A_TODO_LIST: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("todo", json!({"action": "add", "text": "change the mode"})),
@@ -573,6 +600,7 @@ const READ_FILES_IN_PARALLEL: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             calls(&[
@@ -618,6 +646,7 @@ const ASKED_THE_USER: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call(
@@ -649,6 +678,7 @@ const SAW_THE_CHANGE: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call(
@@ -680,6 +710,7 @@ const SHRANK_A_LARGE_DIFF: Fixture = Fixture {
     web: &[],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("bash", json!({"command": BIG_REPORT_COMMAND})),
@@ -713,6 +744,7 @@ const READ_A_PAGE: Fixture = Fixture {
     }],
     unseen: Some("steal()"),
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("fetch", json!({"url": "https://docs.example/guide"})),
@@ -750,6 +782,7 @@ const REFUSED_A_PRIVATE_HOST: Fixture = Fixture {
     }],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("fetch", json!({"url": "https://internal.example/status"})),
@@ -797,6 +830,7 @@ const REFUSED_A_REDIRECT: Fixture = Fixture {
     ],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("fetch", json!({"url": "https://a.example/start"})),
@@ -836,6 +870,7 @@ const CUT_A_LONG_PAGE: Fixture = Fixture {
     }],
     unseen: None,
     earlier: &[],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("fetch", json!({"url": "https://long.example/notes"})),
@@ -870,6 +905,7 @@ const RECALLED_AN_EARLIER_SESSION: Fixture = Fixture {
             text: "The logo should be blue.",
         },
     ],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("recall", json!({"query": "retry setting name"})),
@@ -903,11 +939,69 @@ const RECALLED_NOTHING_FROM_ANOTHER_REPOSITORY: Fixture = Fixture {
         same_repo: false,
         text: "The password policy is to rotate every 30 days.",
     }],
+    map: MapExpect::Off,
     script: || {
         vec![
             call("recall", json!({"query": "password policy"})),
             call("write", json!({"path": "policy.txt", "content": "none\n"})),
             reply("Nothing about a password policy was said in this repository."),
+        ]
+    },
+};
+
+const MAPPED_THE_REPOSITORY: Fixture = Fixture {
+    name: "mapped_the_repository",
+    prompt: "In beta.rs add a function named added_by_model that returns 1.",
+    files: &[
+        ("src/alpha.rs", "pub fn alpha() -> i32 {\n    0\n}\n"),
+        ("src/beta.rs", "pub fn beta() -> i32 {\n    0\n}\n"),
+        ("src/gamma.rs", "pub struct Gamma;\n"),
+    ],
+    check: "grep -q 'fn added_by_model' src/beta.rs",
+    untrusted: None,
+    guard: None,
+    text_calls: false,
+    fallback: false,
+    todo: false,
+    ask: false,
+    git: false,
+    saw: None,
+    web: &[],
+    unseen: None,
+    earlier: &[],
+    map: MapExpect::FirstPath("src/beta.rs"),
+    script: || {
+        vec![
+            call(
+                "bash",
+                json!({"command": "printf 'pub fn added_by_model() -> i32 {\\n    1\\n}\\n' >> src/beta.rs"}),
+            ),
+            reply("Added added_by_model to beta.rs."),
+        ]
+    },
+};
+
+const MAPPED_NOTHING_IN_A_FOLDER_OF_NOTES: Fixture = Fixture {
+    name: "mapped_nothing_in_a_folder_of_notes",
+    prompt: "Write ok to done.txt.",
+    files: &[("notes.txt", "plain text, no source files\n")],
+    check: "grep -qx ok done.txt",
+    untrusted: None,
+    guard: None,
+    text_calls: false,
+    fallback: false,
+    todo: false,
+    ask: false,
+    git: false,
+    saw: None,
+    web: &[],
+    unseen: None,
+    earlier: &[],
+    map: MapExpect::NoMap,
+    script: || {
+        vec![
+            call("write", json!({"path": "done.txt", "content": "ok\n"})),
+            reply("Wrote ok."),
         ]
     },
 };
@@ -937,5 +1031,7 @@ pub fn all() -> Vec<Fixture> {
         CUT_A_LONG_PAGE,
         RECALLED_AN_EARLIER_SESSION,
         RECALLED_NOTHING_FROM_ANOTHER_REPOSITORY,
+        MAPPED_THE_REPOSITORY,
+        MAPPED_NOTHING_IN_A_FOLDER_OF_NOTES,
     ]
 }

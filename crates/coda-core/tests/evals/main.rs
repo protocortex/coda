@@ -293,6 +293,33 @@ mod offline {
     }
 
     #[tokio::test]
+    async fn the_map_leads_the_first_request_and_a_folder_with_nothing_to_map_has_none() {
+        let outcomes = run_all().await;
+
+        for name in [
+            "mapped_the_repository",
+            "mapped_nothing_in_a_folder_of_notes",
+        ] {
+            let outcome = find(&outcomes, name);
+            assert_eq!(outcome.tool_errors, 0, "{outcome:?}");
+            assert!(outcome.passed, "{outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_map_that_does_not_lead_with_the_named_file_fails_the_fixture() {
+        let mut fixture = fixtures::all()
+            .into_iter()
+            .find(|f| f.name == "mapped_the_repository")
+            .unwrap();
+        fixture.map = fixtures::MapExpect::FirstPath("src/gamma.rs");
+
+        let outcome = runner::run_offline(&fixture).await;
+
+        assert!(!outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
     async fn a_rate_limit_with_no_fallback_fails_the_fixture() {
         let mut fixture = fixtures::all()
             .into_iter()
