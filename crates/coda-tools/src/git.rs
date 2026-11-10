@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,11 @@ pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Keys of the filter settings that name a program git runs on file content.
 const FILTER_KEY_PREFIX: &str = "filter.";
 const REQUIRED_OFF: &str = "false";
+/// The oldest git that honours every override below: `GIT_NO_LAZY_FETCH` came in
+/// 2.44 and `GIT_CONFIG_COUNT` in 2.31. An older git ignores them without a message.
+const MIN_GIT_VERSION: (u32, u32) = (2, 44);
+const VERSION_ARG: &str = "--version";
+const VERSION_PREFIX: &str = "git version ";
 const CONFIG_COUNT_VAR: &str = "GIT_CONFIG_COUNT";
 const CONFIG_PARAMETERS_VAR: &str = "GIT_CONFIG_PARAMETERS";
 const CONFIG_KEY_VAR_PREFIX: &str = "GIT_CONFIG_KEY_";
@@ -89,13 +95,67 @@ struct GitRunner {
     env: Vec<(OsString, OsString)>,
     timeout: Duration,
     max_output_bytes: usize,
+    /// The outcome of the first version check, shared by clones of the runner.
+    version_check: Arc<OnceLock<Result<(), String>>>,
 }
 
 impl GitRunner {
+    fn new(
+        workdir: PathBuf,
+        env: Vec<(OsString, OsString)>,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Self {
+        Self {
+            workdir,
+            env,
+            timeout,
+            max_output_bytes,
+            version_check: Arc::default(),
+        }
+    }
+
+    /// Fails closed when git is older than the overrides need or says nothing
+    /// parseable, because such a git would run a repository's programs unannounced.
+    fn require_supported_git(&self) -> Result<(), ToolError> {
+        let checked = self.version_check.get_or_init(|| {
+            let output = self
+                .bare_command()
+                .arg(VERSION_ARG)
+                .output()
+                .map_err(|err| format!("could not run git --version: {err}"))?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            match parse_git_version(&text) {
+                Some(found) if found >= MIN_GIT_VERSION => Ok(()),
+                Some((major, minor)) => Err(format!(
+                    "git {major}.{minor} is too old: the git tools need git {}.{} or later, \
+                     because an older git ignores the settings that stop a repository's programs from running",
+                    MIN_GIT_VERSION.0, MIN_GIT_VERSION.1
+                )),
+                None => Err(format!(
+                    "could not read the git version from {:?}; the git tools need git {}.{} or later",
+                    text.trim(),
+                    MIN_GIT_VERSION.0,
+                    MIN_GIT_VERSION.1
+                )),
+            }
+        });
+        checked
+            .clone()
+            .map_err(|reason| ToolError::Spawn(std::io::Error::other(reason)))
+    }
+
     fn command(&self) -> Command {
+        let mut command = self.bare_command();
+        command.args(GLOBAL_ARGS);
+        command
+    }
+
+    /// Git with the guarded environment but no switches, so that the version
+    /// probe works on a git too old to know the switches of `command`.
+    fn bare_command(&self) -> Command {
         let mut command = Command::new(GIT);
         command
-            .args(GLOBAL_ARGS)
             .current_dir(&self.workdir)
             .env_clear()
             .envs(self.env.iter().map(|(k, v)| (k, v)))
@@ -152,6 +212,7 @@ impl GitRunner {
     }
 
     fn run(&self, args: &[&str], cancel: &AtomicBool) -> Result<ToolOutput, ToolError> {
+        self.require_supported_git()?;
         let overrides = self.filter_overrides()?;
         let mut command = self.command();
         command.env(CONFIG_COUNT_VAR, overrides.len().to_string());
@@ -206,6 +267,15 @@ impl GitRunner {
         }
         Ok(output)
     }
+}
+
+/// Reads `major.minor` from the text of `git --version`.
+fn parse_git_version(text: &str) -> Option<(u32, u32)> {
+    let numbers = text.trim().strip_prefix(VERSION_PREFIX)?;
+    let mut parts = numbers.split(|c: char| !c.is_ascii_digit());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 /// Keeps the first `limit` bytes of `pipe`, read on its own thread so a command
@@ -314,12 +384,7 @@ impl GitStatusTool {
         timeout: Duration,
         max_output_bytes: usize,
     ) -> Self {
-        Self(GitRunner {
-            workdir,
-            env,
-            timeout,
-            max_output_bytes,
-        })
+        Self(GitRunner::new(workdir, env, timeout, max_output_bytes))
     }
 }
 
@@ -332,12 +397,7 @@ impl GitDiffTool {
         timeout: Duration,
         max_output_bytes: usize,
     ) -> Self {
-        Self(GitRunner {
-            workdir,
-            env,
-            timeout,
-            max_output_bytes,
-        })
+        Self(GitRunner::new(workdir, env, timeout, max_output_bytes))
     }
 }
 
@@ -860,6 +920,82 @@ mod tests {
         assert!(shown.text.contains("+two"), "{}", shown.text);
         assert!(!shown.text.contains("secret"), "{}", shown.text);
         assert!(one.text.contains("+two"), "{}", one.text);
+    }
+
+    /// A stand-in `git` that reports `version` and records any other call.
+    fn fake_git(version: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'git version {version}'; exit 0; fi\n: > {}\nexit 129\n",
+            marker.display()
+        );
+        let path = dir.path().join(GIT);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, marker)
+    }
+
+    fn tools_with_fake_git(dir: &Path) -> (GitStatusTool, GitDiffTool) {
+        let env = vec![(OsString::from("PATH"), dir.as_os_str().to_owned())];
+        (
+            GitStatusTool::new(dir.to_path_buf(), env.clone(), TIMEOUT, CAP),
+            GitDiffTool::new(dir.to_path_buf(), env, TIMEOUT, CAP),
+        )
+    }
+
+    #[test]
+    fn a_git_older_than_the_overrides_need_runs_nothing() {
+        for version in [
+            "2.30.2",
+            "2.43.9 (Apple Git-1)",
+            "1.8.3.1",
+            "2.43.0.windows.1",
+        ] {
+            // Arrange
+            let (dir, marker) = fake_git(version);
+            let (status, diff) = tools_with_fake_git(dir.path());
+
+            // Act
+            let status_err = status.call(&json!({})).unwrap_err().to_string();
+            let diff_err = diff.call(&json!({})).unwrap_err().to_string();
+
+            // Assert
+            assert!(status_err.contains("2.44"), "{version}: {status_err}");
+            assert!(diff_err.contains("2.44"), "{version}: {diff_err}");
+            assert!(
+                !marker.exists(),
+                "{version}: git ran after the version check"
+            );
+        }
+    }
+
+    #[test]
+    fn a_git_that_does_not_report_a_version_runs_nothing() {
+        // Arrange
+        let (dir, marker) = fake_git("unparseable");
+        let (status, _) = tools_with_fake_git(dir.path());
+
+        // Act
+        let err = status.call(&json!({})).unwrap_err().to_string();
+
+        // Assert
+        assert!(err.contains("version"), "{err}");
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_git_at_the_minimum_version_is_allowed_to_run() {
+        // Arrange
+        let (dir, marker) = fake_git("2.44.0");
+        let (status, _) = tools_with_fake_git(dir.path());
+
+        // Act
+        let _ = status.call(&json!({}));
+
+        // Assert
+        assert!(marker.exists(), "a supported git was refused");
     }
 
     #[test]
