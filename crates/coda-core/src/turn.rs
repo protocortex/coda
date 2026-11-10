@@ -26,7 +26,7 @@ use coda_tools::ask as ask_tool;
 use coda_tools::todo::{self as todo_tool, TodoList};
 use coda_tools::{
     Tool, fetch as fetch_tool, git as git_tool, recall as recall_tool, skill as skill_tool,
-    task as task_tool,
+    task as task_tool, tool_server,
 };
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -1854,8 +1854,12 @@ fn tool_request(name: &str, input: &Value, cwd: &Path) -> ToolRequest {
 }
 
 /// The argument a permission grant is matched against: the address for `fetch`,
-/// as the tool will fetch it, and the command line for everything else.
+/// as the tool will fetch it, the arguments for a tool server's tool, and the
+/// command line for everything else.
 fn command_text(tool: &str, input: &Value) -> Option<String> {
+    if tool.contains(tool_server::SEPARATOR) {
+        return Some(input.to_string());
+    }
     if tool == fetch_tool::NAME {
         let raw = input.get("url").and_then(Value::as_str)?;
         return Some(fetch_tool::canonical_address(raw).unwrap_or_else(|| raw.to_owned()));
@@ -1910,6 +1914,19 @@ mod tests {
             Some("https://docs.example/page")
         );
         assert_eq!(request.target_paths, Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_tool_server_request_is_unknown_to_the_policy_and_carries_its_arguments() {
+        // Arrange
+        let input = serde_json::json!({"text": "hi"});
+
+        // Act
+        let request = super::tool_request("srv__echo", &input, Path::new("/ws"));
+
+        // Assert
+        assert_eq!(request.tool, RequestTool::Unknown("srv__echo".to_owned()));
+        assert_eq!(request.command.as_deref(), Some(r#"{"text":"hi"}"#));
     }
 
     #[test]

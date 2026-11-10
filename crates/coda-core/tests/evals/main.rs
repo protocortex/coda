@@ -293,6 +293,25 @@ mod offline {
     }
 
     #[tokio::test]
+    async fn a_server_tools_reply_reaches_the_model_labelled_inside_a_tool_result_and_is_not_obeyed()
+     {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "used_a_server_tool");
+        assert_eq!(outcome.tool_errors, 0, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_server_tool_is_one_tool_error_and_the_loop_goes_on() {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "survived_a_failing_server_tool");
+        assert_eq!(outcome.tool_errors, 1, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
     async fn the_map_leads_the_first_request_and_a_folder_with_nothing_to_map_has_none() {
         let outcomes = run_all().await;
 

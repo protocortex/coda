@@ -2,6 +2,7 @@
 
 //! Runs one fixture through the turn loop and judges the result.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::future::Future;
@@ -14,10 +15,12 @@ use std::time::Duration;
 use coda_config::hooks::{HookConfig, HookEvent};
 use coda_config::recall::RecallConfig;
 use coda_config::repo_map::RepoMapConfig;
+use coda_config::tool_servers::{DEFAULT_SERVER_TIMEOUT_MS, ToolServerConfig};
 use coda_core::hooks::HookRunner;
 use coda_core::prompt::ToolSchema;
 use coda_core::prompt::{Conversation, Prefix};
 use coda_core::repo_map::{HEADER as MAP_HEADER, build as build_repo_map};
+use coda_core::tool_servers::{ToolServers, with_tool_servers};
 use coda_core::tools::{
     BaseTools, BaseToolsConfig, StoreOriginals, ask_schema, base_tools, fetch_schema,
     refresh_index, todo_schema, with_recall,
@@ -33,6 +36,7 @@ use coda_providers::model::{
 };
 use coda_providers::tool_request::ToolRequest;
 use coda_store::{EventRecord, NewSession, Store};
+use coda_testkit::paths::fake_tool_server_path;
 use coda_tools::fetch::{
     FetchPolicy, FetchTool, Reply, Request, Resolver, Transport, UNTRUSTED_RULE,
 };
@@ -195,7 +199,7 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
         Arc::clone(&store),
         session.clone(),
     );
-    let (tool_set, schemas, system) = offered(fixture, tools);
+    let (tool_set, schemas, system) = offered(fixture, tools, &workdir);
     let prefix = Prefix::new(&system, schemas, "").unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -313,7 +317,16 @@ fn seed_earlier_sessions(store: &mut Store, fixture: &Fixture, workdir: &Path) {
 }
 
 /// The tools, schemas and system prompt a fixture's model is offered.
-fn offered(fixture: &Fixture, tools: BaseTools) -> (ToolSet, Vec<ToolSchema>, String) {
+fn offered(
+    fixture: &Fixture,
+    tools: BaseTools,
+    workdir: &Path,
+) -> (ToolSet, Vec<ToolSchema>, String) {
+    let tools = if fixture.server {
+        with_fake_server(tools, workdir)
+    } else {
+        tools
+    };
     let mut schemas = tools.schemas;
     let mut tool_set = tools.tools;
     let mut system = SYSTEM_PROMPT.to_owned();
@@ -322,6 +335,9 @@ fn offered(fixture: &Fixture, tools: BaseTools) -> (ToolSet, Vec<ToolSchema>, St
         schemas.push(fetch_schema());
         system = format!("{system} {UNTRUSTED_RULE}");
     }
+    if fixture.server {
+        system = format!("{system} {}", coda_tools::tool_server::UNTRUSTED_RULE);
+    }
     if fixture.todo {
         schemas.push(todo_schema());
     }
@@ -329,6 +345,23 @@ fn offered(fixture: &Fixture, tools: BaseTools) -> (ToolSet, Vec<ToolSchema>, St
         schemas.push(ask_schema());
     }
     (tool_set, schemas, system)
+}
+
+/// `tools` with the tools of the scripted tool server, started for `workdir`.
+fn with_fake_server(tools: BaseTools, workdir: &Path) -> BaseTools {
+    let config = BTreeMap::from([(
+        "srv".to_owned(),
+        ToolServerConfig {
+            command: vec![
+                fake_tool_server_path().unwrap().display().to_string(),
+                "default".to_owned(),
+            ],
+            env: Vec::new(),
+            timeout_ms: DEFAULT_SERVER_TIMEOUT_MS,
+        },
+    )]);
+    let started = ToolServers::new(&config, &[]).start(workdir, &[]);
+    with_tool_servers(tools, &started)
 }
 
 /// The names and pages of a fixture's fake web.

@@ -1583,6 +1583,7 @@ mod skills;
 mod switch;
 mod task;
 mod todo;
+mod tool_servers;
 
 fn overflow_turn() -> Value {
     json!({"events": [], "error": {"class": "context_window_exceeded"}})

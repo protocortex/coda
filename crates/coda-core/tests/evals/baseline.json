@@ -89,9 +89,17 @@
       "turns": 4,
       "tokens": 10536
     },
+    "survived_a_failing_server_tool": {
+      "turns": 3,
+      "tokens": 4855
+    },
     "text_shaped_call": {
       "turns": 2,
       "tokens": 2809
+    },
+    "used_a_server_tool": {
+      "turns": 3,
+      "tokens": 4935
     },
     "warned_for_a_repeat": {
       "turns": 5,
