@@ -498,6 +498,7 @@ name = "coda-tools"
 version = "0.1.0"
 dependencies = [
  "coda-protocol",
+ "coda-testkit",
  "globset",
  "regex",
  "reqwest",

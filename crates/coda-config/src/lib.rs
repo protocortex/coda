@@ -15,5 +15,6 @@ pub mod repo_map;
 pub mod review;
 pub mod routing;
 pub mod timing;
+pub mod tool_servers;
 pub mod tui;
 pub mod worktree;
