@@ -97,13 +97,15 @@ pub fn decide(input: &PolicyInput<'_>) -> Verdict {
     match input.tool {
         // Skill reads only the definitions the user already admitted for the session.
         // The git tools run a fixed read-only command that ignores the repository's own programs.
+        // Recall reads only what sessions of this repository stored and sends it nowhere itself.
         Tool::Retrieve
         | Tool::CodeSearch
         | Tool::CodeSymbol
         | Tool::CodeOutline
         | Tool::Skill
         | Tool::GitStatus
-        | Tool::GitDiff => Verdict::Allow,
+        | Tool::GitDiff
+        | Tool::Recall => Verdict::Allow,
         Tool::Unknown(_) => Verdict::Prompt,
         // A fetch reaches the network, so like a command it needs a grant for its exact address.
         Tool::Bash | Tool::Fetch => grant_or_prompt(input.granted),
@@ -604,6 +606,7 @@ fn bash_and_scope_rows(rows: &mut Rows, mode: PermissionMode) {
         Tool::Skill,
         Tool::GitStatus,
         Tool::GitDiff,
+        Tool::Recall,
     ] {
         rows.add(
             "session scope tool",

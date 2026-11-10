@@ -494,6 +494,17 @@ async fn a_session_offers_fetch_and_the_untrusted_rule_only_when_a_host_is_liste
 }
 
 #[tokio::test]
+async fn a_session_offers_recall_only_when_the_user_switched_it_on() {
+    // Act
+    let (off_tools, _) = offered_by(|_| {}).await;
+    let (on_tools, _) = offered_by(|config| config.recall.enabled = true).await;
+
+    // Assert
+    assert!(!off_tools.contains(&"recall".to_owned()), "{off_tools:?}");
+    assert!(on_tools.contains(&"recall".to_owned()), "{on_tools:?}");
+}
+
+#[tokio::test]
 async fn a_write_over_an_unread_file_or_outside_the_workspace_is_refused() {
     // Arrange
     let calls = tool_turn(&[

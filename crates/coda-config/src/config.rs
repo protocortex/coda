@@ -24,6 +24,7 @@ use crate::hooks::{HookConfig, MAX_TIMEOUT_MS};
 use crate::loop_guard::{
     LOOP_GUARD_KEY, LoopGuardConfig, MIN_WARN_AFTER, STOP_AFTER_KEY, WARN_AFTER_KEY,
 };
+use crate::recall::{DELEGATED_REPOS_KEY, RECALL_KEY, RecallConfig, is_repo_path};
 use crate::review::{
     CHECK_COMMANDS_KEY, CHUNK_CONCURRENCY_KEY, DIFF_BUDGET_CHARS_KEY, MAX_CHUNKS_KEY,
     MAX_FINDINGS_KEY, REVIEW_KEY, ROUTING_MODEL_KEY, ROUTING_RULES_PATH, ReviewConfig,
@@ -354,6 +355,8 @@ pub struct Config {
     pub describe: DescribeConfig,
     /// The hosts the `fetch` tool may read; off while the list is empty.
     pub fetch: FetchConfig,
+    /// Whether earlier sessions are indexed for the `recall` tool; off by default.
+    pub recall: RecallConfig,
 }
 
 impl Default for Config {
@@ -379,6 +382,7 @@ impl Default for Config {
             checkpoints: CheckpointsConfig::default(),
             describe: DescribeConfig::default(),
             fetch: FetchConfig::default(),
+            recall: RecallConfig::default(),
         }
     }
 }
@@ -425,6 +429,7 @@ impl Config {
         config.check_worktree()?;
         config.check_checkpoints()?;
         config.check_fetch()?;
+        config.check_recall()?;
         Ok(Parsed {
             config,
             unknown_keys,
@@ -760,6 +765,16 @@ impl Config {
             });
         }
         Ok(())
+    }
+
+    fn check_recall(&self) -> Result<(), ConfigError> {
+        if self.recall.delegated_repos.iter().all(|r| is_repo_path(r)) {
+            return Ok(());
+        }
+        Err(ConfigError::InvalidValue {
+            path: format!("{RECALL_KEY}.{DELEGATED_REPOS_KEY}"),
+            allowed: "absolute folder paths".to_owned(),
+        })
     }
 
     fn check_checkpoints(&self) -> Result<(), ConfigError> {
@@ -1680,6 +1695,53 @@ bots = true
 
             // Assert
             assert!(error.to_string().contains(key), "{line}: {error}");
+        }
+    }
+
+    #[test]
+    fn recall_is_off_and_lists_no_repository_until_the_file_says_so() {
+        // Act
+        let recall = Config::from_toml_str("").unwrap().config.recall;
+
+        // Assert
+        assert!(!recall.enabled);
+        assert_eq!(recall.delegated_repos, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_recall_table_is_read_from_the_file() {
+        // Arrange
+        let text = "[recall]\nenabled = true\ndelegated_repos = [\"/work/repo\"]\n";
+
+        // Act
+        let recall = Config::from_toml_str(text).unwrap().config.recall;
+
+        // Assert
+        assert!(recall.enabled);
+        assert_eq!(recall.delegated_repos, ["/work/repo"]);
+    }
+
+    #[test]
+    fn a_misspelled_recall_key_or_a_relative_repository_is_an_error() {
+        // Arrange
+        let cases = [
+            ("[recall]\nenable = true\n", "enable"),
+            (
+                "[recall]\ndelegated_repos = [\"repo\"]\n",
+                "recall.delegated_repos",
+            ),
+            (
+                "[recall]\ndelegated_repos = [\"\"]\n",
+                "recall.delegated_repos",
+            ),
+        ];
+
+        for (text, key) in cases {
+            // Act
+            let error = Config::from_toml_str(text).unwrap_err();
+
+            // Assert
+            assert!(error.to_string().contains(key), "{text}: {error}");
         }
     }
 

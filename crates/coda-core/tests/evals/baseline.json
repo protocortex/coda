@@ -41,6 +41,14 @@
       "turns": 3,
       "tokens": 4306
     },
+    "recalled_an_earlier_session": {
+      "turns": 3,
+      "tokens": 4882
+    },
+    "recalled_nothing_from_another_repository": {
+      "turns": 3,
+      "tokens": 4812
+    },
     "recover_after_bad_call": {
       "turns": 4,
       "tokens": 5701

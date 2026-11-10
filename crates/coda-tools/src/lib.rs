@@ -18,6 +18,7 @@ pub mod list;
 pub mod multi_edit;
 pub mod read;
 pub mod read_log;
+pub mod recall;
 pub mod retrieve;
 pub mod sandbox;
 pub mod skill;

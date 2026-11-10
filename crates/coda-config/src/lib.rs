@@ -10,6 +10,7 @@ pub mod describe;
 pub mod fetch;
 pub mod hooks;
 pub mod loop_guard;
+pub mod recall;
 pub mod review;
 pub mod routing;
 pub mod timing;

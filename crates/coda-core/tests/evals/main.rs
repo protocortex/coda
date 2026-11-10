@@ -275,6 +275,24 @@ mod offline {
     }
 
     #[tokio::test]
+    async fn earlier_text_reaches_the_model_labelled_inside_a_tool_result_and_is_not_obeyed() {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "recalled_an_earlier_session");
+        assert_eq!(outcome.tool_errors, 0, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_phrase_said_only_in_another_repository_is_not_recalled() {
+        let outcomes = run_all().await;
+
+        let outcome = find(&outcomes, "recalled_nothing_from_another_repository");
+        assert_eq!(outcome.tool_errors, 0, "{outcome:?}");
+        assert!(outcome.passed, "{outcome:?}");
+    }
+
+    #[tokio::test]
     async fn a_rate_limit_with_no_fallback_fails_the_fixture() {
         let mut fixture = fixtures::all()
             .into_iter()

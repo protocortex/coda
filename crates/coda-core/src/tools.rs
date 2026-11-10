@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, UNIX_EPOCH};
 
 use coda_config::fetch::FetchConfig;
+use coda_config::recall::RecallConfig;
 use coda_index::{WalkLimits, apply_walk, index_workspace, list_sources};
 use coda_protocol::readers::{
-    IndexReader, OriginalsReader, ReaderError, SearchHit, SymbolLocation,
+    IndexReader, OriginalsReader, ReaderError, RecallHit, RecallReader, SearchHit, SymbolLocation,
 };
 use coda_protocol::types::{OriginalId, SessionId};
 use coda_store::Store;
@@ -28,6 +29,7 @@ use coda_tools::list::ListTool;
 use coda_tools::multi_edit::MultiEditTool;
 use coda_tools::read::ReadTool;
 use coda_tools::read_log::ReadLog;
+use coda_tools::recall::{self, RecallTool};
 use coda_tools::retrieve::RetrieveTool;
 use coda_tools::sandbox::{Sandbox, SandboxError};
 use coda_tools::write::WriteTool;
@@ -118,6 +120,69 @@ pub fn with_fetch(mut tools: BaseTools, config: &FetchConfig) -> BaseTools {
     };
     tools.tools = tools.tools.with(Arc::new(FetchTool::new(policy)));
     tools.schemas.push(fetch_schema());
+    tools.schemas.sort_by(|a, b| a.name.cmp(&b.name));
+    tools
+}
+
+/// The schema of the `recall` tool.
+#[must_use]
+pub fn recall_schema() -> ToolSchema {
+    schema(
+        recall::NAME,
+        recall::DESCRIPTION,
+        &json!({
+            "query": {"type": "string", "description": "A few words to look for."},
+            "limit": {"type": "integer", "description": "How many matches to return, at most; the default is 5."},
+        }),
+        &["query"],
+    )
+}
+
+/// Searches the recall index kept in a shared store, for one session's repository.
+pub struct StoreRecall {
+    store: Arc<Mutex<Store>>,
+    session: SessionId,
+    delegated_repos: Vec<String>,
+}
+
+impl StoreRecall {
+    /// A search for `session`, which also reaches delegated sessions of the
+    /// repositories in `delegated_repos`.
+    #[must_use]
+    pub fn new(store: Arc<Mutex<Store>>, session: SessionId, delegated_repos: Vec<String>) -> Self {
+        Self {
+            store,
+            session,
+            delegated_repos,
+        }
+    }
+}
+
+impl RecallReader for StoreRecall {
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<RecallHit>, ReaderError> {
+        lock(&self.store)
+            .recall_reader(&self.session, &self.delegated_repos)
+            .search(query, limit)
+    }
+}
+
+/// `tools` with the `recall` tool added when the user switched recall on. Off,
+/// they come back unchanged, so the tool is not offered.
+#[must_use]
+pub fn with_recall(
+    mut tools: BaseTools,
+    config: &RecallConfig,
+    store: Arc<Mutex<Store>>,
+    session: SessionId,
+) -> BaseTools {
+    if !config.enabled {
+        return tools;
+    }
+    let reader = StoreRecall::new(store, session, config.delegated_repos.clone());
+    tools.tools = tools
+        .tools
+        .with(Arc::new(RecallTool::new(reader, DEFAULT_MAX_OUTPUT_BYTES)));
+    tools.schemas.push(recall_schema());
     tools.schemas.sort_by(|a, b| a.name.cmp(&b.name));
     tools
 }

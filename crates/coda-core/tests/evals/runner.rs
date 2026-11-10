@@ -12,11 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use coda_config::hooks::{HookConfig, HookEvent};
+use coda_config::recall::RecallConfig;
 use coda_core::hooks::HookRunner;
 use coda_core::prompt::ToolSchema;
 use coda_core::prompt::{Conversation, Prefix};
 use coda_core::tools::{
     BaseTools, BaseToolsConfig, StoreOriginals, ask_schema, base_tools, fetch_schema, todo_schema,
+    with_recall,
 };
 use coda_core::turn::{
     Fallback, StopCondition, ToolSet, TurnConfig, TurnError, TurnEvent, TurnLoop,
@@ -28,7 +30,7 @@ use coda_providers::model::{
     ModelProvider, ModelRequest, ModelStream, ProviderError, RequestMessage,
 };
 use coda_providers::tool_request::ToolRequest;
-use coda_store::{NewSession, Store};
+use coda_store::{EventRecord, NewSession, Store};
 use coda_tools::fetch::{
     FetchPolicy, FetchTool, Reply, Request, Resolver, Transport, UNTRUSTED_RULE,
 };
@@ -46,6 +48,8 @@ const FETCH_MAX_BYTES: usize = 256;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const BASH_TIMEOUT: Duration = Duration::from_secs(20);
 const GUARD_TIMEOUT_MS: u64 = 10_000;
+const OTHER_REPO: &str = "/somewhere/else";
+const USER_MESSAGE_KIND: &str = "user_message";
 const SHELL_PATH: &str = "/usr/bin:/bin";
 /// A rough size of a token in request bytes, enough to compare runs with each other.
 const BYTES_PER_TOKEN: u64 = 4;
@@ -166,6 +170,7 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
             mode: Mode::default(),
         })
         .unwrap();
+    seed_earlier_sessions(&mut store, fixture, &workdir);
     let store = Arc::new(Mutex::new(store));
     let tools = base_tools(
         &BaseToolsConfig {
@@ -177,6 +182,15 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
         StoreOriginals::new(Arc::clone(&store), session.clone()),
     )
     .unwrap();
+    let tools = with_recall(
+        tools,
+        &RecallConfig {
+            enabled: !fixture.earlier.is_empty(),
+            delegated_repos: Vec::new(),
+        },
+        Arc::clone(&store),
+        session.clone(),
+    );
     let (tool_set, schemas, system) = offered(fixture, tools);
     let prefix = Prefix::new(&system, schemas, "").unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -244,6 +258,37 @@ async fn run_with_fallback<P: ModelProvider + Send + Sync>(
         fallbacks,
         stop,
         failure,
+    }
+}
+
+/// Stores what the fixture says was said in earlier sessions, one session per
+/// message, with recall on so the messages are indexed.
+fn seed_earlier_sessions(store: &mut Store, fixture: &Fixture, workdir: &Path) {
+    if fixture.earlier.is_empty() {
+        return;
+    }
+    store.configure_recall(true).unwrap();
+    for earlier in fixture.earlier {
+        let cwd = if earlier.same_repo {
+            workdir.display().to_string()
+        } else {
+            OTHER_REPO.to_owned()
+        };
+        let session = store
+            .create_session(&NewSession {
+                backend: BackendKind::Faux,
+                model: None,
+                cwd,
+                mode: Mode::default(),
+            })
+            .unwrap();
+        let turn = store.begin_turn(&session).unwrap();
+        let record = EventRecord {
+            kind: USER_MESSAGE_KIND.to_owned(),
+            body: serde_json::json!({ "text": earlier.text }).to_string(),
+        };
+        store.append_event(&session, &turn, &record).unwrap();
+        store.end_turn(&session, &turn).unwrap();
     }
 }
 
