@@ -76,7 +76,6 @@ impl TurnsRunner {
     }
 
     async fn send(&self, session_id: SessionId, text: &str) -> Result<(), String> {
-        self.turns.ensure_checkout(&session_id).await?;
         let send = SessionSendParams {
             session_id,
             text: text.to_owned(),

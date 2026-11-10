@@ -126,7 +126,14 @@ async fn a_run_into_a_session_that_does_not_exist_says_so() {
 }
 
 /// Puts the rig's session in a worktree, then removes the folder as `worktree.clean` does.
-async fn cleaned_worktree(rig: &mut Rig) -> std::path::PathBuf {
+pub(super) async fn cleaned_worktree(rig: &mut Rig) -> std::path::PathBuf {
+    let path = session_in_worktree(rig).await;
+    std::fs::remove_dir_all(&path).unwrap();
+    path
+}
+
+/// Moves the rig's session, which must not have started, into a worktree.
+pub(super) async fn session_in_worktree(rig: &mut Rig) -> std::path::PathBuf {
     git(rig, &["init", "-q", "-b", "main"]);
     std::fs::write(rig.cwd.path().join("a.txt"), "one\n").unwrap();
     git(rig, &["add", "."]);
@@ -143,9 +150,7 @@ async fn cleaned_worktree(rig: &mut Rig) -> std::path::PathBuf {
     )
     .await
     .unwrap();
-    let path = std::path::PathBuf::from(moved["session"]["cwd"].as_str().unwrap());
-    std::fs::remove_dir_all(&path).unwrap();
-    path
+    std::path::PathBuf::from(moved["session"]["cwd"].as_str().unwrap())
 }
 
 async fn wait_for_a_user_message(rig: &Rig) {
